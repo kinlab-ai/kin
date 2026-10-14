@@ -12,9 +12,93 @@ import { fileURLToPath } from 'node:url';
 import {
   removeChangelogSection,
   stampServerVersion,
+  stampNpmVersion,
+  stampCompatibilityNpmLock,
   updateWorkspaceLock,
   upsertChangelogSection,
 } from './prepare-release.mjs';
+
+test('compatibility package upgrades cannot retain an older canonical resolver dependency', () => {
+  const source = {
+    name: '@kinlab/kin-mcp', version: '0.8.6',
+    dependencies: { '@kinlab/kin': '0.8.6', preserved: '2.0.0' },
+  };
+  const upgraded = stampNpmVersion(source, '0.8.6', '0.8.7');
+  assert.equal(upgraded.version, '0.8.7');
+  assert.equal(upgraded.dependencies['@kinlab/kin'], '0.8.7');
+  assert.equal(upgraded.dependencies.preserved, '2.0.0');
+  assert.equal(source.dependencies['@kinlab/kin'], '0.8.6');
+  assert.deepEqual(stampNpmVersion(upgraded, '0.8.6', '0.8.7'), upgraded);
+});
+
+test('an already bumped compatibility manifest repairs its stale resolver pin', () => {
+  const manifest = { name: '@kinlab/kin-mcp', version: '0.8.7', dependencies: { '@kinlab/kin': '0.8.6' } };
+  assert.equal(stampNpmVersion(manifest, '0.8.6', '0.8.7').dependencies['@kinlab/kin'], '0.8.7');
+  assert.throws(() => stampNpmVersion({ ...manifest, version: 'unrelated' }, '0.8.6', '0.8.7'), /expected/);
+});
+
+test('compatibility source lock advances both manifests while preserving the local development link', () => {
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const source = JSON.parse(fs.readFileSync(path.join(root, 'packages/kin-mcp/package-lock.json'), 'utf8'));
+  const from = source.version;
+  const to = '99.0.0';
+  const updated = stampCompatibilityNpmLock(source, from, to);
+  assert.equal(updated.version, to);
+  assert.equal(updated.packages[''].version, to);
+  assert.equal(updated.packages[''].dependencies['@kinlab/kin'], to);
+  assert.equal(updated.packages['../kin'].version, to);
+  assert.equal(updated.packages[''].devDependencies['@kinlab/kin'], 'file:../kin');
+  assert.deepEqual(updated.packages['node_modules/@kinlab/kin'], source.packages['node_modules/@kinlab/kin']);
+  assert.equal(updated.dependencies, undefined, 'v3 lock must not gain invented registry dependency records');
+  assert.equal(source.version, from);
+  assert.deepEqual(stampCompatibilityNpmLock(updated, from, to), updated);
+});
+
+test('compatibility lock stamping refuses registry-byte claims and unrelated local versions', () => {
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const source = JSON.parse(fs.readFileSync(path.join(root, 'packages/kin-mcp/package-lock.json'), 'utf8'));
+  for (const property of ['integrity', 'resolved']) {
+    const changed = structuredClone(source);
+    changed.packages['../kin'][property] = 'untrusted-registry-claim';
+    assert.throws(() => stampCompatibilityNpmLock(changed, source.version, '99.0.0'), /generated local/);
+  }
+  const changed = structuredClone(source);
+  changed.packages['../kin'].version = 'unrelated';
+  assert.throws(() => stampCompatibilityNpmLock(changed, source.version, '99.0.0'), /expected/);
+});
+
+test('a future source version installs offline through the generated lock before registry publication', () => {
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const canonical = path.join(root, 'packages/kin');
+  const compatibility = path.join(root, 'packages/kin-mcp');
+  const lock = JSON.parse(fs.readFileSync(path.join(compatibility, 'package-lock.json'), 'utf8'));
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-source-lock-'));
+  const sibling = path.join(fixture, 'kin');
+  const project = path.join(fixture, 'kin-mcp');
+  const version = '99.0.0';
+  try {
+    fs.mkdirSync(sibling);
+    fs.mkdirSync(project);
+    for (const directory of ['bin', 'lib']) fs.cpSync(path.join(canonical, directory), path.join(sibling, directory), { recursive: true });
+    for (const [source, destination] of [[canonical, sibling], [compatibility, project]]) {
+      const manifest = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
+      fs.writeFileSync(path.join(destination, 'package.json'), JSON.stringify(stampNpmVersion(manifest, lock.version, version)));
+    }
+    fs.writeFileSync(path.join(project, 'package-lock.json'), JSON.stringify(stampCompatibilityNpmLock(lock, lock.version, version)));
+    const env = { ...process.env, npm_config_cache: path.join(fixture, 'cache'), npm_config_registry: 'http://127.0.0.1:9' };
+    execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--offline'], {
+      cwd: project, env, encoding: 'utf8', shell: process.platform === 'win32',
+    });
+    assert.equal(fs.realpathSync(path.join(project, 'node_modules/@kinlab/kin')), fs.realpathSync(sibling));
+    const output = execFileSync(process.execPath, ['--input-type=module', '--eval',
+      "import { targetKinVersion } from '@kinlab/kin/lib/resolve.mjs'; process.stdout.write(targetKinVersion());"], {
+      cwd: project, env, encoding: 'utf8',
+    });
+    assert.equal(output, version);
+    const installed = JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8'));
+    assert.equal(installed.dependencies['@kinlab/kin'], version, 'published dependency remains an exact registry version');
+  } finally { fs.rmSync(fixture, { recursive: true, force: true }); }
+});
 
 test('updates only local Kin workspace packages in Cargo.lock', () => {
   const source = `version = 4

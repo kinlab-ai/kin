@@ -29,9 +29,10 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const VERSION_LINE_SHA = /\(([0-9a-f]{40})(-dirty)?\s/;
@@ -170,8 +171,89 @@ export function judgeBuildMeta(meta, { expectedCommit, expectedVersion, lockSha,
   }
 }
 
-const run = (file, args) =>
-  execFileSync(file, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], maxBuffer: 64 * 1024 * 1024 });
+const run = (file, args, options = {}) =>
+  execFileSync(file, args, { ...options, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], maxBuffer: 64 * 1024 * 1024 });
+
+const identityFields = ["version", "commit_sha", "source_dirty", "source_known", "target", "build_profile"];
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const identityFromMeta = (meta) => ({
+  version: meta.kin_version,
+  commit_sha: meta.kin_commit,
+  source_dirty: meta.kin_dirty,
+  source_known: meta.kin_source_known,
+  target: meta.kin_target,
+  build_profile: meta.kin_build_profile,
+});
+const identityFromStatus = (binary) => Object.fromEntries(identityFields.map((key) => [key, binary?.[key]]));
+
+function activateCanonicalPair(args, { env, exec, log }) {
+  const root = mkdtempSync(join(realpathSync(args.out), "native-runtime-"));
+  try {
+    const home = join(root, "home"), kinHome = join(home, ".kin"), bin = join(kinHome, "bin");
+    mkdirSync(bin, { recursive: true, mode: 0o700 });
+    const suffix = args.target.includes("windows") ? ".exe" : "";
+    const pair = Object.fromEntries([["cli", args.kin, `kin${suffix}`], ["daemon", args.daemon, `kin-daemon${suffix}`]].map(([role, source, name]) => {
+      const bytes = readFileSync(source), path = join(bin, name), hash = sha256(bytes);
+      writeFileSync(path, bytes, { flag: "wx", mode: 0o755 });
+      if (sha256(readFileSync(path)) !== hash) throw new Error(`canonical ${role} copy changed the selected artifact bytes`);
+      return [role, { source: realpathSync(source), path, sha256: hash }];
+    }));
+    const scopedEnv = Object.fromEntries(Object.entries(env).filter(([key]) =>
+      !/^(?:_?KIN_|GIT_|DYLD_|LD_|HOME$|USERPROFILE$|APPDATA$|LOCALAPPDATA$|XDG_)/i.test(key)));
+    Object.assign(scopedEnv, { HOME: home, USERPROFILE: home, KIN_HOME: kinHome, KIN_DIR: kinHome,
+      KIN_RUNTIME_MODE: "managed", APPDATA: join(home, "appdata"), LOCALAPPDATA: join(home, "local-appdata"),
+      XDG_CONFIG_HOME: join(home, "config"), XDG_CACHE_HOME: join(home, "cache") });
+    const kinVersion = exec(args.kin, ["--version"], { env: scopedEnv });
+    const daemonVersion = exec(args.daemon, ["--version"], { env: scopedEnv });
+    writeFileSync(join(args.out, "kin-version.txt"), kinVersion);
+    writeFileSync(join(args.out, "kin-daemon-version.txt"), daemonVersion);
+    log(kinVersion.trim());
+    log(daemonVersion.trim());
+    judgeVersionLines([kinVersion.trim(), daemonVersion.trim()], args.expectCommit);
+    const probe = (binary, argv, name) => {
+      const text = exec(binary, argv, { env: scopedEnv });
+      writeFileSync(join(args.out, name), text);
+      try { return JSON.parse(text); }
+      catch (cause) { throw new Error(`${name} did not print JSON: ${cause.message}`, { cause }); }
+    };
+    const cliMeta = probe(pair.cli.path, ["bench-meta", "--json", "--runtime-identity-only"], "kin-runtime-build-identity.json");
+    if (cliMeta.schema !== "kin.runtime-build-identity.v1") throw new Error("CLI runtime identity schema is unsupported");
+    const identity = identityFromMeta(cliMeta);
+    if (typeof identity.version !== "string" || !identity.version ||
+        !COMMIT_SHA.test(identity.commit_sha ?? "") || identity.commit_sha !== args.expectCommit ||
+        identity.source_dirty !== false || identity.source_known !== true ||
+        identity.target !== args.target || identity.build_profile !== "release" ||
+        (args.expectVersion !== undefined && identity.version !== args.expectVersion)) {
+      throw new Error("selected CLI runtime identity did not prove the expected clean, known release target");
+    }
+    const daemon = probe(pair.daemon.path, ["--compat-json"], "kin-daemon-compat.json");
+    if (daemon.schema !== "kin.daemon.compat.v2" || !isDeepStrictEqual(daemon.runtime_identity, identity)) {
+      throw new Error("independent daemon runtime identity does not match the selected CLI");
+    }
+    const status = probe(pair.cli.path, ["runtime", "status", "--json"], "kin-runtime-status.json");
+    if (status.schema !== "kin.runtime-status.v1" || status.ready !== true || status.mode !== "managed" ||
+        status.pair_matches !== true || status.kin_home !== kinHome) {
+      throw new Error("isolated canonical runtime pair is not ready in managed mode");
+    }
+    for (const role of ["cli", "daemon"]) {
+      if (status[role]?.path !== pair[role].path || status[role]?.sha256 !== pair[role].sha256 ||
+          !isDeepStrictEqual(identityFromStatus(status[role]), identity) ||
+          sha256(readFileSync(pair[role].path)) !== pair[role].sha256 ||
+          sha256(readFileSync(pair[role].source)) !== pair[role].sha256) {
+        throw new Error(`canonical ${role} path, hash or identity differs from the selected artifact`);
+      }
+    }
+    writeFileSync(join(args.out, "kin-canonical-pair.json"), JSON.stringify({
+      schema: "kin.native-provenance-canonical-pair.v1", verified: true, pair, identity,
+      mode: status.mode, channel: status.channel, release_kind: status.release_kind,
+      scope: "isolated selected archive execution; no public release or installer first-contact claim",
+    }, null, 2) + "\n");
+    return { root, pair, env: scopedEnv, identity };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
 
 export function verify(args, { env = process.env, exec = run, log = console.log } = {}) {
   const plan = executionPlan(hostArch(env), args.target);
@@ -217,34 +299,43 @@ export function verify(args, { env = process.env, exec = run, log = console.log 
   }
 
   mkdirSync(args.out, { recursive: true });
-  const kinVersion = exec(args.kin, ["--version"]);
-  const daemonVersion = exec(args.daemon, ["--version"]);
-  const benchMeta = exec(args.kin, ["bench-meta", "--json"]);
-  writeFileSync(join(args.out, "kin-version.txt"), kinVersion);
-  writeFileSync(join(args.out, "kin-daemon-version.txt"), daemonVersion);
-  writeFileSync(join(args.out, "kin-build-meta.json"), benchMeta);
-  log(kinVersion.trim());
-  log(daemonVersion.trim());
-
-  judgeVersionLines([kinVersion.trim(), daemonVersion.trim()], args.expectCommit);
-  const lockSha = createHash("sha256").update(readFileSync(args.cargoLock)).digest("hex");
-  let meta;
+  const canonical = activateCanonicalPair(args, { env, exec, log });
   try {
-    meta = JSON.parse(benchMeta);
-  } catch (cause) {
-    throw new Error(`kin bench-meta --json did not print JSON: ${cause.message}`, { cause });
+    const benchMeta = exec(canonical.pair.cli.path, ["bench-meta", "--json"], { env: canonical.env });
+    writeFileSync(join(args.out, "kin-build-meta.json"), benchMeta);
+    const lockSha = createHash("sha256").update(readFileSync(args.cargoLock)).digest("hex");
+    let meta;
+    try {
+      meta = JSON.parse(benchMeta);
+    } catch (cause) {
+      throw new Error(`kin bench-meta --json did not print JSON: ${cause.message}`, { cause });
+    }
+    judgeBuildMeta(meta, {
+      expectedCommit: args.expectCommit,
+      expectedVersion: args.expectVersion,
+      lockSha,
+      target: args.target,
+    });
+    const fullIdentity = identityFromMeta(meta);
+    for (const key of identityFields) {
+      if ((["target", "build_profile"].includes(key) && fullIdentity[key] === undefined)) continue;
+      if (fullIdentity[key] !== canonical.identity[key]) {
+        throw new Error("full metadata identity differs from the independently verified canonical pair");
+      }
+    }
+    for (const binary of Object.values(canonical.pair)) {
+      if (sha256(readFileSync(binary.path)) !== binary.sha256 || sha256(readFileSync(binary.source)) !== binary.sha256) {
+        throw new Error("selected artifact bytes changed during full metadata execution");
+      }
+    }
+    log(
+      `${args.target}: kin and kin-daemon executed ${plan === "rosetta" ? "under Rosetta 2" : "natively"} ` +
+        `and proved ${args.expectCommit}, a clean known source, Cargo.lock ${lockSha} and the default archive profile`,
+    );
+    return { executed: true, plan, lockSha };
+  } finally {
+    rmSync(canonical.root, { recursive: true, force: true });
   }
-  judgeBuildMeta(meta, {
-    expectedCommit: args.expectCommit,
-    expectedVersion: args.expectVersion,
-    lockSha,
-    target: args.target,
-  });
-  log(
-    `${args.target}: kin and kin-daemon executed ${plan === "rosetta" ? "under Rosetta 2" : "natively"} ` +
-      `and proved ${args.expectCommit}, a clean known source, Cargo.lock ${lockSha} and the default archive profile`,
-  );
-  return { executed: true, plan, lockSha };
 }
 
 function isDirectRun() {

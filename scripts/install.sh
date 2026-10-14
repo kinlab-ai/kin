@@ -29,6 +29,10 @@ umask go-w
 # ── Config ──────────────────────────────────────────────────────────────
 
 KIN_DIR="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
+case "$KIN_DIR" in
+    /*) ;;
+    *) KIN_DIR="$(pwd)/$KIN_DIR" ;;
+esac
 KIN_BIN="$KIN_DIR/bin"
 KIN_LIB="$KIN_DIR/lib"
 export KIN_HOME="$KIN_DIR"
@@ -72,6 +76,82 @@ detect_arch() {
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Migration needs parsed official metadata and a parsed final identity. Refuse
+# rather than infer those values from text when no JSON parser is available.
+json_value() {
+    json_file="$1"
+    json_path="$2"
+    if has_cmd python3; then
+        python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): v=v[k]
+if not isinstance(v,(str,bool,int)): raise ValueError("expected scalar")
+print(str(v).lower() if isinstance(v,bool) else v)' "$json_file" "$json_path"
+    elif has_cmd node; then
+        node -e 'let v=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")); for(const k of process.argv[2].split("."))v=v[k]; if(!["string","boolean","number"].includes(typeof v))throw Error("expected scalar"); process.stdout.write(String(v)+"\n")' "$json_file" "$json_path"
+    elif has_cmd jq; then
+        jq -r ".$json_path | if type == \"string\" or type == \"boolean\" or type == \"number\" then . else error(\"expected scalar\") end" "$json_file"
+    else
+        err "Migrating an older install requires python3, node, or jq to verify official release metadata and runtime identity."
+        return 1
+    fi
+}
+
+fetch_json() {
+    if has_cmd curl; then
+        curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: Kin-Installer' "$1" -o "$2"
+    elif has_cmd wget; then
+        wget -q --header='Accept: application/vnd.github+json' --header='User-Agent: Kin-Installer' "$1" -O "$2"
+    else
+        err "Neither curl nor wget found. Install one and retry."
+        return 1
+    fi
+}
+
+physical_runtime_path() (
+    case "$1" in /*) ;; *) return 1 ;; esac
+    runtime_parent=$(dirname "$1")
+    runtime_name=$(basename "$1")
+    runtime_parent=$(cd "$runtime_parent" && pwd -P) || return 1
+    printf '%s/%s\n' "$runtime_parent" "$runtime_name"
+)
+
+verify_selected_runtime() {
+    status_file="$1"
+    for check in 'schema:kin.runtime-status.v1' 'ready:true' 'mode:managed' 'pair_matches:true' 'restart_needed:false'; do
+        field="${check%%:*}"
+        wanted="${check#*:}"
+        [ "$(json_value "$status_file" "$field" 2>/dev/null)" = "$wanted" ] || return 1
+    done
+    reported_home=$(json_value "$status_file" kin_home 2>/dev/null) || return 1
+    case "$reported_home" in /*) ;; *) return 1 ;; esac
+    [ "$(cd "$reported_home" && pwd -P)" = "$MANAGED_ROOT" ] || return 1
+    for component in cli daemon; do
+        [ "$(json_value "$status_file" "$component.version" 2>/dev/null)" = "$VERSION" ] || return 1
+        [ "$(json_value "$status_file" "$component.commit_sha" 2>/dev/null)" = "$SOURCE_SHA" ] || return 1
+        [ "$(json_value "$status_file" "$component.target" 2>/dev/null)" = "$RUST_TARGET" ] || return 1
+        [ "$(json_value "$status_file" "$component.source_dirty" 2>/dev/null)" = false ] || return 1
+        json_value "$status_file" "$component.sha256" 2>/dev/null | grep -Eq '^[0-9a-fA-F]{64}$' || return 1
+    done
+    cli_profile=$(json_value "$status_file" cli.build_profile 2>/dev/null) || return 1
+    [ -n "$cli_profile" ] && [ "$cli_profile" = "$(json_value "$status_file" daemon.build_profile 2>/dev/null)" ] || return 1
+    [ "$(physical_runtime_path "$(json_value "$status_file" cli.path 2>/dev/null)")" = "$MANAGED_ROOT/bin/kin$BIN_EXT" ] || return 1
+    [ "$(physical_runtime_path "$(json_value "$status_file" daemon.path 2>/dev/null)")" = "$MANAGED_ROOT/bin/kin-daemon$BIN_EXT" ] || return 1
+}
+
+INSTALL_STAGE=""
+KEEP_STAGE=0
+cleanup_stage() {
+    if [ -n "$INSTALL_STAGE" ]; then
+        if [ "$KEEP_STAGE" = 1 ]; then
+            err "Migration is pending. Verified staging files were retained at $INSTALL_STAGE."
+        else
+            rm -rf "$INSTALL_STAGE"
+        fi
+    fi
+}
+trap cleanup_stage EXIT
+
 # Succeeds when $KIN_DIR is a real directory the installing user owns that its
 # group or other users can write. find does not follow a symlink here, so a
 # link in that position never matches.
@@ -82,18 +162,17 @@ kin_dir_is_shared_write() {
 # ── Detect platform ────────────────────────────────────────────────────
 
 OS="$(detect_os)"
+if [ "$OS" = windows ]; then
+    err "Native Windows installs and updates require the official PowerShell installer."
+    err "Open PowerShell and run: irm https://get.kinlab.dev/install.ps1 | iex"
+    exit 1
+fi
 ARCH="$(detect_arch)"
 TARGET="${OS}-${ARCH}"
 
-# Windows release archives carry `.exe`-suffixed binaries; every other platform
-# ships bare names. Derive the suffix once from the detected OS and apply it
-# everywhere a binary is named after extraction. Naming a bare `kin-daemon`
-# under a Windows archive aborted the install after the download had already
-# been fetched and verified, which is a worse failure than the 404 it replaced.
-case "$OS" in
-    windows) BIN_EXT=".exe" ;;
-    *)       BIN_EXT="" ;;
-esac
+# The POSIX installer consumes the macOS and Linux tar archives. PowerShell
+# owns native Windows ZIP extraction and its synchronous update worker.
+BIN_EXT=""
 
 printf '\n'
 printf '  \033[1;36mKin Installer\033[0m\n'
@@ -114,16 +193,36 @@ if ! has_cmd git; then
     info 'git not found. Kin installs and runs without it, but `kin setup` inside a Git repository and adopting an existing project both require it.'
 fi
 
-# ── Detect an existing install (reinstall / upgrade) ──────────────────
+# ── Existing installs use the native transactional updater ─────────────
 
 PREVIOUS_VERSION=""
-if [ -x "$KIN_BIN/kin$BIN_EXT" ]; then
-    PREVIOUS_VERSION=$("$KIN_BIN/kin$BIN_EXT" --version 2>/dev/null | awk '{print $2}')
-    if [ -n "$PREVIOUS_VERSION" ]; then
-        info "Existing install found: kin $PREVIOUS_VERSION (will be replaced)"
-    else
-        info "Existing install found in $KIN_DIR (will be replaced)"
+LEGACY_BOOTSTRAP=0
+if [ -e "$KIN_BIN/kin$BIN_EXT" ] || [ -L "$KIN_BIN/kin$BIN_EXT" ] ||    [ -e "$KIN_BIN/kin-daemon$BIN_EXT" ] || [ -L "$KIN_BIN/kin-daemon$BIN_EXT" ]; then
+    if [ ! -x "$KIN_BIN/kin$BIN_EXT" ] || [ -L "$KIN_BIN/kin$BIN_EXT" ]; then
+        err "An incomplete or invalid managed install exists at $KIN_BIN. No component was replaced."
+        exit 1
     fi
+    if [ -n "${KIN_VERSION:-}" ] || [ -n "${KIN_BASE_URL:-}" ]; then
+        err "Pinned or mirrored reinstalls cannot replace an existing managed runtime independently."
+        err "Use kin update with its verified release pins, or select a separate development binary."
+        exit 1
+    fi
+    # A typed refusal still identifies a current API whose updater can repair
+    # the pair. An old release's unknown command must never authorize raw copies.
+    RUNTIME_PROBE=$("$KIN_BIN/kin$BIN_EXT" runtime status --json 2>/dev/null) || true
+    if printf '%s\n' "$RUNTIME_PROBE" | grep -Eq '"schema"[[:space:]]*:[[:space:]]*"kin\.runtime-status\.v1"'; then
+        info "Updating the existing managed runtime through its native transaction..."
+        "$KIN_BIN/kin$BIN_EXT" update --apply
+        "$KIN_BIN/kin$BIN_EXT" runtime status --json
+        if ! is_truthy "${KIN_NO_SETUP:-}"; then
+            "$KIN_BIN/kin$BIN_EXT" setup --no-interactive
+        fi
+        ok "Managed runtime updated and verified"
+        exit 0
+    fi
+    LEGACY_BOOTSTRAP=1
+    ORIGINAL_KIN_HOME="$KIN_DIR"
+    info "Older managed runtime detected. Staging an official release for native migration..."
 fi
 
 # ── Resolve version ────────────────────────────────────────────────────
@@ -163,8 +262,74 @@ CHECKSUM_URL="${URL}.sha256"
 
 info "Downloading $ARCHIVE..."
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+if [ "$LEGACY_BOOTSTRAP" = 1 ]; then
+    MANAGED_ROOT=$(cd "$KIN_DIR" && pwd -P)
+    STAGE_PARENT=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+    case "$STAGE_PARENT/" in
+        "$MANAGED_ROOT/"*) err "Migration staging must be outside the managed Kin home."; exit 1 ;;
+    esac
+fi
+INSTALL_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/kin-install.XXXXXXXX")
+chmod 700 "$INSTALL_STAGE"
+if [ "$LEGACY_BOOTSTRAP" = 1 ]; then
+    if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+        err "Official release metadata returned an invalid version. No component was replaced."
+        exit 1
+    fi
+    RELEASE_VERSION="${VERSION%%+*}"
+    case "$RELEASE_VERSION" in
+        *-*) CHANNEL=alpha; PRERELEASE=true ;;
+        *) CHANNEL=stable; PRERELEASE=false ;;
+    esac
+    case "$TARGET" in
+        linux-x86_64) RUST_TARGET=x86_64-unknown-linux-musl ;;
+        linux-aarch64) RUST_TARGET=aarch64-unknown-linux-musl ;;
+        macos-x86_64) RUST_TARGET=x86_64-apple-darwin ;;
+        macos-aarch64) RUST_TARGET=aarch64-apple-darwin ;;
+        *) err "No supported native migration target for $TARGET."; exit 1 ;;
+    esac
+    fetch_json "https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/tags/v${VERSION}" "$INSTALL_STAGE/release.json"
+    if [ "$(json_value "$INSTALL_STAGE/release.json" tag_name)" != "v$VERSION" ] ||
+       [ "$(json_value "$INSTALL_STAGE/release.json" draft)" != false ] ||
+       [ "$(json_value "$INSTALL_STAGE/release.json" prerelease)" != "$PRERELEASE" ]; then
+        err "Official release metadata does not admit the selected version and channel."
+        exit 1
+    fi
+    fetch_json "https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/git/ref/tags/v${VERSION}" "$INSTALL_STAGE/tag-ref.json"
+    if [ "$(json_value "$INSTALL_STAGE/tag-ref.json" ref)" != "refs/tags/v$VERSION" ]; then
+        err "Official tag metadata did not identify the exact selected release tag."
+        exit 1
+    fi
+    TAG_RECORD="$INSTALL_STAGE/tag-ref.json"
+    TAG_DEPTH=0
+    while :; do
+        SOURCE_SHA=$(json_value "$TAG_RECORD" object.sha)
+        SOURCE_TYPE=$(json_value "$TAG_RECORD" object.type)
+        if ! printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            err "Official tag metadata did not resolve to a full source commit. No component was replaced."
+            exit 1
+        fi
+        SOURCE_SHA=$(printf '%s' "$SOURCE_SHA" | tr '[:upper:]' '[:lower:]')
+        case "$SOURCE_TYPE" in
+            commit) break ;;
+            tag)
+                if [ "$TAG_DEPTH" -ge 5 ]; then
+                    err "Official tag metadata exceeded the supported annotation depth."
+                    exit 1
+                fi
+                TAG_DEPTH=$((TAG_DEPTH + 1))
+                REQUESTED_TAG_SHA="$SOURCE_SHA"
+                TAG_RECORD="$INSTALL_STAGE/tag-$TAG_DEPTH.json"
+                fetch_json "https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/git/tags/$SOURCE_SHA" "$TAG_RECORD"
+                if [ "$(json_value "$TAG_RECORD" sha | tr '[:upper:]' '[:lower:]')" != "$REQUESTED_TAG_SHA" ]; then
+                    err "Official annotation metadata did not identify the requested tag object."
+                    exit 1
+                fi
+                ;;
+            *) err "Official release tag does not resolve to a commit."; exit 1 ;;
+        esac
+    done
+fi
 
 # Download the archive and its per-artifact checksum. Interactive terminals get
 # the downloader's live byte/percent meter for the large archive; piped and CI
@@ -173,41 +338,42 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # -a 256 format: "<hash>  <filename>"). Both downloads must succeed.
 if has_cmd curl; then
     if [ -t 2 ]; then
-        curl -fL "$URL" -o "$TMPDIR/$ARCHIVE"
+        curl -fL "$URL" -o "$INSTALL_STAGE/$ARCHIVE"
     else
-        curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
+        curl -fsSL "$URL" -o "$INSTALL_STAGE/$ARCHIVE"
     fi
     # Tolerate a failed checksum fetch here so the explicit, friendly error
     # below fires (instead of a bare curl error under `set -e`).
-    curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
+    curl -fsSL "$CHECKSUM_URL" -o "$INSTALL_STAGE/$ARCHIVE.sha256" 2>/dev/null || true
 elif has_cmd wget; then
     if [ -t 2 ]; then
-        wget "$URL" -O "$TMPDIR/$ARCHIVE"
+        wget "$URL" -O "$INSTALL_STAGE/$ARCHIVE"
     else
-        wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
+        wget -q "$URL" -O "$INSTALL_STAGE/$ARCHIVE"
     fi
-    wget -q "$CHECKSUM_URL" -O "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
+    wget -q "$CHECKSUM_URL" -O "$INSTALL_STAGE/$ARCHIVE.sha256" 2>/dev/null || true
 fi
 
 # ── Verify checksum ───────────────────────────────────────────────────
 
-if [ ! -s "$TMPDIR/$ARCHIVE.sha256" ]; then
+if [ ! -s "$INSTALL_STAGE/$ARCHIVE.sha256" ]; then
     err "Could not download checksum file: $CHECKSUM_URL"
     err "Refusing to install an unverified download. Aborting."
     exit 1
 fi
 
-EXPECTED=$(cut -d' ' -f1 "$TMPDIR/$ARCHIVE.sha256")
-if [ -z "$EXPECTED" ]; then
+EXPECTED=$(cut -d' ' -f1 "$INSTALL_STAGE/$ARCHIVE.sha256")
+if ! printf '%s\n' "$EXPECTED" | grep -Eq '^[0-9a-fA-F]{64}$'; then
     err "Checksum file was empty or malformed: $CHECKSUM_URL"
     err "Refusing to install an unverified download. Aborting."
     exit 1
 fi
+EXPECTED=$(printf '%s' "$EXPECTED" | tr '[:upper:]' '[:lower:]')
 
 if has_cmd shasum; then
-    ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+    ACTUAL=$(shasum -a 256 "$INSTALL_STAGE/$ARCHIVE" | cut -d' ' -f1)
 elif has_cmd sha256sum; then
-    ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+    ACTUAL=$(sha256sum "$INSTALL_STAGE/$ARCHIVE" | cut -d' ' -f1)
 else
     err "No SHA-256 tool (shasum or sha256sum) found."
     err "Cannot verify the download integrity. Install one and retry. Aborting."
@@ -227,7 +393,9 @@ ok "SHA-256 checksum verified"
 
 info "Installing to $KIN_DIR..."
 
-mkdir -p "$KIN_BIN" "$KIN_LIB"
+if [ "$LEGACY_BOOTSTRAP" = 0 ]; then
+    mkdir -p "$KIN_BIN" "$KIN_LIB"
+fi
 
 # Everything under $KIN_DIR must end owned by the user doing the install. GNU
 # tar restores the uid/gid recorded in the archive when it runs as root, and
@@ -240,14 +408,14 @@ mkdir -p "$KIN_BIN" "$KIN_LIB"
 # --no-same-owner is the fix, but it is not universal: busybox tar spells it -o
 # and rejects the long option. Fall back to a plain extraction and repair the
 # ownership directly, which is the only case where the chown has anything to do.
-if ! tar --no-same-owner -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" 2>/dev/null; then
-    tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
+if ! tar --no-same-owner -xzf "$INSTALL_STAGE/$ARCHIVE" -C "$INSTALL_STAGE" 2>/dev/null; then
+    tar xzf "$INSTALL_STAGE/$ARCHIVE" -C "$INSTALL_STAGE"
 fi
 
 # Find the extracted directory (archive contains a subdirectory)
-EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "kin-*" | head -1)
+EXTRACT_DIR=$(find "$INSTALL_STAGE" -mindepth 1 -maxdepth 1 -type d -name "kin-*" | head -1)
 if [ -z "$EXTRACT_DIR" ]; then
-    EXTRACT_DIR="$TMPDIR"
+    EXTRACT_DIR="$INSTALL_STAGE"
 fi
 
 # Only root can be handed foreign ownership by tar, and only root can repair it.
@@ -304,6 +472,56 @@ if [ "$OS" = "macos" ]; then
         err "No installed binary or notification bundle was replaced."
         exit 1
     fi
+fi
+
+if [ "$LEGACY_BOOTSTRAP" = 1 ]; then
+    if [ -L "$EXTRACT_DIR/kin$BIN_EXT" ] || [ ! -f "$EXTRACT_DIR/kin$BIN_EXT" ] ||
+       [ -L "$EXTRACT_DIR/kin-daemon$BIN_EXT" ]; then
+        err "The official archive contains unsafe native components. No component was replaced."
+        exit 1
+    fi
+    chmod +x "$EXTRACT_DIR/kin$BIN_EXT"
+    KEEP_STAGE=1
+    BOOTSTRAP_EXIT=0
+    (
+        unset KIN_DIR KIN_DAEMON_BIN KIN_MANAGED_BIN KIN_BINARY_PATH KIN_MCP_KIN_BINARY KIN_DAEMON_URL
+        KIN_HOME="$ORIGINAL_KIN_HOME"
+        KIN_RUNTIME_MODE=managed
+        export KIN_HOME KIN_RUNTIME_MODE
+        cd "$EXTRACT_DIR"
+        "$EXTRACT_DIR/kin$BIN_EXT" update --bootstrap-published \
+            --channel "$CHANNEL" --expect-version "$VERSION" --expect-sha "$SOURCE_SHA" \
+            --expect-archive-sha256 "$ACTUAL" --expect-target "$RUST_TARGET" \
+            --expect-archive-name "$ARCHIVE" --apply
+    ) || BOOTSTRAP_EXIT=$?
+    if [ "$BOOTSTRAP_EXIT" -ne 0 ]; then
+        err "Native migration refused or requires recovery. The installer performed no direct component replacement."
+        exit "$BOOTSTRAP_EXIT"
+    fi
+    STATUS_EXIT=0
+    (
+        unset KIN_DIR KIN_DAEMON_BIN KIN_MANAGED_BIN KIN_BINARY_PATH KIN_MCP_KIN_BINARY KIN_DAEMON_URL
+        KIN_HOME="$ORIGINAL_KIN_HOME"
+        KIN_RUNTIME_MODE=managed
+        export KIN_HOME KIN_RUNTIME_MODE
+        "$KIN_BIN/kin$BIN_EXT" runtime status --json
+    ) > "$INSTALL_STAGE/final-status.json" || STATUS_EXIT=$?
+    if [ "$STATUS_EXIT" -ne 0 ] || ! verify_selected_runtime "$INSTALL_STAGE/final-status.json"; then
+        err "Native migration has not produced the selected ready runtime. Completion remains pending."
+        exit 1
+    fi
+    KEEP_STAGE=0
+    if ! is_truthy "${KIN_NO_SETUP:-}"; then
+        (
+            unset KIN_DIR KIN_DAEMON_BIN KIN_MANAGED_BIN KIN_BINARY_PATH KIN_MCP_KIN_BINARY KIN_DAEMON_URL
+            KIN_HOME="$ORIGINAL_KIN_HOME"
+            KIN_RUNTIME_MODE=managed
+            export KIN_HOME KIN_RUNTIME_MODE
+            "$KIN_BIN/kin$BIN_EXT" setup --no-interactive
+        )
+    fi
+    ok "Managed runtime migrated and verified"
+    exit 0
 fi
 
 # The freshly downloaded binary owns the registry-authority contract used by
@@ -381,6 +599,8 @@ if [ -d "$EXTRACT_DIR/KinNotifier.app" ]; then
     chmod +x "$KIN_LIB/KinNotifier.app/Contents/MacOS/KinNotifier" 2>/dev/null || true
     HAVE_NOTIFIER=1
 fi
+
+"$KIN_BIN/kin$BIN_EXT" runtime status --json
 
 ok "Binaries installed (kin, kin-daemon)"
 
@@ -521,12 +741,7 @@ case "$OS" in
             add_bash_to_path
         fi
         ;;
-    linux|windows)
-        # The windows arm is reached from the MSYS, MINGW, and Cygwin shells,
-        # whose startup files are the same ones Linux uses. It could not run at
-        # all until the post-extract path above stopped aborting on those hosts,
-        # so a Windows install that got this far previously left the CLI off
-        # PATH with nothing said about it.
+    linux)
         if uses_bash; then
             add_bash_to_path
         fi

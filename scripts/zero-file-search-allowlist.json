@@ -761,7 +761,7 @@
     },
     {
       "file": "crates/kin-daemon/src/bin/kin-daemon.rs",
-      "reason": "Daemon process entry point. The pins cover process exits, the directory probe recognizing a named Kin store, and canonical path equality enforcing that an explicitly named external store serves the requested checkout. These binding checks precede any graph consult and do not read repository content or answer a semantic query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify. The eleventh failure exit refuses invalid repository model configuration before startup; it cannot launch a subprocess or supply a semantic answer.",
+      "reason": "Daemon process entry point. The pins cover process exits, the directory probe recognizing a named Kin store, and canonical path equality enforcing that an explicitly named external store serves the requested checkout. These binding checks precede any graph consult and do not read repository content or answer a semantic query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify. The eleventh failure exit refuses invalid repository model configuration before startup; it cannot launch a subprocess or supply a semantic answer. The three exact exit-2 sites refuse invalid local runtime selection, installed-pair authority, or home-namespace capture before profiles, models or graph stores load. The added filesystem expressions inspect only the selected installed daemon executable: its regular non-symlink type and canonical equality with the running executable. They neither read repository source nor execute a subprocess.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -775,7 +775,15 @@
         },
         "process::exit(exit_code);",
         "if names_store && path.is_dir() {",
-        "let same_tree = match (layout.working_dir().canonicalize(), path.canonicalize()) {"
+        "let same_tree = match (layout.working_dir().canonicalize(), path.canonicalize()) {",
+        {
+          "expr": "process::exit(2);",
+          "count": 3
+        },
+        "std::fs::symlink_metadata(&expected)",
+        "if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {",
+        "std::fs::canonicalize(&expected)",
+        ".and_then(std::fs::canonicalize)"
       ]
     },
     {
@@ -3209,7 +3217,7 @@
     },
     {
       "file": "crates/kin-io/src/confined.rs",
-      "reason": "The capability crate's own directory handle, the boundary every kin-io capability is built on. Each body resolves its path beneath a cap-std directory opened from a Grant, so none can reach outside the directory it was handed: replace and replace_unflushed take the process id for a temporary name beside the record they replace, kind reads one entry's type without following a link, names lists one directory, and read_bounded asks an entry it already opened for its length before reading it. The is_symlink, is_dir and is_file calls in kind read a FileType already returned, not the filesystem. Function-scoped so any other primitive added to this module is reported.",
+      "reason": "The capability crate's own directory handle, the boundary every kin-io capability is built on. Each body resolves its path beneath a cap-std directory opened from a Grant, so none can reach outside the directory it was handed: replace and replace_unflushed take the process id for a temporary name beside the record they replace, kind reads one entry's type without following a link, names lists one directory, and read_bounded asks an entry it already opened for its length before reading it. The is_symlink, is_dir and is_file calls in kind read a FileType already returned, not the filesystem. Function-scoped so any other primitive added to this module is reported. The new expression pins cover only regular-entry type checks and no-follow metadata beneath the retained cap-std directory, including their method declaration; no new function body is exempted.",
       "owner": "kin-io",
       "expiration": "2027-04-16",
       "allow_fn": [
@@ -3219,6 +3227,12 @@
         "read_bounded",
         "create_file",
         "replace_unflushed"
+      ],
+      "allow_match": [
+        "self.dir.symlink_metadata(relative)?.is_file()",
+        "file.metadata()?.is_file()",
+        "pub(crate) fn symlink_metadata(&self, relative: &Path) -> io::Result<cap_std::fs::Metadata>",
+        "self.dir.symlink_metadata(relative)"
       ]
     },
     {
@@ -3236,11 +3250,15 @@
     },
     {
       "file": "crates/kin-io/src/store.rs",
-      "reason": "The capability crate's store and host directory types. HostDir::create_file hands back an opened std::fs::File for a writer that streams into it, such as a transcript; the entry is created beneath the directory the HostDir was opened on, so it cannot land outside it. Function-scoped so any other primitive added to this module is reported.",
+      "reason": "The capability crate's store and host directory types. HostDir::create_file hands back an opened std::fs::File for a writer that streams into it, such as a transcript; the entry is created beneath the directory the HostDir was opened on, so it cannot land outside it. Function-scoped so any other primitive added to this module is reported. The new expression pins cover only the HostDir no-follow metadata declaration and delegation to its confined directory; no new function body is exempted.",
       "owner": "kin-io",
       "expiration": "2027-04-16",
       "allow_fn": [
         "create_file"
+      ],
+      "allow_match": [
+        "pub fn symlink_metadata(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::Metadata>",
+        "self.inner.symlink_metadata(name.as_ref())"
       ]
     },
     {
@@ -3271,6 +3289,41 @@
       "expiration": "2027-04-09",
       "allow_fn": [
         "make_editor_uri"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/runtime.rs",
+      "reason": "Managed-install admission and runtime-diagnostics boundary. The exact pins resolve selected executable paths, inspect only selected install entries and native update policy/restart metadata, inspect already-opened executable handles for bounded hashing, and declare the owned metadata-probe process handles/imports. The probes use fixed bench-meta --runtime-identity-only, daemon --compat-json or legacy --version arguments; managed-entry delegation forwards unchanged arguments only to the admitted canonical executable. None reads repository source, supplies graph-query results or provides a raw-filesystem fallback. Exact expression/count pins keep neighboring reads, additional subprocess sites and every other line scanned.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30",
+      "allow_match": [
+        "use std::process::Stdio;",
+        "absolute.canonicalize()",
+        "metadata.symlink_metadata(\"update.toml\")",
+        "!entry.is_file()",
+        "metadata.symlink_metadata(\"update-restart-ack-required.json\")",
+        "directory.symlink_metadata(name)",
+        "!metadata.file_type().is_symlink()",
+        "metadata.is_dir()",
+        "metadata.is_file()",
+        {
+          "expr": "use std::os::unix::process::CommandExt;",
+          "count": 2
+        },
+        "file.metadata()?.is_file()",
+        "file.metadata()?.len()",
+        "fn stop_probe(child: &mut std::process::Child)"
+      ]
+    },
+    {
+      "file": "crates/kin-core/src/runtime_identity.rs",
+      "reason": "Local runtime identity metadata binds the selected Kin home directory to its canonical path and retained native object identity. The two exact canonicalization expressions capture and recheck only that administrative root; the exact process-id expression reports the current service incarnation. These metadata checks precede graph access and do not read repository contents or supply semantic answers. Every other expression remains scanned.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26",
+      "allow_match": [
+        "let canonical = home.canonicalize().map_err(refusal)?;",
+        "if home.canonicalize().map_err(refusal)? != canonical",
+        "pid: std::process::id(),"
       ]
     }
   ]

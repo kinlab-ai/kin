@@ -25,6 +25,7 @@ kin-model = { workspace = true }
 # consults it rather than opening `/sys/fs/cgroup` a second time, so the two
 # can never describe the same container differently.
 kin-daemon-spawn = { workspace = true }
+kin-buildinfo = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-git = { workspace = true }

@@ -324,6 +324,8 @@ crates/kin-cli/src/commands/release_orch.rs	update_manifest_pin	std::fs::read_to
 crates/kin-cli/src/commands/release_orch.rs	update_manifest_pin	std::fs::write
 crates/kin-cli/src/commands/release_orch.rs	workspace_root	std::path::Path::is_dir
 crates/kin-cli/src/commands/resolve.rs	read_resolution_body	std::fs::File::open
+crates/kin-cli/src/commands/runtime.rs	absolute_path	std::path::Path::canonicalize
+crates/kin-cli/src/commands/runtime.rs	installation_grant	kin_blobs::authority::Grant::ambient
 crates/kin-cli/src/commands/session_run.rs	command	std::process::Command::new
 crates/kin-cli/src/commands/session_run.rs	discard	std::fs::remove_dir_all
 crates/kin-cli/src/commands/session_run.rs	discard	std::path::Path::is_symlink
@@ -507,7 +509,7 @@ crates/kin-cli/src/commands/update.rs	ensure_private_updater_temp_container	std:
 crates/kin-cli/src/commands/update.rs	executable_identity_for_process	std::fs::metadata
 crates/kin-cli/src/commands/update.rs	file_identity	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	file_identity_from_open_file	std::fs::File::metadata
-crates/kin-cli/src/commands/update.rs	install_staged_bundle_locked_with_hook	std::fs::symlink_metadata
+crates/kin-cli/src/commands/update.rs	install_staged_bundle_locked_with_hooks	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	load_from	std::fs::read_to_string
 crates/kin-cli/src/commands/update.rs	load_unattended_deferral	std::fs::read
 crates/kin-cli/src/commands/update.rs	normalize_runtime_binding	std::path::Path::canonicalize
@@ -518,6 +520,8 @@ crates/kin-cli/src/commands/update.rs	optional_file_identity	std::fs::symlink_me
 crates/kin-cli/src/commands/update.rs	pending_install_identity	std::fs::read
 crates/kin-cli/src/commands/update.rs	persist_unattended_deferral	std::fs::OpenOptions::open
 crates/kin-cli/src/commands/update.rs	persist_unattended_deferral	std::fs::rename
+crates/kin-cli/src/commands/update.rs	prepare_windows_update_worker	std::fs::File::open
+crates/kin-cli/src/commands/update.rs	prepare_windows_update_worker	std::fs::OpenOptions::open
 crates/kin-cli/src/commands/update.rs	private_temp_directory_age	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	private_temp_root_identity	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	process_path_matches_component	std::fs::read_link
@@ -526,6 +530,8 @@ crates/kin-cli/src/commands/update.rs	read_journal	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	recover_stale_transactions	std::path::Path::exists
 crates/kin-cli/src/commands/update.rs	refuse_new_update_while_restart_marker_exists	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	refuse_restart_marker_before_remote_preflight	std::fs::symlink_metadata
+crates/kin-cli/src/commands/update.rs	refuse_windows_worker_cleanup_with_recovery_fence	std::fs::read_dir
+crates/kin-cli/src/commands/update.rs	refuse_windows_worker_cleanup_with_recovery_fence	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update.rs	reject_active_managed_runtime	std::path::Path::canonicalize
 crates/kin-cli/src/commands/update.rs	remove_quarantined_private_temp_root	std::fs::remove_dir_all
 crates/kin-cli/src/commands/update.rs	remove_unchanged	std::fs::symlink_metadata
@@ -567,6 +573,8 @@ crates/kin-cli/src/commands/update.rs	write_managed_component_atomically	std::pa
 crates/kin-cli/src/commands/update.rs	write_staged_component	std::fs::File::create
 crates/kin-cli/src/commands/update_windows.rs	capture	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	capture_component_generation	std::fs::symlink_metadata
+crates/kin-cli/src/commands/update_windows.rs	capture_handoff_target	windows_sys::Win32::Storage::FileSystem::CreateFileW
+crates/kin-cli/src/commands/update_windows.rs	claim	std::fs::OpenOptions::open
 crates/kin-cli/src/commands/update_windows.rs	create	std::fs::remove_dir
 crates/kin-cli/src/commands/update_windows.rs	create_current_user_private_file_with_disposition	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	create_managed_config_staged_file	windows_sys::Win32::Storage::FileSystem::CreateFileW
@@ -579,8 +587,13 @@ crates/kin-cli/src/commands/update_windows.rs	open_current_user_private_file_exi
 crates/kin-cli/src/commands/update_windows.rs	open_managed_config_for_exact_quarantine_inner	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	open_managed_config_for_terminal_observation	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	open_path_handle	windows_sys::Win32::Storage::FileSystem::CreateFileW
+crates/kin-cli/src/commands/update_windows.rs	read_record	std::fs::metadata
+crates/kin-cli/src/commands/update_windows.rs	read_record	std::fs::read
+crates/kin-cli/src/commands/update_windows.rs	require_names	std::fs::read_dir
+crates/kin-cli/src/commands/update_windows.rs	require_worker_cleanup_absent	std::fs::symlink_metadata
 crates/kin-cli/src/commands/update_windows.rs	revalidate_managed_file_path	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	revalidate_visible	windows_sys::Win32::Storage::FileSystem::CreateFileW
+crates/kin-cli/src/commands/update_windows.rs	revalidate_worker_cleanup_object	windows_sys::Win32::Storage::FileSystem::CreateFileW
 crates/kin-cli/src/commands/update_windows.rs	seal_staged_bundle	std::fs::symlink_metadata
 crates/kin-cli/src/commands/upgrade.rs	remove_legacy_owed_work_records	std::fs::remove_file
 crates/kin-cli/src/commands/upgrade.rs	rewrite_upgrade_sidecar	std::fs::File::open
@@ -936,6 +949,8 @@ crates/kin-core/src/registry.rs	write_registry_atomically	std::fs::rename
 crates/kin-core/src/registry.rs	write_registry_atomically	std::fs::write
 crates/kin-core/src/registry.rs	write_registry_atomically_at	libc::renameat
 crates/kin-core/src/repository_origin.rs	git_config_origin_url	gix::open
+crates/kin-core/src/runtime_identity.rs	capture	cap_std::ambient_authority
+crates/kin-core/src/runtime_identity.rs	capture	std::path::Path::canonicalize
 crates/kin-core/src/shims.rs	ensure_shim_dir	std::fs::create_dir_all
 crates/kin-core/src/shims.rs	write_shim	std::fs::set_permissions
 crates/kin-core/src/shims.rs	write_shim	std::fs::write
@@ -1047,6 +1062,8 @@ crates/kin-daemon/src/auth_rotation.rs	write_window_record	std::fs::File::create
 crates/kin-daemon/src/auth_rotation.rs	write_window_record	std::fs::create_dir_all
 crates/kin-daemon/src/auth_rotation.rs	write_window_record	std::fs::remove_file
 crates/kin-daemon/src/auth_rotation.rs	write_window_record	std::fs::rename
+crates/kin-daemon/src/bin/kin-daemon.rs	require_managed_daemon_authority	std::fs::canonicalize
+crates/kin-daemon/src/bin/kin-daemon.rs	require_managed_daemon_authority	std::fs::symlink_metadata
 crates/kin-daemon/src/bin/kin-daemon.rs	resolve_layout	std::path::Path::canonicalize
 crates/kin-daemon/src/bin/kin-daemon.rs	resolve_layout	std::path::Path::is_dir
 crates/kin-daemon/src/daemon.rs	classify_control_plane	std::path::Path::exists

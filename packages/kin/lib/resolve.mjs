@@ -128,9 +128,10 @@ export function binaryName(name, platform = process.platform) {
   return platform === 'win32' ? `${name}.exe` : name;
 }
 
-/** Root of Kin's managed install, honoring $KIN_HOME (default ~/.kin). */
+/** Root of Kin's managed install, honoring $KIN_HOME, then $KIN_DIR (default ~/.kin). */
 export function kinHome(env = process.env, home = os.homedir()) {
-  return env.KIN_HOME && env.KIN_HOME.trim() ? env.KIN_HOME : path.join(home, '.kin');
+  const root = env.KIN_HOME || env.KIN_DIR;
+  return root ? path.resolve(root) : path.join(home, '.kin');
 }
 
 /**

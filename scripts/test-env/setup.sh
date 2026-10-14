@@ -32,8 +32,9 @@
 # otherwise create stores and index entries in the developer's real Kin home,
 # and leave them behind when its working tree is deleted. Each run gets
 # KIN_REGISTRY_PATH=<run>/kin-home/registry.toml, which moves the registry,
-# the store index and the central stores together. KIN_HOME is left alone so
-# installed tools and model caches resolve as before.
+# the store index and the central stores together. The same existing directory
+# is KIN_HOME, so local runtime handshakes bind the test profile rather than a
+# developer's installed runtime. It is selected before any test thread starts.
 set -u
 
 [ -n "${NEXTEST_ENV:-}" ] || exit 0
@@ -73,6 +74,7 @@ if [ -n "$run_dir" ]; then
     fi
     if mkdir -p -m 700 "$run_dir/kin-home"; then
         echo "KIN_REGISTRY_PATH=$run_dir/kin-home/registry.toml" >> "$NEXTEST_ENV"
+        echo "KIN_HOME=$run_dir/kin-home" >> "$NEXTEST_ENV"
     fi
 fi
 

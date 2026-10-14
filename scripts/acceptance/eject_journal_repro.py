@@ -73,6 +73,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -458,6 +459,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repos = {}
         self.commits = 0
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def log(self, line):
         if self.verbose:

@@ -67,6 +67,8 @@ import tempfile
 import time
 import urllib.request
 
+from runtime_fixture import prepare_runtime_fixture
+
 print = functools.partial(print, flush=True)
 
 PASS = "PASS"
@@ -432,6 +434,8 @@ class Suite(object):
         self.cleanup_kin = self.published_kin
         self.cleanup_home = "home-published"
         self.cleanup_daemon = self.published_daemon
+        self.cleanup_env = None
+        self.candidate_env = None
 
     def shutdown(self):
         """Stop only this run's repositories, including a failed initialization."""
@@ -449,7 +453,8 @@ class Suite(object):
                 continue
             try:
                 proc = subprocess.run(
-                    [self.cleanup_kin, "daemon", "stop", "--json"], cwd=repo, env=self.env(self.cleanup_home, self.cleanup_daemon),
+                    [self.cleanup_kin, "daemon", "stop", "--json"], cwd=repo,
+                    env=self.cleanup_env or self.env(self.cleanup_home, self.cleanup_daemon),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
                 rc, out, err = proc.returncode, proc.stdout, proc.stderr
                 record.update({"returncode": rc, "stdout": out, "stderr": err})
@@ -477,6 +482,7 @@ class Suite(object):
         # test must not share a supervisor or a registry, and neither may reach
         # the operator's own stores. Nothing here runs inference.
         env["KIN_HOME"] = os.path.join(self.workdir, home)
+        env["HOME"] = os.path.join(self.workdir, home + "-user")
         env["KIN_DAEMON_BIN"] = daemon
         env["KIN_DAEMON_AUTO_EMBED"] = "0"
         env["KIN_EMBED_BACKEND"] = "cpu"
@@ -485,9 +491,10 @@ class Suite(object):
         env["KIN_INIT_HISTORY"] = "full"
         env["KIN_DAEMON_DISABLE_LSP"] = "1"
         env["KIN_DAEMON_READY_TIMEOUT_SECS"] = str(SERVE_BOUND_SECONDS)
-        for name in ("KIN_MCP_REPO", "KIN_DIR", "KIN_DAEMON_URL"):
+        for name in ("KIN_MCP_REPO", "KIN_DIR", "KIN_DAEMON_URL", "KIN_REGISTRY_PATH"):
             env.pop(name, None)
         os.makedirs(env["KIN_HOME"], exist_ok=True)
+        os.makedirs(env["HOME"], exist_ok=True)
         return env
 
     def published(self, args, timeout=900):
@@ -495,11 +502,17 @@ class Suite(object):
                    env=self.env("home-published", self.published_daemon), timeout=timeout)
 
     def under_test(self, args, timeout=SERVE_BOUND_SECONDS + 60, stdout_only=False):
-        self.cleanup_kin = self.kin
+        if self.candidate_env is None:
+            env = self.env("home-under-test", self.daemon)
+            self.candidate_kin, self.candidate_daemon = prepare_runtime_fixture(
+                self.kin, self.daemon, env, env["KIN_HOME"])
+            self.candidate_env = env
+        self.cleanup_kin = self.candidate_kin
         self.cleanup_home = "home-under-test"
-        self.cleanup_daemon = self.daemon
-        return run([self.kin] + args, cwd=self.repo,
-                   env=self.env("home-under-test", self.daemon), timeout=timeout,
+        self.cleanup_daemon = self.candidate_daemon
+        self.cleanup_env = dict(self.candidate_env)
+        return run([self.candidate_kin] + args, cwd=self.repo,
+                   env=self.candidate_env, timeout=timeout,
                    stdout_only=stdout_only)
 
     def git(self, args):

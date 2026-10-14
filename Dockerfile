@@ -118,6 +118,10 @@ COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
 # it resolves for the mounted repository, so the daemon binary has to be here
 # even though nothing in this image starts one and no port is published.
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
+RUN mkdir -p /home/kin/.kin/bin \
+    && chown kin:kin /home/kin/.kin /home/kin/.kin/bin \
+    && ln /usr/local/bin/kin /home/kin/.kin/bin/kin \
+    && ln /usr/local/bin/kin-daemon /home/kin/.kin/bin/kin-daemon
 USER kin
 # stdio transport: MCP travels over stdin and stdout, so run this image with
 # `-i`, mount the repository, and set the working directory to it.
@@ -133,6 +137,10 @@ ENV HOME=/home/kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
 COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
+RUN mkdir -p /home/kin/.kin/bin \
+    && chown kin:kin /home/kin/.kin /home/kin/.kin/bin \
+    && ln /usr/local/bin/kin /home/kin/.kin/bin/kin \
+    && ln /usr/local/bin/kin-daemon /home/kin/.kin/bin/kin-daemon
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # Pre-create the default workspace owned by the runtime user. Docker seeds a

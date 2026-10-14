@@ -57,6 +57,7 @@ pub mod repository_authority;
 pub mod repository_origin;
 pub mod resolver;
 pub mod retained_parse;
+pub mod runtime_identity;
 #[cfg(any(test, feature = "test-support"))]
 pub mod session_publication_test_support;
 pub mod shims;

@@ -83,6 +83,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import tempfile
 
+from runtime_fixture import prepare_runtime_fixture
+
 PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
@@ -662,6 +664,7 @@ def check_1(suite):
     # one its own commands put there. Without this the probe resolves the
     # operator's installed kin and passes a block that installs nothing.
     env["PATH"] = suite.sanitized_path(work)
+    suite.prepare_runtime(env)
     rc, out, err = run(["bash", "-euo", "pipefail", "-c", script],
                        cwd=work, env=env, timeout=900)
     said = flatten(out + " " + err)
@@ -742,6 +745,7 @@ def check_2(suite):
     # terminal otherwise prints only the short summary.
     command = [suite.kin, "setup", "--no-interactive", "--verbose", "--skip-mcp-check",
                "--install-language-servers"]
+    command[0] = suite.prepare_runtime(env)
     rc, out, err = run(command, cwd=work, env=env, timeout=1800)
     # The installer's full account, beside the files it touched: the verdict
     # below quotes 220 characters of it.
@@ -780,7 +784,8 @@ def doctor_report(suite, extra_env=None):
     work = os.path.join(suite.workdir, "no-repository")
     if not os.path.isdir(work):
         os.makedirs(work)
-    rc, out, err = run([suite.kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
+    kin = suite.prepare_runtime(env)
+    rc, out, err = run([kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
     if not out.strip():
         return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
             rc, flatten(failure_excerpt(err)))
@@ -1156,9 +1161,11 @@ def check_4(suite):
         for name in TOOLCHAIN_HOME_VARS:
             env.pop(name, None)
 
+        kin = suite.prepare_runtime(env)
+
         work = suite.scratch("toolchain-free-repo")
         suite.own(work, env)
-        rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
+        rc, out, err = run([kin, "init", "."], cwd=work, env=env, timeout=900)
         if rc != 0:
             res.unknown("kin init exited %d in the fixture repository: %s"
                         % (rc, flatten(failure_excerpt(err))))
@@ -1173,7 +1180,7 @@ def check_4(suite):
         with open(os.path.join(work, "src", "lib.rs"), "w") as source:
             source.write("pub fn answer() -> u32 {\n    42\n}\n")
         rc, out, err = run(
-            [suite.kin, "doctor", "--fix", "--install-language-servers"],
+            [kin, "doctor", "--fix", "--install-language-servers"],
             cwd=work, env=env, timeout=900)
         combined = (out or "") + "\n" + (err or "")
 
@@ -1419,6 +1426,7 @@ def check_5(suite):
     res.ok("the prober tells a served handshake from a process that exits, proven both ways "
            "before the product was read")
 
+    env["KIN_MCP_KIN_BINARY"] = suite.prepare_runtime(env)
     verdict, out_lines, err, alive = mcp_initialize([node, wrapper], work, env, timeout=300)
     kin_created = os.path.exists(os.path.join(work, ".kin"))
     ok, detail = grade_unbound_start(verdict, alive, err, out_lines, kin_created)
@@ -1724,9 +1732,10 @@ def check_6(suite):
     skipped_env["HOME"] = home
     skipped_env["KIN_HOME"] = os.path.join(home, ".kin")
     skipped_env["PATH"] = os.pathsep.join([served_only, path])
+    skipped_kin = suite.prepare_runtime(skipped_env)
 
     suite.own(work, skipped_env)
-    rc, out, err = run([suite.kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
+    rc, out, err = run([skipped_kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
     combined = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("kin init exited %d on the fixture: %s"
@@ -1743,7 +1752,7 @@ def check_6(suite):
 
     # The sibling command, on the store that run just built. It holds the whole
     # status object and used to read two numbers out of it.
-    rc, out, err = run([suite.kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
+    rc, out, err = run([skipped_kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
     sweep_output = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("kin daemon sweep exited %d: %s" % (rc, flatten(failure_excerpt(err))))
@@ -1768,9 +1777,10 @@ def check_6(suite):
     control_env["HOME"] = control_home
     control_env["KIN_HOME"] = os.path.join(control_home, ".kin")
     control_env["PATH"] = os.pathsep.join([both, path])
+    control_kin = suite.prepare_runtime(control_env)
 
     suite.own(control, control_env)
-    rc, out, err = run([suite.kin, "init", "."], cwd=control, env=control_env, timeout=1800)
+    rc, out, err = run([control_kin, "init", "."], cwd=control, env=control_env, timeout=1800)
     control_output = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("the control kin init exited %d: %s"
@@ -1852,7 +1862,8 @@ def check_7(suite):
     work = os.path.join(suite.workdir, "no-repository")
     if not os.path.isdir(work):
         os.makedirs(work)
-    rc, out, err = run([suite.kin, "doctor"], cwd=work, env=env, timeout=600)
+    kin = suite.prepare_runtime(env)
+    rc, out, err = run([kin, "doctor"], cwd=work, env=env, timeout=600)
     page = flatten(strip_ansi(out or ""))
     if not page:
         res.unknown("`kin doctor` exited %d and printed no page: %s"
@@ -1885,6 +1896,12 @@ class Suite(object):
         self.verbose = verbose
         # Repository path to the environment it was built and initialized with.
         self.owned_repos = {}
+        self.runtime_paths = {}
+
+    def prepare_runtime(self, env):
+        kin, daemon = prepare_runtime_fixture(self.kin, self.daemon, env, env["KIN_HOME"])
+        self.runtime_paths[env["KIN_HOME"]] = (kin, daemon)
+        return kin
 
     def own(self, repo, env=None):
         """Record a repository this run creates, before any init touches it."""
@@ -1919,8 +1936,9 @@ class Suite(object):
                 errors.append("%s: %s" % (repo, record["error"]))
                 continue
             try:
+                kin = self.runtime_paths.get(env.get("KIN_HOME"), (self.kin, self.daemon))[0]
                 proc = subprocess.run(
-                    [self.kin, "daemon", "stop", "--json"], cwd=repo, env=env,
+                    [kin, "daemon", "stop", "--json"], cwd=repo, env=env,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                     timeout=60)
                 rc, out, err = proc.returncode, proc.stdout, proc.stderr
@@ -1949,6 +1967,11 @@ class Suite(object):
 
     def base_env(self):
         env = dict(os.environ)
+        home = os.path.join(self.workdir, "base-home")
+        env["HOME"] = home
+        env["KIN_HOME"] = os.path.join(home, ".kin")
+        for name in ("KIN_REGISTRY_PATH", "KIN_MCP_REPO", "KIN_DIR", "KIN_DAEMON_URL"):
+            env.pop(name, None)
         # This fixture inspects/copies an in-tree store; central layout is
         # qualified separately by brownfield_repro --store-layout central.
         env["KIN_STORE_LAYOUT"] = "in-tree"
@@ -2061,6 +2084,7 @@ def self_test_toolchain_fixture(expect):
 
         with mock.patch(__name__ + "._serve_asset", side_effect=serve), \
                 mock.patch(__name__ + ".run", side_effect=repair), \
+                mock.patch.object(suite, "prepare_runtime", return_value=suite.kin), \
                 mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
                 mock.patch(__name__ + ".HTTPServer", side_effect=AssertionError("unexpected listener")):
             result = check_4(suite)
@@ -2264,6 +2288,9 @@ def self_test_cleanup_dispositions(expect):
             env = {"FIRST_CONTACT_STUB_LOG": log, "FIRST_CONTACT_STUB_STOP": mode}
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.dict(os.environ, env))
+                # The cleanup stub is intentionally not a native runtime pair.
+                stack.enter_context(mock.patch.object(
+                    Suite, "prepare_runtime", lambda suite, child_env: suite.kin))
                 if checks is not None:
                     stack.enter_context(mock.patch(__name__ + ".CHECKS", checks))
                 for patch in patches:

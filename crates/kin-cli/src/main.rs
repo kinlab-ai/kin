@@ -4,7 +4,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
@@ -171,6 +171,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "telemetry",
             "resources",
             "daemon",
+            "runtime",
             "registry",
             "update",
             "upgrade",
@@ -323,6 +324,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect the one admitted CLI and daemon runtime pair
+    Runtime {
+        #[command(subcommand)]
+        action: RuntimeAction,
+    },
     /// Show which Git commands Kin replaces, and how ready each one is
     Capabilities {
         /// Output the versioned capability inventory as JSON
@@ -1409,6 +1415,14 @@ enum Command {
         /// Include repo-specific prepared-state cache manifest fields
         #[arg(long, default_value_t = false, hide = true)]
         prepared_state: bool,
+        /// Static executable identity, without host or repository configuration
+        #[arg(
+            long,
+            hide = true,
+            requires = "json",
+            conflicts_with = "prepared_state"
+        )]
+        runtime_identity_only: bool,
     },
     /// Hidden prepared-state publish/materialize surfaces for benchmark/runtime orchestration
     #[command(hide = true)]
@@ -1818,6 +1832,51 @@ enum Command {
         /// own activity gates.
         #[arg(long, requires = "unattended")]
         force_window: bool,
+        /// Prepare a verified out-of-process Windows update worker
+        #[arg(long, hide = true, conflicts_with_all = [
+            "skip_verify", "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "check_only", "ack_restart", "runtime_sessions", "set_policy", "apply", "dry_run",
+            "unattended", "force_window", "windows_worker"
+        ])]
+        prepare_windows_worker: bool,
+        /// Verify the native updater's exact Windows handoff before replacement
+        #[arg(long, hide = true, value_name = "RECORD", conflicts_with_all = [
+            "prepare_windows_worker", "skip_verify", "check_only", "json", "ack_restart", "runtime_sessions",
+            "set_policy", "unattended", "force_window", "dry_run"
+        ])]
+        windows_worker: Option<PathBuf>,
+        /// Remove an authenticated, completed Windows update worker handoff
+        #[arg(long, hide = true, value_name = "RECORD", conflicts_with_all = [
+            "skip_verify", "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "check_only", "json", "ack_restart", "runtime_sessions", "set_policy", "apply", "dry_run",
+            "unattended", "force_window", "prepare_windows_worker", "windows_worker",
+            "bootstrap_published", "expect_target", "expect_archive_name"
+        ])]
+        cleanup_windows_worker: Option<PathBuf>,
+        /// Admit an independently verified published archive into the managed install
+        #[arg(long, hide = true, requires_all = [
+            "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "expect_target", "expect_archive_name"
+        ], conflicts_with_all = [
+            "skip_verify", "check_only", "json", "ack_restart", "runtime_sessions",
+            "set_policy", "dry_run", "unattended", "force_window",
+            "prepare_windows_worker", "windows_worker"
+        ])]
+        bootstrap_published: bool,
+        #[arg(
+            long,
+            hide = true,
+            requires = "bootstrap_published",
+            value_name = "TARGET"
+        )]
+        expect_target: Option<String>,
+        #[arg(
+            long,
+            hide = true,
+            requires = "bootstrap_published",
+            value_name = "ARCHIVE"
+        )]
+        expect_archive_name: Option<String>,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -2070,6 +2129,21 @@ enum Command {
     Resources {
         #[command(subcommand)]
         action: ResourcesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Report exact executable identities without opening a repository
+    Status {
+        #[arg(long)]
+        json: bool,
+        /// Inspect an isolated development pair instead of the managed install
+        #[arg(long)]
+        development: bool,
+        /// Development CLI whose adjacent daemon should be inspected
+        #[arg(long, requires = "development", value_name = "PATH")]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -3847,6 +3921,53 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if is_top_level_display_flag() {
+        let _ = parse_cli_or_report_retired_command();
+    }
+    let startup_args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if typed_command_path(&startup_args).first() == Some(&"runtime") {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::Runtime {
+            action:
+                RuntimeAction::Status {
+                    json,
+                    development,
+                    binary,
+                },
+        } = cli.command
+        {
+            let code = commands::runtime::run(
+                json,
+                &commands::runtime::StatusOptions {
+                    development,
+                    binary,
+                },
+            )?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+    }
+    if typed_command_path(&startup_args).first() == Some(&"bench-meta")
+        && startup_args
+            .iter()
+            .any(|arg| arg == "--runtime-identity-only")
+    {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::BenchMeta {
+            json: true,
+            prepared_state: false,
+            runtime_identity_only: true,
+        } = cli.command
+        {
+            return commands::runtime::run_identity_probe();
+        }
+    }
+    let runtime_mode = commands::runtime::prepare_environment()?;
     // Raise this process's open-file soft limit before anything opens a file.
     // macOS ships that limit at 256, which is below what one admission needs,
     // so on a stock Mac `kin init` died on the first real repository a person
@@ -3871,10 +3992,6 @@ fn run() -> Result<()> {
     // retrieval or resource settings into every repository daemon it opens.
     // Consult the same parser metadata used for leading command paths, so a
     // global option value named `ui` is not mistaken for the command.
-    let startup_args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let workspace_ui_requested = startup_args.iter().any(|arg| arg == "ui")
         && typed_command_path(&startup_args).first() == Some(&"ui");
     // ...then let the repository's recorded profile take over from that default,
@@ -3899,6 +4016,94 @@ fn run() -> Result<()> {
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = parse_cli_or_report_retired_command();
+    let setup_read_only = matches!(
+        &cli.command,
+        Command::Setup {
+            action: None,
+            check: true,
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Status { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Clients { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Ledger { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Doctor { fix: false, .. }),
+            install_language_servers: false,
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Uninstall { dry_run: true, .. }),
+            ..
+        }
+    );
+    let update_read_only = matches!(
+        &cli.command,
+        Command::Update {
+            check_only: true,
+            cleanup_windows_worker: None,
+            ..
+        } | Command::Update {
+            apply: true,
+            dry_run: true,
+            cleanup_windows_worker: None,
+            ..
+        }
+    );
+    if runtime_mode == kin_core::runtime_identity::RuntimeMode::Development
+        && matches!(&cli.command, Command::Update { .. })
+        && !update_read_only
+    {
+        anyhow::bail!(
+            "development mode cannot mutate the managed installation; run kin update from the admitted managed runtime"
+        );
+    }
+    if runtime_mode == kin_core::runtime_identity::RuntimeMode::Development
+        && ((matches!(&cli.command, Command::Setup { .. }) && !setup_read_only)
+            || matches!(
+                &cli.command,
+                Command::Doctor { fix: true, .. }
+                    | Command::Doctor {
+                        install_language_servers: true,
+                        ..
+                    }
+                    | Command::Doctor { heal: true, .. }
+                    | Command::Doctor {
+                        reclaim_staging: true,
+                        ..
+                    }
+            ))
+    {
+        anyhow::bail!("development mode cannot run setup or doctor repairs against global clients and shell configuration; use the admitted managed runtime");
+    }
+    let runtime_exempt = setup_read_only
+        || matches!(
+            &cli.command,
+            Command::Runtime { .. }
+                | Command::BenchMeta {
+                    prepared_state: false,
+                    ..
+                }
+                | Command::Update { .. }
+                | Command::Capabilities { .. }
+                | Command::Describe { .. }
+                | Command::Languages { .. }
+                | Command::Completions { .. }
+                | Command::SemanticOnlyGuard
+                | Command::Doctor {
+                    fix: false,
+                    install_language_servers: false,
+                    heal: false,
+                    reclaim_staging: false,
+                    ..
+                }
+        );
+    if let Some(code) = commands::runtime::route_startup(runtime_mode, runtime_exempt)? {
+        std::process::exit(code);
+    }
     if !is_top_level_display_flag() && !matches!(&cli.command, Command::Ui { .. }) {
         let model_repository = match &cli.command {
             Command::Mcp {
@@ -3994,7 +4199,7 @@ fn run() -> Result<()> {
 
     // A durable MCP marker is an active repair obligation. Ordinary commands
     // retry it; the update command retries while holding the install lock.
-    if !matches!(&cli.command, Command::Update { .. }) {
+    if !runtime_exempt && !matches!(&cli.command, Command::Update { .. }) {
         match commands::update::retry_pending_mcp_repair_from_managed_process() {
             Ok(_) => {}
             Err(error) => eprintln!("kin: MCP repair remains pending: {error:#}"),
@@ -4014,6 +4219,9 @@ fn run() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
+                Command::Runtime { .. } => {
+                    unreachable!("runtime status returned before repository startup")
+                }
                 Command::Capabilities { json, verbose } => {
                     commands::capabilities::run(json, verbose)
                 }
@@ -5151,6 +5359,7 @@ fn run() -> Result<()> {
                 Command::BenchMeta {
                     json,
                     prepared_state,
+                    runtime_identity_only: _,
                 } => commands::bench_meta::run(json, prepared_state).await,
                 Command::PreparedState { action } => match action {
                     PreparedStateAction::Publish { target, json } => {
@@ -5507,7 +5716,32 @@ fn run() -> Result<()> {
                     dry_run,
                     unattended,
                     force_window,
+                    prepare_windows_worker,
+                    windows_worker,
+                    cleanup_windows_worker,
+                    bootstrap_published,
+                    expect_target,
+                    expect_archive_name,
                 } => {
+                    if let Some(record) = cleanup_windows_worker {
+                        return commands::update::cleanup_windows_update_worker(&record);
+                    }
+                    if bootstrap_published {
+                        return commands::update::run_bootstrap_published(
+                            channel.context("published bootstrap requires an explicit channel")?,
+                            expect_version.context("published bootstrap requires a version")?,
+                            expect_sha
+                                .context("published bootstrap requires an exact source commit")?,
+                            expect_archive_sha256
+                                .context("published bootstrap requires an archive digest")?,
+                            expect_target
+                                .context("published bootstrap requires an exact build target")?,
+                            expect_archive_name
+                                .context("published bootstrap requires an exact archive name")?,
+                            apply,
+                        )
+                        .await;
+                    }
                     commands::update::run(
                         skip_verify,
                         channel,
@@ -5523,6 +5757,8 @@ fn run() -> Result<()> {
                         dry_run,
                         unattended,
                         force_window,
+                        prepare_windows_worker,
+                        windows_worker,
                     )
                     .await
                 }

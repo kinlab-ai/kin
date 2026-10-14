@@ -3,12 +3,15 @@
 # Copyright 2026 Firelock, LLC
 """Negative controls for the fixed, released Windows compatibility baseline."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import zipfile
 
 SOURCE = Path(__file__).with_name("release-rehearsal-compat.py")
 SPEC = importlib.util.spec_from_file_location("release_rehearsal_compat", SOURCE)
@@ -175,6 +178,86 @@ class ExecutionEvidence(unittest.TestCase):
             self.assertEqual((output / "negative.stdout.txt").read_text().strip(), "output")
             self.assertEqual((output / "negative.stderr.txt").read_text().strip(), "reason")
             self.assertEqual(json.loads((output / "negative.exit.json").read_text())["exit_code"], 3)
+
+
+class ArchivePreparation(unittest.TestCase):
+    """Inert archive data controls; no executable or native readiness is simulated."""
+    def fixture(self, root, entries=None):
+        entries = entries or [("kin.exe", b"inert CLI bytes"), ("kin-daemon.exe", b"inert daemon bytes")]
+        archive = root / "kin-windows-x86_64.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            for name, body in entries:
+                bundle.writestr(name, body)
+        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+        Path(str(archive) + ".sha256").write_text(checksum + "  " + archive.name + "\n")
+        expected = {"name": archive.name, "sha256": checksum,
+                    "components": {name: {"sha256": hashlib.sha256(body).hexdigest(), "size_bytes": len(body)}
+                                   for name, body in entries}}
+        return archive, expected
+
+    def test_preparation_copies_only_verified_bytes_and_makes_no_admission_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, expected = self.fixture(root)
+            with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected):
+                report = COMPAT.prepare_baseline(archive, root / "fixture-account")
+            self.assertFalse(report["candidate_installer_invoked"])
+            self.assertFalse(report["modern_managed_admission"])
+            self.assertEqual(report["source_archive"]["sha256"], expected["sha256"])
+            for name, component in expected["components"].items():
+                info = report["installed"][name]
+                self.assertEqual({key: info[key] for key in ("sha256", "size_bytes")}, component)
+
+    def test_wrong_archive_pin_is_refused_before_account_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, expected = self.fixture(root)
+            expected["sha256"] = "0" * 64
+            home = root / "fixture-account"
+            with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected), self.assertRaisesRegex(ValueError, "reviewed release"):
+                COMPAT.prepare_baseline(archive, home)
+            self.assertFalse(home.exists())
+
+    def test_sidecar_must_bind_exact_archive_name_and_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, expected = self.fixture(root)
+            for text in (expected["sha256"] + "  other.zip\n", "0" * 64 + "  " + archive.name + "\n", "invalid"):
+                Path(str(archive) + ".sha256").write_text(text)
+                with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected), self.subTest(text=text), self.assertRaisesRegex(ValueError, "sidecar"):
+                    COMPAT.read_baseline_archive(archive)
+
+    def test_missing_or_duplicate_daemon_cannot_be_materialized(self):
+        for entries in ([('kin.exe', b'inert CLI')],
+                        [('kin.exe', b'inert CLI'), ('kin-daemon.exe', b'inert daemon'), ('kin-daemon.exe', b'duplicate')]):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive, expected = self.fixture(root, entries)
+                expected["components"]["kin-daemon.exe"] = {"sha256": hashlib.sha256(b'inert daemon').hexdigest(), "size_bytes": len(b'inert daemon')}
+                with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected), self.assertRaisesRegex(ValueError, "unique regular"):
+                    COMPAT.read_baseline_archive(archive)
+
+    def test_component_hash_and_size_have_independent_checks(self):
+        for key, value in (("sha256", "0" * 64), ("size_bytes", 1)):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive, expected = self.fixture(root)
+                expected["components"]["kin-daemon.exe"][key] = value
+                with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected), self.subTest(key=key), self.assertRaisesRegex(ValueError, "reviewed component"):
+                    COMPAT.read_baseline_archive(archive)
+
+    def test_existing_bin_directory_is_preserved_and_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, expected = self.fixture(root)
+            home = root / "fixture-account"
+            installed = home / ".kin" / "bin" / "kin.exe"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b"existing account pair")
+            with mock.patch.object(COMPAT, "BASELINE_ARCHIVE", expected), self.assertRaisesRegex(ValueError, "existing or linked"):
+                COMPAT.prepare_baseline(archive, home)
+            self.assertEqual(installed.read_bytes(), b"existing account pair")
+            self.assertFalse(installed.with_name("kin-daemon.exe").exists())
 
 
 if __name__ == "__main__":

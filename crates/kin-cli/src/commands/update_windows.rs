@@ -2765,6 +2765,7 @@ pub(super) struct WindowsPrivateTempDir {
     path: PathBuf,
     parent: SecurePathGuard,
     tree: Option<WindowsPrivateTree>,
+    persisted: bool,
 }
 
 pub(crate) fn ensure_private_temp_container(parent: &Path, name: &str) -> Result<PathBuf> {
@@ -2819,6 +2820,7 @@ impl WindowsPrivateTempDir {
                 path,
                 parent: parent_guard,
                 tree: Some(tree),
+                persisted: false,
             });
         }
         anyhow::bail!(
@@ -2877,7 +2879,431 @@ pub(super) fn private_directory_identity(path: &Path) -> Result<PlatformObjectId
 impl Drop for WindowsPrivateTempDir {
     fn drop(&mut self) {
         drop(self.tree.take());
-        let _ = std::fs::remove_dir_all(&self.path);
+        if !self.persisted {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+impl WindowsPrivateTempDir {
+    pub(super) fn persist_for_worker(mut self) -> Result<PathBuf> {
+        self.validate()?;
+        self.persisted = true;
+        Ok(self.path.clone())
+    }
+}
+
+pub(super) fn file_object_identity(file: &File) -> Result<PlatformObjectIdentity> {
+    object_identity(file.as_raw_handle().cast(), false)
+}
+
+const WINDOWS_WORKER_CONSUMED_SCHEMA: &str = "kin.windows-update-worker-consumed.v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WindowsWorkerConsumption {
+    schema: String,
+    directory_binding: PlatformObjectIdentity,
+    handoff_binding: PlatformObjectIdentity,
+    handoff_sha256: String,
+    pub(super) worker_process: crate::daemon_client::ProcessIdentity,
+}
+
+/// A cleanup handle authenticates and disposes the same object. Withholding
+/// write and delete sharing prevents a path replacement between those steps.
+struct WindowsWorkerCleanupObject {
+    path: PathBuf,
+    directory: bool,
+    identity: PlatformObjectIdentity,
+    file: File,
+}
+
+impl WindowsWorkerCleanupObject {
+    fn open(path: &Path, directory: bool, user: &CurrentUserSid) -> Result<Self> {
+        let path_wide = wide_null(path.as_os_str())?;
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+                FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 },
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+                null_mut(),
+            )
+        };
+        let handle = OwnedHandle::new(
+            handle,
+            &format!(
+                "failed to retain Windows worker cleanup object {}",
+                path.display()
+            ),
+        )?;
+        let identity = object_identity(handle.raw(), directory)?;
+        validate_private_security(handle.raw(), user, directory)?;
+        let object = Self {
+            path: path.to_path_buf(),
+            directory,
+            identity,
+            file: handle.into_file(),
+        };
+        object.revalidate_worker_cleanup_object(user)?;
+        Ok(object)
+    }
+
+    fn revalidate_worker_cleanup_object(&self, user: &CurrentUserSid) -> Result<()> {
+        let held = self.file.as_raw_handle().cast();
+        anyhow::ensure!(
+            object_identity(held, self.directory)? == self.identity,
+            "retained Windows worker cleanup object changed"
+        );
+        validate_private_security(held, user, self.directory)?;
+        let path_wide = wide_null(self.path.as_os_str())?;
+        let visible = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if self.directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+                null_mut(),
+            )
+        };
+        let visible = OwnedHandle::new(
+            visible,
+            "could not validate visible Windows worker cleanup object",
+        )?;
+        anyhow::ensure!(
+            object_identity(visible.raw(), self.directory)? == self.identity,
+            "Windows worker cleanup path changed: {}",
+            self.path.display()
+        );
+        validate_private_security(visible.raw(), user, self.directory)
+    }
+
+    fn read_bounded(&self, user: &CurrentUserSid) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        self.revalidate_worker_cleanup_object(user)?;
+        let mut reader = &self.file;
+        reader.rewind()?;
+        let mut bytes = Vec::new();
+        reader.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= 64 * 1024,
+            "Windows worker cleanup record exceeds its bound"
+        );
+        self.revalidate_worker_cleanup_object(user)?;
+        Ok(bytes)
+    }
+
+    fn require_names(&self, expected: &[&str], user: &CurrentUserSid) -> Result<()> {
+        self.revalidate_worker_cleanup_object(user)?;
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.path)? {
+            names.push(entry?.file_name());
+        }
+        names.sort();
+        let mut expected: Vec<_> = expected
+            .iter()
+            .map(|name| std::ffi::OsString::from(*name))
+            .collect();
+        expected.sort();
+        anyhow::ensure!(
+            names == expected,
+            "Windows worker directory has unexpected entries; retained"
+        );
+        self.revalidate_worker_cleanup_object(user)
+    }
+
+    fn dispose_file(self, user: &CurrentUserSid, label: &str) -> Result<()> {
+        self.revalidate_worker_cleanup_object(user)?;
+        dispose_private_file_handle_exact(&self.file, &self.path, label)?;
+        let path = self.path.clone();
+        drop(self);
+        require_worker_cleanup_absent(&path)
+    }
+
+    fn dispose_directory(self, user: &CurrentUserSid) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{FileDispositionInfo, FILE_DISPOSITION_INFO};
+        self.revalidate_worker_cleanup_object(user)?;
+        self.require_names(&[], user)?;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let removed = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle().cast(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if removed == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to dispose exact empty Windows worker directory; retained");
+        }
+        let path = self.path.clone();
+        drop(self);
+        require_worker_cleanup_absent(&path)
+    }
+}
+
+fn require_worker_cleanup_absent(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "disposed Windows worker object remains visible at {}; cleanup is incomplete",
+            path.display()
+        ),
+        Err(error) => {
+            Err(error).context("could not confirm exact Windows worker object disposition")
+        }
+    }
+}
+
+pub(super) struct WindowsWorkerCleanup {
+    directory: WindowsWorkerCleanupObject,
+    worker: WindowsWorkerCleanupObject,
+    handoff: WindowsWorkerCleanupObject,
+    claim: WindowsWorkerCleanupObject,
+    user: CurrentUserSid,
+}
+
+impl WindowsWorkerCleanup {
+    pub(super) fn open(directory: &Path, handoff: &Path) -> Result<Self> {
+        let user = CurrentUserSid::load()?;
+        let directory_object = WindowsWorkerCleanupObject::open(directory, true, &user)?;
+        directory_object.require_names(
+            &[
+                super::WINDOWS_WORKER_EXECUTABLE,
+                super::WINDOWS_WORKER_RECORD,
+                "claimed",
+            ],
+            &user,
+        )?;
+        let worker = WindowsWorkerCleanupObject::open(
+            &directory.join(super::WINDOWS_WORKER_EXECUTABLE),
+            false,
+            &user,
+        )?;
+        let handoff = WindowsWorkerCleanupObject::open(handoff, false, &user)?;
+        let claim = WindowsWorkerCleanupObject::open(&directory.join("claimed"), false, &user)?;
+        Ok(Self {
+            directory: directory_object,
+            worker,
+            handoff,
+            claim,
+            user,
+        })
+    }
+
+    pub(super) fn worker_file(&self) -> &File {
+        &self.worker.file
+    }
+
+    pub(super) fn read_handoff(&self) -> Result<Vec<u8>> {
+        self.handoff.read_bounded(&self.user)
+    }
+
+    pub(super) fn read_consumption(&self) -> Result<WindowsWorkerConsumption> {
+        serde_json::from_slice(&self.claim.read_bounded(&self.user)?)
+            .context("invalid Windows worker consumption evidence")
+    }
+
+    pub(super) fn validate_consumption(
+        &self,
+        consumed: &WindowsWorkerConsumption,
+        handoff: &[u8],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            consumed.schema == WINDOWS_WORKER_CONSUMED_SCHEMA
+                && consumed.directory_binding == self.directory.identity
+                && consumed.handoff_binding == self.handoff.identity
+                && consumed.handoff_sha256 == hex::encode(Sha256::digest(handoff))
+                && consumed.worker_process.pid() != 0,
+            "Windows worker consumption evidence or retained object binding changed"
+        );
+        self.directory.require_names(
+            &[
+                super::WINDOWS_WORKER_EXECUTABLE,
+                super::WINDOWS_WORKER_RECORD,
+                "claimed",
+            ],
+            &self.user,
+        )?;
+        self.worker.revalidate_worker_cleanup_object(&self.user)?;
+        self.handoff.revalidate_worker_cleanup_object(&self.user)?;
+        self.claim.revalidate_worker_cleanup_object(&self.user)
+    }
+
+    pub(super) fn dispose<F>(self, mut before_remove: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        let Self {
+            directory,
+            worker,
+            handoff,
+            claim,
+            user,
+        } = self;
+        directory.require_names(
+            &[
+                super::WINDOWS_WORKER_EXECUTABLE,
+                super::WINDOWS_WORKER_RECORD,
+                "claimed",
+            ],
+            &user,
+        )?;
+        before_remove()?;
+        // Keep both records until the helper has actually disappeared. A live
+        // mapped image or sharing refusal therefore preserves its evidence.
+        worker.dispose_file(&user, "Windows copied update worker")?;
+        directory.require_names(&[super::WINDOWS_WORKER_RECORD, "claimed"], &user)?;
+        before_remove()?;
+        handoff.dispose_file(&user, "Windows worker handoff")?;
+        directory.require_names(&["claimed"], &user)?;
+        before_remove()?;
+        claim.dispose_file(&user, "Windows worker consumption evidence")?;
+        before_remove()?;
+        directory.dispose_directory(&user)
+    }
+}
+
+/// Holds a prepared record and its private directory across the complete
+/// worker transaction, without changing their permissions on consumption.
+pub(super) struct WindowsWorkerFiles {
+    directory: SecurePathGuard,
+    record: SecurePathGuard,
+    claim: Option<SecurePathGuard>,
+    user: CurrentUserSid,
+}
+
+impl WindowsWorkerFiles {
+    pub(super) fn open(directory: &Path, record: &Path) -> Result<Self> {
+        let user = CurrentUserSid::load()?;
+        let directory = SecurePathGuard::open(directory, true, Some(&user), false, false)?;
+        let record = SecurePathGuard::open(record, false, Some(&user), false, true)?;
+        let files = Self {
+            directory,
+            record,
+            claim: None,
+            user,
+        };
+        files.validate()?;
+        Ok(files)
+    }
+
+    pub(super) fn read_record(&self, path: &Path) -> Result<Vec<u8>> {
+        self.validate()?;
+        anyhow::ensure!(
+            path == self.record.path,
+            "Windows worker record path changed"
+        );
+        anyhow::ensure!(
+            std::fs::metadata(path)?.len() <= 64 * 1024,
+            "Windows worker record exceeds its bound"
+        );
+        let bytes = std::fs::read(path)?;
+        self.validate()?;
+        Ok(bytes)
+    }
+
+    pub(super) fn claim(&mut self) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        self.validate()?;
+        let handoff = self.read_record(&self.record.path)?;
+        let consumption = WindowsWorkerConsumption {
+            schema: WINDOWS_WORKER_CONSUMED_SCHEMA.to_string(),
+            directory_binding: self.directory.identity.clone(),
+            handoff_binding: self.record.identity.clone(),
+            handoff_sha256: hex::encode(Sha256::digest(&handoff)),
+            worker_process: crate::daemon_client::process_identity(std::process::id())?
+                .context("could not capture the consuming Windows worker process")?,
+        };
+        let path = self.directory.path.join("claimed");
+        let created_binding;
+        {
+            let mut file = create_current_user_private_file_for_exact_commit(&path)
+                .context("Windows worker handoff was already consumed")?;
+            created_binding = file_object_identity(&file)?;
+            file.write_all(&serde_json::to_vec(&consumption)?)?;
+            kin_blobs::durable::sync_all(&file)
+                .context("failed to durably claim the Windows worker handoff")?;
+        }
+        self.claim = Some(SecurePathGuard::open(
+            &path,
+            false,
+            Some(&self.user),
+            false,
+            true,
+        )?);
+        anyhow::ensure!(
+            self.claim
+                .as_ref()
+                .context("Windows worker lost its claim")?
+                .identity
+                == created_binding,
+            "Windows worker consumption object changed during capture"
+        );
+        self.validate()
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        self.directory.validate(Some(&self.user))?;
+        self.record.validate(Some(&self.user))?;
+        if let Some(claim) = &self.claim {
+            claim.validate(Some(&self.user))?;
+        }
+        Ok(())
+    }
+}
+
+impl ExecutingFileAuthority {
+    /// The worker retains the original exact object without keeping its name
+    /// replacement-protected. Ordinary executing-image capture remains strict.
+    pub(super) fn capture_handoff_target(
+        path: &Path,
+        expected: &PlatformObjectIdentity,
+    ) -> Result<Self> {
+        let path_wide = wide_null(path.as_os_str())?;
+        // Deny in-place writes while permitting the existing transaction to
+        // rename the retained original object into its backup directory.
+        // SAFETY: all pointers reference live, NUL-terminated storage.
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        let handle = OwnedHandle::new(handle, "failed to retain the prepared managed CLI object")?;
+        let binding = object_identity(handle.raw(), false)?;
+        anyhow::ensure!(
+            &binding == expected,
+            "prepared managed CLI object changed before worker capture"
+        );
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: handle.into_file(),
+            binding,
+        })
     }
 }
 
@@ -3370,6 +3796,57 @@ mod tests {
         root.validate().unwrap();
         drop(root);
         assert!(!path.exists());
+        std::fs::remove_dir(container).unwrap();
+    }
+
+    #[test]
+    fn worker_handoff_target_guard_denies_writes_but_allows_transaction_rename() {
+        let container = private_test_container();
+        let root = WindowsPrivateTempDir::create(&container, ".kin-worker-target-test-").unwrap();
+        let target = root.path().join("kin.exe");
+        std::fs::write(&target, b"original CLI").unwrap();
+        let original = std::fs::File::open(&target).unwrap();
+        let binding = file_object_identity(&original).unwrap();
+        drop(original);
+        let authority = ExecutingFileAuthority::capture_handoff_target(&target, &binding).unwrap();
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .is_err());
+        let backup = root.path().join("backup.exe");
+        std::fs::rename(&target, &backup).unwrap();
+        authority.validate().unwrap();
+        std::fs::write(&target, b"replacement CLI").unwrap();
+        assert!(ExecutingFileAuthority::capture_handoff_target(&target, &binding).is_err());
+        drop(authority);
+        drop(root);
+        std::fs::remove_dir(container).unwrap();
+    }
+
+    #[test]
+    fn prepared_worker_record_is_private_immutable_and_consumed_only_once() {
+        let container = private_test_container();
+        let mut root =
+            WindowsPrivateTempDir::create(&container, ".kin-worker-record-test-").unwrap();
+        let record = root.path().join("handoff.json");
+        std::fs::write(&record, b"{}\n").unwrap();
+        root.seal_file(&record).unwrap();
+        let path = root.persist_for_worker().unwrap();
+        assert!(path.exists());
+        let mut files = WindowsWorkerFiles::open(&path, &record).unwrap();
+        assert_eq!(files.read_record(&record).unwrap(), b"{}\n");
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&record)
+            .is_err());
+        files.claim().unwrap();
+        assert!(files.claim().is_err());
+        let mut competing = WindowsWorkerFiles::open(&path, &record).unwrap();
+        assert!(competing.claim().is_err());
+        files.validate().unwrap();
+        drop(competing);
+        drop(files);
+        std::fs::remove_dir_all(&path).unwrap();
         std::fs::remove_dir(container).unwrap();
     }
 

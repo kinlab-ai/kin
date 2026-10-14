@@ -211,6 +211,14 @@ fn main() {
     println!("cargo:rustc-env=KIN_BUILD_BRANCH={branch}");
     println!("cargo:rustc-env=KIN_BUILD_TIME={built_at}");
     println!("cargo:rustc-env=KIN_BUILD_VERSION={version}");
+    println!(
+        "cargo:rustc-env=KIN_BUILD_TARGET={}",
+        std::env::var("TARGET").expect("Cargo target")
+    );
+    println!(
+        "cargo:rustc-env=KIN_BUILD_PROFILE={}",
+        std::env::var("PROFILE").expect("Cargo profile")
+    );
 }
 
 fn explicit_build_identity() -> Option<ExplicitBuildIdentity> {

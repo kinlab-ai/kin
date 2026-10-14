@@ -23,6 +23,14 @@ import {
   provision,
   probeBinaryVersion,
   ensureProvisioned,
+  resolveReadyManagedBinary,
+  probeManagedRuntime,
+  developmentLaunchEnvironment,
+  updateManagedInstall,
+  bootstrapPublishedInstall,
+  resolvePublishedRelease,
+  resolveLatestPublishedRelease,
+  releaseRustTarget,
   isTruthyEnv,
   persistentPathAdvice,
   setupFollows,
@@ -562,6 +570,12 @@ function seedExistingManagedInstall(home) {
   return env;
 }
 
+function refusingCurrentNative(binary, args) {
+  return { status: 1, stdout: args[0] === 'runtime'
+    ? JSON.stringify({ schema: 'kin.runtime-status.v1', ready: false, reason: 'repair_required' })
+    : '', stderr: 'native transaction refused' };
+}
+
 async function assertMalformedBundleUpgradeIsPreflightOnly(notifier, expectedError) {
   const { work, fetchImpl } = makeFixture({ notifier });
   const home = path.join(work, 'kin-home');
@@ -573,9 +587,10 @@ async function assertMalformedBundleUpgradeIsPreflightOnly(notifier, expectedErr
       platform: 'darwin',
       arch: 'arm64',
       fetchImpl,
+      spawnImpl: refusingCurrentNative,
       log: () => {},
     }),
-    expectedError,
+    /native transactional update failed/,
   );
 
   assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin'), 'utf8'), 'old-kin');
@@ -591,11 +606,11 @@ async function assertMalformedBundleUpgradeIsPreflightOnly(notifier, expectedErr
   fs.rmSync(work, { recursive: true, force: true });
 }
 
-test('provision refuses an absent macOS bundle before mutating a previous install', async () => {
+test('a reinstall cannot bypass native authority to replace an existing pair', async () => {
   await assertMalformedBundleUpgradeIsPreflightOnly('absent', /carries no KinNotifier\.app/);
 });
 
-macArchiveModeTest('provision refuses an incomplete macOS bundle before mutating a previous install', async () => {
+macArchiveModeTest('a malformed reinstall also cannot bypass native authority', async () => {
   await assertMalformedBundleUpgradeIsPreflightOnly('no-plist', /missing Contents\/Info\.plist/);
 });
 
@@ -679,7 +694,7 @@ macArchiveModeTest('provision creates Kin directories at 0755 and initializes th
 // A Kin home an earlier install left group writable is not repaired silently.
 // The refusal names the directory and the command that repairs it, and the
 // installed binaries stay as they were.
-macArchiveModeTest('provision names the exact repair for a group-writable Kin home and replaces nothing', async () => {
+macArchiveModeTest('refused native update preserves an existing group-writable home', async () => {
   const { work, fetchImpl } = makeFixture({ kinScript: REGISTRY_CHECKING_KIN });
   const home = path.join(work, 'kin home');
   fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
@@ -691,16 +706,12 @@ macArchiveModeTest('provision names the exact repair for a group-writable Kin ho
       platform: 'darwin',
       arch: 'arm64',
       fetchImpl,
+      spawnImpl: refusingCurrentNative,
       log: () => {},
     }),
     (error) => {
-      assert.match(error.message, /must not be group\/world writable/);
-      assert.ok(
-        error.message.includes(`chmod go-w '${home}'`),
-        `the refusal carries a remedy that can be pasted: ${error.message}`,
-      );
-      assert.match(error.message, /mode 0775/);
-      assert.match(error.message, /KIN_REGISTRY_REPAIR=1/);
+      assert.match(error.message, /native transactional update failed/);
+      assert.match(error.message, /native updater recovery instructions/);
       return true;
     },
   );
@@ -711,15 +722,28 @@ macArchiveModeTest('provision names the exact repair for a group-writable Kin ho
   const calls = path.join(work, 'registry-calls.log');
   fs.rmSync(calls, { force: true });
   fs.chmodSync(home, 0o755);
-  await provision('9.9.9', {
+  await assert.rejects(provision('9.9.9', {
     env: { KIN_HOME: home, KIN_REGISTRY_REPAIR: '1' },
-    platform: 'darwin',
-    arch: 'arm64',
-    fetchImpl,
-    log: () => {},
-  });
-  assert.equal(fs.readFileSync(calls, 'utf8'), 'registry authority --fix --initialize\n');
+    platform: 'darwin', arch: 'arm64', fetchImpl, log: () => {}, spawnImpl: refusingCurrentNative,
+  }), /native transactional update failed/);
+  assert.equal(fs.existsSync(calls), false, 'npm did not replace the unsupported authority with a staged binary');
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin'), 'utf8'), 'old kin');
   fs.rmSync(work, { recursive: true, force: true });
+});
+
+macArchiveModeTest('fresh provisioning refuses symlinked component directories before downloading', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-route-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const outside = path.join(home, 'outside');
+  const root = path.join(home, 'managed');
+  fs.mkdirSync(outside);
+  fs.mkdirSync(root);
+  fs.symlinkSync(outside, path.join(root, 'bin'));
+  await assert.rejects(provision('9.9.9', {
+    env: { KIN_HOME: root }, log: () => {},
+    fetchImpl: async () => { throw new Error('no download before directory authority'); },
+  }), /real non-symlink directory/);
+  assert.deepEqual(fs.readdirSync(outside), [], 'no component was written outside the managed root');
 });
 
 test('provision refuses a checksum mismatch without installing', async () => {
@@ -778,16 +802,31 @@ test('probeBinaryVersion parses the kin version line and null on failure', () =>
   assert.equal(probeBinaryVersion('/any', () => ({ status: 0, stdout: 'kin 1.2.3-rc.1+build\n' })), '1.2.3-rc.1+build');
 });
 
-test('ensureProvisioned respects KIN_MANAGED_BIN and never provisions over it', async () => {
-  const real = process.execPath;
+test('an explicit development pair is isolated and never provisioned', async t => {
+  const { cliPath, report, env } = managedFixture(t);
+  report.mode = 'development';
+  report.cli.source_dirty = true;
+  report.daemon.source_dirty = true;
   const result = await ensureProvisioned({
-    env: { KIN_MANAGED_BIN: real },
-    fetchImpl: async () => {
-      throw new Error('network must not be touched');
+    env: { ...env, KIN_MANAGED_BIN: cliPath },
+    fetchImpl: async () => { throw new Error('network must not be touched'); },
+    spawnImpl: (binary, args, options) => {
+      assert.equal(binary, cliPath);
+      assert.deepEqual(args, ['runtime', 'status', '--json', '--development']);
+      assert.equal(options.env.KIN_RUNTIME_MODE, 'development');
+      return { status: 0, stdout: JSON.stringify(report) };
     },
-    log: () => {},
   });
-  assert.equal(result, real);
+  assert.equal(result, cliPath);
+});
+
+test('an explicit old development binary cannot silently attach without isolation', async t => {
+  const { cliPath, env } = managedFixture(t);
+  await assert.rejects(ensureProvisioned({
+    env: { ...env, KIN_MANAGED_BIN: cliPath },
+    spawnImpl: () => ({ status: 1, stdout: '', stderr: 'unknown subcommand runtime' }),
+    fetchImpl: async () => { throw new Error('no install repair permitted'); },
+  }), /development build.*runtime-isolation contract/);
 });
 
 test('ensureProvisioned is resolve-only under KIN_NO_PROVISION', async () => {
@@ -803,427 +842,629 @@ test('ensureProvisioned is resolve-only under KIN_NO_PROVISION', async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('ensureProvisioned verifies a stamped current install without network', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamped-'));
+function managedFixture(t, version = '99.0.0', platform = process.platform) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-paired-runtime-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', process.platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  writeLauncherStamp(targetKinVersion(), env);
-  const result = await ensureProvisioned({
-    env,
-    platform: process.platform,
-    fetchImpl: async () => {
-      throw new Error('network must not be touched');
-    },
-    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()}\n` }),
-    log: () => {},
+  const cliPath = path.join(home, 'bin', binaryName('kin', platform));
+  const daemonPath = path.join(home, 'bin', binaryName('kin-daemon', platform));
+  fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+  fs.writeFileSync(cliPath, 'preserve-cli');
+  fs.writeFileSync(daemonPath, 'preserve-daemon');
+  const component = candidate => ({
+    path: candidate, version, commit_sha: 'a'.repeat(40), source_dirty: false,
+    target: 'test-target', build_profile: 'release', sha256: sha256Hex(fs.readFileSync(candidate)),
   });
-  assert.equal(result, path.join(binDir, kinName));
-  fs.rmSync(home, { recursive: true, force: true });
-});
-
-// ── mismatch matrix ─────────────────────────────────────────────────────────
-//
-// ensureProvisioned's pin-vs-installed policy, exercised on both the stamped
-// (this package provisioned it before) and foreign installs, always probing
-// via `--version`: an older install upgrades automatically, a newer install
-// runs with a one-time notice, an equal install just runs, and
-// KIN_LAUNCHER_ADOPT=1 forces a re-provision regardless.
-
-test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT needed)', async () => {
-  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
-  const home = path.join(work, 'kin-home');
-  const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    platform,
-    arch,
-    fetchImpl,
-    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1-foreign (x)\n' }),
-    log: (line) => notices.push(line),
-  });
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  assert.equal(result, path.join(binDir, kinName));
-  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
-  assert.equal(readLauncherStamp(env), targetKinVersion());
-  assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
-  assert.ok(
-    notices.some(
-      (l) => l.includes('run `kin upgrade`') && l.includes(`npx -y @kinlab/kin@${targetKinVersion()} upgrade`),
-    ),
-    notices.join('\n'),
-  );
-  fs.rmSync(work, { recursive: true, force: true });
-});
-
-test('ensureProvisioned auto-provisions when a stamped install is older than the pin', async () => {
-  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
-  const home = path.join(work, 'kin-home');
-  const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  writeLauncherStamp('0.0.1', env);
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    platform,
-    arch,
-    fetchImpl,
-    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1\n' }),
-    log: (line) => notices.push(line),
-  });
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  assert.equal(result, path.join(binDir, kinName));
-  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
-  assert.equal(readLauncherStamp(env), targetKinVersion());
-  assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
-  assert.ok(
-    notices.some(
-      (l) => l.includes('run `kin upgrade`') && l.includes(`npx -y @kinlab/kin@${targetKinVersion()} upgrade`),
-    ),
-    notices.join('\n'),
-  );
-  fs.rmSync(work, { recursive: true, force: true });
-});
-
-// `kin update` and the shell installer move $KIN_HOME forward without touching
-// the npm package, so a launcher that refused a newer install made every
-// command exit 1 the day after an update, and named only a downgrade as the
-// way out. The launcher runs the newer install instead and says so once.
-test('ensureProvisioned runs a newer foreign install instead of refusing it', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-foreign-'));
-  const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', process.platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), 'preserve the newer executable');
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    platform: process.platform,
-    fetchImpl: async () => {
-      throw new Error('a newer install must never be replaced by the older pin');
-    },
-    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0 (newer)\n' }),
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, path.join(binDir, kinName), 'the newer install is what runs');
-  assert.equal(
-    fs.readFileSync(path.join(binDir, kinName), 'utf8'),
-    'preserve the newer executable',
-    'the newer binary must be left exactly as it was',
-  );
-  assert.equal(notices.length, 1, `exactly one notice: ${JSON.stringify(notices)}`);
-  const [notice] = notices;
-  assert.match(notice, /running managed kin 99\.0\.0/);
-  assert.ok(notice.includes(`newer than the ${targetKinVersion()}`), notice);
-  assert.ok(notice.includes('npm install -g @kinlab/kin@latest'), `the forward move is named: ${notice}`);
-  assert.ok(notice.includes('KIN_LAUNCHER_ADOPT=1'), `the deliberate downgrade is still named: ${notice}`);
-  assert.equal(/refusing/.test(notice), false, notice);
-  assert.equal(readLauncherStamp(env), '99.0.0', 'the confirmed version is recorded');
-  fs.rmSync(home, { recursive: true, force: true });
-});
-
-test('a newer install the launcher already confirmed runs without a notice', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-stamped-'));
-  const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', process.platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  writeLauncherStamp('99.0.0', env);
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    platform: process.platform,
-    fetchImpl: async () => {
-      throw new Error('a newer install must never be replaced by the older pin');
-    },
-    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0\n' }),
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, path.join(binDir, kinName));
-  assert.deepEqual(notices, [], 'the notice is owed once per installed version, not once per run');
-  assert.equal(readLauncherStamp(env), '99.0.0');
-  fs.rmSync(home, { recursive: true, force: true });
-});
-
-test('the newer-install notice comes back when the installed version moves again', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-moved-'));
-  const env = { KIN_HOME: home };
-  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-  fs.mkdirSync(path.dirname(binary), { recursive: true });
-  fs.writeFileSync(binary, '#!/bin/sh\n');
-  let installed = '99.0.0';
-  const run = async () => {
-    const notices = [];
-    const result = await ensureProvisioned({
-      env,
-      platform: process.platform,
-      fetchImpl: async () => { throw new Error('must not download'); },
-      spawnImpl: () => ({ status: 0, stdout: `kin ${installed}\n` }),
-      log: (line) => notices.push(line),
-    });
-    assert.equal(result, binary);
-    return notices;
+  const report = {
+    schema: 'kin.runtime-status.v1', ready: true, mode: 'managed', kin_home: home,
+    cli: component(cliPath), daemon: component(daemonPath), pair_matches: true,
+    channel: 'stable', release_kind: 'published', reason: null, detail: null,
+    restart_needed: false,
   };
-  assert.equal((await run()).length, 1, 'first sight of 99.0.0 is announced');
-  assert.equal((await run()).length, 0, 'second run on the same version is quiet');
-  installed = '99.1.0';
-  const moved = await run();
-  assert.equal(moved.length, 1, 'a further update is announced again');
-  assert.match(moved[0], /running managed kin 99\.1\.0/);
-  assert.equal(readLauncherStamp(env), '99.1.0');
-  fs.rmSync(home, { recursive: true, force: true });
-});
+  return { home, env, cliPath, daemonPath, report };
+}
 
-test('ensureProvisioned adopts a foreign install when its version already matches the pin', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-foreign-equal-'));
-  const env = { KIN_HOME: home };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', process.platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  const result = await ensureProvisioned({
-    env,
-    platform: process.platform,
-    fetchImpl: async () => {
-      throw new Error('must not provision when the foreign install already matches');
-    },
-    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()} (foreign)\n` }),
-    log: () => {},
-  });
-  assert.equal(result, path.join(binDir, kinName));
-  assert.equal(readLauncherStamp(env), targetKinVersion());
-  fs.rmSync(home, { recursive: true, force: true });
-});
+function publishedFixtureFetch(fixture, version, { commitSha = 'c'.repeat(40), mutateRelease = () => {} } = {}) {
+  const archiveName = artifactName(fixture.platform, fixture.arch);
+  const url = releaseDownloadUrl(version, archiveName);
+  const release = { tag_name: `v${version}`, draft: false, prerelease: version.includes('-'), assets: [
+    { name: archiveName, browser_download_url: url },
+    { name: `${archiveName}.sha256`, browser_download_url: `${url}.sha256` },
+  ] };
+  mutateRelease(release);
+  return async address => {
+    if (!address.startsWith('https://api.github.com/')) return fixture.fetchImpl(address);
+    const value = address.includes('/git/ref/') ? { ref: `refs/tags/v${version}`, object: { type: 'commit', sha: commitSha } } : release;
+    const bytes = Buffer.from(JSON.stringify(value));
+    return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+  };
+}
 
-for (const stamped of ['0.0.1', '99.0.0']) {
-  test(`a stale ${stamped} stamp cannot override the matching installed binary`, async (t) => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-stamp-'));
-    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-    const env = { KIN_HOME: home };
-    const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-    fs.mkdirSync(path.dirname(binary), { recursive: true });
-    fs.writeFileSync(binary, 'preserve the existing executable');
-    writeLauncherStamp(stamped, env);
-    const { targetKinVersion } = await import('../lib/resolve.mjs');
-    let probes = 0;
-    const result = await ensureProvisioned({
-      env,
-      fetchImpl: async () => { throw new Error('matching installed bytes must not be replaced'); },
-      spawnImpl: (command, args) => {
-        assert.equal(command, binary);
-        assert.deepEqual(args, ['--version']);
-        probes += 1;
-        return { status: 0, stdout: `kin ${targetKinVersion()} (installed separately)\n` };
+for (const oldVersion of ['0.8.1', '0.8.6']) {
+  test(`legacy ${oldVersion} uses a private incoming helper and awaits exact canonical proof`, async t => {
+    const fixture = makeHostProvisionFixture();
+    t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+    const { home, env, cliPath, daemonPath, report } = managedFixture(t, '99.0.0', fixture.platform);
+    const expectedTarget = releaseRustTarget(fixture.platform, fixture.arch);
+    report.cli.commit_sha = report.daemon.commit_sha = 'c'.repeat(40);
+    report.cli.target = report.daemon.target = expectedTarget;
+    const calls = [];
+    let migrated = false;
+    let incoming;
+    const selected = await ensureProvisioned({
+      env: { ...env, KIN_DIR: '/conflicting-root', KIN_DAEMON_BIN: daemonPath, KIN_DAEMON_URL: 'http://old-daemon.test' },
+      platform: fixture.platform, arch: fixture.arch, minimumVersion: '99.0.0',
+      fetchImpl: publishedFixtureFetch(fixture, '99.0.0'), log: () => {},
+      spawnImpl: (binary, args, options) => {
+        calls.push({ binary, args });
+        if (binary === cliPath && args[0] === '--version') return { status: 0, stdout: `kin ${oldVersion}\n` };
+        if (args.includes('--bootstrap-published')) {
+          incoming = binary;
+          assert.notEqual(binary, cliPath, 'the old installed executable never receives new flags');
+          assert.equal(options.cwd, path.dirname(binary), 'incoming Windows/native helper has a private working directory');
+          assert.equal(options.env.KIN_HOME, home);
+          assert.equal(options.env.KIN_DIR, undefined);
+          assert.equal(options.env.KIN_DAEMON_BIN, undefined);
+          assert.equal(options.env.KIN_DAEMON_URL, undefined);
+          assert.equal(options.env.KIN_RUNTIME_MODE, 'managed');
+          assert.deepEqual(fs.readdirSync(home), ['bin'], 'staging did not initialize live registry or directories');
+          assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+          assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+          assert.deepEqual(args, ['update', '--bootstrap-published', '--channel', 'stable',
+            '--expect-version', '99.0.0', '--expect-sha', 'c'.repeat(40),
+            '--expect-archive-sha256', sha256Hex(fixture.bytes), '--expect-target', expectedTarget,
+            '--expect-archive-name', artifactName(fixture.platform, fixture.arch), '--apply']);
+          migrated = true;
+          return { status: 0, stdout: 'fixture native transaction result\n' };
+        }
+        assert.equal(binary, cliPath);
+        return migrated ? { status: 0, stdout: JSON.stringify(report) } : { status: 2, stdout: 'unknown runtime command' };
       },
-      log: () => {},
     });
-    assert.equal(result, binary);
-    assert.equal(probes, 1);
-    assert.equal(readLauncherStamp(env), targetKinVersion());
-    assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the existing executable');
+    assert.equal(selected, cliPath);
+    assert.equal(readLauncherStamp(env), '99.0.0', 'stamp follows exact canonical proof');
+    assert.equal(fs.existsSync(incoming), false, 'successful stage is removed');
+    assert.equal(calls.filter(call => call.binary === cliPath && call.args[0] === 'update').length, 0);
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli', 'only native fixture authority could replace installed bytes');
   });
 }
 
-test('a stale older stamp cannot authorize downgrading a newer installed binary', async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-downgrade-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const env = { KIN_HOME: home };
-  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-  fs.mkdirSync(path.dirname(binary), { recursive: true });
-  fs.writeFileSync(binary, 'preserve the newer executable');
-  writeLauncherStamp('0.0.1', env);
-  let probes = 0;
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    fetchImpl: async () => { throw new Error('must not download a downgrade'); },
-    spawnImpl: () => {
-      probes += 1;
-      return { status: 0, stdout: 'kin 99.0.0 (installed separately)\n' };
+test('bootstrap preflight refuses unofficial metadata without invoking an installed or incoming updater', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const { env, cliPath } = managedFixture(t, '0.8.1', fixture.platform);
+  await assert.rejects(bootstrapPublishedInstall('99.0.0', {
+    env, platform: fixture.platform, arch: fixture.arch, log: () => {},
+    fetchImpl: publishedFixtureFetch(fixture, '99.0.0', { mutateRelease: release => { release.draft = true; } }),
+    spawnImpl: () => { throw new Error('no executable before official preflight'); },
+  }), /official.*(metadata|published)/);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(readLauncherStamp(env), null);
+});
+
+test('bootstrap archive checksum failure does not invoke native migration or change the managed home', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const { home, env, cliPath } = managedFixture(t, '0.8.6', fixture.platform);
+  const publishedFetch = publishedFixtureFetch(fixture, '99.0.0');
+  await assert.rejects(bootstrapPublishedInstall('99.0.0', {
+    env, platform: fixture.platform, arch: fixture.arch, log: () => {},
+    fetchImpl: async address => {
+      if (!address.endsWith('.sha256')) return publishedFetch(address);
+      const bytes = Buffer.from(`${'0'.repeat(64)}  ${artifactName(fixture.platform, fixture.arch)}\n`);
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
     },
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, binary);
-  assert.equal(probes, 1);
-  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the newer executable');
-  assert.ok(notices.some((line) => line.includes('running managed kin 99.0.0')), notices.join('\n'));
-  assert.equal(readLauncherStamp(env), '99.0.0');
+    spawnImpl: () => { throw new Error('no executable before archive verification'); },
+  }), /archive checksum/);
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
 });
 
-test('a receipt write failure repeats the newer-install notice rather than failing the run', async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-receipt-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const env = { KIN_HOME: home };
-  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-  // A directory at the receipt path refuses writes even for privileged test users.
-  fs.mkdirSync(path.join(home, 'bin', '.kinlab-kin-version'), { recursive: true });
-  fs.writeFileSync(binary, 'preserve the newer executable');
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    fetchImpl: async () => { throw new Error('must not download a downgrade'); },
-    spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0\n' }),
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, binary);
-  assert.ok(notices.some((line) => line.includes('running managed kin 99.0.0')));
-  assert.ok(notices.some((line) => line.includes('could not record the launcher receipt')));
-});
-
-// The whole bin, end to end: the launcher probes the real file it would run and
-// forwards the command to it. On a newer install this used to exit 1 before the
-// command ran at all.
-const posixLauncherTest = process.platform === 'win32' ? test.skip : test;
-posixLauncherTest('the kin bin forwards a command to a newer managed install and mirrors its exit', (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-launcher-forward-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const binary = path.join(home, 'bin', 'kin');
-  fs.mkdirSync(path.dirname(binary), { recursive: true });
-  fs.writeFileSync(
-    binary,
-    '#!/bin/sh\n' +
-      'if [ "$1" = "--version" ]; then echo "kin 99.0.0"; exit 0; fi\n' +
-      'echo "forwarded: $*"\n' +
-      'exit 3\n',
-  );
-  fs.chmodSync(binary, 0o755);
-  const launcher = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'kin.mjs');
-  const env = { ...process.env, KIN_HOME: home };
-  delete env.KIN_MANAGED_BIN;
-  delete env.KIN_NO_PROVISION;
-  delete env.KIN_LAUNCHER_ADOPT;
-  const first = spawnSync(process.execPath, [launcher, 'status', '--json'], { env, encoding: 'utf8' });
-  assert.equal(first.stdout, 'forwarded: status --json\n', `stderr: ${first.stderr}`);
-  assert.equal(first.status, 3, 'the managed binary\'s own exit is mirrored');
-  assert.match(first.stderr, /running managed kin 99\.0\.0/);
-  const second = spawnSync(process.execPath, [launcher, 'status'], { env, encoding: 'utf8' });
-  assert.equal(second.stdout, 'forwarded: status\n');
-  assert.equal(second.stderr, '', 'the notice is not repeated once the version is recorded');
-});
-
-test('a stale matching stamp cannot hide an older installed binary', async (t) => {
-  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
-  t.after(() => fs.rmSync(work, { recursive: true, force: true }));
-  const env = { KIN_HOME: path.join(work, 'kin-home') };
-  const binary = path.join(env.KIN_HOME, 'bin', binaryName('kin', platform));
-  fs.mkdirSync(path.dirname(binary), { recursive: true });
-  fs.writeFileSync(binary, 'old executable');
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  writeLauncherStamp(targetKinVersion(), env);
-  const result = await ensureProvisioned({
-    env, platform, arch, fetchImpl,
-    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1 (restored backup)\n' }),
-    log: () => {},
-  });
-  assert.equal(result, binary);
-  assert.match(fs.readFileSync(binary, 'utf8'), /9\.9\.9/);
-});
-
-test('a stale stamp is not version evidence when the installed binary cannot be probed', async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stale-unknown-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const env = { KIN_HOME: home };
-  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-  fs.mkdirSync(path.dirname(binary), { recursive: true });
-  fs.writeFileSync(binary, 'preserve unknown executable');
-  writeLauncherStamp('0.0.1', env);
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    fetchImpl: async () => { throw new Error('cannot establish upgrade direction'); },
-    spawnImpl: () => ({ status: 1, stdout: '' }),
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, binary);
-  assert.ok(notices.some((line) => line.includes('version unknown')));
-  assert.equal(readLauncherStamp(env), '0.0.1');
-  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve unknown executable');
-});
-
-test('receipt write failure does not block a verified matching installed binary', async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-receipt-write-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const env = { KIN_HOME: home };
-  const binary = path.join(home, 'bin', binaryName('kin', process.platform));
-  // A directory at the receipt path refuses writes even for privileged test users.
-  fs.mkdirSync(path.join(home, 'bin', '.kinlab-kin-version'), { recursive: true });
-  fs.writeFileSync(binary, 'preserve the verified executable');
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  const notices = [];
-  const result = await ensureProvisioned({
-    env,
-    fetchImpl: async () => { throw new Error('matching installed binary must not be replaced'); },
-    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()}\n` }),
-    log: (line) => notices.push(line),
-  });
-  assert.equal(result, binary);
-  assert.ok(notices.some((line) => line.includes('could not refresh the launcher receipt')));
-  assert.equal(fs.readFileSync(binary, 'utf8'), 'preserve the verified executable');
-});
-
-test('KIN_LAUNCHER_ADOPT=1 forces re-provisioning even when the stamped version already matches', async () => {
-  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
-  const home = path.join(work, 'kin-home');
-  const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
-  const { targetKinVersion } = await import('../lib/resolve.mjs');
-  writeLauncherStamp(targetKinVersion(), env);
-  const result = await ensureProvisioned({
-    env,
-    platform,
-    arch,
-    fetchImpl,
-    spawnImpl: () => {
-      throw new Error('ADOPT must skip the probe and provision unconditionally');
+test('an older compatible npm wrapper migrates legacy Kin with the exact latest stable tuple', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const { env, cliPath, report } = managedFixture(t, '0.8.8', fixture.platform);
+  report.cli.target = report.daemon.target = releaseRustTarget(fixture.platform, fixture.arch);
+  report.cli.commit_sha = report.daemon.commit_sha = 'c'.repeat(40);
+  let migrated = false;
+  const requested = [];
+  const publishedFetch = publishedFixtureFetch(fixture, '0.8.8');
+  const selected = await ensureProvisioned({
+    env, platform: fixture.platform, arch: fixture.arch, minimumVersion: '0.8.7', log: () => {},
+    fetchImpl: address => { requested.push(address); return publishedFetch(address); },
+    spawnImpl: (binary, args) => {
+      if (args[0] === '--version') return { status: 0, stdout: 'kin 0.8.1\n' };
+      if (args.includes('--bootstrap-published')) {
+        assert.notEqual(binary, cliPath);
+        assert.deepEqual(args, ['update', '--bootstrap-published', '--channel', 'stable',
+          '--expect-version', '0.8.8', '--expect-sha', 'c'.repeat(40),
+          '--expect-archive-sha256', sha256Hex(fixture.bytes),
+          '--expect-target', releaseRustTarget(fixture.platform, fixture.arch),
+          '--expect-archive-name', artifactName(fixture.platform, fixture.arch), '--apply']);
+        migrated = true;
+        return { status: 0, stdout: '' };
+      }
+      return migrated ? { status: 0, stdout: JSON.stringify(report) } : { status: 2, stdout: 'unsupported runtime command' };
     },
-    log: () => {},
   });
-  assert.equal(result, path.join(binDir, kinName));
-  // Reprovisioned from the fixture archive, not the pre-existing stub.
-  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
-  fs.rmSync(work, { recursive: true, force: true });
+  assert.equal(selected, cliPath);
+  assert.equal(readLauncherStamp(env), '0.8.8');
+  assert.ok(requested.some(address => address.endsWith('/releases/latest')));
+  assert.ok(requested.some(address => address.endsWith('/git/ref/tags/v0.8.8')));
+  assert.equal(requested.some(address => address.includes('v0.8.7')), false);
 });
 
-test('KIN_LAUNCHER_ADOPT=1 forces the downgrade the launcher otherwise never makes', async () => {
-  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
-  const home = path.join(work, 'kin-home');
-  const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
-  const binDir = path.join(home, 'bin');
-  const kinName = binaryName('kin', platform);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
+test('latest stable below the npm minimum refuses before staging or managed writes', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const { home, env, cliPath } = managedFixture(t, '0.8.1', fixture.platform);
+  const requested = [];
+  const publishedFetch = publishedFixtureFetch(fixture, '0.8.6');
+  await assert.rejects(ensureProvisioned({
+    env, platform: fixture.platform, arch: fixture.arch, minimumVersion: '0.8.7', log: () => {},
+    fetchImpl: address => { requested.push(address); return publishedFetch(address); },
+    spawnImpl: (binary, args) => {
+      assert.equal(binary, cliPath);
+      assert.notEqual(args[0], 'update', 'legacy installed CLI is never invoked to migrate');
+      return { status: args[0] === '--version' ? 0 : 2, stdout: args[0] === '--version' ? 'kin 0.8.1\n' : 'unsupported runtime command' };
+    },
+  }), /latest stable Kin 0\.8\.6 is below.*minimum 0\.8\.7/);
+  assert.equal(requested.length, 1, 'no tag or archive is staged after an incompatible latest version');
+  assert.deepEqual(fs.readdirSync(home), ['bin']);
+  assert.equal(readLauncherStamp(env), null);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  await assert.rejects(resolveLatestPublishedRelease('0.8.7', {
+    platform: fixture.platform, arch: fixture.arch, fetchImpl: publishedFetch,
+  }), /below.*minimum/);
+});
+
+for (const refusal of ['native', 'restart', 'wrong-source']) {
+  test(`bootstrap ${refusal} refusal retains stage and never claims installed success`, async t => {
+    const fixture = makeHostProvisionFixture();
+    t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+    const { home, env, cliPath, report } = managedFixture(t, '99.0.0', fixture.platform);
+    report.cli.target = report.daemon.target = releaseRustTarget(fixture.platform, fixture.arch);
+    report.cli.commit_sha = report.daemon.commit_sha = refusal === 'wrong-source' ? 'b'.repeat(40) : 'c'.repeat(40);
+    if (refusal === 'restart') { report.ready = false; report.restart_needed = true; report.reason = 'restart_pending'; }
+    let incoming;
+    await assert.rejects(bootstrapPublishedInstall('99.0.0', {
+      env, platform: fixture.platform, arch: fixture.arch, log: () => {},
+      fetchImpl: publishedFixtureFetch(fixture, '99.0.0'),
+      spawnImpl: (binary, args) => {
+        if (args.includes('--bootstrap-published')) {
+          incoming = binary;
+          return { status: refusal === 'native' ? 1 : 0, stdout: '', stderr: 'fixture native refusal' };
+        }
+        assert.equal(binary, cliPath);
+        return { status: refusal === 'restart' ? 1 : 0, stdout: JSON.stringify(report) };
+      },
+    }), /Bootstrap stage retained/);
+    assert.ok(fs.existsSync(incoming));
+    assert.deepEqual(fs.readdirSync(home), ['bin']);
+    assert.equal(readLauncherStamp(env), null);
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+    // Fixture cleanup owns only the private stage named by the retained helper.
+    const stage = path.dirname(incoming);
+    fs.rmSync(path.basename(stage).startsWith('kin-published-bootstrap-') ? stage : path.dirname(stage), { recursive: true, force: true });
+  });
+}
+
+test('published tag resolution rejects unknown commit identity and binds the platform release assets', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const release = await resolvePublishedRelease('99.0.0', {
+    platform: fixture.platform, arch: fixture.arch, fetchImpl: publishedFixtureFetch(fixture, '99.0.0'),
+  });
+  assert.equal(release.commitSha, 'c'.repeat(40));
+  assert.equal(release.target, releaseRustTarget(fixture.platform, fixture.arch));
+  await assert.rejects(resolvePublishedRelease('99.0.0', {
+    platform: fixture.platform, arch: fixture.arch,
+    fetchImpl: publishedFixtureFetch(fixture, '99.0.0', { commitSha: 'unknown' }),
+  }), /published release metadata/);
+});
+
+test('published source resolution peels the exact annotated tag instead of a same-named branch', async t => {
+  const fixture = makeHostProvisionFixture();
+  t.after(() => fs.rmSync(fixture.work, { recursive: true, force: true }));
+  const original = publishedFixtureFetch(fixture, '99.0.0');
+  const calls = [];
+  const fetchImpl = async address => {
+    calls.push(address);
+    let record;
+    if (address.includes('/git/ref/')) record = { ref: 'refs/tags/v99.0.0', object: { type: 'tag', sha: 'd'.repeat(40) } };
+    else if (address.includes('/git/tags/')) record = { sha: 'd'.repeat(40), object: { type: 'commit', sha: 'e'.repeat(40) } };
+    else return original(address);
+    const bytes = Buffer.from(JSON.stringify(record));
+    return { ok: true, status: 200, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+  };
+  const release = await resolvePublishedRelease('99.0.0', { platform: fixture.platform, arch: fixture.arch, fetchImpl });
+  assert.equal(release.commitSha, 'e'.repeat(40));
+  assert.ok(calls.some(address => address.endsWith(`/git/tags/${'d'.repeat(40)}`)));
+  assert.equal(calls.some(address => address.includes('/commits/')), false);
+});
+
+test('normal resolution requires paired source identity even when versions and stamp agree', t => {
+  const { env, report } = managedFixture(t);
+  writeLauncherStamp(report.cli.version, env);
+  for (const mutate of [
+    r => { r.daemon = null; },
+    r => { r.daemon.commit_sha = 'b'.repeat(40); },
+    r => { r.daemon.target = 'different-target'; },
+    r => { r.cli.source_dirty = true; },
+    r => { r.daemon.path = '/different/runtime/kin-daemon'; },
+    r => { r.schema = 'unknown.v2'; },
+    r => { r.ready = false; r.reason = 'restart_pending'; },
+  ]) {
+    const changed = structuredClone(report);
+    mutate(changed);
+    assert.throws(() => resolveReadyManagedBinary({
+      env, spawnImpl: () => ({ status: 0, stdout: JSON.stringify(changed) }),
+    }), /not certified/);
+  }
+});
+
+test('matching paired identity is reused without touching network or launcher stamp', async t => {
+  const { env, report, cliPath, daemonPath } = managedFixture(t);
+  writeLauncherStamp('0.0.1', env);
+  const calls = [];
+  const selected = await ensureProvisioned({
+    env,
+    fetchImpl: async () => { throw new Error('no download expected'); },
+    spawnImpl: (binary, args) => {
+      calls.push(args);
+      return { status: 0, stdout: args[0] === '--version' ? `kin ${report.cli.version}\n` : JSON.stringify(report) };
+    },
+  });
+  assert.equal(selected, cliPath);
+  assert.deepEqual(calls, [['--version'], ['runtime', 'status', '--json']]);
+  assert.equal(readLauncherStamp(env), '0.0.1', 'receipt is not rewritten as runtime proof');
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+});
+
+test('an old managed runtime delegates upgrade exclusively to the native updater', async t => {
+  const { env, report, cliPath, daemonPath } = managedFixture(t, '99.0.0', 'linux');
+  const calls = [];
+  let updated = false;
+  const selected = await ensureProvisioned({
+    env, platform: 'linux',
+    fetchImpl: async () => { throw new Error('launcher must not download an upgrade'); },
+    log: () => {},
+    spawnImpl: (binary, args) => {
+      assert.equal(binary, cliPath);
+      calls.push(args);
+      if (args[0] === '--version') return { status: 0, stdout: 'kin 0.0.1\n' };
+      if (args[0] === 'update') { updated = true; return { status: 0, stdout: 'native transaction completed\n' }; }
+      return { status: updated ? 0 : 1, stdout: JSON.stringify(updated ? report : {
+        schema: 'kin.runtime-status.v1', ready: false, reason: 'upgrade_required',
+      }) };
+    },
+  });
+  assert.equal(selected, cliPath);
+  assert.deepEqual(calls, [['--version'], ['runtime', 'status', '--json'], ['update', '--apply'], ['runtime', 'status', '--json']]);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+});
+
+test('a refused native upgrade preserves both existing files and never falls back to provisioning', async t => {
+  const { env, cliPath, daemonPath } = managedFixture(t, '99.0.0', 'linux');
+  await assert.rejects(ensureProvisioned({
+    env, platform: 'linux',
+    fetchImpl: async () => { throw new Error('must not download'); },
+    spawnImpl: (binary, args) => ({ status: args[0] === '--version' ? 0 : 1,
+      stdout: args[0] === '--version' ? 'kin 0.0.1\n' : args[0] === 'runtime'
+        ? JSON.stringify({ schema: 'kin.runtime-status.v1', ready: false, reason: 'upgrade_required' }) : '',
+      stderr: 'managed runtime is active' }),
+    log: () => {},
+  }), /transactional update failed/);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+});
+
+test('Windows updates prepare a private native worker and await its exit before status', t => {
+  const { env, cliPath, report, home, daemonPath } = managedFixture(t, '99.0.0', 'win32');
+  const copied = copiedWindowsWorker(home);
+  const calls = [];
+  const selected = updateManagedInstall({
+    env, platform: 'win32', log: () => {},
+    spawnImpl: (binary, args, options) => {
+      calls.push({ binary, args });
+      if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+      if (args.includes('--windows-worker')) {
+        assert.equal(binary, copied.worker);
+        assert.equal(options.cwd, copied.directory);
+        assert.deepEqual(args, ['update', '--windows-worker', copied.record, '--apply']);
+        recordMockWorkerConsumption(copied);
+        return { status: 0, pid: 4312, stdout: 'native transaction complete' };
+      }
+      if (args.includes('--cleanup-windows-worker')) {
+        assert.equal(binary, cliPath);
+        assert.equal(options.cwd, path.dirname(cliPath), 'cleanup runs outside the mapped worker directory');
+        assert.deepEqual(args, ['update', '--cleanup-windows-worker', copied.record]);
+        assert.ok(fs.existsSync(copied.worker), 'wrapper has not deleted runtime-owned scratch');
+        return { status: 0, stdout: 'native cleanup complete' };
+      }
+      assert.equal(binary, cliPath);
+      assert.deepEqual(args, ['runtime', 'status', '--json']);
+      assert.ok(fs.existsSync(copied.directory), 'only native cleanup owns scratch deletion');
+      return { status: 0, stdout: JSON.stringify(report) };
+    },
+  });
+  assert.equal(selected, cliPath);
+  assert.equal(calls.length, 4);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+});
+
+function copiedWindowsWorker(home) {
+  const directory = path.join(home, `.update-worker-${crypto.randomUUID()}`);
+  fs.mkdirSync(directory);
+  const worker = path.join(directory, 'kin-update-worker.exe');
+  const record = path.join(directory, 'handoff.json');
+  fs.writeFileSync(worker, 'copied worker bytes');
+  fs.writeFileSync(record, 'private handoff bytes');
+  return { directory, worker, record, prepared: {
+    schema: 'kin.windows-update-worker.v1', worker_executable: worker, handoff_record: record,
+    source_commit_sha: 'a'.repeat(40), version: '99.0.0', worker_sha256: sha256Hex(fs.readFileSync(worker)),
+  } };
+}
+
+// These injected records test consumer dispatch only. Native Windows controls
+// execute the actual worker and its process/object-bound consumption proof.
+function recordMockWorkerConsumption(copied, overrides = {}) {
+  const consumed = {
+    schema: 'kin.windows-update-worker-consumed.v1',
+    worker_process: { pid: 4312, boot_id: 'mock boot', birth_token: 'mock birth' },
+    directory_binding: { mock: true }, handoff_binding: { mock: true },
+    handoff_sha256: sha256Hex(fs.readFileSync(copied.record)),
+    ...overrides,
+  };
+  fs.writeFileSync(path.join(copied.directory, 'claimed'), JSON.stringify(consumed));
+}
+
+for (const outcome of ['no-update', 'failure']) {
+  test(`consumed Windows worker ${outcome} requests native cleanup after exit and preserves its result`, t => {
+    const { home, env, cliPath, report, daemonPath } = managedFixture(t, '99.0.0', 'win32');
+    const copied = copiedWindowsWorker(home);
+    const calls = [];
+    const run = () => updateManagedInstall({
+      env, platform: 'win32', log: () => {},
+      spawnImpl: (binary, args) => {
+        calls.push(args);
+        if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+        if (args.includes('--windows-worker')) {
+          assert.ok(fs.existsSync(copied.worker));
+          recordMockWorkerConsumption(copied);
+          return { status: outcome === 'failure' ? 17 : 0, pid: 4312,
+            stdout: outcome === 'no-update' ? 'already current' : '', stderr: 'fixture failure' };
+        }
+        if (args.includes('--cleanup-windows-worker')) {
+          assert.equal(binary, cliPath);
+          return { status: 0, stdout: '' };
+        }
+        return { status: 0, stdout: JSON.stringify(report) };
+      },
+    });
+    if (outcome === 'failure') assert.throws(run, /transactional update failed \(17\)/);
+    else assert.equal(run(), cliPath);
+    assert.deepEqual(calls.slice(0, 3), [
+      ['update', '--prepare-windows-worker'], ['update', '--windows-worker', copied.record, '--apply'],
+      ['update', '--cleanup-windows-worker', copied.record],
+    ]);
+    assert.ok(fs.existsSync(copied.directory), 'the mock native cleanup did not delete; the wrapper must not do so');
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+    assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+  });
+}
+
+for (const cleanupOutcome of ['refusal', 'throw']) {
+  test(`native Windows cleanup ${cleanupOutcome} never replaces the worker exit result`, t => {
+    const { home, env, cliPath } = managedFixture(t, '99.0.0', 'win32');
+    const copied = copiedWindowsWorker(home);
+    const logs = [];
+    assert.throws(() => updateManagedInstall({
+      env, platform: 'win32', log: line => logs.push(line),
+      spawnImpl: (binary, args) => {
+        if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+        if (args.includes('--windows-worker')) {
+          recordMockWorkerConsumption(copied);
+          return { status: 17, pid: 4312, stdout: '', stderr: 'original worker failure' };
+        }
+        assert.equal(binary, cliPath);
+        assert.deepEqual(args, ['update', '--cleanup-windows-worker', copied.record]);
+        if (cleanupOutcome === 'throw') throw new Error('native cleanup invocation failed');
+        return { status: 19, stdout: '', stderr: 'native recovery fence retained scratch' };
+      },
+    }), /transactional update failed \(17\)/);
+    assert.ok(logs.some(line => line.includes('cleanup deferred')));
+    assert.ok(fs.existsSync(copied.worker));
+    assert.ok(fs.existsSync(copied.record));
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  });
+}
+
+test('native cleanup refusal does not turn a successful worker into a failed update', t => {
+  const { home, env, cliPath, report } = managedFixture(t, '99.0.0', 'win32');
+  const copied = copiedWindowsWorker(home);
+  assert.equal(updateManagedInstall({
+    env, platform: 'win32', log: () => {},
+    spawnImpl: (binary, args) => {
+      if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+      if (args.includes('--windows-worker')) {
+        recordMockWorkerConsumption(copied);
+        return { status: 0, pid: 4312, stdout: '' };
+      }
+      if (args.includes('--cleanup-windows-worker')) return { status: 1, stderr: 'scratch preserved', stdout: '' };
+      return { status: 0, stdout: JSON.stringify(report) };
+    },
+  }), cliPath);
+  assert.ok(fs.existsSync(copied.worker));
+});
+
+for (const consumption of ['unclaimed', 'empty', 'wrong-schema', 'wrong-pid', 'wrong-handoff-hash', 'linked-marker']) {
+  test(`Windows wrapper refuses native cleanup dispatch for ${consumption} consumption proof`, {
+    skip: consumption === 'linked-marker' && process.platform === 'win32',
+  }, t => {
+    const { home, env, cliPath, report } = managedFixture(t, '99.0.0', 'win32');
+    const copied = copiedWindowsWorker(home);
+    let cleanupCalls = 0;
+    assert.equal(updateManagedInstall({
+      env, platform: 'win32', log: () => {},
+      spawnImpl: (binary, args) => {
+        if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+        if (args.includes('--windows-worker')) {
+          const marker = path.join(copied.directory, 'claimed');
+          if (consumption === 'empty') fs.writeFileSync(marker, '');
+          else if (consumption !== 'unclaimed') {
+            const overrides = consumption === 'wrong-schema' ? { schema: 'unknown' }
+              : consumption === 'wrong-pid' ? { worker_process: { pid: 9999 } }
+                : consumption === 'wrong-handoff-hash' ? { handoff_sha256: '0'.repeat(64) } : {};
+            recordMockWorkerConsumption(copied, overrides);
+            if (consumption === 'linked-marker') {
+              const retained = path.join(home, 'retained-claim');
+              fs.renameSync(marker, retained);
+              fs.symlinkSync(retained, marker);
+            }
+          }
+          return { status: 0, pid: 4312, stdout: '' };
+        }
+        if (args.includes('--cleanup-windows-worker')) cleanupCalls++;
+        return { status: 0, stdout: JSON.stringify(report) };
+      },
+    }), cliPath);
+    assert.equal(cleanupCalls, 0);
+    assert.ok(fs.existsSync(copied.worker));
+    assert.ok(fs.existsSync(copied.record));
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  });
+}
+
+test('Windows prepare cannot direct wrapper cleanup outside the exact managed worker directory', t => {
+  const { home, env, cliPath } = managedFixture(t, '99.0.0', 'win32');
+  const otherHome = path.join(home, 'unrelated-data');
+  fs.mkdirSync(otherHome);
+  const copied = copiedWindowsWorker(otherHome);
+  let calls = 0;
+  assert.throws(() => updateManagedInstall({
+    env, platform: 'win32',
+    spawnImpl: () => { calls++; return { status: 0, stdout: JSON.stringify(copied.prepared) }; },
+  }), /scratch is not an unclaimed owned directory/);
+  assert.equal(calls, 1, 'worker outside managed direct child was never launched');
+  assert.ok(fs.existsSync(copied.worker));
+  assert.ok(fs.existsSync(copied.record));
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+});
+
+test('a preclaimed Windows handoff remains intact and is never replayed by the wrapper', t => {
+  const { home, env } = managedFixture(t, '99.0.0', 'win32');
+  const copied = copiedWindowsWorker(home);
+  fs.writeFileSync(path.join(copied.directory, 'claimed'), '');
+  let calls = 0;
+  assert.throws(() => updateManagedInstall({
+    env, platform: 'win32',
+    spawnImpl: () => { calls++; return { status: 0, stdout: JSON.stringify(copied.prepared) }; },
+  }), /scratch is not an unclaimed owned directory/);
+  assert.equal(calls, 1);
+  assert.ok(fs.existsSync(copied.worker));
+  assert.ok(fs.existsSync(copied.record));
+});
+
+for (const uncertain of ['no-exit-status', 'no-child-pid', 'wait-threw']) {
+  test(`Windows worker scratch is retained when synchronous completion is uncertain: ${uncertain}`, t => {
+    const { home, env, cliPath } = managedFixture(t, '99.0.0', 'win32');
+    const copied = copiedWindowsWorker(home);
+    let cleanupCalls = 0;
+    assert.throws(() => updateManagedInstall({
+      env, platform: 'win32', log: () => {},
+      spawnImpl: (binary, args) => {
+        if (args.includes('--prepare-windows-worker')) return { status: 0, stdout: JSON.stringify(copied.prepared) };
+        if (args.includes('--cleanup-windows-worker')) cleanupCalls++;
+        assert.equal(binary, copied.worker);
+        recordMockWorkerConsumption(copied);
+        if (uncertain === 'wait-threw') throw new Error('synchronous worker wait failed');
+        if (uncertain === 'no-child-pid') return { status: 1, stdout: '' };
+        return { status: null, error: new Error('no confirmed worker exit'), stdout: '' };
+      },
+    }), /worker wait failed|no confirmed worker exit|transactional update failed \(1\)/);
+    assert.equal(cleanupCalls, 0);
+    assert.ok(fs.existsSync(copied.worker));
+    assert.ok(fs.existsSync(copied.record));
+    assert.ok(fs.existsSync(path.join(copied.directory, 'claimed')));
+    assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  });
+}
+
+test('a changed Windows worker is refused before launch or installed-file mutation', t => {
+  const { env, home, cliPath } = managedFixture(t, '99.0.0', 'win32');
+  const worker = path.join(home, 'worker.exe');
+  const handoff = path.join(home, 'handoff.json');
+  fs.writeFileSync(worker, 'changed bytes');
+  fs.writeFileSync(handoff, 'handoff fixture');
+  let calls = 0;
+  assert.throws(() => updateManagedInstall({
+    env, platform: 'win32',
+    spawnImpl: () => {
+      calls += 1;
+      return { status: 0, stdout: JSON.stringify({
+        schema: 'kin.windows-update-worker.v1', worker_executable: worker, handoff_record: handoff,
+        source_commit_sha: 'a'.repeat(40), version: '99.0.0', worker_sha256: '0'.repeat(64),
+      }) };
+    },
+  }), /worker identity changed/);
+  assert.equal(calls, 1);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+});
+
+test('development launch strips an inherited normal root and uses the admitted isolated home', t => {
+  const { env, cliPath, report, home } = managedFixture(t);
+  report.mode = 'development';
+  report.kin_home = path.join(home, 'isolated-home');
+  const inherited = { ...env, KIN_DIR: env.KIN_HOME };
+  const launched = developmentLaunchEnvironment(cliPath, {
+    env: inherited,
+    spawnImpl: (binary, args, options) => {
+      assert.equal(options.env.KIN_RUNTIME_MODE, 'development');
+      assert.equal(options.env.KIN_HOME, undefined);
+      assert.equal(options.env.KIN_DIR, undefined);
+      return { status: 0, stdout: JSON.stringify(report) };
+    },
+  });
+  assert.equal(launched.KIN_HOME, report.kin_home);
+  assert.equal(launched.KIN_DIR, report.kin_home);
+  assert.equal(inherited.KIN_HOME, env.KIN_HOME, 'the caller environment was not mutated');
+});
+
+test('old status API cannot be certified by stamp when official migration metadata is unavailable', async t => {
+  const { env, cliPath } = managedFixture(t);
   writeLauncherStamp('99.0.0', env);
-  const result = await ensureProvisioned({
-    env,
-    platform,
-    arch,
-    fetchImpl,
-    spawnImpl: () => {
-      throw new Error('ADOPT must skip the probe and provision unconditionally');
-    },
-    log: () => {},
-  });
-  assert.equal(result, path.join(binDir, kinName));
-  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
-  fs.rmSync(work, { recursive: true, force: true });
+  for (const version of ['kin 99.0.0\n', 'unknown binary']) {
+    await assert.rejects(ensureProvisioned({
+      env, spawnImpl: (binary, args) => ({ status: 0, stdout: args[0] === '--version' ? version : 'old CLI' }),
+      fetchImpl: async () => { throw new Error('official release unavailable'); },
+    }), /official release unavailable/);
+  }
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+});
+
+test('an explicit development selection cannot use direct managed provisioning', async t => {
+  const { env, cliPath } = managedFixture(t);
+  await assert.rejects(provision('99.0.0', {
+    env: { ...env, KIN_MANAGED_BIN: cliPath },
+    fetchImpl: async () => { throw new Error('no download permitted'); },
+    spawnImpl: () => { throw new Error('no managed repair permitted'); },
+  }), /development selections cannot run managed provisioning/);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+});
+
+test('independent adoption cannot overwrite an existing managed pair', async t => {
+  const { env, cliPath, daemonPath } = managedFixture(t);
+  await assert.rejects(ensureProvisioned({
+    env: { ...env, KIN_LAUNCHER_ADOPT: '1' },
+    spawnImpl: () => { throw new Error('must not launch'); },
+    fetchImpl: async () => { throw new Error('must not download'); },
+  }), /cannot replace a managed pair independently/);
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
 });
 
 // FIR-2628. `npm install -g` dies with EACCES on a root-owned global prefix,

@@ -143,7 +143,10 @@ async fn worker_publication_pull_cancel_keeps_gate_until_workspace_publication()
         workspace.base_target,
         Some(kin_model::RefTarget::change(fixture.peer_head))
     );
-    assert!(gate_was_retained, "cancelling the request released coordination before the blocking workspace writer finished");
+    assert!(
+        gate_was_retained,
+        "cancelling the request released coordination before the blocking workspace writer finished"
+    );
     let released = tokio::time::timeout(
         Duration::from_secs(20),
         fixture.state.coordination_gate.lock(),

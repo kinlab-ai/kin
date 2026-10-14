@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -305,6 +306,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repos = {}
         self.owned_repos = set()
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, os.path.join(workdir, "kin-home"))
 
     def shutdown(self):
         """Stop only this run's repositories, including a failed initialization."""

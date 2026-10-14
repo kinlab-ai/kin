@@ -129,6 +129,16 @@ impl HostDir {
         self.inner.read_bounded(name.as_ref(), max_bytes)
     }
 
+    /// Stream a regular file within this host directory without materializing it.
+    pub fn open_read_file(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::File> {
+        self.inner.open_read_file(name.as_ref())
+    }
+
+    /// Inspect an entry without following its final symbolic link.
+    pub fn symlink_metadata(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::Metadata> {
+        self.inner.symlink_metadata(name.as_ref())
+    }
+
     /// Replace `name` atomically and durably.
     pub fn write(&self, name: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
         self.inner.replace(name.as_ref(), bytes)

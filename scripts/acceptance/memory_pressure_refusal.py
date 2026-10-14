@@ -107,6 +107,8 @@ import sys
 import tempfile
 import threading
 import time
+from runtime_fixture import (IDENTITY_HEADER, fixture_daemon_metadata,
+                             prepare_runtime_fixture, runtime_fingerprint)
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -895,10 +897,13 @@ class DaemonStub(object):
     annotation and negative-verdict pipeline without opening a graph store or
     competing for the shared daemon/GPU.
     """
-    def __init__(self, resources_status, resources_body, graph_status_coverage=None):
+    def __init__(self, resources_status, resources_body, graph_status_coverage=None,
+                 runtime_metadata=None):
         self.resources_status = resources_status
         self.resources_body = resources_body
         self.graph_status_coverage = graph_status_coverage
+        self.runtime_metadata = runtime_metadata
+        self.handler_calls = 0
         self.requests = []
         self.server = None
         self.thread = None
@@ -931,6 +936,12 @@ class DaemonStub(object):
 
             def do_POST(self):
                 body = self._capture()
+                metadata = owner.runtime_metadata
+                if metadata is None or self.headers.get(IDENTITY_HEADER) != runtime_fingerprint(
+                        metadata["identity"], metadata["mode"], metadata["namespace"]):
+                    self._json(409, {"error": "controlled peer requires the selected runtime fingerprint"})
+                    return
+                owner.handler_calls += 1
                 if self.path == "/mcp/tools/call":
                     try:
                         tool = json.loads(body).get("name")
@@ -970,6 +981,9 @@ class DaemonStub(object):
 
             def do_GET(self):
                 self._capture()
+                if self.path == "/runtime/identity" and owner.runtime_metadata is not None:
+                    self._json(200, owner.runtime_metadata)
+                    return
                 if self.path == "/health":
                     self._json(200, {})
                     return
@@ -1025,6 +1039,8 @@ class Suite(object):
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repos = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def git(self, args, cwd):
         base = ["git",
@@ -2514,6 +2530,7 @@ def check_13(suite):
     )
     repo = suite.fixture("mcp-pressure-response")
     run([suite.kin, "daemon", "stop"], cwd=repo, env=suite.env, timeout=180)
+    runtime_metadata = fixture_daemon_metadata(suite.kin, suite.env, cwd=repo)
 
     embed_refusal = {
         "work": "embed-batch",
@@ -2592,7 +2609,7 @@ def check_13(suite):
                 embed_refusal,
             )
         session_id = "memory-pressure-%s" % name
-        with DaemonStub(status, body) as daemon:
+        with DaemonStub(status, body, runtime_metadata=runtime_metadata) as daemon:
             try:
                 payload = suite.mcp(
                     repo,
@@ -2667,7 +2684,8 @@ def check_13(suite):
                 [embed_refusal, lsp_refusal, future_refusal],
                 embed_refusal,
             )
-        with DaemonStub(status, body, graph_status_coverage=coverage) as daemon:
+        with DaemonStub(status, body, graph_status_coverage=coverage,
+                        runtime_metadata=runtime_metadata) as daemon:
             try:
                 payload = suite.mcp(
                     repo,

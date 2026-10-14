@@ -23,6 +23,22 @@ import zipfile
 
 SCHEMA = 'kin.release-rehearsal.v2'
 BASELINE = 'v0.8.6'
+# These reviewed pins keep the extracted verifier independent of candidate code.
+BASELINE_IDENTITY = {
+    'tag': BASELINE, 'version': '0.8.6',
+    'commit': '522ede0d0dfbdd33ff8ba3a5798bb3bed6902c08',
+    'lock_sha256': '9db830e29224527847b5a122e0883a2c9f968d806e34b4bf4d5052c4ceb60495',
+}
+BASELINE_ARCHIVE = {
+    'name': 'kin-windows-x86_64.zip',
+    'sha256': 'b40bb7d72b2313dceaf806b76c58dd8c7b06cbf62a2a57cdd21d7a31f228e392',
+    'components': {
+        'kin.exe': {'sha256': '5e9729490b7a7bcf7a803d5333fab6476849dc1765d2f5c57deea71ca86249ab',
+                    'size_bytes': 105574912},
+        'kin-daemon.exe': {'sha256': '923fbf6d669d6d32fab65a68b3338173af15ef4ea99d43f6d5b589d0882d7696',
+                           'size_bytes': 120715776},
+    },
+}
 MODES = ('compatibility-baseline', 'candidate-full')
 SHA = re.compile(r'^[0-9a-f]{40}$')
 HASH = re.compile(r'^[0-9a-f]{64}$')
@@ -42,6 +58,7 @@ INPUTS = (
     'scripts/acceptance/magic_repro.py',
     'scripts/acceptance/brownfield_repro.py',
     'scripts/acceptance/trace_pages.py',
+    'scripts/acceptance/runtime_fixture.py',
 )
 
 
@@ -160,11 +177,15 @@ def imports(args) -> None:
         help_text = run(sys.executable, str(destination), '--help', cwd=root, env=clean)
         if 'usage:' not in help_text.lower():
             raise ValueError(f'staged {suite} suite did not reach its actual argument parser')
-        siblings = destination.parent / 'trace_pages.py'
-        if siblings.read_bytes() != (args.source / 'scripts/acceptance/trace_pages.py').read_bytes():
-            raise ValueError(f'staged {suite} imported a stale acceptance sibling')
+        siblings = {}
+        for name in ('trace_pages.py', 'runtime_fixture.py'):
+            sibling = destination.parent / name
+            if sibling.read_bytes() != (args.source / 'scripts/acceptance' / name).read_bytes():
+                raise ValueError(f'staged {suite} imported a stale acceptance sibling: {name}')
+            siblings[name] = digest(sibling.read_bytes())
         staged[suite] = {'entry_sha256': digest(destination.read_bytes()),
-                         'sibling_sha256': digest(siblings.read_bytes()),
+                         'sibling_sha256': siblings['trace_pages.py'],
+                         'runtime_fixture_sha256': siblings['runtime_fixture.py'],
                          'help_sha256': digest(help_text.encode()),
                          'resolution': json.loads(resolution.read_text())}
     help_text = run('bash', str(args.source / 'scripts/release-proof/bin/kin-release-preflight'),
@@ -221,11 +242,7 @@ def record(args) -> None:
         common['native_handoff'] = 'PASS'
     elif args.mode == 'compatibility-baseline':
         compatibility = json.loads((args.output.parent / 'compatibility/result.json').read_text())
-        if (compatibility.get('schema') != 'kin.release-rehearsal-compat.v1'
-                or compatibility.get('status') != 'PASS'
-                or compatibility.get('coverage') != 'compatibility-baseline'
-                or compatibility.get('baseline', {}).get('tag') != BASELINE):
-            raise ValueError('Windows compatibility baseline did not pass its actual stable setup proof')
+        validate_compatibility_baseline(compatibility)
         common['compatibility'] = compatibility
         common['baseline'] = compatibility['baseline']
     else:
@@ -247,6 +264,49 @@ def record(args) -> None:
         common['candidate_binary'] = binary
         common['full_install_proof'] = 'PASS'
     write(args.output, common)
+
+
+def validate_compatibility_baseline(compatibility: dict) -> None:
+    if (not isinstance(compatibility, dict)
+            or compatibility.get('schema') != 'kin.release-rehearsal-compat.v1'
+            or compatibility.get('status') != 'PASS'
+            or compatibility.get('coverage') != 'compatibility-baseline'
+            or compatibility.get('baseline') != BASELINE_IDENTITY):
+        raise ValueError('Windows compatibility baseline differs from the exact reviewed stable identity')
+    preparation = compatibility.get('preparation', {})
+    if (not isinstance(preparation, dict)
+            or preparation.get('schema') != 'kin.legacy-baseline-preparation.v1'
+            or preparation.get('status') != 'PASS'
+            or preparation.get('coverage') != 'verified-legacy-archive-materialization'
+            or preparation.get('candidate_installer_invoked') is not False
+            or preparation.get('modern_managed_admission') is not False):
+        raise ValueError('Windows baseline has no verified legacy archive preparation')
+    archive = preparation.get('source_archive', {})
+    if (not isinstance(archive, dict)
+            or archive.get('name') != BASELINE_ARCHIVE['name']
+            or archive.get('sha256') != BASELINE_ARCHIVE['sha256']
+            or not isinstance(archive.get('checksum_sha256'), str)
+            or not HASH.fullmatch(archive['checksum_sha256'])
+            or archive.get('components') != BASELINE_ARCHIVE['components']):
+        raise ValueError('Windows baseline preparation differs from the reviewed archive or components')
+    prepared = preparation.get('installed', {})
+    executed = compatibility.get('installed', {})
+    if (not isinstance(prepared, dict) or set(prepared) != set(BASELINE_ARCHIVE['components'])
+            or not isinstance(executed, dict) or set(executed) != {'kin', 'kin-daemon'}):
+        raise ValueError('Windows baseline has no complete prepared and executed component identity')
+    for filename, pin in BASELINE_ARCHIVE['components'].items():
+        component = archive['components'][filename]
+        installed = prepared[filename]
+        observed = executed[filename.removesuffix('.exe')]
+        if (not isinstance(installed, dict) or not isinstance(observed, dict)
+                or type(component.get('size_bytes')) is not int
+                or not isinstance(installed.get('path'), str) or not installed['path']
+                or type(installed.get('size_bytes')) is not int
+                or any(installed.get(key) != value for key, value in pin.items())
+                or any(type(observed.get(key)) is not type(installed.get(key))
+                       or observed.get(key) != installed.get(key)
+                       for key in ('path', 'sha256', 'size_bytes'))):
+            raise ValueError(f'Windows baseline prepared and executed {filename} identities disagree')
 
 
 def validate_receipt(receipt: dict, source: dict, run_id: int, repository: str,
@@ -292,10 +352,8 @@ def validate_receipt(receipt: dict, source: dict, run_id: int, repository: str,
     else:
         baseline = windows.get('baseline', {})
         compatibility = windows.get('compatibility', {})
-        if (baseline.get('tag') != BASELINE or not SHA.fullmatch(baseline.get('commit', ''))
-                or not HASH.fullmatch(baseline.get('lock_sha256', ''))
-                or compatibility.get('coverage') != mode or compatibility.get('status') != 'PASS'
-                or compatibility.get('baseline') != baseline):
+        validate_compatibility_baseline(compatibility)
+        if baseline != BASELINE_IDENTITY:
             raise ValueError('Windows rehearsal has no actual reviewed compatibility-baseline proof')
     tooling = legs['tooling']
     if tooling.get('native_handoff') != 'PASS':

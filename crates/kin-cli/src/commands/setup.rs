@@ -5666,56 +5666,24 @@ pub(crate) fn managed_mcp_launcher() -> Result<String> {
     Ok(launcher_spelling(&path))
 }
 
-/// Where the launcher a client config names comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum McpLauncherOrigin {
-    /// `<kin_home>/bin/kin`, the binary `kin update` replaces in place.
-    Managed,
-    /// The running executable, or the `kin` on PATH that is the same file: a
-    /// source checkout, a scratch build, or a Homebrew or manual install.
-    /// Nothing manages that path, so an update leaves configs naming it behind.
-    Unmanaged,
-}
-
-/// The launcher `kin setup` registers, with where it came from.
+/// The validated stable launcher `kin setup` registers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpLauncher {
     pub(crate) command: String,
-    pub(crate) origin: McpLauncherOrigin,
 }
 
-/// Resolve the stable launcher that ordinary setup, health, and doctor must
-/// agree on for the installation channel currently running Kin.
-///
-/// Managed curl/npm installs own `$KIN_HOME/bin/kin`, so that stable path wins
-/// when present. Homebrew and manual installs do not create it; for those
-/// channels, prefer the `kin` path on PATH only when it resolves to this exact
-/// running executable, then fall back to `current_exe`. The updater keeps using
-/// [`managed_mcp_launcher`] directly after it has installed managed bytes.
+/// Resolve only the validated managed pair. Client registrations are durable
+/// pointers, so an arbitrary running executable cannot become their authority.
 pub(crate) fn resolve_mcp_launcher() -> Result<McpLauncher> {
-    if let Ok(command) = managed_mcp_launcher() {
-        return Ok(McpLauncher {
-            command,
-            origin: McpLauncherOrigin::Managed,
-        });
-    }
-
-    let current = env::current_exe().context("could not resolve the running Kin executable")?;
-    validate_running_mcp_launcher(&current)?;
-    if let Ok(path_candidate) = which::which(if cfg!(windows) { "kin.exe" } else { "kin" }) {
-        let candidate_target = fs::canonicalize(&path_candidate).ok();
-        let current_target = fs::canonicalize(&current).ok();
-        if candidate_target.is_some() && candidate_target == current_target {
-            validate_running_mcp_launcher(&path_candidate)?;
-            return Ok(McpLauncher {
-                command: launcher_spelling(&path_candidate),
-                origin: McpLauncherOrigin::Unmanaged,
-            });
-        }
+    let report = crate::commands::runtime::inspect(&Default::default());
+    if !report.ready || !report.pair_matches {
+        anyhow::bail!(
+            "managed Kin runtime is unavailable: {}. Run `kin runtime status --json` and repair the managed installation before registering clients",
+            report.detail.as_deref().or(report.reason.as_deref()).unwrap_or("the CLI and daemon pair did not pass validation")
+        );
     }
     Ok(McpLauncher {
-        command: launcher_spelling(&current),
-        origin: McpLauncherOrigin::Unmanaged,
+        command: launcher_spelling(&report.cli.path),
     })
 }
 
@@ -5724,60 +5692,11 @@ pub(crate) fn configured_mcp_launcher() -> Result<String> {
     resolve_mcp_launcher().map(|launcher| launcher.command)
 }
 
-/// The warning setup prints before it registers an unmanaged launcher, or
-/// `None` when the launcher is the managed binary.
-///
-/// A client config is a standing pointer, and `kin update` repairs only
-/// pointers at the managed binary. Registering a source checkout or a scratch
-/// build without saying so is how every agent client on one machine came to
-/// launch a lane build out of a scratch directory nothing manages.
-fn unmanaged_mcp_launcher_warning(launcher: &McpLauncher, kin_home: &Path) -> Option<String> {
-    match launcher.origin {
-        McpLauncherOrigin::Managed => None,
-        McpLauncherOrigin::Unmanaged => Some(format!(
-            "registering {} as the Kin MCP launcher: no managed binary exists at {}, so this \
-             path is a source checkout, a scratch build or a package-manager install that Kin \
-             does not manage, and `kin update` will not repair client configs that point at \
-             it. If this machine should be on the managed install, install Kin through the \
-             installer or npm and re-run `kin setup` to register the managed binary.",
-            launcher.command,
-            managed_mcp_launcher_path(kin_home).display()
-        )),
-    }
-}
-
-/// Print the unmanaged-launcher warning once per setup run, ahead of the
-/// per-client writes that all name the same launcher. A resolution failure is
-/// left to those writes, which report it against the client they were writing.
+/// Report a refused managed runtime before per-client registration attempts.
 fn announce_mcp_launcher_origin() {
-    let Ok(kin_home) = kin_dir() else {
-        return;
-    };
-    let Ok(launcher) = resolve_mcp_launcher() else {
-        return;
-    };
-    if let Some(warning) = unmanaged_mcp_launcher_warning(&launcher, &kin_home) {
-        say!("  {} {warning}", style("!").yellow());
+    if let Err(error) = resolve_mcp_launcher() {
+        say!("  {} {error}", style("!").yellow());
     }
-}
-
-fn validate_running_mcp_launcher(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        anyhow::bail!("Kin MCP launcher is not absolute: {}", path.display());
-    }
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("Kin MCP launcher is unavailable at {}", path.display()))?;
-    if !metadata.is_file() {
-        anyhow::bail!("Kin MCP launcher is not a file: {}", path.display());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            anyhow::bail!("Kin MCP launcher is not executable: {}", path.display());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -19726,6 +19645,9 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use tests::write_managed_runtime_fixture;
+
 #[cfg(test)]
 mod tests {
     use super::projection_mode_to_record;
@@ -20107,7 +20029,11 @@ mod tests {
     #[tokio::test]
     async fn post_install_refresh_requires_an_available_enrichment_channel() {
         use super::{request_post_install_sweep, PostInstallDaemonRefresh};
-        use axum::{http::StatusCode, routing::post, Router};
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Router,
+        };
 
         let cases = [
             (
@@ -20141,10 +20067,20 @@ mod tests {
                 .await
                 .expect("bind isolated response fixture");
             let address = listener.local_addr().unwrap();
-            let app = Router::new().route(
-                "/lsp/sweep",
-                post(move || async move { (status, axum::Json(body)) }),
-            );
+            let identity = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+                .expect("the test runner provides an existing isolated Kin home");
+            let app = Router::new()
+                .route(
+                    "/runtime/identity",
+                    get(move || {
+                        let identity = identity.clone();
+                        async move { axum::Json(identity) }
+                    }),
+                )
+                .route(
+                    "/lsp/sweep",
+                    post(move || async move { (status, axum::Json(body)) }),
+                );
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
@@ -25844,7 +25780,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         std::fs::write(&path, b"this is not json {{{").unwrap();
 
         let original = std::fs::read(&path).unwrap();
-        let err = merge_mcp_config(&path, "cursor").unwrap_err();
+        let err = merge_configuration_fixture_json(&path, "cursor").unwrap_err();
         let msg = err.to_string();
 
         assert!(
@@ -25873,7 +25809,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"existingKey": true}"#).unwrap();
 
-        merge_mcp_config(&path, "cursor").unwrap();
+        merge_configuration_fixture_json(&path, "cursor").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -25983,7 +25919,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         };
         for (id, profile) in [("cursor", "agent-routed"), ("claude", "agent-default")] {
             let path = dir.path().join(format!("{id}.json"));
-            merge_mcp_config(&path, id).unwrap();
+            merge_configuration_fixture_json(&path, id).unwrap();
             assert_eq!(profile_in(&path).as_deref(), Some(profile), "{id}");
         }
 
@@ -25994,6 +25930,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn claude_writer_uses_fallback_only_while_primary_is_absent() {
@@ -26003,6 +25940,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
         let fallback = home.join(".claude/config.json");
         let primary = home.join(".claude.json");
         fs::create_dir_all(fallback.parent().unwrap()).unwrap();
@@ -26015,7 +25954,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let fallback_entry = read_kin_mcp_entry(&fallback).unwrap();
         assert_eq!(
             fallback_entry["command"].as_str(),
-            env::current_exe().unwrap().to_str()
+            Some(launcher_spelling(&managed).as_str())
         );
         assert_eq!(fallback_entry["args"], serde_json::json!(["mcp", "start"]));
         assert_eq!(
@@ -26461,11 +26400,11 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         };
 
         let cursor = dir.path().join("cursor.json");
-        merge_mcp_config(&cursor, "cursor").unwrap();
+        merge_configuration_fixture_json(&cursor, "cursor").unwrap();
         assert_eq!(profile_of(&cursor), ("agent-routed".to_string(), false));
         // An older Kin wrote agent-default here, and the ledger says so.
         edit_entry(&cursor, "cursor", true, &set_profile("agent-default"));
-        merge_mcp_config(&cursor, "cursor").unwrap();
+        merge_configuration_fixture_json(&cursor, "cursor").unwrap();
         assert_eq!(
             profile_of(&cursor),
             ("agent-routed".to_string(), false),
@@ -26473,14 +26412,14 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
         // A person set agent-query after that.
         edit_entry(&cursor, "cursor", false, &set_profile("agent-query"));
-        merge_mcp_config(&cursor, "cursor").unwrap();
+        merge_configuration_fixture_json(&cursor, "cursor").unwrap();
         assert_eq!(
             profile_of(&cursor),
             ("agent-query".to_string(), true),
             "a profile set by hand is kept"
         );
         repair(&cursor, "cursor");
-        merge_mcp_config(&cursor, "cursor").unwrap();
+        merge_configuration_fixture_json(&cursor, "cursor").unwrap();
         assert_eq!(
             profile_of(&cursor),
             ("agent-query".to_string(), true),
@@ -26489,7 +26428,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
 
         // A person who puts a routed client back on the named belt is heard too.
         let gemini = dir.path().join("gemini.json");
-        merge_mcp_config(&gemini, "gemini").unwrap();
+        merge_configuration_fixture_json(&gemini, "gemini").unwrap();
         edit_entry(&gemini, "gemini", false, &set_profile("agent-default"));
         repair(&gemini, "gemini");
         assert_eq!(profile_of(&gemini), ("agent-default".to_string(), true));
@@ -26498,7 +26437,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         // has no ledger record to say who chose it, so it moves forward and the
         // rest of what was changed stays.
         let windsurf = dir.path().join("windsurf.json");
-        merge_mcp_config(&windsurf, "windsurf").unwrap();
+        merge_configuration_fixture_json(&windsurf, "windsurf").unwrap();
         edit_entry(
             &windsurf,
             "windsurf",
@@ -26519,7 +26458,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let lmstudio = dir.path().join("lmstudio.json");
         {
             let scope = RequestedProfileScope::enter(Some("agent-routed-query"));
-            merge_mcp_config(&lmstudio, "lmstudio").unwrap();
+            merge_configuration_fixture_json(&lmstudio, "lmstudio").unwrap();
             let choice = scope
                 .choice_for(&lmstudio)
                 .expect("the writer noted its choice");
@@ -26534,7 +26473,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             profile_of(&lmstudio),
             ("agent-routed-query".to_string(), true)
         );
-        merge_mcp_config(&lmstudio, "lmstudio").unwrap();
+        merge_configuration_fixture_json(&lmstudio, "lmstudio").unwrap();
         repair(&lmstudio, "lmstudio");
         assert_eq!(
             profile_of(&lmstudio),
@@ -26564,9 +26503,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let kin_home = dir.path().join("kin-home");
         let repo = dir.path().join("repo");
         fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
         fs::create_dir_all(repo.join(".kin")).unwrap();
-        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let _scan_root =
@@ -26806,7 +26744,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn non_managed_install_setup_health_and_doctor_repair_converge() {
+    fn setup_health_and_doctor_repair_converge_after_managed_installation() {
         if !kin_core::test_env::alone_in_process() {
             return;
         }
@@ -26823,6 +26761,12 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             !kin_home.join("bin/kin").exists(),
             "fixture must model Homebrew/manual install without a managed launcher"
         );
+        let error =
+            configure_cursor().expect_err("unmanaged setup must refuse client registration");
+        assert!(format!("{error:#}").contains("managed Kin runtime is unavailable"));
+        assert!(!home.join(".cursor/mcp.json").exists());
+
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
         let config = configure_cursor().unwrap();
         let expected = configured_mcp_launcher().unwrap();
         let entry = read_kin_mcp_entry(&config).unwrap();
@@ -26859,10 +26803,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
     }
 
-    /// `kin update` replaces `<kin_home>/bin/kin` in place, so a client config
-    /// naming that path is repaired by every update. When it exists, setup
-    /// registers it rather than whichever binary happens to be running, and
-    /// has nothing to warn about.
+    /// Client registrations always point at the admitted pair, regardless of the
+    /// executable running setup.
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -26874,22 +26816,12 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
         fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
-        let managed = kin_home.join("bin").join("kin");
-        fs::copy(env::current_exe().unwrap(), &managed).unwrap();
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
-
         let launcher = resolve_mcp_launcher().unwrap();
-        assert_eq!(launcher.origin, McpLauncherOrigin::Managed);
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
         assert_eq!(launcher.command, launcher_spelling(&managed));
-        assert_ne!(
-            fs::canonicalize(&launcher.command).unwrap(),
-            fs::canonicalize(env::current_exe().unwrap()).unwrap(),
-            "the fixture must be able to tell the managed copy from the running binary"
-        );
-        assert_eq!(unmanaged_mcp_launcher_warning(&launcher, &kin_home), None);
-
         let config = configure_cursor().unwrap();
         assert_eq!(
             read_kin_mcp_entry(&config).unwrap()["command"].as_str(),
@@ -26902,7 +26834,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     /// at the index it dispatches on.
     #[test]
     #[serial]
-    fn setup_registers_kin_with_lm_studio_beside_its_other_servers() {
+    fn lm_studio_config_writer_preserves_other_servers_and_detects_installation() {
         if !kin_core::test_env::alone_in_process() {
             return;
         }
@@ -26910,12 +26842,6 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
         fs::create_dir_all(home.join(".lmstudio")).unwrap();
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
-        fs::copy(
-            env::current_exe().unwrap(),
-            kin_home.join("bin").join("kin"),
-        )
-        .unwrap();
         fs::write(
             home.join(".lmstudio").join("mcp.json"),
             r#"{"mcpServers":{"other":{"command":"other-server"}}}"#,
@@ -26924,7 +26850,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
-        let config = configure_lmstudio().unwrap();
+        let config = mcp_config_path_for_index(IDX_LMSTUDIO).unwrap();
+        merge_configuration_fixture_json(&config, "lmstudio").unwrap();
         assert_eq!(config, home.join(".lmstudio").join("mcp.json"));
         let root: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         let kin = &root["mcpServers"]["kin"];
@@ -26945,13 +26872,12 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert_eq!(assistants[IDX_GROK].name, "Grok CLI");
     }
 
-    /// Without a managed binary, setup falls back to the running executable
-    /// and says so: nothing manages that path, and `kin update` will not
-    /// repair a client config that points at it.
+    /// A missing or mismatched pair cannot create a client registration through
+    /// an executable or PATH fallback.
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn setup_warns_when_the_registered_launcher_is_unmanaged() {
+    fn setup_refuses_unmanaged_or_mismatched_runtime_without_client_write() {
         if !kin_core::test_env::alone_in_process() {
             return;
         }
@@ -26961,26 +26887,69 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         fs::create_dir_all(&home).unwrap();
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
-        assert!(!kin_home.join("bin").join("kin").exists());
+        assert!(resolve_mcp_launcher().is_err());
+        assert!(configure_cursor().is_err());
+        assert!(!home.join(".cursor/mcp.json").exists());
+        write_managed_runtime_fixture(&kin_home, "2222222222222222222222222222222222222222");
+        let error = resolve_mcp_launcher().unwrap_err().to_string();
+        assert!(
+            error.contains("managed Kin runtime is unavailable"),
+            "{error}"
+        );
+        assert!(configure_cursor().is_err());
+        assert!(!home.join(".cursor/mcp.json").exists());
+    }
 
-        let launcher = resolve_mcp_launcher().unwrap();
-        assert_eq!(launcher.origin, McpLauncherOrigin::Unmanaged);
-        assert_eq!(
-            fs::canonicalize(&launcher.command).unwrap(),
-            fs::canonicalize(env::current_exe().unwrap()).unwrap()
-        );
-        let warning = unmanaged_mcp_launcher_warning(&launcher, &kin_home)
-            .expect("an unmanaged launcher must be announced");
-        assert!(warning.contains(&launcher.command), "{warning}");
-        assert!(
-            warning.contains(&kin_home.join("bin").join("kin").display().to_string()),
-            "{warning}"
-        );
-        assert!(
-            warning.contains("`kin update` will not repair"),
-            "{warning}"
-        );
-        assert!(!warning.contains('\u{2014}'), "{warning}");
+    #[cfg(unix)]
+    pub(crate) fn write_managed_runtime_fixture(kin_home: &Path, daemon_sha: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        let cli = serde_json::json!({"schema":"kin.runtime-build-identity.v1","kin_version":"0.8.6","kin_commit":"1111111111111111111111111111111111111111","kin_dirty":false,"kin_source_known":true,"kin_target":"aarch64-apple-darwin","kin_build_profile":"release"});
+        let daemon = serde_json::json!({"schema":"kin.daemon.compat.v2","version":"0.8.6","build":{"sha":daemon_sha,"dirty":false,"source_known":true,"target":"aarch64-apple-darwin","build_profile":"release"}});
+        for (name, identity) in [("kin", cli), ("kin-daemon", daemon)] {
+            let path = kin_home.join("bin").join(name);
+            fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", identity)).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    // Writer unit tests supply their launcher explicitly. Managed admission is
+    // exercised separately by the normal setup entrypoint tests.
+    fn merge_configuration_fixture_json(path: &PathBuf, target_id: &str) -> Result<()> {
+        let target = McpRepairTarget {
+            id: target_id.to_string(),
+            path: path.clone(),
+            repo_root: None,
+            captured_config_sha256: "0".repeat(64),
+        };
+        let command = launcher_spelling(&managed_mcp_launcher_path(&kin_dir()?));
+        let lock = ConfigLock::acquire(path)?;
+        merge_json_mcp_target_locked(&target, &command, &lock)
+    }
+
+    fn merge_configuration_fixture_toml(path: &PathBuf, repo_root: &Path) -> Result<()> {
+        merge_configuration_fixture_toml_for(path, repo_root, "codex")
+    }
+
+    fn merge_configuration_fixture_toml_for(
+        path: &PathBuf,
+        repo_root: &Path,
+        target_id: &str,
+    ) -> Result<()> {
+        let command = launcher_spelling(&managed_mcp_launcher_path(&kin_dir()?));
+        let lock = ConfigLock::acquire(path)?;
+        merge_mcp_config_toml_locked(path, repo_root, &lock, target_id, &command)
+    }
+
+    fn write_configuration_writer_launcher_fixture(kin_home: &Path) {
+        let path = managed_mcp_launcher_path(kin_home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"configuration writer fixture, never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     /// Setup writes these bytes into files a person reads: the discovery
@@ -27019,7 +26988,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         )
         .unwrap();
 
-        merge_mcp_config_toml_for(&path, &repo, "grok").unwrap();
+        merge_configuration_fixture_toml_for(&path, &repo, "grok").unwrap();
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(
@@ -27060,7 +27029,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         std::fs::write(&path, b"this is not toml [[[").unwrap();
 
         let original = std::fs::read(&path).unwrap();
-        let err = merge_mcp_config_toml(&path, &repo).unwrap_err();
+        let err = merge_configuration_fixture_toml(&path, &repo).unwrap_err();
         let msg = err.to_string();
 
         assert!(
@@ -27096,7 +27065,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         )
         .unwrap();
 
-        merge_mcp_config_toml(&path, &repo).unwrap();
+        merge_configuration_fixture_toml(&path, &repo).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -27142,8 +27111,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let repo = repo.canonicalize().unwrap();
         let path = dir.path().join(".codex").join("config.toml");
 
-        merge_mcp_config_toml(&path, &repo).unwrap();
-        merge_mcp_config_toml(&path, &repo).unwrap();
+        merge_configuration_fixture_toml(&path, &repo).unwrap();
+        merge_configuration_fixture_toml(&path, &repo).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let root: toml::Value = toml::from_str(&content).unwrap();
@@ -27188,7 +27157,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         )
         .unwrap();
 
-        merge_mcp_config_toml(&path, &repo).unwrap();
+        merge_configuration_fixture_toml(&path, &repo).unwrap();
         let root: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         let kin = &root["mcp_servers"]["kin"];
         assert_eq!(kin["cwd"].as_str(), repo.to_str());
@@ -27212,7 +27181,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let json = dir.path().join("config.json");
         let json_bytes = br#"{"mcpServers":{"kin":{"env":"user-owned"}}}"#;
         fs::write(&json, json_bytes).unwrap();
-        assert!(merge_mcp_config(&json, "cursor").is_err());
+        assert!(merge_configuration_fixture_json(&json, "cursor").is_err());
         assert_eq!(fs::read(json).unwrap(), json_bytes);
 
         let repo = dir.path().join("repo");
@@ -27220,7 +27189,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let toml = dir.path().join("config.toml");
         let toml_bytes = b"mcp_servers = 7\n";
         fs::write(&toml, toml_bytes).unwrap();
-        assert!(merge_mcp_config_toml(&toml, &repo).is_err());
+        assert!(merge_configuration_fixture_toml(&toml, &repo).is_err());
         assert_eq!(fs::read(toml).unwrap(), toml_bytes);
     }
 
@@ -29489,8 +29458,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
-        fs::copy(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        write_configuration_writer_launcher_fixture(&kin_home);
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".kin")).unwrap();
         let repo = repo.canonicalize().unwrap();
@@ -29544,8 +29512,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
-        fs::copy(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        write_configuration_writer_launcher_fixture(&kin_home);
         let repo_a = dir.path().join("repo-a");
         let repo_b = dir.path().join("repo-b");
         fs::create_dir_all(repo_a.join(".kin")).unwrap();
@@ -29570,7 +29537,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             .into_iter()
             .find(|target| target.id == "codex")
             .expect("Codex target must be captured");
-        merge_mcp_config_toml(&config, &repo_b).unwrap();
+        merge_configuration_fixture_toml(&config, &repo_b).unwrap();
         let rebound_bytes = fs::read(&config).unwrap();
         let finalized = std::cell::Cell::new(false);
 
@@ -29596,8 +29563,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
-        fs::copy(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        write_configuration_writer_launcher_fixture(&kin_home);
         let cursor = home.join(".cursor/mcp.json");
         let windsurf = home.join(".codeium/windsurf/mcp_config.json");
         fs::create_dir_all(cursor.parent().unwrap()).unwrap();
@@ -29614,7 +29580,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         // This is a normal setup writer that wins after the updater's durable
         // target capture. Finalization must include it, not clear an incomplete
         // obligation.
-        merge_mcp_config(&windsurf, "windsurf").unwrap();
+        merge_configuration_fixture_json(&windsurf, "windsurf").unwrap();
         let finalized = std::cell::Cell::new(false);
         let repaired = remerge_mcp_targets_exact_with_finalizer(&captured, || {
             finalized.set(true);
@@ -29707,9 +29673,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
         let repo = dir.path().join("repo");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
         fs::create_dir_all(repo.join(".kin")).unwrap();
-        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
         assert!(
             !repo.join(".git").exists(),
             "the fixture is Git-free by construction"
@@ -29758,9 +29723,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
         let repo = dir.path().join("repo");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
         fs::create_dir_all(repo.join(".kin")).unwrap();
-        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
         let legacy = home.join(".gemini/antigravity-ide/mcp_config.json");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         let legacy_without_kin =
@@ -29792,7 +29757,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             let entry = read_kin_mcp_entry(path).unwrap();
             assert_eq!(
                 entry["command"].as_str(),
-                Some(kin_home.join("bin/kin").to_string_lossy().as_ref())
+                Some(launcher_spelling(&managed).as_str())
             );
             assert_eq!(
                 entry["args"],
@@ -29854,11 +29819,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let bound = dir.path().join("bound-repo");
         let moved = dir.path().join("bound-repo-moved");
         let elsewhere = dir.path().join("another-repo");
-        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
         fs::create_dir_all(bound.join(".kin")).unwrap();
         fs::create_dir_all(elsewhere.join(".kin")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
         // The workspace binding refuses a repository without trusted Git
         // authority, so the fixture is a real one.
         for repo in [&bound, &elsewhere] {

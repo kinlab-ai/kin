@@ -63,6 +63,8 @@ import subprocess
 import sys
 import tempfile
 
+from runtime_fixture import prepare_runtime_fixture
+
 PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
@@ -352,6 +354,7 @@ class Suite(object):
         base["HOME"] = self.real_home
         base.pop("KIN_MCP_REPO", None)
         base.pop("KIN_DIR", None)
+        base.pop("KIN_DAEMON_URL", None)
         # This suite is explicitly about enabled sibling pinning. An inherited
         # opt-out would make the foreign-home assertion look sealed and disable
         # the unbindable-sibling control at the same time.
@@ -375,6 +378,12 @@ class Suite(object):
         self.real_env["KIN_REGISTRY_PATH"] = self.real_registry
 
         self.scratch_registry = os.path.join(self.scratch_home, "registry.toml")
+        scratch_pair = prepare_runtime_fixture(kin, daemon, self.env, self.scratch_home)
+        real_pair = prepare_runtime_fixture(kin, daemon, self.real_env,
+                                            self.real_env["KIN_HOME"])
+        self.runtime_paths = {self.env["KIN_HOME"]: scratch_pair,
+                              self.real_env["KIN_HOME"]: real_pair}
+        self.kin = scratch_pair[0]
         self.repos = {}
         self.bulk_pin_failures = 0
         self.other_location_rows = 0
@@ -414,14 +423,16 @@ class Suite(object):
         rc, out = self.git(["commit", "-m", "a python library"], repo)
         if rc != 0:
             raise RuntimeError("git commit failed in %s: %s" % (repo, tail(out)))
-        rc, out = run([self.kin, "init"], cwd=repo, env=env, timeout=900)
+        rc, out = run([self.runtime_paths[env["KIN_HOME"]][0], "init"],
+                      cwd=repo, env=env, timeout=900)
         if rc != 0:
             raise RuntimeError("kin init failed in %s: %s" % (repo, tail(out)))
         self.repos[name] = repo
         return repo
 
     def stop_daemon(self, repo, env):
-        run([self.kin, "daemon", "stop"], cwd=repo, env=env, timeout=180)
+        run([self.runtime_paths[env["KIN_HOME"]][0], "daemon", "stop"],
+            cwd=repo, env=env, timeout=180)
 
     def unbind(self, repo, env):
         """Stop this repository's daemon, then take its `.kin` away.
@@ -734,14 +745,8 @@ def check_2(suite):
 
 
 def check_3(suite):
-    """KIN_HOME moves the registry and still does NOT move the supervisor.
-
-    The other half of the same seam, and the reason this fix is a split rather
-    than a move. The supervisor is a machine-level singleton on purpose: one
-    supervisor holds daemons from several managed homes, and following KIN_HOME
-    would hide from a pinned session the daemons it shares the box with.
-    """
-    res = Result("3", TICKET, "the supervisor stays machine-level")
+    """The supervisor is scoped to the selected home and runtime mode."""
+    res = Result("3", TICKET, "the supervisor is bounded by KIN_HOME and runtime mode")
     rc, out = suite.kin_run(["graph", "status"])
     if rc != 0:
         res.unknown("kin graph status exited %d, so no daemon was started to "
@@ -750,27 +755,32 @@ def check_3(suite):
 
     marks = ("supervisor.pid", "supervisor.port", "supervisor.lock")
     real_dir = os.path.join(suite.real_home, ".kin")
+    selected_dir = os.path.join(suite.scratch_home, "services", suite.env["KIN_RUNTIME_MODE"])
+    at_selected = [m for m in marks if os.path.exists(os.path.join(selected_dir, m))]
     at_real = [m for m in marks if os.path.exists(os.path.join(real_dir, m))]
     at_scratch = [m for m in marks if os.path.exists(os.path.join(suite.scratch_home, m))]
 
-    if not at_real and not at_scratch:
+    if not at_selected and not at_real and not at_scratch:
         res.unknown("no supervisor file appeared in either home, so where the "
                     "supervisor lives cannot be read from this run")
         return res
-    if at_real:
-        res.ok("the supervisor is in the real home at %s (%s)"
-               % (real_dir, ", ".join(at_real)))
+    if at_selected:
+        res.ok("the supervisor is in the selected runtime namespace at %s (%s)"
+               % (selected_dir, ", ".join(at_selected)))
     else:
-        res.bad("no supervisor file is in the real home at %s, so the supervisor "
-                "did not stay machine-level" % real_dir)
+        res.bad("no supervisor file is in the selected runtime namespace at %s" % selected_dir)
+    if at_real:
+        res.bad("supervisor files remain in the obsolete global directory %s (%s)"
+                % (real_dir, ", ".join(at_real)))
+    else:
+        res.ok("no supervisor file is in the obsolete global directory %s" % real_dir)
     if at_scratch:
-        res.bad("the supervisor followed KIN_HOME into %s (%s), which would hide "
-                "from a pinned session the daemons it shares the box with"
+        res.bad("supervisor files are outside the selected runtime mode in %s (%s)"
                 % (suite.scratch_home, ", ".join(at_scratch)))
     else:
-        res.ok("no supervisor file followed KIN_HOME into %s" % suite.scratch_home)
-    # The registry, unlike the supervisor, MUST have moved. Without this the
-    # check would pass on a build where KIN_HOME moved nothing at all.
+        res.ok("no supervisor file is outside the selected runtime mode in %s" % suite.scratch_home)
+    # A selected supervisor namespace without an isolated registry would leave
+    # the cross-repository authority leak intact.
     if os.path.exists(suite.scratch_registry):
         res.ok("control: the registry did move with KIN_HOME, to %s"
                % suite.scratch_registry)
@@ -1169,7 +1179,7 @@ def main(argv):
         if suite is not None:
             for name, repo in suite.repos.items():
                 env = suite.real_env if name == "outsider" else suite.env
-                run([kin, "daemon", "stop"], cwd=repo, env=env, timeout=180)
+                suite.stop_daemon(repo, env)
         if not args.keep:
             shutil.rmtree(workdir, ignore_errors=True)
 

@@ -71,6 +71,27 @@ impl Confined {
         })
     }
 
+    pub(crate) fn open_read_file(&self, relative: &Path) -> io::Result<cap_std::fs::File> {
+        if !self.dir.symlink_metadata(relative)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "entry is not a regular file",
+            ));
+        }
+        let file = self.dir.open(relative)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn symlink_metadata(&self, relative: &Path) -> io::Result<cap_std::fs::Metadata> {
+        self.dir.symlink_metadata(relative)
+    }
+
     /// Read `relative` whole, refusing anything longer than `max_bytes`.
     /// `Ok(None)` when nothing exists there.
     pub(crate) fn read_bounded(

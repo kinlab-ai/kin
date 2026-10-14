@@ -8,9 +8,10 @@ Every install surface builds a release asset name from the platform it detects,
 and the release publishes a fixed list of asset names. Nothing compared the two
 lists, so a disagreement shipped through every release to date: the POSIX
 installer builds `kin-<os>-<arch>.tar.gz` on every platform it supports,
-including the MSYS, MINGW, and CYGWIN shells it maps to `windows`, while the
-Windows leg published only a `.zip`. Piping the documented curl command into a
-shell on Windows therefore 404'd.
+while native Windows uses PowerShell and npm ZIP archives. The POSIX entry
+point must refuse MSYS, MINGW and CYGWIN before downloading or installing and
+direct the user to the official PowerShell command. Published compatibility
+archives retain their separate release inventory and attestation requirements.
 
 The names checked here are DERIVED from the installers rather than restated.
 `scripts/install.sh` is executed once per platform against a stubbed `uname` and
@@ -24,6 +25,7 @@ restated the expected names would agree with itself forever.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -59,6 +61,10 @@ ATTEST_STEP = "      - name: Attest final release archives and provenance"
 ATTEST_SUBJECT_KEY = "          subject-path: |"
 INVENTORY_STEP = "      - name: Verify complete release asset inventory"
 INVENTORY_ASSETS = re.compile(r"^\s+assets=\(\n(?P<body>(?:\s+\S+\n)+?)\s*\)\s*$", re.M)
+COMPATIBILITY_STEP = "      - name: Verify and aggregate release provenance"
+COMPATIBILITY_ARCHIVES = re.compile(r"^\s+additionalArchives:\s*\[(?P<items>[^\]]*)\],\s*$", re.M)
+OFFICIAL_POWERSHELL_COMMAND = "irm https://get.kinlab.dev/install.ps1 | iex"
+WINDOWS_UNAME_PREFIXES = ("MINGW", "MSYS", "CYGWIN")
 
 
 class GuardError(RuntimeError):
@@ -85,9 +91,8 @@ PLATFORMS: tuple[Platform, ...] = (
     Platform("linux aarch64", "kin-linux-aarch64", "Linux", "aarch64", ("linux", "arm64")),
     Platform("macos x86_64", "kin-macos-x86_64", "Darwin", "x86_64", ("darwin", "x64")),
     Platform("macos aarch64", "kin-macos-aarch64", "Darwin", "arm64", ("darwin", "arm64")),
-    # The three shells whose uname the installer maps to `windows`. All three
-    # reach the same published artifact, and all three 404'd before the Windows
-    # leg published a tarball.
+    # Windows shells must receive the PowerShell redirect, while the native
+    # PowerShell/npm surfaces still resolve their release ZIP independently.
     Platform(
         "windows x86_64 (Git Bash)",
         "kin-windows-x86_64",
@@ -114,7 +119,7 @@ def executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def posix_installer_asset(install_sh: Path, platform: Platform) -> str:
+def posix_installer_asset(install_sh: Path, platform: Platform) -> str | None:
     """Ask install.sh itself what it downloads on this platform."""
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -156,8 +161,16 @@ def posix_installer_asset(install_sh: Path, platform: Platform) -> str:
             timeout=180,
             check=False,
         )
+        managed_home_created = (home / ".kin").exists() or (home / ".kin").is_symlink()
     output = ANSI.sub("", completed.stdout + completed.stderr)
     names = DOWNLOAD_LINE.findall(output)
+    if platform.uname_s.startswith(WINDOWS_UNAME_PREFIXES):
+        if completed.returncode == 0 or names or managed_home_created or OFFICIAL_POWERSHELL_COMMAND not in output:
+            raise GuardError(
+                f"{install_sh.name} must refuse {platform.label} with the official PowerShell redirect "
+                f"before any download or managed write. Output:\n{output}"
+            )
+        return None
     if len(names) != 1:
         raise GuardError(
             f"{install_sh.name} named {len(names)} archives on {platform.label} "
@@ -306,6 +319,25 @@ def inventory_assets(workflow_source: str) -> set[str]:
     return {line.strip() for line in bodies[0].splitlines() if line.strip()}
 
 
+def compatibility_archives(workflow_source: str) -> list[str]:
+    """Derive separately published legacy containers from their provenance step."""
+    source = "\n".join(workflow_step_lines(workflow_source, COMPATIBILITY_STEP))
+    declarations = re.findall(r"^\s+additionalArchives\s*:", source, re.M)
+    matches = COMPATIBILITY_ARCHIVES.findall(source)
+    if not declarations or len(matches) != len(declarations):
+        raise GuardError("release compatibility archive declarations are missing or unreadable")
+    archives: list[str] = []
+    for items in matches:
+        try:
+            names = json.loads(f"[{items}]")
+        except json.JSONDecodeError as error:
+            raise GuardError("release compatibility archive declaration is not a literal list") from error
+        if not names or not all(isinstance(name, str) and ASSET_NAME.fullmatch(name) for name in names):
+            raise GuardError("release compatibility archive declaration contains an invalid name")
+        archives.extend(names)
+    return archives
+
+
 def asset_sources(assets_dir: Path | None, workflow_source: str) -> list[tuple[str, set[str]]]:
     """Every list a published asset has to appear in, with a name for each.
 
@@ -355,7 +387,7 @@ def guarded_platform_artifacts(workflow_source: str) -> None:
         )
 
 
-def required_assets() -> dict[str, Requirement]:
+def required_assets(workflow_source: str) -> dict[str, Requirement]:
     required: dict[str, Requirement] = {}
 
     def record(asset: str, surface: str) -> None:
@@ -365,10 +397,9 @@ def required_assets() -> dict[str, Requirement]:
 
     for platform in PLATFORMS:
         if platform.uname_s:
-            record(
-                posix_installer_asset(INSTALL_SH, platform),
-                f"scripts/install.sh on {platform.label}",
-            )
+            asset = posix_installer_asset(INSTALL_SH, platform)
+            if asset is not None:
+                record(asset, f"scripts/install.sh on {platform.label}")
         # The npm launcher and the PowerShell installer detect their platform
         # from the running process rather than from uname, so they are reported
         # against the artifact they resolve instead of against a shell name.
@@ -384,6 +415,8 @@ def required_assets() -> dict[str, Requirement]:
             )
     if not required:
         raise GuardError("no installer asset names were derived; the check is vacuous")
+    for asset in compatibility_archives(workflow_source):
+        record(asset, "the release provenance compatibility archive declaration")
     return required
 
 
@@ -404,7 +437,7 @@ def main() -> int:
     workflow_source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     try:
         guarded_platform_artifacts(workflow_source)
-        required = required_assets()
+        required = required_assets(workflow_source)
         sources = asset_sources(args.assets_dir, workflow_source)
     except GuardError as error:
         print(f"installer asset guard: {error}", file=sys.stderr)

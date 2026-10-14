@@ -81,6 +81,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -588,6 +589,8 @@ class Suite(object):
         self._measured = None
         self._printed_id = None
         self._changes = None
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, os.path.join(workdir, "kin-home"))
 
     def kin_run(self, args, timeout=600):
         rc, out, err = run([self.kin] + args, cwd=self.repo(), env=self.env, timeout=timeout)

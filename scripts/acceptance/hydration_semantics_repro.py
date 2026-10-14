@@ -62,6 +62,7 @@ import sys
 import tempfile
 import time
 import uuid
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -649,6 +650,8 @@ class Suite(object):
         self._doors = None
         self._transfer = None
         self._stop_repos = []
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def log(self, line):
         if self.verbose:

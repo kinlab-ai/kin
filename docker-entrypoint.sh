@@ -23,6 +23,54 @@ fi
 
 KIN_DIR="$(cd "${WORKSPACE_DIR}/.kin" && pwd -P)"
 
+activate_managed_pair() {
+    runtime_home="$1"
+    mkdir -p "${runtime_home}/bin" || return 1
+    runtime_home="$(cd "${runtime_home}" && pwd -P)"
+    cli="${runtime_home}/bin/kin"
+    daemon="${runtime_home}/bin/kin-daemon"
+    if [ -e "${cli}" ] || [ -L "${cli}" ] || [ -e "${daemon}" ] || [ -L "${daemon}" ]; then
+        if [ ! -f "${cli}" ] || [ ! -x "${cli}" ] || [ ! -f "${daemon}" ] || [ ! -x "${daemon}" ]; then
+            echo "[entrypoint] FATAL: canonical image pair is incomplete; existing files were preserved." >&2
+            return 1
+        fi
+    else
+        staging="$(mktemp -d "${runtime_home}/bin/.image-pair.XXXXXX")" || return 1
+        if ! cp /usr/local/bin/kin "${staging}/kin" \
+            || ! cp /usr/local/bin/kin-daemon "${staging}/kin-daemon" \
+            || ! chmod 0755 "${staging}/kin" "${staging}/kin-daemon"; then
+            rm -rf "${staging}"
+            return 1
+        fi
+        if ! ln "${staging}/kin" "${cli}"; then
+            rm -rf "${staging}"
+            return 1
+        fi
+        if ! ln "${staging}/kin-daemon" "${daemon}"; then
+            [ ! "${cli}" -ef "${staging}/kin" ] || rm -f "${cli}"
+            rm -rf "${staging}"
+            return 1
+        fi
+        rm -rf "${staging}"
+    fi
+    if [ "$(sha256sum < "${cli}")" != "$(sha256sum < /usr/local/bin/kin)" ] \
+        || [ "$(sha256sum < "${daemon}")" != "$(sha256sum < /usr/local/bin/kin-daemon)" ]; then
+        echo "[entrypoint] FATAL: canonical pair differs from image bytes; existing files were preserved." >&2
+        return 1
+    fi
+    if ! KIN_HOME="${runtime_home}" KIN_RUNTIME_MODE=managed \
+        "${cli}" runtime status --json >&2; then
+        echo "[entrypoint] FATAL: canonical image pair is not ready in managed mode." >&2
+        return 1
+    fi
+    printf '%s\n' "${runtime_home}"
+}
+
+SELECTED_RUNTIME_HOME="${KIN_HOME:-${HOME}/.kin}"
+if [ "${KIN_STORAGE:-local}" = local ]; then
+    SELECTED_RUNTIME_HOME="$(activate_managed_pair "${SELECTED_RUNTIME_HOME}")" || exit 1
+fi
+
 # Paths every layout version creates. HEAD, objects/ and kindb/graph.kndb were
 # git-shaped artifacts of the pre-authority layout and are NOT produced by a
 # current `kin init`, so testing for them was unconditionally true and turned the
@@ -59,8 +107,12 @@ if ! layout_is_materialized; then
         echo "[entrypoint] Prepare the repository before anything is mounted under .kin, or mount that volume outside the repository." >&2
         exit 1
     fi
+    if [ "${KIN_STORAGE:-local}" != local ]; then
+        SELECTED_RUNTIME_HOME="$(activate_managed_pair "${SELECTED_RUNTIME_HOME}")" || exit 1
+    fi
     rm -rf "${KIN_DIR}"
-    kin init "${WORKSPACE_DIR}"
+    KIN_HOME="${SELECTED_RUNTIME_HOME}" KIN_RUNTIME_MODE=managed \
+        "${SELECTED_RUNTIME_HOME}/bin/kin" init "${WORKSPACE_DIR}"
 fi
 
 # Start kin-daemon. Let K8s handle restarts via restartPolicy. Using exec so the
@@ -69,4 +121,8 @@ fi
 # the prepared directory authoritative regardless of any --repo carried by the
 # image CMD or pod args; configure the workspace via KIN_WORKSPACE_DIR instead.
 echo "[entrypoint] Starting kin-daemon (storage=${KIN_STORAGE:-local}, workspace=${WORKSPACE_DIR})..."
+if [ "${KIN_STORAGE:-local}" = local ]; then
+    export KIN_HOME="${SELECTED_RUNTIME_HOME}" KIN_RUNTIME_MODE=managed
+    exec "${SELECTED_RUNTIME_HOME}/bin/kin-daemon" "$@" --repo "${WORKSPACE_DIR}"
+fi
 exec /usr/local/bin/kin-daemon "$@" --repo "${WORKSPACE_DIR}"

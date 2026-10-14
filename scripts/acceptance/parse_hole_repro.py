@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -337,6 +338,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repos = {}
         self.owned_repos = set()
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def git(self, args, cwd):
         base = ["git",

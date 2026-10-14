@@ -143,8 +143,9 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- validation control ---------------------------------------------------
     EnvVarSpec { name: "KIN_ENV_VALIDATION", kind: Kind::OneOf(&["off", "warn", "strict"]), default: "warn", sensitivity: Sensitivity::Operational, summary: "startup env validation mode: off, warn (default), or strict" },
     // ---- install / setup root -------------------------------------------------
-    EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks; bounds install and store state, NOT the machine-wide daemon supervisor" },
+    EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the admitted Kin runtime, install, stores and supervisor service namespace; development builds use an isolated home; KIN_HOME wins over KIN_DIR" },
     EnvVarSpec { name: "KIN_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "compatibility alias for the managed Kin install root; KIN_HOME wins when both are set" },
+    EnvVarSpec { name: "KIN_RUNTIME_MODE", kind: Kind::OneOf(&["managed", "development"]), default: "", sensitivity: Sensitivity::Correctness, summary: "runtime admission mode: clean release builds default to managed; debug or dirty builds default to development with isolated home and services; explicit managed requires known clean release identity" },
     EnvVarSpec { name: "KIN_VERSION", kind: Kind::Str, default: "latest", sensitivity: Sensitivity::Operational, summary: "release version selected by the shell and PowerShell installers" },
     EnvVarSpec { name: "KIN_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the shell and PowerShell installers" },
     EnvVarSpec { name: "KIN_NO_SETUP", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "skip the installer's post-install setup wizard when set truthy" },
@@ -975,6 +976,7 @@ fn doc_group(name: &str) -> &'static str {
         ("KIN_ENV_VALIDATION", "Validation control"),
         ("KIN_HOME", "Install & launch"),
         ("KIN_DIR", "Install & launch"),
+        ("KIN_RUNTIME_MODE", "Install & launch"),
         ("KIN_VERSION", "Install & launch"),
         ("KIN_BASE_URL", "Install & launch"),
         ("KIN_NO_SETUP", "Install & launch"),

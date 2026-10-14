@@ -69,6 +69,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -864,6 +865,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repo = None
         self.unadmitted_path = "linkgraph/predicates.py"
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def git(self, args, repo):
         base = ["git", "-c", "core.hooksPath=/dev/null",

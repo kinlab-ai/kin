@@ -206,6 +206,9 @@ jobs:
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
+      - name: Test isolated acceptance runtime consumers
+        run: python3 -m unittest discover -s scripts/acceptance -p test_runtime_fixture.py
+
       # A green suite step is not a verdict, and this makes that a rule rather
       # than a reading: every suite-run step must say the verdict comes from the
       # gate step, keep its exit-code capture, and report a nonzero result as a

@@ -62,6 +62,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 TICKET = "FIR-2918"
 PASS = "PASS"
@@ -454,6 +455,8 @@ class Suite(object):
             os.makedirs(path, exist_ok=True)
         self._arms = None
         self._setup_error = None
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     # ------------------------------------------------------------- plumbing
 

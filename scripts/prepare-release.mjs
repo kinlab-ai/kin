@@ -55,6 +55,44 @@ function replaceSpinePin(manifest, from, to) {
   return manifest.replace(pattern, `$1${to}$2`);
 }
 
+/** Keep a compatibility launcher and its canonical runtime resolver in lockstep. */
+export function stampNpmVersion(manifest, from, to) {
+  if (manifest.version !== from && manifest.version !== to) {
+    throw new Error(`${manifest.name} is ${manifest.version}, expected ${from} or ${to}`);
+  }
+  const updated = { ...manifest, version: to };
+  if (manifest.name === '@kinlab/kin-mcp') {
+    updated.dependencies = { ...manifest.dependencies, '@kinlab/kin': to };
+  }
+  return updated;
+}
+
+/** Stamp the npm-generated local development link without inventing registry bytes. */
+export function stampCompatibilityNpmLock(lock, from, to) {
+  const root = lock.packages?.[''];
+  const sibling = lock.packages?.['../kin'];
+  const link = lock.packages?.['node_modules/@kinlab/kin'];
+  if (lock.lockfileVersion !== 3 || lock.name !== '@kinlab/kin-mcp' ||
+      root?.name !== '@kinlab/kin-mcp' || sibling?.name !== '@kinlab/kin' ||
+      root.devDependencies?.['@kinlab/kin'] !== 'file:../kin' ||
+      link?.link !== true || link.resolved !== '../kin' ||
+      sibling.resolved || sibling.integrity || link.integrity) {
+    throw new Error('compatibility npm lock must use the generated local canonical development link');
+  }
+  if (lock.version !== from && lock.version !== to) {
+    throw new Error(`${lock.name} lock is ${lock.version}, expected ${from} or ${to}`);
+  }
+  return {
+    ...lock,
+    version: to,
+    packages: {
+      ...lock.packages,
+      '': stampNpmVersion(root, from, to),
+      '../kin': stampNpmVersion(sibling, from, to),
+    },
+  };
+}
+
 /**
  * The MCP Registry entry at `to`, or a refusal when it names neither version.
  *
@@ -293,14 +331,17 @@ async function main() {
 
   for (const path of NPM_MANIFESTS) {
     const manifest = JSON.parse(await fs.readFile(path, 'utf8'));
-    if (manifest.version === workingVersion && workingVersion !== target) {
-      manifest.version = target;
-      await fs.writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
-    } else if (manifest.version !== target) {
-      throw new Error(
-        `${path} is ${manifest.version}, expected ${workingVersion} or ${target}`,
-      );
+    const updated = stampNpmVersion(manifest, workingVersion, target);
+    if (JSON.stringify(updated) !== JSON.stringify(manifest)) {
+      await fs.writeFile(path, `${JSON.stringify(updated, null, 2)}\n`);
     }
+  }
+
+  const compatibilityLockPath = 'packages/kin-mcp/package-lock.json';
+  const compatibilityLock = JSON.parse(await fs.readFile(compatibilityLockPath, 'utf8'));
+  const stampedCompatibilityLock = stampCompatibilityNpmLock(compatibilityLock, workingVersion, target);
+  if (JSON.stringify(stampedCompatibilityLock) !== JSON.stringify(compatibilityLock)) {
+    await fs.writeFile(compatibilityLockPath, `${JSON.stringify(stampedCompatibilityLock, null, 2)}\n`);
   }
 
   const serverPath = 'server.json';

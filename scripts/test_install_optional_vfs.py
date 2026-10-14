@@ -424,7 +424,6 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         result, kin_home = self.run_installer(
             vfs_exit=0,
             umask=0o002,
-            seed_current_install=True,
             group_writable_kin_home=True,
         )
 
@@ -434,15 +433,12 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertIn("KIN_REGISTRY_REPAIR=1", result.stderr)
         self.assertNotIn("For permission-only drift", result.stderr)
         self.assertEqual(stat.S_IMODE(kin_home.stat().st_mode), 0o775)
-        self.assertIn(
-            "old-kin", (kin_home / "bin" / "kin").read_text(encoding="utf-8")
-        )
+        self.assertFalse((kin_home / "bin" / "kin").exists())
 
     def test_registry_repair_consent_covers_a_group_writable_kin_home(self) -> None:
         result, kin_home = self.run_installer(
             vfs_exit=0,
             umask=0o002,
-            seed_current_install=True,
             group_writable_kin_home=True,
             extra_env={"KIN_REGISTRY_REPAIR": "1"},
         )
@@ -489,26 +485,16 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertTrue((kin_home / "bin" / "kin-daemon").exists())
         self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
 
-    def test_upgrading_past_the_retirement_clears_the_stale_projection(self) -> None:
-        """A v0.7.17 kin-vfs must not outlive the release that retired it.
-
-        Left in place it sits on PATH beside a daemon several releases newer,
-        and the installs that most need this are exactly the ones recovering
-        from an updater that cannot move itself.
-        """
-
+    def test_existing_projection_is_not_removed_outside_native_transaction(self) -> None:
         result, kin_home = self.run_installer(
-            vfs_exit=0,
-            archive_vfs=False,
-            seed_current_install=True,
+            vfs_exit=0, archive_vfs=False, seed_current_install=True,
             seed_stale_projection=True,
         )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Removed the filesystem projection", result.stdout)
-        self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
-        self.assertFalse(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
-        self.assertTrue((kin_home / "bin" / "kin-daemon").exists())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Pinned or mirrored reinstalls", result.stderr)
+        self.assertTrue((kin_home / "bin" / "kin-vfs").exists())
+        self.assertTrue(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
+        self.assertIn("old-daemon", (kin_home / "bin" / "kin-daemon").read_text())
 
     def test_extraction_refuses_the_archives_recorded_ownership(self) -> None:
         # tar running as root restores the uid/gid the archive records, and
@@ -573,28 +559,14 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertIn("% Total", result.stderr)
         self.assertIn("% Received", result.stderr)
 
-    def test_same_version_managed_reinstall_restores_a_missing_bundle(self) -> None:
+    def test_same_version_pin_cannot_repair_bundles_outside_native_transaction(self) -> None:
         result, kin_home = self.run_installer(
-            vfs_exit=0,
-            pretend_macos=True,
-            seed_current_install=True,
+            vfs_exit=0, pretend_macos=True, seed_current_install=True,
         )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Existing install found: kin 9.9.9 (will be replaced)", result.stdout)
-        notifier = (
-            kin_home
-            / "lib"
-            / "KinNotifier.app"
-            / "Contents"
-            / "MacOS"
-            / "KinNotifier"
-        )
-        self.assertIn("new-notifier", notifier.read_text(encoding="utf-8"))
-        self.assertTrue(notifier.stat().st_mode & stat.S_IXUSR)
-        self.assertTrue(
-            (kin_home / "lib" / "KinNotifier.app" / "Contents" / "Info.plist").is_file()
-        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Pinned or mirrored reinstalls", result.stderr)
+        self.assertIn("old-kin", (kin_home / "bin" / "kin").read_text())
+        self.assertFalse((kin_home / "lib" / "KinNotifier.app").exists())
 
     def test_malformed_macos_archive_refuses_before_replacing_existing_install(self) -> None:
         result, kin_home = self.run_installer(
@@ -606,7 +578,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("No installed binary or notification bundle was replaced", result.stderr)
+        self.assertIn("Pinned or mirrored reinstalls", result.stderr)
         self.assertIn(
             "kin 9.9.9",
             (kin_home / "bin" / "kin").read_text(encoding="utf-8"),
@@ -634,8 +606,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("contains a symlink or special entry", result.stderr)
-        self.assertIn("No installed binary or notification bundle was replaced", result.stderr)
+        self.assertIn("Pinned or mirrored reinstalls", result.stderr)
         self.assertEqual(
             (kin_home / "bin" / "kin").read_text(encoding="utf-8"),
             "#!/bin/sh\n# old-kin\nprintf 'kin 9.9.9\\n'\n",
@@ -665,6 +636,16 @@ class OptionalVfsInstallerTests(unittest.TestCase):
             (kin_home / "bin" / ".kinlab-kin-version").read_text(encoding="utf-8"),
             "8.8.8\n",
         )
+
+    def test_fresh_bootstrap_rejects_symlinked_notification_bundle_before_native_bytes(self) -> None:
+        result, kin_home = self.run_installer(
+            vfs_exit=0, pretend_macos=True, symlinked_notifier_ancestry=True,
+            existing_notifier=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains a symlink or special entry", result.stderr)
+        self.assertFalse((kin_home / "bin" / "kin").exists())
+        self.assertIn("old-notifier", (kin_home / "lib" / "KinNotifier.app" / "Contents" / "MacOS" / "KinNotifier").read_text())
 
 
 if __name__ == "__main__":

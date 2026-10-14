@@ -73,6 +73,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -721,6 +722,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = os.path.abspath(daemon)
         self.repo = None
         self.owned_repos = set()
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def shutdown(self):
         """Stop only this run's repositories, including a failed initialization."""

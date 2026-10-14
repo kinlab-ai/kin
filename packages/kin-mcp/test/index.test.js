@@ -170,6 +170,14 @@ const fakeKinPreload = [
   "const fs = require('node:fs');",
   "const path = require('node:path');",
   "const command = path.basename(process.argv[1] || '');",
+  "if (command === 'runtime') {",
+  "  const suffix = process.platform === 'win32' ? '.exe' : '';",
+  "  const binary = process.execPath;",
+  "  const daemon = path.join(path.dirname(binary), 'kin-daemon' + suffix);",
+  "  const component = file => ({ path: file, version: '99.0.0', commit_sha: 'a'.repeat(40), source_dirty: true, target: 'fixture', build_profile: 'debug', sha256: require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex') });",
+  "  process.stdout.write(JSON.stringify({ schema: 'kin.runtime-status.v1', ready: true, mode: 'development', kin_home: path.join(process.env.HOME, '.kin-development-fixture'), pair_matches: true, cli: component(binary), daemon: component(daemon) }));",
+  "  process.exit(0);",
+  "}",
   "if (command === 'store') {",
   "  if (process.env.KIN_MCP_FAKE_STORE_REPLY) { process.stdout.write(process.env.KIN_MCP_FAKE_STORE_REPLY); process.exit(0); }",
   "  let dir = process.cwd();",
@@ -218,12 +226,29 @@ const fakeKinPreload = [
 ].join('\n');
 
 async function fakeKinEnvironment(tmpDir, overrides = {}) {
-  const preloadName = 'fake-kin-preload.cjs';
-  await fs.writeFile(path.join(tmpDir, preloadName), fakeKinPreload);
+  const preloadPath = path.join(tmpDir, 'fake-kin-preload.cjs');
+  await fs.writeFile(preloadPath, fakeKinPreload);
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  const binary = path.join(tmpDir, 'kin' + suffix);
+  if (!await exists(binary)) await fs.copyFile(process.execPath, binary);
+  const daemon = path.join(tmpDir, 'kin-daemon' + suffix);
+  if (!await exists(daemon)) await fs.copyFile(process.execPath, daemon);
+  if (process.platform === 'darwin') {
+    // Homebrew's shared Node executable resolves this actual host library
+    // relative to itself. Keep the copied protocol fixture runnable too.
+    const libraryName = `libnode.${process.versions.modules}.dylib`;
+    try {
+      const actualLibrary = await fs.realpath(path.join(path.dirname(process.execPath), '..', 'lib', libraryName));
+      const fixtureLibrary = path.join(tmpDir, libraryName);
+      if (!await exists(fixtureLibrary)) await fs.symlink(actualLibrary, fixtureLibrary);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
   const env = {
     ...process.env,
-    NODE_OPTIONS: `--require=./${preloadName}`,
-    KIN_MCP_KIN_BINARY: process.execPath,
+    NODE_OPTIONS: `--require=${JSON.stringify(preloadPath)}`,
+    KIN_MCP_KIN_BINARY: binary,
     KIN_MCP_FAKE_REPO: tmpDir,
     ...overrides
   };
@@ -549,7 +574,7 @@ function mockReleaseFetch(t, version, archiveName, archiveBytes, checksum) {
   return baseUrl;
 }
 
-test('ensureKinBinary downloads kin and its daemon from a release asset', async t => {
+test('a development archive is extracted but cannot serve without runtime identity', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-download-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
@@ -562,12 +587,14 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
   };
 
   try {
-    const binaryPath = await ensureKinBinary({
+    const options = {
       env,
       platform: 'linux',
       arch: 'x64',
       version
-    });
+    };
+    await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+    const binaryPath = resolveCachedBinaryPath(options);
 
     assert.equal(
       binaryPath,
@@ -588,7 +615,7 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
   }
 });
 
-test('ensureKinBinary installs the flat native Windows zip and .exe pair', async t => {
+test('ensureKinBinary installs the flat native Windows zip and .exe pair but refuses unsupported identity', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-windows-download-'));
   const assetName = 'kin-windows-x86_64';
   const version = '9.9.9-test';
@@ -601,12 +628,14 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
   });
 
   try {
-    const binaryPath = await ensureKinBinary({
+    const options = {
       env,
       platform: 'win32',
       arch: 'x64',
       version
-    });
+    };
+    await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+    const binaryPath = resolveCachedBinaryPath(options);
 
     assert.equal(path.basename(binaryPath), 'kin.exe');
     assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
@@ -640,12 +669,14 @@ test(
     });
 
     try {
-      const binaryPath = await ensureKinBinary({
+      const options = {
         env,
         platform: 'linux',
         arch: 'x64',
         version
-      });
+      };
+      await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+      const binaryPath = resolveCachedBinaryPath(options);
 
       assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
       const daemonPath = resolveDaemonBinaryPath(binaryPath);
@@ -1849,6 +1880,12 @@ const fakeKinSource = [
   "const path = require('node:path');",
   'const env = process.env;',
   "const log = line => fs.appendFileSync(env.KIN_MCP_FAKE_SERVER_LOG, JSON.stringify(line) + '\\n');",
+  "if (process.argv[2] === 'runtime') {",
+  "  const binary = process.env.KIN_MCP_FAKE_INSTALLED_BINARY;",
+  "  const daemon = path.join(path.dirname(binary), 'kin-daemon');",
+  "  process.stdout.write(JSON.stringify({ schema: 'kin.runtime-status.v1', ready: true, mode: 'development', kin_home: path.join(process.env.HOME, '.kin-development-fixture'), pair_matches: true, cli: { path: binary }, daemon: { path: daemon } }));",
+  "  process.exit(0);",
+  "}",
   'log({ argv: process.argv.slice(2), pid: process.pid });',
   'const waitFor = (marker, then) => {',
   '  if (!marker || fs.existsSync(marker)) return then();',
@@ -1909,7 +1946,7 @@ async function buildFakeKinArchive(tmpDir, asset) {
   await fs.mkdir(packageDir, { recursive: true });
   await fs.writeFile(
     path.join(packageDir, 'kin'),
-    `#!/bin/sh\nexec "${process.execPath}" "${fakeKin}" "$@"\n`,
+    `#!/bin/sh\nKIN_MCP_FAKE_INSTALLED_BINARY="$0"; export KIN_MCP_FAKE_INSTALLED_BINARY\nexec "${process.execPath}" "${fakeKin}" "$@"\n`,
     { mode: 0o755 }
   );
   await fs.writeFile(path.join(packageDir, 'kin-daemon'), '#!/bin/sh\nexit 0\n', {

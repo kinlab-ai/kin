@@ -556,6 +556,43 @@ fn main() {
     }
 
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
+    let program = env::args()
+        .next()
+        .unwrap_or_else(|| "kin-daemon".to_string());
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("kin-daemon: {error}");
+            usage(&program);
+            process::exit(1);
+        }
+    };
+    if args.compat_json {
+        println!("{}", compatibility_json());
+        return;
+    }
+    // Hosted GCS serving is admitted by release digest and publication control,
+    // independently of the local per-user runtime installation.
+    if args.supervisor || matches!(args.storage, StorageMode::Local) {
+        let mode = match kin_cli::commands::runtime::prepare_environment() {
+            Ok(mode) => mode,
+            Err(error) => {
+                eprintln!("kin-daemon: {error:#}");
+                process::exit(2);
+            }
+        };
+        if mode == kin_core::runtime_identity::RuntimeMode::Managed {
+            if let Err(error) = require_managed_daemon_authority() {
+                eprintln!("kin-daemon: {error:#}");
+                process::exit(2);
+            }
+        }
+        if let Err(error) = kin_core::runtime_identity::RuntimeNamespace::initialize_local_service()
+        {
+            eprintln!("kin-daemon: {error}");
+            process::exit(2);
+        }
+    }
     // Before the embedder can be built: a machine whose `kin setup` declined
     // the embedding model download never fetches it, whether the background
     // pass, a query or an explicit embed request reaches the embedder.
@@ -606,7 +643,7 @@ fn main() {
         }
     };
 
-    let exit_code = runtime.block_on(async_main());
+    let exit_code = runtime.block_on(async_main(args));
 
     // `block_on` has returned (graceful shutdown released the lock + endpoint
     // files), but a blocking embed batch may still be running. `shutdown_timeout`
@@ -664,59 +701,78 @@ fn init_tracing() {
         .init();
 }
 
-async fn async_main() -> i32 {
-    let program = env::args()
-        .next()
-        .unwrap_or_else(|| "kin-daemon".to_string());
-    let args = match parse_args() {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("kin-daemon: {error}");
-            usage(&program);
-            process::exit(1);
-        }
-    };
-
-    // The CLI's daemon-compat probe runs `kin-daemon --compat-json` and parses
-    // this process's stdout as JSON. Emit that payload before installing the
-    // tracing subscriber (whose default writer is stdout) or running startup env
-    // validation, so no log line — e.g. a KIN_* override warning — can precede
-    // the JSON and be misread as a stale/incompatible daemon. A compat probe is
-    // a pure metadata query needing neither logging nor env enforcement.
-    if args.compat_json {
-        let build = kin_buildinfo::get();
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "kin.daemon.compat.v2",
-                "version": env!("CARGO_PKG_VERSION"),
-                "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
-                "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
-                "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
-                "supervisor_startup_protocol": 2,
-                "supervisor_startup_capabilities": [
-                    "generation-adoption-ack-v2",
-                    "legacy-directory-sentinel-v1",
-                    "bounded-legacy-rollback-v1",
-                ],
-                "build": {
-                    "sha": build.sha,
-                    "dirty": build.dirty,
-                    "source_known": build.source_known,
-                    "dependency_provenance": build.dependency_provenance,
-                    "branch": build.branch,
-                    "built_at": build.built_at,
-                },
-                // What this image needs before it can serve hosted, declared by
-                // the same table its start path refuses from. A deployment can
-                // grade its config against the image it pins instead of against
-                // a list typed after the last rollback.
-                "hosted_start_requirements": kin_daemon::hosted_start::declaration(),
-            })
-        );
-        return 0;
+fn require_managed_daemon_authority() -> Result<(), String> {
+    let expected = kin_core::registry::managed_kin_home()
+        .join("bin")
+        .join(if cfg!(windows) {
+            "kin-daemon.exe"
+        } else {
+            "kin-daemon"
+        });
+    let metadata = std::fs::symlink_metadata(&expected).map_err(|error| {
+        format!(
+            "managed daemon is unavailable at {}: {error}",
+            expected.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("managed daemon must be a regular selected binary, not a symlink; select development mode for custom builds".into());
     }
+    let selected = std::fs::canonicalize(&expected).map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| error.to_string())?;
+    if executable != selected {
+        return Err(format!(
+            "this daemon is outside the selected managed runtime at {}; select explicit development mode with an isolated home",
+            expected.display()
+        ));
+    }
+    if let Some(pin) = std::env::var_os("KIN_DAEMON_BIN") {
+        let pin = std::path::PathBuf::from(pin);
+        if pin != expected {
+            return Err("KIN_DAEMON_BIN cannot select another managed daemon; use explicit development mode for a custom pair".into());
+        }
+    }
+    kin_cli::commands::runtime::require_managed_pair().map_err(|error| error.to_string())?;
+    Ok(())
+}
 
+fn compatibility_json() -> serde_json::Value {
+    let build = kin_buildinfo::get();
+    serde_json::json!({
+        "schema": "kin.daemon.compat.v2",
+        "version": env!("CARGO_PKG_VERSION"),
+        "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+        "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+        "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+        "supervisor_startup_protocol": 2,
+        "supervisor_startup_capabilities": [
+            "generation-adoption-ack-v2",
+            "legacy-directory-sentinel-v1",
+            "bounded-legacy-rollback-v1",
+        ],
+        "build": {
+            "sha": build.sha,
+            "dirty": build.dirty,
+            "source_known": build.source_known,
+            "dependency_provenance": build.dependency_provenance,
+            "branch": build.branch,
+            "built_at": build.built_at,
+            "target": build.target,
+            "build_profile": build.build_profile,
+        },
+        "runtime_identity": kin_core::runtime_identity::RuntimeIdentity::current(),
+        "runtime_mode": kin_core::runtime_identity::RuntimeMode::current().ok(),
+        // What this image needs before it can serve hosted, declared by
+        // the same table its start path refuses from. A deployment can
+        // grade its config against the image it pins instead of against
+        // a list typed after the last rollback.
+        "hosted_start_requirements": kin_daemon::hosted_start::declaration(),
+    })
+}
+
+async fn async_main(args: Args) -> i32 {
     init_tracing();
 
     // Validate the KIN_* environment surface at startup: unknown names and

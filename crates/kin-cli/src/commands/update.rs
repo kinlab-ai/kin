@@ -23,6 +23,10 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, U
 #[path = "update_windows.rs"]
 pub(crate) mod windows_update;
 
+#[path = "update_bootstrap.rs"]
+mod bootstrap_update;
+pub use bootstrap_update::run_bootstrap_published;
+
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/kinlab-ai/kin/releases/latest";
@@ -752,6 +756,12 @@ struct RestartPending {
     /// and a fresh process scan proved every managed server was quiescent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     commit_runtime_fence: Option<Vec<RuntimeCommitIdentity>>,
+    /// Exact process incarnations of MCP transports deliberately preserved by
+    /// the update. Their continued life keeps runtime readiness pending; this
+    /// field never authorizes a signal or treats a pathname as an image proof.
+    /// None identifies an older schema-3 marker that needs quiescent recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_mcp_sessions: Option<Vec<crate::daemon_client::ProcessIdentity>>,
     reason: String,
     runtime_obligations: Vec<RuntimeRestartObligation>,
 }
@@ -1209,6 +1219,7 @@ async fn run_check_only_json(
         Vec::new(),
         false,
         false,
+        None,
     )
     .await
     {
@@ -1242,7 +1253,24 @@ pub async fn run(
     dry_run: bool,
     unattended: bool,
     force_window: bool,
+    prepare_windows_worker: bool,
+    windows_worker: Option<PathBuf>,
 ) -> Result<()> {
+    if prepare_windows_worker {
+        return prepare_windows_update_worker();
+    }
+    if windows_worker.is_some()
+        && (skip_verify
+            || check_only
+            || json
+            || ack_restart
+            || set_policy.is_some()
+            || dry_run
+            || unattended
+            || force_window)
+    {
+        anyhow::bail!("a Windows update worker only accepts a mutating update and release pins");
+    }
     // Setting the policy is a preference write and nothing else. It runs before
     // any expectation parsing, network client, or install-root inspection so
     // that changing how updates arrive never depends on one being available.
@@ -1277,6 +1305,7 @@ pub async fn run(
         runtime_sessions,
         apply,
         dry_run,
+        windows_worker.as_deref(),
     )
     .await?;
 
@@ -1299,6 +1328,7 @@ async fn run_update_flow(
     runtime_sessions: Vec<String>,
     apply: bool,
     dry_run: bool,
+    windows_worker: Option<&Path>,
 ) -> Result<()> {
     // A dry run of the chain is a read. Forcing the check-only path is what
     // makes that a property of the code rather than a promise in the help text:
@@ -1316,7 +1346,9 @@ async fn run_update_flow(
             "release pins require checksum and provenance verification; remove --skip-verify"
         );
     }
-    ensure_mutating_update_supported(std::env::consts::OS, check_only)?;
+    if !ack_restart && windows_worker.is_none() {
+        ensure_mutating_update_supported(std::env::consts::OS, check_only)?;
+    }
     registry_authority_preflight()?;
     if ack_restart {
         return acknowledge_runtime_restart(&parse_runtime_session_evidence(&runtime_sessions)?);
@@ -1362,7 +1394,16 @@ async fn run_update_flow(
     // process' mapped executable before constructing an HTTP client or making
     // any network request. A stale interactive install is recovered under its
     // lock first, then captured before that flow reaches the network.
-    let mut start_authority = if stale.is_empty() {
+    if windows_worker.is_some() && !stale.is_empty() {
+        anyhow::bail!("a Windows worker cannot recover a different interrupted generation; recover the native transaction before preparing a new worker");
+    }
+    let mut start_authority = if let Some(record) = windows_worker {
+        Some(capture_windows_worker_authority(
+            &inspected_home,
+            spec,
+            record,
+        )?)
+    } else if stale.is_empty() {
         Some(UpdaterStartAuthority::capture(&inspected_home, spec)?)
     } else {
         None
@@ -1432,7 +1473,12 @@ async fn run_update_flow(
 
         let latest = prepared.version.to_string();
         let current_version = parse_release_version(CURRENT_VERSION)?;
-        let update_available = prepared.version > current_version;
+        let update_available = managed_runtime_update_available(
+            &current_version,
+            &kin_core::runtime_identity::RuntimeIdentity::current().commit_sha,
+            &prepared.version,
+            &prepared.commit_sha,
+        );
         let restart_ack_required = restart_pending_path(&kin_home).exists();
         if !update_available {
             println!("Already up to date (v{CURRENT_VERSION}).");
@@ -1446,7 +1492,7 @@ async fn run_update_flow(
             return Ok(());
         }
 
-        println!("New version available: v{latest}");
+        print_available_runtime_update(&latest, &prepared.commit_sha);
         println!(
             "Using preflight-verified {} after matching its external byte-authority digest (release commit {}).",
             prepared.archive_name, prepared.commit_sha
@@ -1489,7 +1535,12 @@ async fn run_update_flow(
     };
     let latest = latest_version.to_string();
     let current_version = parse_release_version(CURRENT_VERSION)?;
-    let update_available = latest_version > current_version;
+    let update_available = managed_runtime_update_available(
+        &current_version,
+        &kin_core::runtime_identity::RuntimeIdentity::current().commit_sha,
+        &latest_version,
+        &release_commit_sha,
+    );
     let restart_ack_required = restart_pending_path(&kin_home).exists();
     let mcp_repair_pending = mcp_repair_pending_path(&kin_home).exists();
 
@@ -1525,7 +1576,7 @@ async fn run_update_flow(
         if json {
             println!("{}", serde_json::to_string_pretty(&check)?);
         } else if update_available {
-            println!("Update available: v{CURRENT_VERSION} -> v{latest}");
+            print_available_runtime_update(&latest, &release_commit_sha);
         } else {
             println!("Already up to date (v{CURRENT_VERSION}).");
         }
@@ -1556,7 +1607,7 @@ async fn run_update_flow(
         return Ok(());
     }
 
-    println!("New version available: v{latest}");
+    print_available_runtime_update(&latest, &release_commit_sha);
 
     ensure_no_active_managed_runtimes(&kin_home, spec).context(
         "update preflight requires every managed serving executable to be stopped; no release archive was downloaded or staged",
@@ -2317,10 +2368,11 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
         let client = build_update_http_client()?;
         let release = resolve_release(&client, channel).await?;
         let version = parse_release_version(&release.tag_name)?;
-        Ok::<_, anyhow::Error>((client, release, version))
+        let release_commit_sha = resolve_release_commit(&client, &release.tag_name).await?;
+        Ok::<_, anyhow::Error>((client, release, version, release_commit_sha))
     }
     .await;
-    let (client, release, latest_version) = match availability {
+    let (client, release, latest_version, release_commit_sha) = match availability {
         Ok(selected) => selected,
         Err(error) => {
             // No gate ran, so there is no decision to record; the outcome is
@@ -2334,7 +2386,12 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
     };
     let latest = latest_version.to_string();
     let current_version = parse_release_version(CURRENT_VERSION)?;
-    let update_available = latest_version > current_version;
+    let update_available = managed_runtime_update_available(
+        &current_version,
+        &kin_core::runtime_identity::RuntimeIdentity::current().commit_sha,
+        &latest_version,
+        &release_commit_sha,
+    );
     entry.update_available = update_available;
     let chain_needed = update_available
         || restart_pending_path(&kin_home).exists()
@@ -3244,6 +3301,347 @@ pub fn retry_pending_mcp_repair_from_managed_process() -> Result<bool> {
         "automatic MCP repair requires the exact managed Kin launcher and full installed generation; marker retained",
     )?;
     retry_pending_mcp_repair_with_start_authority(&requested_home, spec, &start_authority)
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_WORKER_SCHEMA: &str = "kin.windows-update-worker.v1";
+#[cfg(windows)]
+const WINDOWS_WORKER_PREFIX: &str = ".update-worker-";
+#[cfg(windows)]
+const WINDOWS_WORKER_EXECUTABLE: &str = "kin-update-worker.exe";
+#[cfg(windows)]
+const WINDOWS_WORKER_RECORD: &str = "handoff.json";
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsWorkerHandoff {
+    schema: String,
+    bundle: ManagedBundleGeneration,
+    build: EmbeddedBuildIdentity,
+    worker: ManagedComponentGeneration,
+    preparing_process: crate::daemon_client::ProcessIdentity,
+}
+
+#[cfg(windows)]
+struct WindowsWorkerAuthority {
+    executing: ExecutingProcessAuthority,
+    files: windows_update::WindowsWorkerFiles,
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_worker_handoff(
+    handoff: &WindowsWorkerHandoff,
+    bundle: &ManagedBundleGeneration,
+    worker: &ManagedComponentGeneration,
+    build: &EmbeddedBuildIdentity,
+) -> Result<()> {
+    anyhow::ensure!(
+        handoff.schema == WINDOWS_WORKER_SCHEMA,
+        "unsupported Windows worker handoff"
+    );
+    anyhow::ensure!(
+        &handoff.bundle == bundle,
+        "managed Kin generation changed after Windows worker preparation"
+    );
+    anyhow::ensure!(
+        &handoff.worker == worker,
+        "Windows worker executable object or bytes changed after preparation"
+    );
+    anyhow::ensure!(
+        &handoff.build == build,
+        "Windows worker source identity changed after preparation"
+    );
+    build.require_published_release_identity()?;
+    let cli = bundle
+        .components
+        .get("kin.exe")
+        .and_then(Option::as_ref)
+        .context("Windows worker handoff has no managed kin.exe")?;
+    anyhow::ensure!(
+        worker.identity == cli.identity,
+        "Windows worker is not an exact copy of the prepared managed CLI"
+    );
+    anyhow::ensure!(
+        worker.binding != cli.binding,
+        "Windows worker must be a distinct copied object, not a hard link to the installed CLI"
+    );
+    Ok(())
+}
+
+fn prepare_windows_update_worker() -> Result<()> {
+    #[cfg(not(windows))]
+    anyhow::bail!("Windows update worker preparation is only supported on Windows");
+    #[cfg(windows)]
+    {
+        registry_authority_preflight()?;
+        let requested_home = crate::commands::setup::kin_dir()?;
+        let home = validate_existing_install_root(&requested_home)?;
+        let spec = platform_bundle_spec("windows")?;
+        let authority = UpdaterStartAuthority::capture(&home, spec)?;
+        authority
+            .executing
+            .build
+            .require_published_release_identity()?;
+        let lock = InstallRootLock::acquire_existing(&home)?;
+        authority.verify_locked(&lock, spec)?;
+        refuse_new_update_while_restart_marker_exists(&lock)?;
+        anyhow::ensure!(
+            transaction_dirs(&home)?.is_empty(),
+            "recover the interrupted native transaction before preparing a Windows worker"
+        );
+        ensure_no_active_managed_runtimes(&home, spec)?;
+
+        let mut directory =
+            windows_update::WindowsPrivateTempDir::create(&home, WINDOWS_WORKER_PREFIX)?;
+        let executable = directory.path().join(WINDOWS_WORKER_EXECUTABLE);
+        let record = directory.path().join(WINDOWS_WORKER_RECORD);
+        {
+            let mut source = authority.executing.file.file().try_clone()?;
+            source.rewind()?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&executable)?;
+            std::io::copy(&mut source, &mut output)?;
+            kin_blobs::durable::sync_all(&output)
+                .context("failed to durably prepare the Windows worker executable")?;
+        }
+        directory.seal_file(&executable)?;
+        let copied = File::open(&executable)?;
+        let worker = ManagedComponentGeneration {
+            identity: file_identity_from_open_file(&copied, "prepared Windows update worker")?,
+            binding: windows_update::file_object_identity(&copied)?,
+        };
+        drop(copied);
+        let handoff = WindowsWorkerHandoff {
+            schema: WINDOWS_WORKER_SCHEMA.to_string(),
+            bundle: authority.bundle.clone(),
+            build: authority.executing.build.clone(),
+            worker,
+            preparing_process: crate::daemon_client::process_identity(std::process::id())?
+                .context("could not capture the Windows worker preparing process")?,
+        };
+        validate_windows_worker_handoff(
+            &handoff,
+            &authority.bundle,
+            &handoff.worker,
+            &authority.executing.build,
+        )?;
+        {
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&record)?;
+            output.write_all(&serde_json::to_vec(&handoff)?)?;
+            kin_blobs::durable::sync_all(&output)
+                .context("failed to durably prepare the Windows worker handoff")?;
+        }
+        directory.seal_file(&record)?;
+        directory.validate()?;
+        authority.verify_locked(&lock, spec)?;
+        let ready = serde_json::json!({
+            "schema": WINDOWS_WORKER_SCHEMA,
+            "worker_executable": executable,
+            "handoff_record": record,
+            "source_commit_sha": handoff.build.commit,
+            "version": handoff.build.version,
+            "worker_sha256": handoff.worker.identity.sha256,
+            "authority_lock_file": windows_install_authority_path(lock.root())?,
+        });
+        directory.persist_for_worker()?;
+        println!("{}", serde_json::to_string(&ready)?);
+        Ok(())
+    }
+}
+
+/// Remove a consumed copied worker using the canonical managed updater's
+/// install authority. Recovery evidence is never removed by this action.
+pub fn cleanup_windows_update_worker(record: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = record;
+        anyhow::bail!("Windows update worker cleanup is only supported on Windows");
+    }
+    #[cfg(windows)]
+    {
+        let requested_home = crate::commands::setup::kin_dir()?;
+        let home = validate_existing_install_root(&requested_home)?;
+        let spec = platform_bundle_spec("windows")?;
+        let _directories = windows_update::guard_managed_directories(&home)?;
+        let authority = UpdaterStartAuthority::capture(&home, spec)?;
+        authority
+            .executing
+            .build
+            .require_published_release_identity()?;
+        let lock = InstallRootLock::acquire_existing(&home)?;
+        authority.verify_locked(&lock, spec)?;
+        refuse_windows_worker_cleanup_with_recovery_fence(&home)?;
+
+        anyhow::ensure!(
+            record.is_absolute(),
+            "Windows worker handoff must be absolute"
+        );
+        let directory = record
+            .parent()
+            .context("Windows worker handoff has no directory")?;
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(WINDOWS_WORKER_PREFIX))
+            .context("Windows worker handoff is outside a prepared worker directory")?;
+        let id =
+            uuid::Uuid::parse_str(name).context("invalid Windows worker directory identity")?;
+        anyhow::ensure!(
+            id.get_version_num() == 4
+                && id.to_string() == name
+                && directory.parent() == Some(home.as_path())
+                && record.file_name() == Some(std::ffi::OsStr::new(WINDOWS_WORKER_RECORD)),
+            "Windows worker handoff does not belong to this installation"
+        );
+        let files = windows_update::WindowsWorkerCleanup::open(directory, record)?;
+        let handoff_bytes = files.read_handoff()?;
+        let handoff: WindowsWorkerHandoff = serde_json::from_slice(&handoff_bytes)?;
+        let consumption = files.read_consumption()?;
+        files.validate_consumption(&consumption, &handoff_bytes)?;
+        anyhow::ensure!(
+            handoff.bundle.root == authority.bundle.root
+                && handoff.bundle.root_binding == authority.bundle.root_binding,
+            "Windows worker belongs to a different managed installation object"
+        );
+        let worker = ManagedComponentGeneration {
+            identity: file_identity_from_open_file(files.worker_file(), "consumed Windows worker")?,
+            binding: windows_update::file_object_identity(files.worker_file())?,
+        };
+        // The copied worker describes the old generation. The current updater
+        // is independently authenticated above and may have a newer source.
+        validate_windows_worker_handoff(&handoff, &handoff.bundle, &worker, &handoff.build)?;
+        anyhow::ensure!(
+            !crate::daemon_client::process_identity_is_current(&handoff.preparing_process)?
+                && !crate::daemon_client::process_identity_is_current(&consumption.worker_process)?,
+            "Windows worker cleanup requires the preparing and consuming processes to have exited"
+        );
+        files.dispose(|| {
+            authority.verify_locked(&lock, spec)?;
+            refuse_windows_worker_cleanup_with_recovery_fence(&home)
+        })?;
+        println!("Windows update worker cleanup completed.");
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn refuse_windows_worker_cleanup_with_recovery_fence(home: &Path) -> Result<()> {
+    for entry in fs::read_dir(home)? {
+        anyhow::ensure!(
+            !entry?
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TRANSACTION_PREFIX),
+            "Windows worker retained while native transaction recovery evidence exists"
+        );
+    }
+    for path in [restart_pending_path(home), mcp_repair_pending_path(home)] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!(
+                "Windows worker retained while recovery evidence exists at {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("could not inspect Windows worker recovery fence")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn capture_windows_worker_authority(
+    home: &Path,
+    spec: &[ComponentSpec],
+    record: &Path,
+) -> Result<UpdaterStartAuthority> {
+    #[cfg(not(windows))]
+    {
+        let _ = (home, spec, record);
+        anyhow::bail!("Windows update worker handoffs are only supported on Windows");
+    }
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            record.is_absolute(),
+            "Windows worker handoff must be absolute"
+        );
+        let directory = record
+            .parent()
+            .context("Windows worker handoff has no directory")?;
+        let dirname = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(WINDOWS_WORKER_PREFIX))
+            .context("Windows worker handoff is outside a prepared worker directory")?;
+        uuid::Uuid::parse_str(dirname).context("invalid Windows worker directory identity")?;
+        anyhow::ensure!(
+            directory.parent() == Some(home)
+                && record.file_name() == Some(std::ffi::OsStr::new(WINDOWS_WORKER_RECORD)),
+            "Windows worker handoff does not belong to this installation"
+        );
+        let worker_path = directory.join(WINDOWS_WORKER_EXECUTABLE);
+        let mut files = windows_update::WindowsWorkerFiles::open(directory, record)?;
+        let handoff: WindowsWorkerHandoff = serde_json::from_slice(&files.read_record(record)?)?;
+        anyhow::ensure!(
+            !crate::daemon_client::process_identity_is_current(&handoff.preparing_process)?,
+            "wait for the Windows worker preparing process to exit before replacement"
+        );
+        let worker = ExecutingProcessAuthority::capture()?;
+        // Object identity tolerates Windows' equivalent case and long-path
+        // spellings while still rejecting a different executable or a link.
+        let prepared_worker = windows_update::ExecutingFileAuthority::capture_handoff_target(
+            &worker_path,
+            &worker.generation.binding,
+        )?;
+        anyhow::ensure!(
+            file_identity_from_open_file(prepared_worker.file(), "prepared Windows worker")?
+                == worker.generation.identity,
+            "invoke the exact prepared Windows worker executable"
+        );
+        drop(prepared_worker);
+        let bundle = snapshot_managed_bundle_generation(home, spec)?;
+        validate_windows_worker_handoff(&handoff, &bundle, &worker.generation, &worker.build)?;
+        let cli = bundle
+            .components
+            .get("kin.exe")
+            .and_then(Option::as_ref)
+            .context("prepared Windows bundle lost its CLI")?;
+        let file = windows_update::ExecutingFileAuthority::capture_handoff_target(
+            &home.join("bin/kin.exe"),
+            &cli.binding,
+        )?;
+        let executing = ExecutingProcessAuthority {
+            path: file.path().to_path_buf(),
+            generation: ManagedComponentGeneration {
+                identity: file_identity_from_open_file(file.file(), "handoff managed CLI")?,
+                binding: file.binding().clone(),
+            },
+            build: worker.build.clone(),
+            file,
+        };
+        anyhow::ensure!(
+            snapshot_managed_bundle_generation(home, spec)? == bundle,
+            "managed Kin generation changed during Windows handoff capture"
+        );
+        files.claim()?;
+        let authority = UpdaterStartAuthority {
+            bundle,
+            executing,
+            worker: Some(WindowsWorkerAuthority {
+                executing: worker,
+                files,
+            }),
+        };
+        authority.validate_managed_cli_binding()?;
+        Ok(authority)
+    }
 }
 
 fn ensure_mutating_update_supported(os: &str, check_only: bool) -> Result<()> {
@@ -5850,20 +6248,23 @@ struct PlatformObjectIdentity {
     file: WindowsFileId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedComponentGeneration {
     identity: FileIdentity,
     binding: PlatformObjectIdentity,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedBundleGeneration {
     root: PathBuf,
     root_binding: PlatformObjectIdentity,
     components: HashMap<String, Option<ManagedComponentGeneration>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmbeddedBuildIdentity {
     version: String,
     commit: String,
@@ -6138,13 +6539,20 @@ impl ExecutingProcessAuthority {
 struct UpdaterStartAuthority {
     bundle: ManagedBundleGeneration,
     executing: ExecutingProcessAuthority,
+    #[cfg(windows)]
+    worker: Option<WindowsWorkerAuthority>,
 }
 
 impl UpdaterStartAuthority {
     fn capture(requested_home: &Path, spec: &[ComponentSpec]) -> Result<Self> {
         let executing = ExecutingProcessAuthority::capture()?;
         let bundle = snapshot_managed_bundle_generation(requested_home, spec)?;
-        let authority = Self { bundle, executing };
+        let authority = Self {
+            bundle,
+            executing,
+            #[cfg(windows)]
+            worker: None,
+        };
         authority.validate_managed_cli_binding()?;
 
         // An unlocked snapshot spans several component opens. A second exact
@@ -6157,6 +6565,8 @@ impl UpdaterStartAuthority {
         Ok(Self {
             bundle: confirmed,
             executing: authority.executing,
+            #[cfg(windows)]
+            worker: None,
         })
     }
 
@@ -6207,6 +6617,11 @@ impl UpdaterStartAuthority {
 
     fn verify_locked(&self, lock: &InstallRootLock, spec: &[ComponentSpec]) -> Result<()> {
         self.executing.verify_durable_identity()?;
+        #[cfg(windows)]
+        if let Some(worker) = &self.worker {
+            worker.executing.verify_durable_identity()?;
+            worker.files.validate()?;
+        }
         verify_managed_bundle_generation_locked(lock, spec, &self.bundle)?;
         self.validate_managed_cli_binding()
     }
@@ -9013,9 +9428,39 @@ where
     }
 
     #[cfg(not(unix))]
+    install_staged_bundle_locked_with_hooks(
+        lock,
+        stage_root,
+        spec,
+        verified_staged_identities,
+        target_version,
+        restart_pending,
+        before_install,
+        || Ok(()),
+    )
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+fn install_staged_bundle_locked_with_hooks<F, P>(
+    lock: &InstallRootLock,
+    stage_root: &Path,
+    spec: &[ComponentSpec],
+    verified_staged_identities: &VerifiedStagedIdentities,
+    target_version: &str,
+    restart_pending: &RestartPending,
+    before_install: F,
+    before_commit: P,
+) -> Result<InstallOutcome>
+where
+    F: FnMut(usize, &Path) -> Result<()>,
+    P: FnMut() -> Result<()>,
+{
+    refuse_new_update_while_restart_marker_exists(lock)?;
     {
         let kin_home = lock.root();
         let mut before_install = before_install;
+        let mut before_commit = before_commit;
         validate_staged_bundle(stage_root, spec)?;
         ensure_managed_dirs(kin_home, true)?;
 
@@ -9222,6 +9667,16 @@ where
                 err.context(
                     "a managed serving executable appeared before the durable commit point; the uncommitted update will be rolled back",
                 ),
+                &mut journal,
+                &transaction_root,
+                kin_home,
+                spec,
+            );
+        }
+
+        if let Err(error) = before_commit() {
+            return rollback_after_failure(
+                error.context("update precommit authority revalidation failed"),
                 &mut journal,
                 &transaction_root,
                 kin_home,
@@ -12509,6 +12964,7 @@ fn restart_pending_record(
         recorded_at: now.to_rfc3339(),
         recorded_at_unix_seconds: now.timestamp().max(0) as u64,
         commit_runtime_fence: None,
+        retained_mcp_sessions: Some(capture_retained_mcp_sessions(kin_home, spec)?),
         reason: RESTART_FENCE_REASON.to_string(),
         runtime_obligations,
     })
@@ -12571,6 +13027,153 @@ fn capture_runtime_commit_fence(
     Ok(identities)
 }
 
+/// Classify conservatively, then retain only a native process-birth identity.
+/// A classification can add a restart obligation; it never proves which image
+/// is mapped and never authorizes adoption, convergence, or termination.
+fn capture_retained_mcp_sessions(
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+) -> Result<Vec<crate::daemon_client::ProcessIdentity>> {
+    let system = managed_runtime_process_table();
+    let mut retained = Vec::new();
+    for (kind, _, pid) in scan_active_managed_runtimes(&system, kin_home, spec) {
+        if kind != RuntimeKind::Mcp {
+            continue;
+        }
+        let Some(identity) = crate::daemon_client::process_identity(pid)
+            .with_context(|| format!("cannot capture retained MCP process birth for PID {pid}"))?
+        else {
+            continue;
+        };
+        if !crate::daemon_client::process_identity_is_current(&identity).with_context(|| {
+            format!("cannot revalidate retained MCP process birth for PID {pid}")
+        })? {
+            anyhow::bail!(
+                "MCP process PID {pid} changed during restart-fence capture; retry the update"
+            );
+        }
+        if !retained.contains(&identity) {
+            retained.push(identity);
+        }
+    }
+    retained.sort_by_key(crate::daemon_client::ProcessIdentity::pid);
+    Ok(retained)
+}
+
+fn validate_retained_mcp_sessions(
+    record: &RestartPending,
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+) -> Result<()> {
+    let Some(retained) = record.retained_mcp_sessions.as_ref() else {
+        // Old schema-3 markers fenced installed objects but did not record the
+        // MCP transports they deliberately kept. No image or birth identity
+        // can be reconstructed after the fact. Quiescence is the safe proof.
+        if !capture_retained_mcp_sessions(kin_home, spec)?.is_empty() {
+            anyhow::bail!("this older restart marker did not capture MCP process births; close managed MCP clients before acknowledgement; no session was stopped");
+        }
+        return Ok(());
+    };
+    validate_retained_mcp_births(retained, crate::daemon_client::process_identity_is_current)
+}
+
+fn validate_retained_mcp_births<F>(
+    retained: &[crate::daemon_client::ProcessIdentity],
+    mut is_current: F,
+) -> Result<()>
+where
+    F: FnMut(&crate::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+{
+    for identity in retained {
+        if identity.pid() == 0 {
+            anyhow::bail!("restart marker contains an invalid retained MCP process birth");
+        }
+        if is_current(identity).with_context(|| {
+            format!(
+                "cannot establish whether retained MCP PID {} exited",
+                identity.pid()
+            )
+        })? {
+            anyhow::bail!("pre-update MCP transport PID {} is still live; restart its client to use the installed runtime; no session was stopped", identity.pid());
+        }
+    }
+    Ok(())
+}
+
+/// Legacy markers cannot prove a replacement image off Linux. They can still
+/// be acknowledged under the exact installed-bundle authority after every
+/// recorded PID is authoritatively absent and all managed roles are quiescent.
+/// A reused PID also refuses this path because legacy markers lack an exact
+/// native birth token. No pathname or second-resolution time substitutes one.
+fn validate_quiescent_legacy_restart(
+    record: &RestartPending,
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+    evidence: &[RuntimeSessionEvidence],
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (record, kin_home, spec, evidence);
+        Ok(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if record.schema_version != 2 || !evidence.is_empty() {
+            return Ok(false);
+        }
+        validate_restart_record_schema(record)?;
+        let mut prior_processes = HashSet::new();
+        for obligation in &record.runtime_obligations {
+            for prior in &obligation.prior_sessions {
+                if prior.pid == 0
+                    || prior.start_time == 0
+                    || !prior.executable.is_absolute()
+                    || prior
+                        .binding
+                        .as_ref()
+                        .is_some_and(|path| !path.is_absolute())
+                    || !prior_processes.insert((prior.pid, prior.start_time))
+                {
+                    anyhow::bail!("legacy restart marker has an invalid prior runtime identity");
+                }
+                validate_hex(
+                    &prior.executable_identity.sha256,
+                    64,
+                    "legacy prior runtime SHA-256",
+                )?;
+                if crate::daemon_client::process_identity(prior.pid)
+                    .with_context(|| {
+                        format!(
+                            "cannot establish authoritative absence of legacy runtime PID {}",
+                            prior.pid
+                        )
+                    })?
+                    .is_some()
+                {
+                    anyhow::bail!("legacy runtime PID {} is occupied; exact prior birth is unavailable, so restart acknowledgement remains pending", prior.pid);
+                }
+            }
+        }
+        ensure_no_active_managed_runtimes(kin_home, spec)?;
+        if !capture_retained_mcp_sessions(kin_home, spec)?.is_empty() {
+            anyhow::bail!("legacy restart acknowledgement requires quiescent managed MCP clients; no session was stopped");
+        }
+        // This ephemeral fence validates the current installed objects only.
+        // It never rewrites or promotes the legacy persisted marker.
+        let mut quiescent = record.clone();
+        quiescent.schema_version = RESTART_MARKER_SCHEMA_VERSION;
+        quiescent.reason = RESTART_FENCE_REASON.to_string();
+        quiescent.retained_mcp_sessions = Some(Vec::new());
+        for obligation in &mut quiescent.runtime_obligations {
+            obligation.prior_sessions.clear();
+        }
+        quiescent.commit_runtime_fence =
+            Some(capture_runtime_commit_fence(&quiescent, kin_home, spec)?);
+        validate_runtime_convergence(&quiescent, kin_home, spec, &[], &HashMap::new())?;
+        Ok(true)
+    }
+}
+
 fn mark_restart_record_committed(
     record: &mut RestartPending,
     kin_home: &Path,
@@ -12578,7 +13181,19 @@ fn mark_restart_record_committed(
 ) -> Result<()> {
     validate_restart_record_schema(record)?;
     if record.schema_version == RESTART_MARKER_SCHEMA_VERSION {
+        let first_commit = record.commit_runtime_fence.is_none();
         record.commit_runtime_fence = Some(capture_runtime_commit_fence(record, kin_home, spec)?);
+        // Never append a later process to an already committed journal. Restart
+        // persistence is create-only-or-identical, and recovery must preserve
+        // the exact births captured by that commit rather than inventing proof.
+        if first_commit {
+            let retained = record.retained_mcp_sessions.get_or_insert_with(Vec::new);
+            for process in capture_retained_mcp_sessions(kin_home, spec)? {
+                if !retained.contains(&process) {
+                    retained.push(process);
+                }
+            }
+        }
     }
     let now = chrono::Utc::now();
     record.recorded_at = now.to_rfc3339();
@@ -12876,6 +13491,9 @@ fn validate_restart_record_schema(record: &RestartPending) -> Result<()> {
         2 => {
             if record.commit_runtime_fence.is_some() {
                 anyhow::bail!("legacy restart acknowledgement marker has an unknown commit fence");
+            }
+            if record.retained_mcp_sessions.is_some() {
+                anyhow::bail!("legacy restart acknowledgement marker has an unknown retained MCP fence");
             }
             Ok(())
         }
@@ -13220,6 +13838,9 @@ fn validate_runtime_convergence(
         );
     }
     validate_runtime_commit_fence(record, kin_home, spec)?;
+    if record.schema_version == RESTART_MARKER_SCHEMA_VERSION {
+        validate_retained_mcp_sessions(record, kin_home, spec)?;
+    }
     if record.schema_version == RESTART_MARKER_SCHEMA_VERSION
         && (!evidence.is_empty() || !observed.is_empty())
     {
@@ -13469,8 +14090,17 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
         build.sha,
         build.dependency_provenance,
     )?;
-    let observed = observe_runtime_sessions(&record, evidence)?;
-    validate_runtime_convergence(&record, lock.root(), spec, evidence, &observed)?;
+    let quiescent_legacy = validate_quiescent_legacy_restart(&record, lock.root(), spec, evidence)?;
+    if !quiescent_legacy {
+        let observed = observe_runtime_sessions(&record, evidence)?;
+        validate_runtime_convergence(&record, lock.root(), spec, evidence, &observed)?;
+    }
+    start_authority.verify_locked(&lock, spec)?;
+    if quiescent_legacy {
+        validate_quiescent_legacy_restart(&record, lock.root(), spec, evidence)?;
+    } else if record.schema_version == RESTART_MARKER_SCHEMA_VERSION {
+        validate_retained_mcp_sessions(&record, lock.root(), spec)?;
+    }
     #[cfg(unix)]
     {
         install.ensure_bound()?;
@@ -14466,6 +15096,7 @@ mod tests {
             recorded_at: "2026-07-13T00:00:00Z".to_string(),
             recorded_at_unix_seconds: 1_752_364_800,
             commit_runtime_fence: None,
+            retained_mcp_sessions: None,
             reason: "test restart pending".to_string(),
             runtime_obligations: [
                 (RuntimeKind::Daemon, "kin-daemon", b"new-daemon".as_slice()),
@@ -16451,6 +17082,110 @@ cwd = {:?}
         );
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    #[serial]
+    fn windows_before_commit_rejection_restores_original_bundle() {
+        if !kin_core::test_env::alone_in_process() {
+            eprintln!("Windows precommit rollback control requires an isolated test process");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        write_bundle(&kin_home, WINDOWS_COMPONENTS, b"old-");
+        let original_generation =
+            snapshot_managed_bundle_generation(&kin_home, WINDOWS_COMPONENTS).unwrap();
+        let original: Vec<_> = WINDOWS_COMPONENTS
+            .iter()
+            .map(|component| {
+                let path = component_path(&kin_home, *component);
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        fs::create_dir_all(stage.join("bin")).unwrap();
+        fs::create_dir_all(stage.join("lib")).unwrap();
+        for component in WINDOWS_COMPONENTS
+            .iter()
+            .filter(|component| matches!(component.name, "kin.exe" | "kin-daemon.exe"))
+        {
+            fs::write(
+                component_path(&stage, *component),
+                format!("new-{}", component.name),
+            )
+            .unwrap();
+        }
+        let verified = staged_identities_for_test(&stage, WINDOWS_COMPONENTS).unwrap();
+        let mut pending = test_restart_pending("0.8.7");
+        pending.runtime_obligations = [
+            (RuntimeKind::Daemon, "kin-daemon.exe"),
+            (RuntimeKind::Mcp, "kin.exe"),
+        ]
+        .into_iter()
+        .map(|(kind, component)| RuntimeRestartObligation {
+            kind,
+            component: component.to_string(),
+            expected_identity: verified.get(component).unwrap().clone(),
+            prior_sessions: Vec::new(),
+        })
+        .collect();
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let mut reached_commit = false;
+        let error = install_staged_bundle_locked_with_hooks(
+            &lock,
+            &stage,
+            WINDOWS_COMPONENTS,
+            &verified,
+            "0.8.7",
+            &pending,
+            |_, _| Ok(()),
+            || {
+                reached_commit = true;
+                for component in WINDOWS_COMPONENTS {
+                    let path = component_path(&kin_home, *component);
+                    match verified.get(component.name) {
+                        Some(identity) => {
+                            verify_file_identity(&path, identity, "new pair before rejected commit")
+                                .unwrap()
+                        }
+                        None => assert!(!path.exists(), "unstaged component must be backed up"),
+                    }
+                }
+                let transactions = transaction_dirs(&kin_home).unwrap();
+                assert_eq!(transactions.len(), 1);
+                assert!(matches!(
+                    read_journal(&transactions[0]).unwrap().phase,
+                    TransactionPhase::Installing
+                ));
+                assert!(!restart_pending_path(&kin_home).exists());
+                assert!(!mcp_repair_pending_path(&kin_home).exists());
+                anyhow::bail!("injected Windows before-commit rejection")
+            },
+        )
+        .expect_err("precommit rejection must roll back the activated pair");
+        assert!(
+            reached_commit,
+            "control must reach the final callback after pair activation"
+        );
+        assert!(
+            format!("{error:#}").contains("previous bundle was restored"),
+            "{error:#}"
+        );
+        for (path, bytes) in original {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+        assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+        assert_eq!(
+            snapshot_managed_bundle_generation(&kin_home, WINDOWS_COMPONENTS).unwrap(),
+            original_generation
+        );
+        assert!(!restart_pending_path(&kin_home).exists());
+        assert!(!mcp_repair_pending_path(&kin_home).exists());
+        println!("WINDOWS_PRECOMMIT_ROLLBACK_CONTROL_PASS");
+    }
+
     #[test]
     #[serial]
     fn install_failure_rolls_back_every_component() {
@@ -17875,6 +18610,99 @@ cwd = {:?}
 
     #[cfg(unix)]
     #[test]
+    fn windows_worker_handoff_requires_the_full_generation_and_distinct_exact_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kin-home");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir(root.join("lib")).unwrap();
+        let cli_path = root.join("bin/kin");
+        let worker_path = tmp.path().join("worker");
+        fs::write(&cli_path, b"the installed CLI generation").unwrap();
+        fs::write(root.join("bin/kin-daemon"), b"the paired daemon generation").unwrap();
+        fs::copy(&cli_path, &worker_path).unwrap();
+        let mut bundle = snapshot_managed_bundle_generation(&root, LINUX_COMPONENTS).unwrap();
+        let cli = bundle.components.remove("kin").unwrap().unwrap();
+        bundle
+            .components
+            .insert("kin.exe".to_string(), Some(cli.clone()));
+        let worker = ExecutingProcessAuthority::capture_test_file(&worker_path)
+            .unwrap()
+            .generation;
+        let build = EmbeddedBuildIdentity {
+            version: "0.8.6".to_string(),
+            commit: "a".repeat(40),
+            dirty: false,
+            source_known: true,
+            dependency_provenance: "locked".to_string(),
+        };
+        let handoff = WindowsWorkerHandoff {
+            schema: WINDOWS_WORKER_SCHEMA.to_string(),
+            bundle: bundle.clone(),
+            build: build.clone(),
+            worker: worker.clone(),
+            preparing_process: crate::daemon_client::process_identity(std::process::id())
+                .unwrap()
+                .unwrap(),
+        };
+        validate_windows_worker_handoff(&handoff, &bundle, &worker, &build).unwrap();
+        let roundtrip: WindowsWorkerHandoff =
+            serde_json::from_slice(&serde_json::to_vec(&handoff).unwrap()).unwrap();
+        validate_windows_worker_handoff(&roundtrip, &bundle, &worker, &build).unwrap();
+
+        let mut replaced_worker = worker.clone();
+        replaced_worker.binding.file += 1;
+        assert!(
+            validate_windows_worker_handoff(&handoff, &bundle, &replaced_worker, &build).is_err()
+        );
+        let mut replaced_bundle = bundle.clone();
+        replaced_bundle
+            .components
+            .get_mut("kin.exe")
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .binding
+            .file += 1;
+        assert!(
+            validate_windows_worker_handoff(&handoff, &replaced_bundle, &worker, &build).is_err()
+        );
+        let mut changed_pair = bundle.clone();
+        changed_pair
+            .components
+            .get_mut("kin-daemon")
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .identity
+            .sha256 = "b".repeat(64);
+        assert!(validate_windows_worker_handoff(&handoff, &changed_pair, &worker, &build).is_err());
+        let mut same_version_other_source = build.clone();
+        same_version_other_source.commit = "b".repeat(40);
+        assert!(validate_windows_worker_handoff(
+            &handoff,
+            &bundle,
+            &worker,
+            &same_version_other_source
+        )
+        .is_err());
+        let mut hardlink = handoff.clone();
+        hardlink.worker.binding = cli.binding;
+        assert!(
+            validate_windows_worker_handoff(&hardlink, &bundle, &hardlink.worker, &build).is_err()
+        );
+        let mut different_bytes = handoff.clone();
+        different_bytes.worker.identity.sha256 = "b".repeat(64);
+        assert!(validate_windows_worker_handoff(
+            &different_bytes,
+            &bundle,
+            &different_bytes.worker,
+            &build
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn install_root_and_lock_symlinks_are_rejected_without_touching_targets() {
         use std::os::unix::fs::symlink;
 
@@ -18396,6 +19224,8 @@ cwd = {:?}
             false,
             false,
             false,
+            false,
+            None,
         )
         .await
         .expect_err("check-only must report, not recover, a stale transaction");
@@ -18420,6 +19250,8 @@ cwd = {:?}
             false,
             false,
             false,
+            false,
+            None,
         )
         .await
         .expect_err("check-only without --json must report, not recover, a stale transaction");
@@ -18488,6 +19320,7 @@ cwd = {:?}
         let executable_name = if cfg!(windows) { "kin.exe" } else { "kin" };
         fs::create_dir_all(home.join(".codex")).unwrap();
         fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(kin_home.join("lib")).unwrap();
         fs::copy(
             std::env::current_exe().unwrap(),
             kin_home.join("bin").join(executable_name),
@@ -18510,21 +19343,44 @@ cwd = {:?}
         )
         .unwrap();
         let _home = EnvVarGuard::set("HOME", &home);
+        #[cfg(windows)]
+        let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
+        #[cfg(windows)]
+        let _appdata = EnvVarGuard::set("APPDATA", home.join("AppData/Roaming"));
+        #[cfg(windows)]
+        let _localappdata = EnvVarGuard::set("LOCALAPPDATA", home.join("AppData/Local"));
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let _kin_dir = EnvVarGuard::set("KIN_DIR", tmp.path().join("wrong-install"));
 
-        let repaired = crate::commands::setup::remerge_existing_mcp_configs();
+        let target = crate::commands::setup::McpRepairTarget {
+            id: "codex".to_owned(),
+            path: config.clone(),
+            repo_root: Some(repo.clone()),
+            captured_config_sha256: crate::commands::setup_ledger::sha256_hex(
+                &fs::read(&config).unwrap(),
+            ),
+        };
+        let _install = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let topology = crate::commands::setup::McpTopologyLock::acquire().unwrap();
+        let repaired =
+            crate::commands::setup::remerge_mcp_targets_exact_with_topology_and_finalizer(
+                &[target],
+                &topology,
+                || Ok(()),
+            )
+            .unwrap();
         let normalized_config = crate::commands::setup::ConfigLock::normalized_path(&config)
             .expect("test MCP config path must normalize");
         assert!(repaired.contains(&normalized_config));
         let root: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
         let entry = &root["mcp_servers"]["kin"];
-        let expected_launcher = kin_home
-            .join("bin")
-            .join(executable_name)
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(entry["command"].as_str(), Some(expected_launcher.as_str()));
+        let expected_launcher = kin_home.join("bin").join(executable_name);
+        assert_eq!(
+            Path::new(entry["command"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            expected_launcher.canonicalize().unwrap()
+        );
         assert_eq!(entry["cwd"].as_str(), repo.to_str());
         assert_eq!(entry["args"][2].as_str(), Some("--repo"));
         assert_eq!(entry["args"][3].as_str(), repo.to_str());
@@ -19344,13 +20200,17 @@ cwd = {:?}
             outcome
                 .errors
                 .iter()
-                .all(|error| error.contains("directory sync failure")),
+                .all(|error| error.contains("configured installation launcher is unavailable")),
             "{:?}",
             outcome.errors
         );
 
         let lock = InstallRootLock::acquire_existing(&state.kin_home).unwrap();
-        assert!(attempt_pending_mcp_repair(&lock).is_err());
+        let error = attempt_pending_mcp_repair(&lock).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("directory sync failure"),
+            "{error:#}"
+        );
 
         assert_eq!(fs::read(&marker).unwrap(), marker_before);
     }
@@ -19653,6 +20513,117 @@ cwd = {:?}
             RuntimeKind::Vfs,
             &["kin-vfs".into(), "status".into()]
         ));
+    }
+
+    #[test]
+    fn retained_mcp_restart_fence_requires_original_birth_to_exit() {
+        let identity = crate::daemon_client::current_process_identity().unwrap();
+        let retained = vec![identity];
+        let live = validate_retained_mcp_births(
+            &retained,
+            crate::daemon_client::process_identity_is_current,
+        )
+        .expect_err("a retained process keeps readiness pending");
+        assert!(format!("{live:#}").contains("is still live"));
+        validate_retained_mcp_births(&retained, |_| Ok(false)).unwrap();
+        let unknown = validate_retained_mcp_births(&retained, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "birth denied",
+            ))
+        })
+        .expect_err("an unobservable process does not prove exit");
+        assert!(format!("{unknown:#}").contains("cannot establish"));
+    }
+
+    #[test]
+    fn retained_mcp_restart_fence_does_not_confuse_a_reused_pid() {
+        let current = crate::daemon_client::current_process_identity().unwrap();
+        let mut prior = serde_json::to_value(&current).unwrap();
+        prior["birth_token"] = serde_json::Value::String("a-different-process-birth".into());
+        let prior: crate::daemon_client::ProcessIdentity = serde_json::from_value(prior).unwrap();
+        assert_eq!(prior.pid(), current.pid());
+        validate_retained_mcp_births(&[prior], crate::daemon_client::process_identity_is_current)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_before_update_marker_retains_mcp_birth_readiness() {
+        let (_tmp, kin_home, mut record) = fenced_runtime_convergence_fixture();
+        let current = crate::daemon_client::current_process_identity().unwrap();
+        record.retained_mcp_sessions = Some(vec![current]);
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let decoded: RestartPending = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.retained_mcp_sessions, record.retained_mcp_sessions);
+        let error = validate_runtime_convergence(
+            &decoded,
+            &kin_home,
+            LINUX_COMPONENTS,
+            &[],
+            &HashMap::new(),
+        )
+        .expect_err("installed bytes do not prove retained MCP processes restarted");
+        assert!(format!("{error:#}").contains("pre-update MCP transport"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_quiescent_restart_requires_authoritative_prior_process_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"new-");
+        let mut record = test_restart_pending("0.2.22");
+        for obligation in &mut record.runtime_obligations {
+            obligation.expected_identity =
+                file_identity(&kin_home.join("bin").join(&obligation.component)).unwrap();
+        }
+        assert!(
+            validate_quiescent_legacy_restart(&record, &kin_home, LINUX_COMPONENTS, &[]).unwrap()
+        );
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("1")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let identity = crate::daemon_client::process_identity(pid)
+            .unwrap()
+            .unwrap();
+        let prior_executable_identity = record.runtime_obligations[0].expected_identity.clone();
+        record.runtime_obligations[0]
+            .prior_sessions
+            .push(RuntimeSessionAtUpdate {
+                pid,
+                start_time: 1,
+                executable: kin_home.join("bin/kin-daemon"),
+                executable_identity: prior_executable_identity,
+                binding: None,
+            });
+        let occupied = validate_quiescent_legacy_restart(&record, &kin_home, LINUX_COMPONENTS, &[])
+            .expect_err("a present PID never substitutes for exact legacy birth proof");
+        assert!(format!("{occupied:#}").contains("is occupied"));
+        let mut child = child;
+        child.wait().unwrap();
+        assert!(!crate::daemon_client::process_identity_is_current(&identity).unwrap());
+        assert!(
+            validate_quiescent_legacy_restart(&record, &kin_home, LINUX_COMPONENTS, &[]).unwrap()
+        );
+        let evidence = [RuntimeSessionEvidence {
+            kind: RuntimeKind::Daemon,
+            pid,
+        }];
+        assert!(!validate_quiescent_legacy_restart(
+            &record,
+            &kin_home,
+            LINUX_COMPONENTS,
+            &evidence
+        )
+        .unwrap());
+        let mut record = record;
+        record.runtime_obligations[0].expected_identity.sha256 = "e".repeat(64);
+        assert!(
+            validate_quiescent_legacy_restart(&record, &kin_home, LINUX_COMPONENTS, &[]).is_err()
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -22247,5 +23218,57 @@ cwd = {:?}
             parse_checksum(checksums, "kin-linux-amd64.tar.gz"),
             Some("abcdef123456".to_string())
         );
+    }
+}
+
+fn print_available_runtime_update(latest: &str, selected_commit: &str) {
+    let current_commit = kin_core::runtime_identity::RuntimeIdentity::current().commit_sha;
+    println!(
+        "Update available: v{CURRENT_VERSION} (source {current_commit}) -> v{latest} (source {selected_commit})"
+    );
+}
+
+/// Equal version labels do not establish equal installed source. The selected
+/// published channel can replace a different build at the same version, while
+/// an older release never causes an implicit downgrade. Unpublished candidates
+/// use development mode, which cannot mutate a managed installation.
+fn managed_runtime_update_available(
+    current_version: &Version,
+    current_commit: &str,
+    release_version: &Version,
+    release_commit: &str,
+) -> bool {
+    release_version > current_version
+        || (release_version == current_version
+            && !release_commit.eq_ignore_ascii_case(current_commit))
+}
+
+#[cfg(test)]
+mod managed_runtime_release_tests {
+    use super::*;
+
+    #[test]
+    fn managed_runtime_update_distinguishes_source_at_the_same_version() {
+        let current = Version::parse("0.8.6").unwrap();
+        let original = "522ede0d0dfbdd33ff8ba3a5798bb3bed6902c08";
+        let different = "25ba64660ab5e4bf155bc07e20997e9f262ceaac";
+        assert!(!managed_runtime_update_available(
+            &current, original, &current, original
+        ));
+        assert!(managed_runtime_update_available(
+            &current, original, &current, different
+        ));
+        assert!(!managed_runtime_update_available(
+            &current,
+            original,
+            &Version::parse("0.8.5").unwrap(),
+            different
+        ));
+        assert!(managed_runtime_update_available(
+            &current,
+            original,
+            &Version::parse("0.8.7").unwrap(),
+            original
+        ));
     }
 }

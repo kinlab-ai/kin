@@ -87,6 +87,7 @@ import time
 os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 from trace_pages import mcp_references
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -615,6 +616,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repo = None
         self.payloads = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def log(self, line):
         if self.verbose:

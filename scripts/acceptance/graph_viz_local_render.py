@@ -74,6 +74,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from runtime_fixture import prepare_runtime_fixture
 
 TICKET = "FIR-3498"
 
@@ -433,7 +434,7 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def suite_env(home, daemon):
+def suite_env(home, daemon, kin):
     env = {
         # This witness reads the in-tree store directly. Central-store
         # qualification runs separately; this preserves its original scope.
@@ -449,6 +450,7 @@ def suite_env(home, daemon):
     }
     if daemon:
         env["KIN_DAEMON_BIN"] = str(daemon)
+    prepare_runtime_fixture(kin, daemon, env, home)
     return env
 
 
@@ -699,7 +701,7 @@ def main():
         home_a = tmp / "home-a"
         home_a.mkdir()
         work_a = tmp / "work-a"
-        env_a = suite_env(home_a, daemon)
+        env_a = suite_env(home_a, daemon, kin)
         # Owned before its init, so a store whose init failed is still stopped.
         owned[work_a] = env_a
         init_a = build_store(kin, env_a, work_a)
@@ -746,7 +748,7 @@ def main():
         home_b = tmp / "home-b"
         home_b.mkdir()
         work_b = tmp / "work-b"
-        env_b = suite_env(home_b, daemon)
+        env_b = suite_env(home_b, daemon, kin)
         owned[work_b] = dict(env_b)
         init_b = build_store(kin, env_b, work_b)
         if init_b.returncode != 0:
@@ -801,7 +803,7 @@ def main():
         home_c = tmp / "home-c"
         home_c.mkdir()
         work_c = tmp / "work-c"
-        env_c = suite_env(home_c, daemon)
+        env_c = suite_env(home_c, daemon, kin)
         owned[work_c] = dict(env_c)
         init_c = build_store(kin, env_c, work_c)
         if init_c.returncode != 0:

@@ -97,13 +97,13 @@ test("bench-meta must prove the version, a clean known source, the lock and the 
 
 function fakeExec(outputs) {
   const calls = [];
-  const exec = (file, args) => {
+  const exec = (file, args, options = {}) => {
     calls.push([file, ...args]);
-    const key = [path.basename(file), ...args].join(" ");
+    const key = [path.basename(file).replace(/\.exe$/, ""), ...args].join(" ");
     if (!(key in outputs)) throw new Error(`unexpected call ${key}`);
     const value = outputs[key];
     if (value instanceof Error) throw value;
-    return value;
+    return typeof value === "function" ? value({ file, args, options, calls }) : value;
   };
   return { exec, calls };
 }
@@ -111,12 +111,33 @@ function fakeExec(outputs) {
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kin-native-provenance-"));
   fs.writeFileSync(path.join(dir, "Cargo.lock"), LOCK);
+  fs.writeFileSync(path.join(dir, "kin"), "selected CLI artifact bytes\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, "kin-daemon"), "selected daemon artifact bytes\n", { mode: 0o755 });
   return dir;
 }
 
-const goodOutputs = (over = {}) => ({
+const runtimeIdentity = (target = "aarch64-apple-darwin", over = {}) => ({
+  version: "0.8.3", commit_sha: SHA, source_dirty: false, source_known: true,
+  target, build_profile: "release", ...over,
+});
+const identityMeta = (target = "aarch64-apple-darwin", over = {}) => ({
+  schema: "kin.runtime-build-identity.v1", kin_version: "0.8.3", kin_commit: SHA,
+  kin_dirty: false, kin_source_known: true, kin_target: target, kin_build_profile: "release", ...over,
+});
+const runtimeStatus = ({ file, options }, target = "aarch64-apple-darwin", over = {}) => {
+  const daemon = path.join(path.dirname(file), `kin-daemon${file.endsWith(".exe") ? ".exe" : ""}`);
+  const binary = (name) => ({ path: name, ...runtimeIdentity(target),
+    sha256: createHash("sha256").update(fs.readFileSync(name)).digest("hex") });
+  return { schema: "kin.runtime-status.v1", ready: true, mode: "managed", pair_matches: true,
+    kin_home: options.env.KIN_HOME, cli: binary(file), daemon: binary(daemon),
+    channel: "stable", release_kind: "unknown", ...over };
+};
+const goodOutputs = (over = {}, target = "aarch64-apple-darwin") => ({
   "kin --version": `kin 0.8.3 (${SHA} 2026-10-12)\n`,
   "kin-daemon --version": `kin-daemon 0.8.3 (${SHA} 2026-10-12)\n`,
+  "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target)),
+  "kin-daemon --compat-json": JSON.stringify({ schema: "kin.daemon.compat.v2", runtime_identity: runtimeIdentity(target) }),
+  "kin runtime status --json": (context) => JSON.stringify(runtimeStatus(context, target)),
   "kin bench-meta --json": JSON.stringify(meta()),
   ...over,
 });
@@ -203,9 +224,9 @@ test("a binary from another commit or a different lock fails the leg", () => {
   const dir = fixture();
   const other = "b".repeat(40);
   for (const [outputs, expected] of [
-    [goodOutputs({ "kin --version": `kin 0.8.3 (${other} x)\n` }), /do not match checkout/],
-    [goodOutputs({ "kin bench-meta --json": JSON.stringify(meta({ dependency_provenance: "d".repeat(64) })) }), /Cargo\.lock/],
-    [goodOutputs({ "kin bench-meta --json": "not json" }), /did not print JSON/],
+    [goodOutputs({ "kin --version": `kin 0.8.3 (${other} x)\n` }, "x86_64-unknown-linux-musl"), /do not match checkout/],
+    [goodOutputs({ "kin bench-meta --json": JSON.stringify(meta({ dependency_provenance: "d".repeat(64) })) }, "x86_64-unknown-linux-musl"), /Cargo\.lock/],
+    [goodOutputs({ "kin bench-meta --json": "not json" }, "x86_64-unknown-linux-musl"), /did not print JSON/],
   ]) {
     const { exec } = fakeExec(outputs);
     assert.throws(
@@ -253,13 +274,28 @@ test("the argument parser refuses a loose commit and missing paths", () => {
 // not only the functions it calls.
 test("the CLI runs real executables and exits non-zero on a wrong commit", { skip: process.platform === "win32" }, () => {
   const dir = fixture();
-  const script = (name, version) =>
-    `#!/bin/sh\nif [ "$1" = bench-meta ]; then cat "${path.join(dir, "meta.json")}"; else echo "${name} 0.8.3 (${version} 2026-10-12)"; fi\n`;
-  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta()));
-  fs.writeFileSync(path.join(dir, "kin"), script("kin", SHA), { mode: 0o755 });
-  fs.writeFileSync(path.join(dir, "kin-daemon"), script("kin-daemon", SHA), { mode: 0o755 });
   const arch = process.arch === "arm64" ? "ARM64" : "X64";
   const target = process.arch === "arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl";
+  const script = (name, version) =>
+    `#!/usr/bin/env node
+const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+const args = process.argv.slice(2), name = ${JSON.stringify(name)};
+const identity = ${JSON.stringify(runtimeIdentity(target, { commit_sha: version }))};
+const print = (value) => console.log(typeof value === "string" ? value : JSON.stringify(value));
+if (args[0] === "--version") print(${JSON.stringify(`${name} 0.8.3 (${version} 2026-10-12)`)});
+else if (name === "kin-daemon" && args[0] === "--compat-json") print({schema:"kin.daemon.compat.v2",runtime_identity:identity});
+else if (name === "kin" && args[0] === "bench-meta" && args.includes("--runtime-identity-only")) print(${JSON.stringify(identityMeta(target, { kin_commit: version }))});
+else {
+  const cli = path.join(process.env.KIN_HOME, "bin", "kin"), daemon = path.join(process.env.KIN_HOME, "bin", "kin-daemon");
+  if (fs.realpathSync(process.argv[1]) !== cli || process.env.KIN_HOME !== path.join(process.env.HOME, ".kin") || process.env.KIN_RUNTIME_MODE !== "managed") process.exit(9);
+  const binary = (file) => ({path:file,...identity,sha256:crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")});
+  if (args[0] === "runtime" && args[1] === "status") print({schema:"kin.runtime-status.v1",ready:true,mode:"managed",pair_matches:true,kin_home:process.env.KIN_HOME,cli:binary(cli),daemon:binary(daemon),channel:"stable",release_kind:"unknown"});
+  else if (args[0] === "bench-meta") print(${JSON.stringify(meta({ kin_target: target, kin_commit: version }))});
+  else process.exit(3);
+}
+`;
+  fs.writeFileSync(path.join(dir, "kin"), script("kin", SHA), { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, "kin-daemon"), script("kin-daemon", SHA), { mode: 0o755 });
   const cli = (commit) =>
     spawnSync(
       process.execPath,
@@ -284,4 +320,111 @@ test("the CLI runs real executables and exits non-zero on a wrong commit", { ski
   const bad = cli("b".repeat(40));
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /::error::release binary SHAs/);
+});
+
+test("full metadata executes only after isolated canonical bytes, identity and ready status agree", () => {
+  const dir = fixture();
+  const target = "aarch64-unknown-linux-musl";
+  const { exec, calls } = fakeExec(goodOutputs({
+    "kin bench-meta --json": ({ file, options }) => {
+      assert.equal(file, path.join(options.env.KIN_HOME, "bin", "kin"));
+      assert.equal(options.env.KIN_HOME, path.join(options.env.HOME, ".kin"));
+      assert.equal(options.env.KIN_RUNTIME_MODE, "managed");
+      for (const key of ["KIN_DAEMON_URL", "KIN_DAEMON_BIN", "KIN_MODEL_EMBEDDINGS_PROVIDER", "GIT_DIR", "DYLD_INSERT_LIBRARIES"]) assert.equal(options.env[key], undefined);
+      assert.equal(fs.readFileSync(file, "utf8"), fs.readFileSync(path.join(dir, "kin"), "utf8"));
+      assert.equal(fs.readFileSync(path.join(path.dirname(file), "kin-daemon"), "utf8"), fs.readFileSync(path.join(dir, "kin-daemon"), "utf8"));
+      return JSON.stringify(meta({ kin_target: target }));
+    },
+  }, target));
+  verify(argsFor(dir, { target }), {
+    env: { RUNNER_ARCH: "ARM64", HOME: "/unrelated", KIN_HOME: "/unrelated/.kin", KIN_RUNTIME_MODE: "development",
+      KIN_DAEMON_URL: "http://unrelated", KIN_DAEMON_BIN: "/unrelated/daemon", KIN_MODEL_EMBEDDINGS_PROVIDER: "external",
+      GIT_DIR: "/unrelated/git", DYLD_INSERT_LIBRARIES: "/unrelated/library" },
+    exec,
+    log: () => {},
+  });
+  assert.ok(calls.some((call) => call.slice(1).join(" ") === "bench-meta --json"));
+  const indexOf = (argv) => calls.findIndex((call) => call.slice(1).join(" ") === argv);
+  assert.ok(indexOf("bench-meta --json --runtime-identity-only") < indexOf("--compat-json"));
+  assert.ok(indexOf("--compat-json") < indexOf("runtime status --json"));
+  assert.ok(indexOf("runtime status --json") < indexOf("bench-meta --json"));
+  const pair = JSON.parse(fs.readFileSync(path.join(dir, "out", "kin-canonical-pair.json"), "utf8"));
+  assert.equal(pair.verified, true);
+  assert.equal(pair.release_kind, "unknown");
+  assert.equal(pair.pair.cli.sha256, createHash("sha256").update(fs.readFileSync(path.join(dir, "kin"))).digest("hex"));
+  assert.ok(!fs.existsSync(pair.pair.cli.path), "temporary executable copies are cleaned after proof");
+});
+
+test("untrusted identities and runtime path or hash mismatches refuse before full metadata", () => {
+  const dir = fixture();
+  const target = "aarch64-unknown-linux-musl";
+  const bad = [
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { schema: "unsupported" })) },
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { kin_commit: "a".repeat(7) })) },
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { kin_target: "x86_64-unknown-linux-musl" })) },
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { kin_dirty: true })) },
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { kin_source_known: false })) },
+    { "kin bench-meta --json --runtime-identity-only": JSON.stringify(identityMeta(target, { kin_build_profile: "debug" })) },
+    { "kin-daemon --compat-json": JSON.stringify({ schema: "kin.daemon.compat.v2", runtime_identity: runtimeIdentity(target, { commit_sha: "b".repeat(40) }) }) },
+    { "kin-daemon --compat-json": JSON.stringify({ schema: "unsupported", runtime_identity: runtimeIdentity(target) }) },
+    ...[{ schema: "unsupported" }, { ready: false }, { mode: "development" }, { pair_matches: false }, { kin_home: "/unrelated" }].map((over) => ({
+      "kin runtime status --json": (context) => JSON.stringify(runtimeStatus(context, target, over)),
+    })),
+    ...["cli", "daemon"].flatMap((role) => [
+      ...[{ path: "/unrelated/bin" }, { sha256: "b".repeat(64) }, { source_dirty: true }].map((over) => ({
+        "kin runtime status --json": (context) => {
+          const status = runtimeStatus(context, target); status[role] = { ...status[role], ...over }; return JSON.stringify(status);
+        },
+      })),
+    ]),
+  ];
+  for (const outputs of bad) {
+    const { exec, calls } = fakeExec(goodOutputs(outputs, target));
+    assert.throws(() => verify(argsFor(dir, { target }), { env: { RUNNER_ARCH: "ARM64" }, exec, log: () => {} }), /runtime identity|canonical runtime|canonical (?:cli|daemon)/);
+    assert.ok(!calls.some((call) => call.slice(1).join(" ") === "bench-meta --json"));
+    assert.ok(!fs.readdirSync(path.join(dir, "out")).some((name) => name.startsWith("native-runtime-")));
+  }
+});
+
+test("full metadata cannot substitute another identity after canonical activation", () => {
+  const dir = fixture();
+  const target = "aarch64-unknown-linux-musl";
+  const { exec } = fakeExec(goodOutputs({ "kin bench-meta --json": JSON.stringify(meta({ kin_target: target, kin_build_profile: "debug" })) }, target));
+  assert.throws(() => verify(argsFor(dir, { target }), { env: { RUNNER_ARCH: "ARM64" }, exec, log: () => {} }), /full metadata identity differs/);
+  assert.ok(!fs.readdirSync(path.join(dir, "out")).some((name) => name.startsWith("native-runtime-")));
+});
+
+test("full metadata keeps its four identity fields while the independent pair proves target and profile", () => {
+  const dir = fixture(), target = "aarch64-unknown-linux-musl";
+  const { exec } = fakeExec(goodOutputs({}, target));
+  verify(argsFor(dir, { target }), { env: { RUNNER_ARCH: "ARM64" }, exec, log: () => {} });
+  const full = JSON.parse(fs.readFileSync(path.join(dir, "out", "kin-build-meta.json"), "utf8"));
+  assert.equal(full.kin_target, undefined);
+  assert.equal(full.kin_build_profile, undefined);
+  const pair = JSON.parse(fs.readFileSync(path.join(dir, "out", "kin-canonical-pair.json"), "utf8"));
+  assert.equal(pair.identity.target, target);
+  assert.equal(pair.identity.build_profile, "release");
+});
+
+test("a selected artifact changed after copying refuses before full metadata", () => {
+  const dir = fixture(), target = "aarch64-unknown-linux-musl";
+  const { exec, calls } = fakeExec(goodOutputs({
+    "kin runtime status --json": (context) => {
+      const status = runtimeStatus(context, target);
+      fs.writeFileSync(path.join(dir, "kin"), "replacement artifact bytes\n");
+      return JSON.stringify(status);
+    },
+  }, target));
+  assert.throws(() => verify(argsFor(dir, { target }), { env: { RUNNER_ARCH: "ARM64" }, exec, log: () => {} }), /canonical cli path, hash or identity/);
+  assert.ok(!calls.some((call) => call.slice(1).join(" ") === "bench-meta --json"));
+});
+
+test("a Windows target stages the canonical executable names with their suffixes", () => {
+  const dir = fixture(), target = "x86_64-pc-windows-msvc";
+  const { exec } = fakeExec(goodOutputs({}, target));
+  verify(argsFor(dir, { target }), { env: { RUNNER_ARCH: "X64" }, exec, log: () => {} });
+  const receipt = JSON.parse(fs.readFileSync(path.join(dir, "out", "kin-canonical-pair.json"), "utf8"));
+  assert.equal(path.basename(receipt.pair.cli.path), "kin.exe");
+  assert.equal(path.basename(receipt.pair.daemon.path), "kin-daemon.exe");
+  assert.equal(receipt.identity.target, target);
 });

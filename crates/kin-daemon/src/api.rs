@@ -2015,6 +2015,291 @@ fn current_build_response() -> BuildResponse {
     }
 }
 
+async fn runtime_identity() -> std::result::Result<
+    Json<kin_core::runtime_identity::RuntimeServiceIdentity>,
+    (StatusCode, String),
+> {
+    runtime_identity_for("daemon").await
+}
+
+async fn runtime_identity_for(
+    component: &'static str,
+) -> std::result::Result<
+    Json<kin_core::runtime_identity::RuntimeServiceIdentity>,
+    (StatusCode, String),
+> {
+    kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
+        .map(Json)
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))
+}
+
+#[derive(Clone)]
+struct RuntimeRequestPolicy {
+    require_identity: bool,
+    local: bool,
+    namespace: Option<kin_core::runtime_identity::RuntimeNamespace>,
+}
+
+async fn validate_runtime_request(
+    State(policy): State<RuntimeRequestPolicy>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let namespace = if policy.local {
+        let Some(namespace) = policy.namespace.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected local runtime namespace could not be captured",
+            )
+                .into_response();
+        };
+        if let Err(error) = namespace.revalidate() {
+            return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+        }
+        Some(namespace)
+    } else {
+        None
+    };
+    let path = request
+        .uri()
+        .path()
+        .strip_prefix("/v2")
+        .unwrap_or(request.uri().path());
+    let diagnostic = matches!(path, "/health" | "/ready" | "/readiness" | "/auth/rotation");
+    if policy.require_identity
+        && !diagnostic
+        && !request
+            .headers()
+            .contains_key(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
+    {
+        return (StatusCode::CONFLICT, "managed semantic requests require the exact runtime identity header; restart the CLI or MCP client using the selected managed runtime").into_response();
+    }
+    if let Some(claim) = request
+        .headers()
+        .get(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
+        .filter(|_| policy.local)
+    {
+        let mode = match kin_core::runtime_identity::RuntimeMode::current() {
+            Ok(mode) => mode,
+            Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+        };
+        let expected = kin_core::runtime_identity::RuntimeIdentity::current().fingerprint(
+            mode,
+            namespace
+                .expect("local policy captured a namespace")
+                .token(),
+        );
+        if claim.to_str().ok() != Some(expected.as_str()) {
+            return (StatusCode::CONFLICT, "runtime generation changed or differs from the caller; reconnect using the same managed CLI and daemon").into_response();
+        }
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn legacy_and_wrong_source_requests_never_reach_the_semantic_handler() {
+        let home = tempfile::tempdir().unwrap();
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::capture(home.path()).unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::clone(&reached);
+        let app = Router::new()
+            .route(
+                "/semantic",
+                get(move || {
+                    let marker = Arc::clone(&marker);
+                    async move {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        "semantic store accessed"
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: true,
+                    local: true,
+                    namespace: Some(namespace.clone()),
+                },
+                validate_runtime_request,
+            ));
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let mode = kin_core::runtime_identity::RuntimeMode::current().unwrap();
+        let mut wrong_source = kin_core::runtime_identity::RuntimeIdentity::current();
+        wrong_source.commit_sha = if wrong_source.commit_sha == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        wrong_source.fingerprint(mode, namespace.token()),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        kin_core::runtime_identity::RuntimeIdentity::current()
+                            .fingerprint(mode, namespace.token()),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn same_source_other_home_and_replaced_home_never_reach_the_semantic_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let service_home = root.path().join("service");
+        let other_home = root.path().join("other");
+        std::fs::create_dir(&service_home).unwrap();
+        std::fs::create_dir(&other_home).unwrap();
+        let namespace =
+            kin_core::runtime_identity::RuntimeNamespace::capture(&service_home).unwrap();
+        let other_namespace =
+            kin_core::runtime_identity::RuntimeNamespace::capture(&other_home).unwrap();
+        let identity = kin_core::runtime_identity::RuntimeIdentity::current();
+        let mode = kin_core::runtime_identity::RuntimeMode::current().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::clone(&reached);
+        let app = Router::new()
+            .route(
+                "/semantic",
+                get(move || {
+                    let marker = Arc::clone(&marker);
+                    async move {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        "semantic store accessed"
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: true,
+                    local: true,
+                    namespace: Some(namespace.clone()),
+                },
+                validate_runtime_request,
+            ));
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        identity.fingerprint(mode, other_namespace.token()),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        identity.fingerprint(mode, namespace.token()),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+        std::fs::rename(&service_home, root.path().join("retired")).unwrap();
+        std::fs::create_dir(&service_home).unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        identity.fingerprint(mode, namespace.token()),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod hosted_runtime_boundary_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn hosted_api_authority_is_independent_of_the_local_runtime_fingerprint() {
+        let app = Router::new()
+            .route("/semantic", get(|| async { "hosted API handler" }))
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: false,
+                    local: false,
+                    namespace: None,
+                },
+                validate_runtime_request,
+            ));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        "different-local-release",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
 #[derive(Clone)]
 struct DaemonAuthState {
     tokens: crate::auth_rotation::RotationTokens,
@@ -2035,7 +2320,7 @@ async fn request_daemon_shutdown(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("current process identity unavailable: {error}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
     if current != expected {
@@ -2092,7 +2377,7 @@ async fn request_daemon_retirement(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("current process identity unavailable: {error}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
     if current != expected {
@@ -3073,9 +3358,9 @@ fn router_with_rotation_tokens(
                 "cargo registry startup repair: repaired {:?}; left unserveable {:?}; snapshot {:?}",
                 report.repaired, report.unrepairable, report.snapshot
             ),
-            Err(error) => tracing::error!(
-                "cargo registry startup repair failed and rolled back: {error}"
-            ),
+            Err(error) => {
+                tracing::error!("cargo registry startup repair failed and rolled back: {error}")
+            }
         }
     } else {
         info!("cargo registry startup repair disabled by KIN_REGISTRY_STARTUP_REPAIR");
@@ -3128,6 +3413,22 @@ fn router_with_rotation_tokens(
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let admission_state = Arc::clone(&state);
     let prepared_state = Arc::clone(&state);
+    let runtime_component = if state.publication_control.is_some() {
+        "hosted-daemon"
+    } else {
+        "daemon"
+    };
+    let runtime_policy = RuntimeRequestPolicy {
+        local: state.publication_control.is_none(),
+        require_identity: state.publication_control.is_none()
+            && kin_core::runtime_identity::RuntimeMode::current().ok()
+                != Some(kin_core::runtime_identity::RuntimeMode::Development),
+        namespace: if state.publication_control.is_none() {
+            kin_core::runtime_identity::RuntimeNamespace::for_service().ok()
+        } else {
+            None
+        },
+    };
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v2", routes)
@@ -3150,10 +3451,22 @@ fn router_with_rotation_tokens(
             },
             daemon_auth,
         ))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            runtime_policy,
+            validate_runtime_request,
+        ));
 
     let app = Router::new()
         .merge(daemon_routes)
+        .route(
+            "/runtime/identity",
+            get(move || runtime_identity_for(runtime_component)),
+        )
+        .route(
+            "/v2/runtime/identity",
+            get(move || runtime_identity_for(runtime_component)),
+        )
         .merge(cargo_routes)
         .merge(npm_routes)
         .merge(oci_routes)
@@ -9924,7 +10237,7 @@ fn command_commit_after_admission(
                     .into_iter()
                     .filter_map(|path| RepoPath::from_utf8(path).ok())
                     .collect(),
-            ))
+            ));
         }
         Err(error) => return Err(repository_commit_error(error).into()),
     };
@@ -14745,7 +15058,9 @@ fn build_semantic_locate_result(
         .get("granularity")
         .is_some_and(|value| value.as_str() != Some("entity"))
     {
-        return kin_mcp::ToolCallResult::error("semantic_locate accepts only entity granularity; select semantic entities, not whole files");
+        return kin_mcp::ToolCallResult::error(
+            "semantic_locate accepts only entity granularity; select semantic entities, not whole files",
+        );
     }
     let file_granularity = false;
     let include_tests = arguments
@@ -14802,7 +15117,9 @@ fn build_semantic_locate_result(
             )) = cached
             {
                 if cached_file_granularity {
-                    return kin_mcp::ToolCallResult::error("semantic_locate cannot continue a file-granularity cursor; start an entity query");
+                    return kin_mcp::ToolCallResult::error(
+                        "semantic_locate cannot continue a file-granularity cursor; start an entity query",
+                    );
                 }
                 if let Err(error) = validate_cursor_projection(
                     arguments,
@@ -15927,7 +16244,9 @@ async fn build_fused_semantic_locate_result(
         .get("granularity")
         .is_some_and(|value| value.as_str() != Some("entity"))
     {
-        return Ok(kin_mcp::ToolCallResult::error("semantic_locate accepts only entity granularity; select semantic entities, not whole files"));
+        return Ok(kin_mcp::ToolCallResult::error(
+            "semantic_locate accepts only entity granularity; select semantic entities, not whole files",
+        ));
     }
     let file_granularity = false;
     // Rank test-role entities alongside source when the caller says so, or
@@ -16059,7 +16378,9 @@ async fn build_fused_semantic_locate_result(
             )) = cached
             {
                 if cached_file_granularity {
-                    return Ok(kin_mcp::ToolCallResult::error("semantic_locate cannot continue a file-granularity cursor; start an entity query"));
+                    return Ok(kin_mcp::ToolCallResult::error(
+                        "semantic_locate cannot continue a file-granularity cursor; start an entity query",
+                    ));
                 }
                 if let Err(error) = validate_cursor_projection(
                     arguments,
@@ -16893,13 +17214,13 @@ async fn mcp_entity_sources_attempt(
                         kin_mcp::handlers::entities::ResolvedEntitySource::Inventory { value }
                     } else {
                         kin_mcp::handlers::entities::ResolvedEntitySource::Derived { value }
-                    }
+                    };
                 }
                 Err(error) => {
                     return kin_mcp::handlers::entities::ResolvedEntitySource::NoSource {
                         id: entity_id.clone(),
                         message: error.to_string(),
-                    }
+                    };
                 }
                 Ok(None) => {}
             }
@@ -18175,7 +18496,8 @@ async fn hosted_view_prewarm_pass(
         if let HostedViewPrewarmOutcome::Quarantined(reason) = outcome {
             if warmed.quarantined.insert(repo_id.clone(), reason).is_none() {
                 warn!(
-                    repo_id, reason,
+                    repo_id,
+                    reason,
                     "hosted view automatic pre-warm disabled for this repository until daemon restart: timed-out storage work may still be running; on-demand reads remain available"
                 );
             }
@@ -19325,7 +19647,7 @@ async fn repo_mcp_tools_call_answer(
                                 message,
                                 false,
                             ),
-                        )
+                        );
                     }
                 };
             if let Err(failure) =
@@ -20540,7 +20862,7 @@ async fn reference_tools_page_with_hooks<F: FnMut(usize), G: FnOnce()>(
         Some(_) => {
             return Ok(kin_mcp::ToolCallResult::error(
                 "reference cursor must be a string",
-            ))
+            ));
         }
     };
     let session_id = extract_session_id_from_headers(&headers)?;
@@ -20610,7 +20932,9 @@ async fn reference_tools_page_with_hooks<F: FnMut(usize), G: FnOnce()>(
                 .await
             || !trace_read_epoch_current(&state, authority, epoch)
         {
-            return Ok(kin_mcp::ToolCallResult::error("reference graph, authority or standing changed while resuming; restart without cursor"));
+            return Ok(kin_mcp::ToolCallResult::error(
+                "reference graph, authority or standing changed while resuming; restart without cursor",
+            ));
         }
         return Ok(page
             .map(|page| kin_mcp::ToolCallResult::text(page.to_string()))
@@ -20728,7 +21052,7 @@ async fn reference_tools_page_with_hooks<F: FnMut(usize), G: FnOnce()>(
             None => {
                 return Ok(kin_mcp::ToolCallResult::error(
                     "reference authority changed while reading; restart without cursor",
-                ))
+                ));
             }
         }
     };
@@ -21009,7 +21333,7 @@ async fn frozen_tools_page_once(
         Some(_) => {
             return Ok(FrozenRead::Served(kin_mcp::ToolCallResult::error(format!(
                 "{label} cursor must be a string"
-            ))))
+            ))));
         }
     };
     let result = if let Some(cursor) = cursor {
@@ -21922,7 +22246,7 @@ async fn mcp_tools_call_selected(
                 let repository_authority = match require_mcp_command_repository_authority(&state) {
                     Ok(authority) => authority,
                     Err(error) => {
-                        return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string())))
+                        return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string())));
                     }
                 };
                 // Same off-runtime seam as the CLI route. This is the arm the
@@ -21937,7 +22261,7 @@ async fn mcp_tools_call_selected(
                         None => {
                             return Ok(Json(kin_mcp::ToolCallResult::error(
                                 "selected trace source scope expired or was replaced",
-                            )))
+                            )));
                         }
                     },
                 )
@@ -24648,7 +24972,7 @@ impl RepoEntityFields {
                         format!(
                             "include accepts 'ranking', 'signature' and 'summary'; got '{other}'"
                         ),
-                    ))
+                    ));
                 }
             }
         }
@@ -26986,7 +27310,7 @@ impl ExactSourceArchiveExportQueue {
                 Ok(_) => {
                     return Some(ExactSourceExportQueueSeat {
                         waiting: &self.waiting,
-                    })
+                    });
                 }
                 Err(current) => observed = current,
             }
@@ -27902,6 +28226,8 @@ pub async fn serve_warming_with_progress_until(
 ) {
     let app = Router::new()
         .route("/health", get(warming_health))
+        .route("/runtime/identity", get(runtime_identity))
+        .route("/v2/runtime/identity", get(runtime_identity))
         .route("/v2/health", get(warming_health))
         .route("/ready", get(warming_readiness))
         .route("/readiness", get(warming_readiness))
@@ -29826,18 +30152,12 @@ pub(crate) mod tests {
     /// verifiable, which is what C4 asks for and what an `is_err()` cannot give.
     const CURSOR_REFUSAL_QUERY: &str =
         "semantic_locate cursor belongs to a different query; re-run the requested query";
-    const CURSOR_REFUSAL_GRANULARITY: &str =
-        "semantic_locate cursor preserves its original granularity; re-run the original query to change it";
-    const CURSOR_REFUSAL_SNIPPET: &str =
-        "semantic_locate cursor preserves its original snippet projection; re-run the original query to change it";
-    const CURSOR_REFUSAL_ALIAS: &str =
-        "semantic_locate cursor preserves its original snippet alias setting; re-run the original query to change it";
-    const CURSOR_REFUSAL_VARIANTS: &str =
-        "semantic_locate cursor preserves its original query variants; re-run the original query to change them";
-    const CURSOR_REFUSAL_TEST_SCOPE: &str =
-        "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it";
-    const CURSOR_REFUSAL_EXPLAIN: &str =
-        "semantic_locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with explain: true";
+    const CURSOR_REFUSAL_GRANULARITY: &str = "semantic_locate cursor preserves its original granularity; re-run the original query to change it";
+    const CURSOR_REFUSAL_SNIPPET: &str = "semantic_locate cursor preserves its original snippet projection; re-run the original query to change it";
+    const CURSOR_REFUSAL_ALIAS: &str = "semantic_locate cursor preserves its original snippet alias setting; re-run the original query to change it";
+    const CURSOR_REFUSAL_VARIANTS: &str = "semantic_locate cursor preserves its original query variants; re-run the original query to change them";
+    const CURSOR_REFUSAL_TEST_SCOPE: &str = "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it";
+    const CURSOR_REFUSAL_EXPLAIN: &str = "semantic_locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with explain: true";
 
     /// Every refusal message a cursor validator can produce, so a test can
     /// require that the message it expected is the one that answered AND that no
@@ -69787,8 +70107,10 @@ pub(crate) mod tests {
             body["cross_repo"]["authority_roots"][provider_repo_id.as_str()],
             provider_root
         );
-        assert_eq!(body["negative"]["safe_to_conclude_absent"], false,
-            "complete federation does not supply the synthetic local graph's missing source proof: {body}");
+        assert_eq!(
+            body["negative"]["safe_to_conclude_absent"], false,
+            "complete federation does not supply the synthetic local graph's missing source proof: {body}"
+        );
     }
 
     #[tokio::test]
@@ -70958,7 +71280,13 @@ pub(crate) mod tests {
             Some(EntitySourceScope::At(revision))
         );
         assert_eq!(
-            state.source_scope_for_selected_graph(Some(&session), &state.graph, RequestGraphAuthority::Head).await,
+            state
+                .source_scope_for_selected_graph(
+                    Some(&session),
+                    &state.graph,
+                    RequestGraphAuthority::Head
+                )
+                .await,
             None,
             "a request selected before the session was scoped must not retain a HEAD source binding",
         );
@@ -76895,9 +77223,12 @@ pub(crate) mod tests {
             body_bytes > 5_000,
             "the fixture must carry substantial source"
         );
-        assert!(with_bodies.len().saturating_sub(compact.len()) >= body_bytes,
+        assert!(
+            with_bodies.len().saturating_sub(compact.len()) >= body_bytes,
             "shape response must save every omitted body byte: {} vs {} bytes, {body_bytes} source bytes",
-            compact.len(), with_bodies.len());
+            compact.len(),
+            with_bodies.len()
+        );
     }
 
     /// `compact: true` is the same request as `include_body: false`.

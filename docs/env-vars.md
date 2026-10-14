@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (611 total, 397 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (612 total, 398 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -31,7 +31,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the shell and PowerShell installers |
 | `KIN_BINARY_PATH` | path | *(unset)* | operational | override the kin binary path for bench dispatch |
 | `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
-| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks; bounds install and store state, NOT the machine-wide daemon supervisor |
+| `KIN_HOME` | path | ~/.kin | operational | preferred root for the admitted Kin runtime, install, stores and supervisor service namespace; development builds use an isolated home; KIN_HOME wins over KIN_DIR |
 | `KIN_LAUNCHER_ADOPT` | bool | false | operational | force the @kinlab/kin launcher to provision its pinned release, including an intentional downgrade |
 | `KIN_MANAGED_BIN` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning |
 | `KIN_MCP_AUTO_INIT` | bool | false | operational | allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup |
@@ -49,6 +49,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
 | `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
 | `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |
+| `KIN_RUNTIME_MODE` | enum | *(unset)* | correctness | runtime admission mode: clean release builds default to managed; debug or dirty builds default to development with isolated home and services; explicit managed requires known clean release identity |
 | `KIN_VERSION` | string | latest | operational | release version selected by the shell and PowerShell installers |
 
 ## General

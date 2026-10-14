@@ -23,8 +23,12 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
     // probe. The compat payload must now be emitted before any logging.
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
     isolate_daemon_test_command(&mut command);
+    let fixture = tempfile::tempdir().unwrap();
+    let untouched_home = fixture.path().join("uninitialized-kin-home");
     command
         .arg("--compat-json")
+        .env("KIN_HOME", &untouched_home)
+        .env("KIN_RUNTIME_MODE", "development")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
         .env("KIN_DAEMON_DISABLE_LSP", "1");
     let output = daemon_test_output(command, "kin-daemon --compat-json", Duration::from_secs(30))
@@ -81,6 +85,41 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
     assert!(parsed["build"]["dependency_provenance"].is_string());
     assert!(parsed["build"]["branch"].is_string());
     assert!(parsed["build"]["built_at"].is_string());
+    assert!(parsed["build"]["target"].is_string());
+    assert!(parsed["build"]["build_profile"].is_string());
+    let identity: kin_core::runtime_identity::RuntimeIdentity =
+        serde_json::from_value(parsed["runtime_identity"].clone())
+            .expect("compat payload must carry typed static runtime identity");
+    assert_eq!(
+        identity,
+        kin_core::runtime_identity::RuntimeIdentity::current()
+    );
+    assert_eq!(identity.version, parsed["version"].as_str().unwrap());
+    assert_eq!(
+        identity.commit_sha,
+        parsed["build"]["sha"].as_str().unwrap()
+    );
+    assert_eq!(
+        identity.source_dirty,
+        parsed["build"]["dirty"].as_bool().unwrap()
+    );
+    assert_eq!(
+        identity.source_known,
+        parsed["build"]["source_known"].as_bool().unwrap()
+    );
+    assert_eq!(identity.target, parsed["build"]["target"].as_str().unwrap());
+    assert_eq!(
+        identity.build_profile,
+        parsed["build"]["build_profile"].as_str().unwrap()
+    );
+    let mode: kin_core::runtime_identity::RuntimeMode =
+        serde_json::from_value(parsed["runtime_mode"].clone())
+            .expect("compat payload must carry typed runtime mode");
+    assert_eq!(mode, kin_core::runtime_identity::RuntimeMode::Development);
+    assert!(
+        !untouched_home.exists(),
+        "the static compatibility probe must not initialize or capture its selected Kin home"
+    );
 
     // The exact top-level key set. kin-infra reads this payload by name and
     // records it verbatim as the evidence a hosted pin is graded against, so a
@@ -101,6 +140,8 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
             "graph_snapshot_min_supported_version",
             "graph_snapshot_version",
             "hosted_start_requirements",
+            "runtime_identity",
+            "runtime_mode",
             "schema",
             "supervisor_startup_capabilities",
             "supervisor_startup_protocol",

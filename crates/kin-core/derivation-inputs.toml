@@ -198,7 +198,17 @@ items = [
 reason = "capability-scoped IO for store sidecars and configuration; reads and writes the caller's record bytes without deriving an entity or relation"
 files = ["src/store_records.rs"]
 
+[[excluded]]
+reason = "runtime build identity and managed/development process routing; no semantic derivation"
+files = ["src/runtime_identity.rs"]
+
+[[excluded_items]]
+file = "src/lib.rs"
+reason = "exports process identity metadata without changing graph derivation"
+items = ["mod runtime_identity"]
+
 [dependencies]
+kin-buildinfo = { reason = "compiled runtime provenance for exact CLI and service identity; derives no graph data" }
 kin-io = { reason = "worktree authority tokens and confined store/config record IO; graph derivation uses the supplied source bytes and never derives a value through this crate" }
 semver = { reason = "compares recorded Kin releases before an upgrade; never derives graph data" }
 kin-model = { decides = ["graph"] }

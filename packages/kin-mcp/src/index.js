@@ -11,6 +11,32 @@ import { createRequire } from 'node:module';
 
 import { instructionsForProfile, startFirstLaunchSession } from './first-launch.js';
 
+// The compatibility package shares the normal install with @kinlab/kin.
+// Source-tree tests run before workspace dependencies are linked; published
+// packages load the declared dependency instead.
+let managedProvision;
+try {
+  managedProvision = await import('@kinlab/kin/lib/provision.mjs');
+} catch (error) {
+  if (error.code !== 'ERR_MODULE_NOT_FOUND' || !String(error.message).includes('@kinlab/kin')) throw error;
+  managedProvision = await import('../../kin/lib/provision.mjs');
+}
+
+function managedInstaller() {
+  if (typeof managedProvision.resolveReadyManagedBinary !== 'function') {
+    throw new Error('the canonical @kinlab/kin launcher is too old to certify native pair identity; update @kinlab/kin before starting this compatibility launcher');
+  }
+  return managedProvision;
+}
+
+function usesDevelopmentCache(env, cacheRoot) {
+  return Boolean(cacheRoot || env.KIN_MCP_CACHE_DIR);
+}
+
+function normalManagedEnvironment(env, homeDir) {
+  return { ...env, KIN_HOME: env.KIN_HOME || env.KIN_DIR || path.join(homeDir, '.kin') };
+}
+
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
 
@@ -161,11 +187,17 @@ export async function cachedKinBinary({
   homeDir = os.homedir(),
   cacheRoot
 } = {}) {
-  const configuredBinary = env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH;
+  const configuredBinary = env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN;
   if (configuredBinary) {
     const resolved = path.resolve(configuredBinary);
     await assertRunnable(resolved, platform);
-    return resolved;
+    return managedInstaller().resolveDevelopmentBinary(resolved, { env, platform });
+  }
+
+  if (!usesDevelopmentCache(env, cacheRoot)) {
+    return managedInstaller().resolveReadyManagedBinary({
+      env: normalManagedEnvironment(env, homeDir), platform, minimumVersion: version
+    });
   }
 
   const binaryPath = resolveCachedBinaryPath({
@@ -182,7 +214,7 @@ export async function cachedKinBinary({
     (await isRunnable(binaryPath, platform)) &&
     (await isRunnable(daemonPath, platform))
   ) {
-    return binaryPath;
+    return managedInstaller().resolveDevelopmentBinary(binaryPath, { env, platform });
   }
   return null;
 }
@@ -196,6 +228,14 @@ export async function ensureKinBinary({
   cacheRoot,
   onProgress
 } = {}) {
+  const configuredBinary = env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN;
+  if (!configuredBinary && !usesDevelopmentCache(env, cacheRoot)) {
+    return managedInstaller().ensureProvisioned({
+      env: normalManagedEnvironment(env, homeDir), platform, arch, onProgress,
+      minimumVersion: version
+    });
+  }
+
   const cached = await cachedKinBinary({ env, platform, arch, version, homeDir, cacheRoot });
   if (cached) {
     return cached;
@@ -211,7 +251,7 @@ export async function ensureKinBinary({
   });
   await installKinBinary({ binaryPath, env, platform, arch, version, onProgress });
   await assertDaemonProvisioned(binaryPath, platform);
-  return binaryPath;
+  return managedInstaller().resolveDevelopmentBinary(binaryPath, { env, platform });
 }
 
 export async function runKinMcp(argv = [], options = {}) {
@@ -226,7 +266,7 @@ export async function runKinMcp(argv = [], options = {}) {
   }
 
   if (argv.includes('--version') || argv.includes('-v')) {
-    stdout.write(`${PACKAGE_VERSION}\n`);
+    stdout.write(`@kinlab/kin-mcp ${PACKAGE_VERSION} (compatibility launcher; runtime identity: kin runtime status --json)\n`);
     return 0;
   }
 
@@ -298,7 +338,7 @@ export async function runKinMcp(argv = [], options = {}) {
 
   const spawnOptions = {
     ...options,
-    env: childEnv(env, binaryPath, platform)
+    env: launchEnvironment(env, binaryPath, platform, options.cacheRoot)
   };
 
   const cwd = options.cwd || process.cwd();
@@ -380,7 +420,7 @@ async function stopKinDaemons(options, { stdout, env, platform }) {
   if (binaryPath) {
     code = await spawnKin(binaryPath, ['daemon', 'stop', '--all', '--when-unused'], {
       ...options,
-      env: childEnv(env, binaryPath, platform),
+      env: launchEnvironment(env, binaryPath, platform, options.cacheRoot),
       cwd: options.cwd || process.cwd(),
       stdio: options.stdio || 'inherit'
     });
@@ -411,10 +451,16 @@ async function existingKinBinary({
   homeDir = os.homedir(),
   cacheRoot
 } = {}) {
-  const configured = env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH;
+  const configured = env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN;
   if (configured) {
     const resolved = path.resolve(configured);
-    return (await isRunnable(resolved, platform)) ? resolved : null;
+    return (await isRunnable(resolved, platform))
+      ? managedInstaller().resolveDevelopmentBinary(resolved, { env, platform }) : null;
+  }
+  if (!usesDevelopmentCache(env, cacheRoot)) {
+    return managedInstaller().resolveReadyManagedBinary({
+      env: normalManagedEnvironment(env, homeDir), platform, minimumVersion: '0.0.0'
+    });
   }
   let asset;
   try {
@@ -425,7 +471,7 @@ async function existingKinBinary({
   const root = cacheRoot || resolveCacheRoot(env, platform, homeDir);
   const own = path.join(root, resolveReleaseTag(version), asset.assetName, asset.binaryName);
   if (await isRunnable(own, platform)) {
-    return own;
+    return managedInstaller().resolveDevelopmentBinary(own, { env, platform });
   }
   let tags = [];
   try {
@@ -436,7 +482,7 @@ async function existingKinBinary({
   for (const tag of tags.sort().reverse()) {
     const candidate = path.join(root, tag, asset.assetName, asset.binaryName);
     if (await isRunnable(candidate, platform)) {
-      return candidate;
+      return managedInstaller().resolveDevelopmentBinary(candidate, { env, platform });
     }
   }
   return null;
@@ -573,14 +619,25 @@ export function resolveDaemonBinaryPath(kinBinaryPath) {
   return path.join(path.dirname(kinBinaryPath), `${DAEMON_BINARY_NAME}${suffix}`);
 }
 
+function launchEnvironment(env, binaryPath, platform, cacheRoot) {
+  const development = usesDevelopmentCache(env, cacheRoot) || env.KIN_MCP_KIN_BINARY ||
+    env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN;
+  const admitted = development
+    ? managedInstaller().developmentLaunchEnvironment(binaryPath, { env, platform }) : env;
+  return childEnv(admitted, binaryPath, platform);
+}
+
 export function childEnv(env, kinBinaryPath, platform = process.platform) {
   const next = { ...env };
+  if (env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN || env.KIN_MCP_CACHE_DIR) {
+    next.KIN_RUNTIME_MODE = 'development';
+  }
 
   if (!next.KIN_MCP_TOOL_PROFILE) {
     next.KIN_MCP_TOOL_PROFILE = DEFAULT_TOOL_PROFILE;
   }
 
-  const usesManagedBinary = !(env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH);
+  const usesManagedBinary = !(env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH || env.KIN_MANAGED_BIN);
   if (usesManagedBinary && !next.KIN_DAEMON_BIN) {
     next.KIN_DAEMON_BIN = resolveDaemonBinaryPath(kinBinaryPath);
   }
@@ -593,12 +650,14 @@ function guidedProvisioningFailure(error) {
   return [
     `kin-mcp could not provision a runnable Kin: ${detail}`,
     'Fixes:',
-    '  - Install Kin directly and run `kin setup` to configure your agent, then point',
-    '    this wrapper at it with KIN_MCP_KIN_BINARY=/path/to/kin.',
+    '  - Inspect the managed runtime with `kin runtime status --json`, then use',
+    '    its `kin update --apply` transaction and re-run `kin setup`.',
+    '  - For a development build, explicitly select KIN_MCP_KIN_BINARY=/path/to/kin;',
+    '    that selection requires the isolated runtime contract and a matching daemon.',
     '  - Or retry on a supported target (macOS, Linux, or Windows x64).',
     '    Native Windows carries semantic vector search but no filesystem projection;',
     '    use WSL2 when you need projection.',
-    '  - Or override the release source with KIN_MCP_RELEASE_BASE_URL if you mirror releases.'
+    '  - Release mirrors apply only to an explicitly selected development cache.'
   ].join('\n');
 }
 
@@ -616,8 +675,9 @@ Usage:
   kin-mcp --print-daemon-bin
   kin-mcp --version
 
-This wrapper downloads a matching Kin release archive on demand, extracts both
-the kin CLI and the kin-daemon it depends on into a local cache, and then runs:
+This compatibility wrapper shares the canonical managed native pair at
+$KIN_HOME/bin (or $KIN_DIR; default ~/.kin/bin), certifies its source identity,
+and then runs:
 
   kin mcp start
 
@@ -628,7 +688,7 @@ download finishes it hands the session to kin mcp start and sends
 notifications/tools/list_changed so the client lists Kin's tools.
 
 It defaults KIN_MCP_TOOL_PROFILE=agent-default so first-run agents see the small
-curated tool surface, and points the kin CLI at the cached kin-daemon via
+curated tool surface, and points the kin CLI at the paired kin-daemon via
 KIN_DAEMON_BIN so it never depends on a stale daemon on PATH.
 
 The first tool call starts a background daemon for the repository, plus one

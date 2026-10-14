@@ -114,8 +114,8 @@ SUITES = {
 # the script's own directory, so a suite staged alone at --dest dies on
 # import; the siblings travel beside it, from the same tree and ref.
 SUITE_SIBLINGS = {
-    "magic": ("scripts/acceptance/trace_pages.py",),
-    "brownfield": ("scripts/acceptance/trace_pages.py",),
+    "magic": ("scripts/acceptance/trace_pages.py", "scripts/acceptance/runtime_fixture.py"),
+    "brownfield": ("scripts/acceptance/trace_pages.py", "scripts/acceptance/runtime_fixture.py"),
 }
 
 BASELINE_REF = "origin/main"

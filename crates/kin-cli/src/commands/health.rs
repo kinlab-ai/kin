@@ -283,6 +283,7 @@ pub async fn run_health_checks() -> HealthReport {
 /// surface Kin has on a real store.
 pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> HealthReport {
     let mut checks = vec![
+        check_managed_runtime(),
         check_kin_binary(),
         check_kin_daemon_binary(),
         check_supervisor_startup_protocol(),
@@ -332,6 +333,40 @@ pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> 
     checks.push(check_binary_assessment_load());
 
     assemble_health_report(env::consts::OS.to_string(), checks)
+}
+/// Installation identity is independent from repository and client readiness.
+fn check_managed_runtime() -> HealthCheck {
+    let report = crate::commands::runtime::inspect(&Default::default());
+    let ready = report.ready && report.pair_matches;
+    let detail = if ready {
+        format!(
+            "validated CLI and daemon pair at {} ({})",
+            report.cli.path.display(),
+            report.cli.commit_sha.as_deref().unwrap_or("unknown")
+        )
+    } else {
+        report
+            .detail
+            .or(report.reason)
+            .unwrap_or_else(|| "the managed CLI and daemon pair did not pass validation".into())
+    };
+    HealthCheck {
+        id: "managed_runtime".into(),
+        label: "Managed runtime".into(),
+        status: if ready {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Misconfigured
+        },
+        detail,
+        platform_note: None,
+        fixable: false,
+        manual_fix: if ready {
+            None
+        } else {
+            Some("Run `kin runtime status --json`, then repair the managed installation before using clients".into())
+        },
+    }
 }
 
 /// Report the active update policy and where it came from.
@@ -3032,13 +3067,23 @@ fn evaluate_antigravity_binding_for(
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
     let expected_command = configured_mcp_launcher().ok()?;
+    evaluate_antigravity_binding_against(entry, path, workspace, repo_root, &expected_command)
+}
+
+fn evaluate_antigravity_binding_against(
+    entry: &Value,
+    path: &Path,
+    workspace: bool,
+    repo_root: &Path,
+    expected_command: &str,
+) -> Option<(HealthStatus, String)> {
     let client_id = if workspace {
         "antigravity_workspace"
     } else {
         "antigravity"
     };
     let expected_repo = repo_root.to_string_lossy();
-    let topology = mcp_launcher_topology(entry, &expected_command);
+    let topology = mcp_launcher_topology(entry, expected_command);
     let launcher_and_args_match = topology.is_some_and(|topology| {
         mcp_argument_vector_matches(entry, client_id, topology)
             && mcp_repo_argument(entry, topology) == Some(expected_repo.as_ref())
@@ -12720,9 +12765,11 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let kin_home = dir.path().join("kin-home");
-        let managed = kin_home.join("bin/kin");
-        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
-        std::fs::copy(std::env::current_exe().unwrap(), &managed).unwrap();
+        crate::commands::setup::write_managed_runtime_fixture(
+            &kin_home,
+            "1111111111111111111111111111111111111111",
+        );
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let path = dir.path().join("claude.json");
         let config = |command: &Path| {
@@ -12901,12 +12948,12 @@ mod tests {
         let (status, detail) =
             evaluate_mcp_client_against(&config, "antigravity_workspace", "/managed/kin");
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
-        assert!(evaluate_antigravity_binding(&config, true).is_none());
+        assert!(evaluate_antigravity_fixture_binding(&config, true, &repo).is_none());
 
         let other = dir.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
         write_config(&other);
-        assert!(evaluate_antigravity_binding(&config, true).is_some());
+        assert!(evaluate_antigravity_fixture_binding(&config, true, &repo).is_some());
     }
 
     /// Write the global Antigravity binding exactly as `kin setup` does: with
@@ -12927,6 +12974,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn evaluate_antigravity_fixture_binding(
+        config: &Path,
+        workspace: bool,
+        repo_root: &Path,
+    ) -> Option<(HealthStatus, String)> {
+        let root: Value = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        evaluate_antigravity_binding_against(
+            &root["mcpServers"]["kin"],
+            config,
+            workspace,
+            repo_root,
+            "/managed/kin",
+        )
     }
 
     /// The two sides of an MCP binding check name the repository differently:
@@ -12990,8 +13052,12 @@ mod tests {
         assert_ne!(discovered, canonical);
 
         assert!(
-            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(discovered))
-                .is_none(),
+            evaluate_antigravity_fixture_binding(
+                &config,
+                false,
+                &canonical_health_repo(discovered)
+            )
+            .is_none(),
             "a binding written with the canonicalized repository root must be accepted when \
              discovery names that same repository through an equivalent path"
         );
@@ -13003,7 +13069,7 @@ mod tests {
         let other = other.canonicalize().unwrap();
         write_global_antigravity_binding(&config, &other);
         assert!(
-            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(canonical))
+            evaluate_antigravity_fixture_binding(&config, false, &canonical_health_repo(canonical))
                 .is_some(),
             "a binding pointed at a different repository must still be misconfigured"
         );

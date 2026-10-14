@@ -87,7 +87,8 @@ test('binaryName adds .exe only on Windows', () => {
 test('kinHome honors $KIN_HOME then falls back to ~/.kin', () => {
   assert.equal(kinHome({ KIN_HOME: '/custom/kin' }, '/home/u'), '/custom/kin');
   assert.equal(kinHome({}, '/home/u'), path.join('/home/u', '.kin'));
-  assert.equal(kinHome({ KIN_HOME: '   ' }, '/home/u'), path.join('/home/u', '.kin'));
+  assert.equal(kinHome({ KIN_HOME: '' }, '/home/u'), path.join('/home/u', '.kin'));
+  assert.equal(kinHome({ KIN_HOME: '   ' }, '/home/u'), path.resolve('   '), 'nonempty path spelling matches the shell and native resolver');
 });
 
 test('managedBinaryPath defaults under kinHome and is overridable', () => {
@@ -128,4 +129,10 @@ test('notProvisionedMessage names the expected path and stays honest', () => {
   assert.match(msg, /managed "kin" binary not found/);
   assert.match(msg, /\/opt\/kin\/bin\/kin/);
   assert.match(msg, /provisioning failed or was disabled/);
+});
+
+test('KIN_DIR is the install-root alias and KIN_HOME takes precedence', () => {
+  assert.equal(kinHome({ KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/legacy-root'));
+  assert.equal(kinHome({ KIN_HOME: '/preferred', KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/preferred'));
+  assert.equal(kinHome({ KIN_HOME: '', KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/legacy-root'));
 });

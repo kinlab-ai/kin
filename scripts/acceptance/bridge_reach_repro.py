@@ -85,6 +85,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from runtime_fixture import prepare_runtime_fixture
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -458,6 +459,8 @@ class Suite(object):
         self.env.pop("KIN_DAEMON_URL", None)
         self.env.pop("KIN_NO_DAEMON", None)
         self.repos = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, None, self.env, self.env["KIN_HOME"])
 
     def git(self, args, cwd):
         proc = subprocess.run(

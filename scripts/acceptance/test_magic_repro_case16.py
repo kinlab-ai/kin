@@ -260,7 +260,8 @@ class IsolatedFixtureReadiness(unittest.TestCase):
             kin.mkdir()
             (kin / "daemon.port").write_text("4219\n")
             (kin / "daemon.token").write_text("fixture-token")
-            suite = m.Suite("unused", repo)
+            with mock.patch.object(m, "prepare_runtime_fixture", return_value=("unused", "unused-daemon")):
+                suite = m.Suite("unused", repo)
             suite.kin_run = mock.Mock(return_value=(0, json.dumps(self.graph(settled=False)), ""))
             suite.mcp = mock.Mock(side_effect=AssertionError("readiness must not query a verdict"))
             elapsed = [0.0]
@@ -268,6 +269,7 @@ class IsolatedFixtureReadiness(unittest.TestCase):
                 elapsed[0] += seconds
             with mock.patch.object(m.time, "monotonic", side_effect=lambda: elapsed[0]), \
                     mock.patch.object(m.time, "sleep", side_effect=sleep), \
+                    mock.patch.object(m, "native_request_headers", return_value={"Authorization": "Bearer fixture-token"}), \
                     mock.patch.object(m.urllib.request, "urlopen",
                                       side_effect=lambda *a, **k: io.StringIO(json.dumps(self.work()))):
                 with self.assertRaisesRegex(RuntimeError, "did not settle in 0.5s"):

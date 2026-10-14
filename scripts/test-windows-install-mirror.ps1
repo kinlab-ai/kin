@@ -5,8 +5,9 @@ Exercise the real Windows installer against a local release mirror.
 .DESCRIPTION
 Downloads the reviewed v0.8.6 ZIP and its public checksum once, then tests the
 candidate install.ps1 in child pwsh processes using file:// paths with spaces.
-The receipt covers installer boundaries against stable binaries. Candidate
-binaries still require their own RC Build and release qualification.
+The receipt covers checksum/extraction boundaries and the exact expected
+runtime refusal of legacy stable binaries. Current-protocol binaries require
+positive runtime readiness and their own RC Build and release qualification.
 User PATH changes require a disposable GitHub-hosted Windows x86_64 account.
 #>
 [CmdletBinding()]
@@ -16,7 +17,9 @@ param(
     [string]$OutputRoot,
 
     [ValidateNotNullOrEmpty()]
-    [string]$InstallerPath = (Join-Path $PSScriptRoot "install.ps1")
+    [string]$InstallerPath = (Join-Path $PSScriptRoot "install.ps1"),
+
+    [switch]$RetainBaselineArchive
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,6 +151,69 @@ function Get-ZipComponents {
     return $Components
 }
 
+function Get-RuntimeBoundaryEvidence {
+    param([string]$PayloadVersion, [int]$ExitCode, [string]$Stdout, [string]$Stderr)
+    $VersionMatch = [regex]::Match($PayloadVersion, '^\d+\.\d+\.\d+(?:[-+].*)?$')
+    if (-not $VersionMatch.Success) { throw "Payload version cannot select a runtime protocol." }
+    $CoreVersion = [version]($PayloadVersion -replace '[-+].*$', '')
+    $Unsupported = "error: unrecognized subcommand 'runtime'"
+    if ($Stdout -cnotmatch [regex]::Escape("[ok] SHA-256 checksum verified")) {
+        throw "Valid file mirror did not report its actual checksum verification."
+    }
+    if ($CoreVersion -lt [version]"0.8.7") {
+        if ($ExitCode -ne 2 -or $Stderr -cnotmatch ("(?m)^" + [regex]::Escape($Unsupported) + "\r?$") ) {
+            throw "Legacy payload must refuse runtime admission with exit 2 and its exact unsupported-command diagnostic."
+        }
+        return [ordered]@{
+            coverage = "checksum-extraction-and-legacy-runtime-refusal"
+            installer_succeeded = $false
+            runtime_ready = $false
+            runtime_admission = "expected-legacy-refusal"
+            expected_installer_exit_code = 2
+            expected_runtime_diagnostic = $Unsupported
+        }
+    }
+    if ($ExitCode -ne 0 -or $Stderr -cmatch [regex]::Escape($Unsupported)) {
+        throw "Current-protocol payload requires positive runtime admission; installer exit was $ExitCode."
+    }
+    return [ordered]@{
+        coverage = "checksum-extraction-and-runtime-readiness"
+        installer_succeeded = $true
+        runtime_ready = $true
+        runtime_admission = "ready"
+        expected_installer_exit_code = 0
+    }
+}
+
+function Test-RuntimeBoundaryEvidence {
+    $Verified = "[ok] SHA-256 checksum verified"
+    $Unsupported = "error: unrecognized subcommand 'runtime'"
+    $Controls = @(
+        @{ version = "0.8.6"; code = 2; stdout = $Verified; stderr = $Unsupported; accepts = $true; ready = $false },
+        @{ version = "0.8.6"; code = 0; stdout = $Verified; stderr = $Unsupported; accepts = $false; ready = $false },
+        @{ version = "0.8.6"; code = 2; stdout = $Verified; stderr = "different failure"; accepts = $false; ready = $false },
+        @{ version = "0.8.6"; code = 2; stdout = ""; stderr = $Unsupported; accepts = $false; ready = $false },
+        @{ version = "0.8.7"; code = 0; stdout = $Verified; stderr = ""; accepts = $true; ready = $true },
+        @{ version = "0.8.7"; code = 2; stdout = $Verified; stderr = $Unsupported; accepts = $false; ready = $false },
+        @{ version = "0.8.7"; code = 0; stdout = $Verified; stderr = $Unsupported; accepts = $false; ready = $false },
+        @{ version = "0.8.7"; code = 1; stdout = $Verified; stderr = "not ready"; accepts = $false; ready = $false },
+        @{ version = "0.8.8"; code = 0; stdout = $Verified; stderr = ""; accepts = $true; ready = $true },
+        @{ version = "unknown"; code = 0; stdout = $Verified; stderr = ""; accepts = $false; ready = $false }
+    )
+    foreach ($Control in $Controls) {
+        $Accepted = $false
+        $Evidence = $null
+        try {
+            $Evidence = Get-RuntimeBoundaryEvidence $Control.version $Control.code $Control.stdout $Control.stderr
+            $Accepted = $true
+        } catch {}
+        if ($Accepted -ne $Control.accepts -or ($Accepted -and $Evidence.runtime_ready -ne $Control.ready)) {
+            throw "Runtime boundary data control failed for $($Control.version), exit $($Control.code)."
+        }
+    }
+    return $Controls.Count
+}
+
 function Invoke-InstallCase {
     param([System.Collections.IDictionary]$Case)
     $Capture = Join-Path $OutputRoot $Case.name
@@ -180,7 +246,8 @@ function Invoke-InstallCase {
         checksum_fixture = $Case.checksum
         checksum_sha256 = if (Test-Path -LiteralPath $Sidecar) { Get-Sha256 $Sidecar } else { $null }
         mirror_uri = $MirrorUri
-        expected_success = $Case.success
+        expected_boundary_success = $Case.success
+        expected_success = $Case.success -and ([version]$Version -ge [version]"0.8.7")
         installer_exit_code = $null
         installed = [ordered]@{}
     }
@@ -214,7 +281,6 @@ function Invoke-InstallCase {
             throw "The installer did not finish within its deadline."
         }
         if ($Case.success) {
-            if ($Child.ExitCode -ne 0) { throw "Valid file mirror install failed with exit $($Child.ExitCode)." }
             foreach ($Name in @("kin.exe", "kin-daemon.exe")) {
                 if (-not $Row.installed.Contains($Name)) { throw "Valid mirror install omitted $Name." }
                 if (
@@ -229,13 +295,16 @@ function Invoke-InstallCase {
                 $Row.installed[$Name]["version_exit_code"] = $VersionResult.ExitCode
                 $Row.installed[$Name]["version_text"] = $VersionResult.Stdout.Trim()
                 $Program = [regex]::Escape(($Name -replace '\.exe$', ''))
+                $ExpectedVersion = [regex]::Escape($Version)
                 if (
                     $VersionResult.TimedOut -or $VersionResult.ExitCode -ne 0 -or
-                    $VersionResult.Stdout.Trim() -cnotmatch "^$Program 0\.8\.6(?: \([^\r\n]*\))?$"
+                    $VersionResult.Stdout.Trim() -cnotmatch "^$Program $ExpectedVersion(?: \([^\r\n]*\))?$"
                 ) {
                     throw "Installed $Name did not report the stable baseline version."
                 }
             }
+            $Evidence = Get-RuntimeBoundaryEvidence $Version $Child.ExitCode $Child.Stdout $Child.Stderr
+            foreach ($Key in $Evidence.Keys) { $Row[$Key] = $Evidence[$Key] }
         } else {
             if ($Child.ExitCode -eq 0) { throw "Invalid mirror install unexpectedly succeeded." }
             if ($Row.installed.Count -ne 0) { throw "Invalid mirror install left installed binaries." }
@@ -271,14 +340,21 @@ $Result = [ordered]@{
     baseline = [ordered]@{ tag = "v0.8.6"; version = $Version; archive_sha256 = $ExpectedArchiveHash }
     installer = [ordered]@{ path = $InstallerPath; sha256 = Get-Sha256 $InstallerPath }
     host_scope = "disposable GitHub-hosted native Windows x86_64 account"
-    scope = "real installer file-mirror/checksum/archive boundaries using stable released bytes; candidate binaries require separate qualification"
+    scope = "real stable checksum/extraction and exact legacy runtime refusal; no legacy readiness claim; current-protocol binaries require separate positive qualification"
+    runtime_protocol_min_version = "0.8.7"
     cases = [System.Collections.Generic.List[object]]::new()
     environment_restored = $false
     user_path_restored = $false
     scratch_removed = $false
 }
 $Succeeded = $false
+$RetainedArchive = $null
+$RetainedArchiveVerified = $false
 try {
+    $Result["runtime_classifier_controls"] = [ordered]@{
+        coverage = "process-data-only"
+        passed = Test-RuntimeBoundaryEvidence
+    }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $SourceArchive = Join-Path $Scratch $ArchiveName
     $SourceChecksum = Join-Path $OutputRoot "$ArchiveName.sha256"
@@ -335,6 +411,18 @@ try {
     if ((Get-Sha256 $InstallerPath) -cne $Result.installer.sha256) {
         throw "Candidate installer bytes changed during the proof."
     }
+    if ($RetainBaselineArchive) {
+        $RetainedArchive = Join-Path $OutputRoot $ArchiveName
+        if (Test-Path -LiteralPath $RetainedArchive) {
+            throw "Refusing to replace an existing retained baseline archive."
+        }
+        Copy-Item -LiteralPath $SourceArchive -Destination $RetainedArchive
+        if ((Get-Sha256 $RetainedArchive) -cne $ExpectedArchiveHash) {
+            throw "Retained baseline archive differs from the reviewed source ZIP."
+        }
+        $RetainedArchiveVerified = $true
+        $Result.source_archive["captured_file"] = $ArchiveName
+    }
     $Succeeded = $true
     $Result.status = "PASS"
 } catch {
@@ -372,7 +460,18 @@ try {
     try {
         Remove-Item -LiteralPath $Scratch -Recurse -Force
         $Result.scratch_removed = $true
-        if ($Result.Contains("source_archive")) { $Result.source_archive.retained = $false }
+        if ($Result.Contains("source_archive")) {
+            $Result.source_archive.retained = $false
+            if ($RetainedArchiveVerified) {
+                if (
+                    -not (Test-Path -LiteralPath $RetainedArchive -PathType Leaf) -or
+                    (Get-Sha256 $RetainedArchive) -cne $ExpectedArchiveHash
+                ) {
+                    throw "Verified retained baseline archive is missing or changed during cleanup."
+                }
+                $Result.source_archive.retained = $true
+            }
+        }
     } catch {
         $CleanupErrors.Add($_.Exception.Message)
     }

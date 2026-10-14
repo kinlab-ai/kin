@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
-"""Exercise candidate installer/setup tooling against reviewed stable binaries.
+"""Exercise candidate proof tooling against reviewed stable setup behaviour.
 
-Run after install.ps1 installs v0.8.6 with KIN_NO_SETUP=1. This script deliberately
-uses only that release's setup, status, doctor and provenance commands. Its
+Prepare genuine v0.8.6 bytes from the independently verified retained release
+archive, then use only that release's setup, status, doctor and provenance commands. Its
 receipt is compatibility-baseline evidence, never candidate-binary qualification.
 Git identity, shell and client configuration changes belong to a disposable
 GitHub-hosted Windows account; persistent accounts are refused.
@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 
 SCHEMA = "kin.release-rehearsal-compat.v1"
 BASELINE = {
@@ -28,6 +29,14 @@ BASELINE = {
     "version": "0.8.6",
     "commit": "522ede0d0dfbdd33ff8ba3a5798bb3bed6902c08",
     "lock_sha256": "9db830e29224527847b5a122e0883a2c9f968d806e34b4bf4d5052c4ceb60495",
+}
+BASELINE_ARCHIVE = {
+    "name": "kin-windows-x86_64.zip",
+    "sha256": "b40bb7d72b2313dceaf806b76c58dd8c7b06cbf62a2a57cdd21d7a31f228e392",
+    "components": {
+        "kin.exe": {"sha256": "5e9729490b7a7bcf7a803d5333fab6476849dc1765d2f5c57deea71ca86249ab", "size_bytes": 105574912},
+        "kin-daemon.exe": {"sha256": "923fbf6d669d6d32fab65a68b3338173af15ef4ea99d43f6d5b589d0882d7696", "size_bytes": 120715776},
+    },
 }
 REQUIRED_HEALTHY = (
     "kin_binary", "kin_daemon_binary", "shell_path", "setup_ledger", "commit_author",
@@ -117,6 +126,56 @@ def binary_info(path: Path) -> dict:
     return {"path": str(path), "sha256": digest(path), "size_bytes": path.stat().st_size}
 
 
+def read_baseline_archive(archive: Path) -> tuple[dict, dict[str, bytes]]:
+    """Recheck the reviewed release bytes without trusting the mirror receipt."""
+    checksum = Path(str(archive) + ".sha256")
+    for path in (archive, checksum):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("baseline archive and sidecar must be regular files")
+    have = digest(archive)
+    if archive.name != BASELINE_ARCHIVE["name"] or have != BASELINE_ARCHIVE["sha256"]:
+        raise ValueError("baseline archive differs from the independently reviewed release")
+    checksum_text = checksum.read_text(encoding="utf-8-sig")
+    if not re.fullmatch(re.escape(have) + r"[ \t]+\*?" + re.escape(archive.name) + r"\r?\n?", checksum_text):
+        raise ValueError("baseline sidecar does not bind the exact reviewed archive hash and name")
+    components = {}
+    with zipfile.ZipFile(archive) as bundle:
+        entries = bundle.infolist()
+        for name, expected in BASELINE_ARCHIVE["components"].items():
+            matches = [entry for entry in entries if entry.filename == name]
+            if len(matches) != 1 or matches[0].is_dir() or ((matches[0].external_attr >> 16) & 0o170000) == 0o120000:
+                raise ValueError(f"baseline archive has no unique regular {name}")
+            body = bundle.read(matches[0])
+            if len(body) != expected["size_bytes"] or hashlib.sha256(body).hexdigest() != expected["sha256"]:
+                raise ValueError(f"baseline archive {name} differs from its reviewed component")
+            components[name] = body
+    return {"name": archive.name, "sha256": have, "checksum_sha256": digest(checksum),
+            "components": dict(BASELINE_ARCHIVE["components"])}, components
+
+
+def prepare_baseline(archive: Path, home: Path) -> dict:
+    """Materialize only a fresh disposable account's known legacy fixture pair."""
+    source, components = read_baseline_archive(archive)
+    root = home / ".kin"
+    bin_dir = root / "bin"
+    if root.is_symlink() or bin_dir.exists() or bin_dir.is_symlink():
+        raise ValueError("legacy baseline preparation refuses an existing or linked account bin directory")
+    bin_dir.mkdir(parents=True, exist_ok=False)
+    installed = {}
+    for name, body in components.items():
+        target = bin_dir / name
+        with target.open("xb") as destination:
+            destination.write(body)
+        info = binary_info(target)
+        if {key: info[key] for key in ("sha256", "size_bytes")} != source["components"][name]:
+            raise ValueError(f"prepared {name} differs from the independently verified release archive")
+        installed[name] = info
+    return {"schema": "kin.legacy-baseline-preparation.v1", "status": "PASS",
+            "coverage": "verified-legacy-archive-materialization", "source_archive": source,
+            "installed": installed, "candidate_installer_invoked": False,
+            "modern_managed_admission": False}
+
+
 def run_command(command: list[str], label: str, output: Path, cwd: Path,
                 env: dict, timeout: int = 120) -> str:
     """Preserve command output and exit evidence before raising on failure."""
@@ -140,7 +199,7 @@ def run_command(command: list[str], label: str, output: Path, cwd: Path,
     return stdout.decode("utf-8-sig").strip()
 
 
-def rehearse(output: Path) -> dict:
+def rehearse(output: Path, baseline_archive: Path) -> dict:
     validate_host(sys.platform, platform.machine(), os.environ)
     # This directory belongs to one invocation. Never overwrite earlier proof.
     output.mkdir(parents=True, exist_ok=False)
@@ -148,18 +207,19 @@ def rehearse(output: Path) -> dict:
         "schema": SCHEMA, "status": "FAIL", "coverage": "compatibility-baseline",
         "baseline": dict(BASELINE), "platform": sys.platform, "architecture": platform.machine(),
         "host_scope": "disposable GitHub-hosted Windows account",
-        "scope": "installed stable CLI/daemon identity and repository-free agent setup; "
+        "scope": "independently verified legacy archive, stable CLI/daemon identity and repository-free agent setup; "
                  "candidate binaries require separate RC Build and preflight qualification",
     }
     try:
         home = Path.home()
+        result["preparation"] = prepare_baseline(baseline_archive, home)
         bin_dir = home / ".kin" / "bin"
         kin = bin_dir / "kin.exe"
         daemon = bin_dir / "kin-daemon.exe"
         work = output / "repo-free"
         work.mkdir()
         # Inherited binary/registry overrides cannot substitute for the real
-        # account install or global Git identity. No new Kin environment keys.
+        # account fixture or global Git identity. No new Kin environment keys.
         env = {key: value for key, value in os.environ.items()
                if not re.match(r"^(?:_?KIN_|GIT_|LD_|DYLD_)", key, re.IGNORECASE)}
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
@@ -251,9 +311,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path,
                         help="new capture directory outside any Git repository")
+    parser.add_argument("--baseline-archive", required=True, type=Path,
+                        help="retained genuine reviewed ZIP with its public .sha256 sidecar")
     args = parser.parse_args()
     try:
-        result = rehearse(args.output.resolve())
+        result = rehearse(args.output.resolve(), args.baseline_archive.resolve())
     except Exception as error:
         print(f"Compatibility baseline failed: {error}", file=sys.stderr)
         return 1

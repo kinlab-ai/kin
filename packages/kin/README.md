@@ -95,37 +95,44 @@ runs agent setup and graph-backed MCP tool calls there too. WSL2 remains the rec
 path for the full Kin experience, so run agent setup inside WSL2. The PowerShell installer
 makes the same call and does not run setup at all.
 
-## Version pinning
+## One managed runtime
 
-Every `@kinlab/kin` release pins one managed `kin` release: its own package version.
-The pin is the oldest release the launcher runs. The launcher starts one extra process
-to check the installed executable's version, even if a receipt from an earlier
-installation exists. Updating Kin through another installer cannot make that old
-receipt authorize a downgrade or hide a needed upgrade.
+Ordinary npm, installer and compatibility MCP launches use the same native pair
+at `$KIN_HOME/bin` (`$KIN_DIR` is the compatibility alias; the default is `~/.kin`).
+Before serving, the launcher reads `kin runtime status --json` and requires a clean
+CLI and daemon with matching source commit, target and build profile. Equal version
+strings or an old launcher stamp do not certify a pair. A missing daemon or a
+differing pair stops with a repair instruction instead of selecting another binary
+from PATH or a cache.
 
-Each run compares that pin against whatever is already installed at `$KIN_HOME`:
+The package version is the minimum supported runtime. An older managed install is
+updated through its own `kin update --apply` transaction when it supports the
+runtime contract. Legacy releases without that contract use a privately staged
+latest official stable release that meets the package minimum. Its native bootstrap
+independently verifies published provenance
+and commits the existing installation through the same native transaction. The
+wrapper binds the official tag's source commit, archive checksum and platform;
+it reports success only after the installed pair certifies that exact identity.
+An incomplete migration retains its private stage and reports recovery or restart
+as pending. npm and the installer do not replace an existing CLI and daemon
+separately. A newer certified pair is reused. `KIN_LAUNCHER_ADOPT` is refused
+because it would bypass that shared update authority.
 
-- **installed is older than the pin**: upgrades it automatically (a one-line notice
-  on stderr, no prompt, no opt-in required).
-- **installed is newer than the pin**: runs the newer install. This is what `kin update`
-  and the shell installer leave behind, since they move `$KIN_HOME` forward without
-  touching the npm package. The first run prints a one-line notice on stderr and
-  records the version it confirmed, so later runs are quiet until it changes again.
-  `npm install -g @kinlab/kin@latest` brings the launcher forward too.
-- **installed matches the pin**: runs it as-is.
-
-`KIN_LAUNCHER_ADOPT=1` always forces a fresh provision of the pinned release, even when
-the installed version already matches or is newer. That is the one way to go back to an
-older release on purpose.
+Explicit development selections stay separate: `KIN_MANAGED_BIN` points at a
+chosen binary and disables provisioning. The owner of that selection is responsible
+for its matching daemon. Development binaries are not silently registered as the
+normal managed install. Development launches derive a private Kin home and remove
+inherited normal-home values. To supply an isolated home yourself, set
+`KIN_RUNTIME_MODE=development` together with that separate `KIN_HOME`.
 
 ## Environment
 
 | Variable | Effect |
 | --- | --- |
 | `KIN_HOME` | Root of the managed install (default `~/.kin`). |
-| `KIN_MANAGED_BIN` | Explicit path to a `kin` binary; disables provisioning entirely. |
-| `KIN_NO_PROVISION=1` | Never touch the network; fail loud if no binary is present. |
-| `KIN_LAUNCHER_ADOPT=1` | Force re-provisioning to the pinned release, including over a newer install, which is a deliberate downgrade. |
+| `KIN_DIR` | Compatibility alias, used only when `KIN_HOME` is unset. |
+| `KIN_MANAGED_BIN` | Explicit development binary; disables provisioning. |
+| `KIN_NO_PROVISION=1` | Resolve and certify an existing pair without network access. |
 
 ## MCP setup
 
