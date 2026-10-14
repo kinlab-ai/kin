@@ -3967,6 +3967,23 @@ fn run() -> Result<()> {
             return commands::runtime::run_identity_probe();
         }
     }
+    if typed_command_path(&startup_args).as_slice() == ["registry", "authority"] {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::Registry {
+            action:
+                Some(RegistryAction::Authority {
+                    json,
+                    fix: false,
+                    initialize: false,
+                }),
+        } = cli.command
+        {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(commands::registry::authority(json, false, false));
+        }
+    }
     let runtime_mode = commands::runtime::prepare_environment()?;
     // Raise this process's open-file soft limit before anything opens a file.
     // macOS ships that limit at 256, which is below what one admission needs,
@@ -4067,11 +4084,6 @@ fn run() -> Result<()> {
                 &cli.command,
                 Command::Doctor { fix: true, .. }
                     | Command::Doctor {
-                        install_language_servers: true,
-                        ..
-                    }
-                    | Command::Doctor { heal: true, .. }
-                    | Command::Doctor {
                         reclaim_staging: true,
                         ..
                     }
@@ -4095,7 +4107,6 @@ fn run() -> Result<()> {
                 | Command::SemanticOnlyGuard
                 | Command::Doctor {
                     fix: false,
-                    install_language_servers: false,
                     heal: false,
                     reclaim_staging: false,
                     ..

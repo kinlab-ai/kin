@@ -198,19 +198,24 @@ pub async fn fetch_spine_impact_typed_at(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(
+    let request = crate::daemon_delegate::with_auth(
         client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
     )
     .query(&[
         ("repo", repo_id),
         ("entity", &entity_id.to_string()),
         ("depth", &depth.to_string()),
-    ])
-    .send()
+    ]);
+    let resp = match crate::daemon_delegate::send_admitted_daemon_request(
+        "spine impact",
+        daemon_url,
+        request,
+        std::time::Duration::from_secs(10),
+    )
     .await
     {
         Ok(resp) => resp,
-        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e}")),
+        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e:?}")),
     };
 
     match classify_spine_probe(true, Some(resp.status().as_u16())) {
@@ -254,15 +259,20 @@ pub async fn fetch_spine_xref_at(
         Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
     };
 
-    let resp = match crate::daemon_delegate::with_auth(
+    let request = crate::daemon_delegate::with_auth(
         client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
     )
-    .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
-    .send()
+    .query(&[("repo", repo_id), ("entity", &entity_id.to_string())]);
+    let resp = match crate::daemon_delegate::send_admitted_daemon_request(
+        "spine xref",
+        daemon_url,
+        request,
+        std::time::Duration::from_secs(10),
+    )
     .await
     {
         Ok(resp) => resp,
-        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e}")),
+        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e:?}")),
     };
 
     match classify_spine_probe(true, Some(resp.status().as_u16())) {

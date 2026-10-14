@@ -20028,12 +20028,38 @@ mod tests {
 
     #[tokio::test]
     async fn post_install_refresh_requires_an_available_enrichment_channel() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use super::{request_post_install_sweep, PostInstallDaemonRefresh};
         use axum::{
             http::StatusCode,
             routing::{get, post},
             Router,
         };
+
+        let fixture = tempfile::tempdir().expect("isolated post-install sweep fixture");
+        let home = fixture.path().join("home");
+        let kin_home = fixture.path().join("kin-home");
+        let repo = fixture.path().join("repo");
+        for directory in [&home, &kin_home, &repo] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let _environment = kin_core::test_env::EnvVarGuard::set("HOME", &home)
+            .with("USERPROFILE", &home)
+            .with("KIN_HOME", &kin_home)
+            .with("KIN_RUNTIME_MODE", "development")
+            .with("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+            .without("KIN_DIR")
+            .without("KIN_STORE")
+            .without("KIN_STORE_LAYOUT")
+            .without("KIN_SESSION_ID")
+            .without("KIN_DAEMON_URL");
+        let layout = kin_core::init(&repo)
+            .expect("initialize the sweep fixture's real repository")
+            .layout;
+        let binding = kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&layout)
+            .expect("capture the sweep fixture's actual repository");
 
         let cases = [
             (
@@ -20067,8 +20093,12 @@ mod tests {
                 .await
                 .expect("bind isolated response fixture");
             let address = listener.local_addr().unwrap();
-            let identity = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
-                .expect("the test runner provides an existing isolated Kin home");
+            let mut identity =
+                kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+                    .expect("the test runner provides an existing isolated Kin home");
+            identity.repository = Some(binding.identity().clone());
+            let sweeps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_sweeps = sweeps.clone();
             let app = Router::new()
                 .route(
                     "/runtime/identity",
@@ -20079,19 +20109,22 @@ mod tests {
                 )
                 .route(
                     "/lsp/sweep",
-                    post(move || async move { (status, axum::Json(body)) }),
+                    post(move || async move {
+                        observed_sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (status, axum::Json(body))
+                    }),
                 );
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let client = crate::daemon_client::DaemonClient::from_base_url_with_explicit_authority(
+            let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(
                 format!("http://{address}"),
-                None,
-                None,
+                &layout,
             )
             .unwrap();
             let observed = request_post_install_sweep(&client).await;
             server.abort();
+            assert_eq!(sweeps.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(observed, expected);
             let message = observed.message().expect("a running daemon has a notice");
             if expected == PostInstallDaemonRefresh::SweepRequested {

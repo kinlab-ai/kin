@@ -283,12 +283,12 @@ fn runtime_status_ignores_empty_home_before_kin_dir() {
 }
 
 #[test]
-fn development_cli_refuses_setup_doctor_repair_and_update_mutations() {
+fn development_cli_refuses_global_setup_doctor_repair_and_update_mutations() {
     let fixture = Fixture::new();
     for args in [
         vec!["setup"],
         vec!["doctor", "--fix"],
-        vec!["doctor", "--heal"],
+        vec!["doctor", "--reclaim-staging"],
         vec!["setup", "doctor", "--install-language-servers"],
         vec!["update", "--apply"],
         vec!["update", "--cleanup-windows-worker", "unused-handoff.json"],

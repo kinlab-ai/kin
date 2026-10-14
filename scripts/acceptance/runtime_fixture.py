@@ -17,6 +17,7 @@ import urllib.request
 
 
 IDENTITY_HEADER = "x-kin-runtime-identity"
+REPOSITORY_IDENTITY_HEADER = "x-kin-repository-identity"
 IDENTITY_FIELDS = (
     "version", "commit_sha", "source_dirty", "source_known", "target", "build_profile",
 )
@@ -88,6 +89,51 @@ def runtime_namespace(kin_home):
         os.close(descriptor)
 
 
+def repository_fingerprint(repository):
+    """Match the native repository claim's independently pinned wire digest."""
+    if not isinstance(repository, dict):
+        raise ValueError("local runtime has no repository claim")
+    fields = [repository.get(key) for key in ("repository_id", "store_namespace")]
+    if any(not isinstance(value, str) or not value.strip() for value in fields):
+        raise ValueError("local runtime repository claim lacks a nonempty identity")
+    wire = json.dumps(["kin.runtime-repository.v1", *fields], ensure_ascii=False,
+                      separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(wire).hexdigest()
+
+
+def _selected_repository_identity(kin, env, cwd):
+    """Read only the selected fixture's store config, never adopt a peer's root."""
+    selected_cwd = Path(cwd or os.getcwd()).resolve(strict=True)
+    layout = _probe([str(kin), "store", "path", "--json"], env, str(selected_cwd))
+    store = layout.get("store") if isinstance(layout, dict) else None
+    if (not isinstance(layout, dict) or layout.get("schema") != "kin.store-path.v1"
+            or not isinstance(store, str) or not store
+            or not isinstance(layout.get("working_dir"), str)
+            or Path(layout["working_dir"]).resolve(strict=True) != selected_cwd):
+        raise ValueError("selected CLI did not bind the intended fixture repository store")
+    store = Path(store)
+    descriptor = os.open(store, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        retained = os.fstat(descriptor)
+        namespace = runtime_namespace(store)
+        observed = store.stat()
+        if (observed.st_dev, observed.st_ino) != (retained.st_dev, retained.st_ino):
+            raise ValueError("selected fixture store changed before manifest capture")
+        manifest_descriptor = os.open("manifest.json", os.O_RDONLY, dir_fd=descriptor)
+        with os.fdopen(manifest_descriptor, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        repository = {"repository_id": manifest.get("repo_id") if isinstance(manifest, dict) else None,
+                      "store_namespace": namespace}
+        repository_fingerprint(repository)
+        current = store.stat()
+        if (runtime_namespace(store) != namespace
+                or (current.st_dev, current.st_ino) != (retained.st_dev, retained.st_ino)):
+            raise ValueError("selected fixture store changed during manifest capture")
+        return repository
+    finally:
+        os.close(descriptor)
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -154,12 +200,18 @@ def prepare_runtime_fixture(kin, daemon, env, kin_home):
 
 
 def native_request_headers(kin, env, endpoint, token=None, cwd=None, timeout=5):
-    """Bind a positive local request to an independently probed CLI identity."""
+    """Pin source, home and the intended repository before a local request."""
     address = urllib.parse.urlsplit(endpoint)
     if address.scheme != "http" or address.hostname not in ("127.0.0.1", "::1", "localhost"):
         raise ValueError("native runtime headers are only for controlled loopback services")
     expected = selected_cli_identity(kin, env, cwd)
     namespace = runtime_namespace(env["KIN_HOME"])
+    path = address.path
+    if path.startswith("/v2/"):
+        path = path[3:]
+    diagnostic = path in ("/health", "/ready", "/readiness", "/auth/rotation",
+                          "/runtime/identity")
+    repository = None if diagnostic else _selected_repository_identity(kin, env, cwd)
     headers = {"Authorization": "Bearer " + token} if token else {}
     identity_url = urllib.parse.urlunsplit((address.scheme, address.netloc,
                                           "/runtime/identity", "", ""))
@@ -176,6 +228,14 @@ def native_request_headers(kin, env, endpoint, token=None, cwd=None, timeout=5):
     if service.get("namespace") != namespace or runtime_namespace(env["KIN_HOME"]) != namespace:
         raise ValueError("native service uses a different or replaced fixture namespace")
     headers[IDENTITY_HEADER] = runtime_fingerprint(expected, mode, namespace)
+    if not diagnostic:
+        claimed = service.get("repository")
+        repository_fingerprint(claimed)
+        if claimed != repository:
+            raise ValueError("native service uses a different fixture repository or store")
+        if _selected_repository_identity(kin, env, cwd) != repository:
+            raise ValueError("intended fixture repository or store changed during metadata capture")
+        headers[REPOSITORY_IDENTITY_HEADER] = repository_fingerprint(repository)
     return headers
 
 
@@ -186,4 +246,5 @@ def fixture_daemon_metadata(kin, env, cwd=None):
         raise ValueError("unsupported fixture runtime mode")
     return {"schema": "kin.runtime-service.v1", "component": "daemon",
             "identity": selected_cli_identity(kin, env, cwd), "mode": mode,
-            "namespace": runtime_namespace(env["KIN_HOME"]), "pid": os.getpid()}
+            "namespace": runtime_namespace(env["KIN_HOME"]), "pid": os.getpid(),
+            "repository": _selected_repository_identity(kin, env, cwd) if cwd is not None else None}

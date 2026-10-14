@@ -530,23 +530,97 @@ mod tests {
         }
     }
 
-    /// A stand-in daemon that answers `/mcp/tools/call` with `answer` and
-    /// records each call it was sent. Every other route is a 404, which the
-    /// server path reads as a daemon with nothing to add.
-    async fn stand_in_daemon(answer: ToolCallResult) -> (String, Arc<Mutex<Vec<Value>>>) {
+    struct LocalMcpRepositoryBinding {
+        original_dir: std::path::PathBuf,
+    }
+
+    impl LocalMcpRepositoryBinding {
+        fn new(layout: &kin_core::layout::KinLayout) -> Self {
+            crate::daemon_client::install_spawn_registrar();
+            let binding = Self {
+                original_dir: std::env::current_dir().expect("the original working directory"),
+            };
+            std::env::set_current_dir(layout.working_dir())
+                .expect("bind the routed call to its isolated repository");
+            let discovered = kin_core::layout::KinLayout::discover(
+                &std::env::current_dir().expect("the isolated working directory"),
+            )
+            .expect("discover the real isolated repository");
+            assert_eq!(
+                discovered.root().canonicalize().unwrap(),
+                layout.root().canonicalize().unwrap(),
+                "the embedded MCP dispatcher must discover this fixture's store"
+            );
+            binding
+        }
+    }
+
+    impl Drop for LocalMcpRepositoryBinding {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original_dir)
+                .expect("restore the original working directory");
+        }
+    }
+
+    /// A stand-in daemon admitted for the isolated repository that answers
+    /// `/mcp/tools/call` with `answer` and records each call it was sent.
+    /// Other optional routes return 404 without adding to the answer.
+    async fn stand_in_daemon(
+        answer: ToolCallResult,
+        layout: &kin_core::layout::KinLayout,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&calls);
-        let app = axum::Router::new().route(
-            "/mcp/tools/call",
-            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
-                let recorded = Arc::clone(&recorded);
-                let answer = answer.clone();
-                async move {
-                    recorded.lock().unwrap().push(body);
-                    axum::Json(answer)
-                }
-            }),
+        let mut identity = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+            .expect("the fixture's actual development runtime identity");
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(layout)
+                .expect("the fixture's actual repository binding")
+                .identity()
+                .clone(),
         );
+        let health = json!({
+            "status": "ok",
+            "version": identity.identity.version,
+            "uptime_seconds": 0,
+            "graph_entity_count": 0,
+            "graph_loaded": true,
+            "reconciliation_status": "idle",
+            "repo_root": layout.working_dir().canonicalize().unwrap(),
+            "pid": std::process::id(),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(identity) }
+                }),
+            )
+            .route(
+                "/readiness",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"ready": true, "warming": false}))
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let health = health.clone();
+                    async move { axum::Json(health) }
+                }),
+            )
+            .route(
+                "/mcp/tools/call",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let recorded = Arc::clone(&recorded);
+                    let answer = answer.clone();
+                    async move {
+                        recorded.lock().unwrap().push(body);
+                        axum::Json(answer)
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
@@ -565,10 +639,30 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn kin_call_runs_the_named_tool_through_the_routed_call() {
-        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
-        let _session = EnvVarGuard::unset("KIN_SESSION_ID");
+        let fixture = tempfile::tempdir().expect("an isolated routed-call fixture");
+        let home = fixture.path().join("home");
+        let kin_home = fixture.path().join("kin-home");
+        let repo = fixture.path().join("repo");
+        for directory in [&home, &kin_home, &repo] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let _environment = EnvVarGuard::set("HOME", &home)
+            .with("USERPROFILE", &home)
+            .with("KIN_HOME", &kin_home)
+            .with("KIN_RUNTIME_MODE", "development")
+            .with("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+            .with("KIN_NO_DAEMON", "1")
+            .without("KIN_DIR")
+            .without("KIN_STORE")
+            .without("KIN_MCP_REPO")
+            .without("KIN_SESSION_ID");
+        let layout = kin_core::init(&repo)
+            .expect("initialize the real isolated repository")
+            .layout;
+        let _repository = LocalMcpRepositoryBinding::new(&layout);
         let payload = json!({"entities": [], "note": "read one body with get_entity_source"});
-        let (url, calls) = stand_in_daemon(ToolCallResult::text(payload.to_string())).await;
+        let (url, calls) =
+            stand_in_daemon(ToolCallResult::text(payload.to_string()), &layout).await;
         let _daemon = EnvVarGuard::set("KIN_DAEMON_URL", &url);
         let config = shell_config();
 
@@ -581,7 +675,7 @@ mod tests {
         );
         let answer = send(&request, &config).await.expect("an answer");
         let sent = calls.lock().unwrap().clone();
-        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent.len(), 1, "{sent:?}; answer: {}", answer.text);
         assert_eq!(sent[0]["name"], "graph_neighborhood");
         assert_eq!(sent[0]["arguments"]["entity_id"], "e1");
         assert_eq!(sent[0]["arguments"]["depth"], 2);
@@ -590,8 +684,11 @@ mod tests {
         assert_eq!(answered["note"], "read one body with kin source");
         assert!(answered.get(kin_mcp::ENVELOPE_KEY).is_some(), "{answered}");
 
-        let (url, _) =
-            stand_in_daemon(ToolCallResult::error("no entity exists with this ID")).await;
+        let (url, _) = stand_in_daemon(
+            ToolCallResult::error("no entity exists with this ID"),
+            &layout,
+        )
+        .await;
         let _daemon = EnvVarGuard::set("KIN_DAEMON_URL", &url);
         let answer = send(&request, &config).await.expect("an answer");
         assert!(answer.is_error, "{}", answer.text);

@@ -12,8 +12,10 @@ import urllib.request
 from unittest.mock import patch
 
 from runtime_fixture import (BUILD_FIELDS, IDENTITY_FIELDS, IDENTITY_HEADER,
+                             REPOSITORY_IDENTITY_HEADER, fixture_daemon_metadata,
                              native_request_headers, prepare_runtime_fixture,
-                             runtime_fingerprint, runtime_namespace)
+                             repository_fingerprint, runtime_fingerprint,
+                             runtime_namespace)
 
 
 IDENTITY = dict(zip(IDENTITY_FIELDS, (
@@ -36,6 +38,11 @@ class RuntimeFixtureTests(unittest.TestCase):
         self.env = {}
         self.identity = copy.deepcopy(IDENTITY)
         self.commands = []
+        self.repo = self.root / "fixture-repo"
+        self.repo.mkdir()
+        self.store = self.root / "selected-store"
+        self.store.mkdir()
+        (self.store / "manifest.json").write_text(json.dumps({"repo_id": "legacy/名"}))
 
     def probe(self, command, env, cwd=None):
         self.commands.append(command)
@@ -44,6 +51,10 @@ class RuntimeFixtureTests(unittest.TestCase):
                         schema="kin.runtime-build-identity.v1")
         if "--compat-json" in command:
             return {"runtime_identity": self.identity}
+        if command[1:] == ["store", "path", "--json"]:
+            self.assertEqual(cwd, str(self.repo))
+            return {"schema": "kin.store-path.v1", "store": str(self.store),
+                    "working_dir": str(self.repo), "external": True}
         self.assertEqual(command[1:], ["runtime", "status", "--json"])
         self.assertEqual(env["KIN_HOME"], str(self.home))
         self.assertEqual(env["KIN_RUNTIME_MODE"], "managed")
@@ -112,16 +123,23 @@ class RuntimeFixtureTests(unittest.TestCase):
         self.home.mkdir(exist_ok=True)
         return dict({"schema": "kin.runtime-service.v1", "component": "daemon",
                      "identity": self.identity, "mode": "managed", "pid": 1,
-                     "namespace": runtime_namespace(self.home)}, **overrides)
+                     "namespace": runtime_namespace(self.home),
+                     "repository": {"repository_id": "legacy/名",
+                                    "store_namespace": runtime_namespace(self.store)}}, **overrides)
 
-    def headers(self, service):
+    def headers(self, service, endpoint="/lsp/sweep/status", on_metadata=None):
+        def reply(*args, **kwargs):
+            if on_metadata:
+                on_metadata()
+            return io.BytesIO(json.dumps(service).encode())
+
         with patch("runtime_fixture._probe", side_effect=self.probe), \
                 patch("runtime_fixture.urllib.request.urlopen",
-                      return_value=io.BytesIO(json.dumps(service).encode())) as opened:
+                      side_effect=reply) as opened:
             headers = native_request_headers(self.cli, {"KIN_RUNTIME_MODE": "managed",
                                                        "KIN_HOME": str(self.home)},
-                                             "http://127.0.0.1:12345/lsp/sweep/status",
-                                             token="fixture-token")
+                                             "http://127.0.0.1:12345" + endpoint,
+                                             token="fixture-token", cwd=self.repo)
         self.assertEqual(opened.call_args.args[0].full_url,
                          "http://127.0.0.1:12345/runtime/identity")
         return headers
@@ -131,8 +149,105 @@ class RuntimeFixtureTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer fixture-token")
         self.assertEqual(headers[IDENTITY_HEADER], runtime_fingerprint(
             IDENTITY, "managed", runtime_namespace(self.home)))
+        self.assertEqual(headers[REPOSITORY_IDENTITY_HEADER], repository_fingerprint(
+            {"repository_id": "legacy/名", "store_namespace": runtime_namespace(self.store)}))
         self.assertEqual(self.commands[0][1:],
                          ["bench-meta", "--json", "--runtime-identity-only"])
+
+    def test_repository_fingerprint_matches_independent_utf8_wire_vector(self):
+        claim = {"store_namespace": "namespace-token", "repository_id": "legacy/名"}
+        # Fixed bytes hashed independently of this helper's JSON serializer.
+        expected = "ce6ab8d12b725df66b4fd95d79f8da5b281e9ece8c2f267abc2ae6346d9cee30"
+        self.assertEqual(repository_fingerprint(claim), expected)
+        for altered in (dict(claim, repository_id="other"), dict(claim, store_namespace="other")):
+            self.assertNotEqual(repository_fingerprint(altered), expected)
+
+    def test_protected_headers_refuse_absent_malformed_or_swapped_repository_claim(self):
+        for claim in (None, {}, {"repository_id": "legacy/名"},
+                      {"repository_id": "", "store_namespace": "x"},
+                      {"repository_id": 1, "store_namespace": "x"},
+                      {"repository_id": "other", "store_namespace": runtime_namespace(self.store)},
+                      {"repository_id": "legacy/名", "store_namespace": "other-native-store"}):
+            with self.subTest(claim=claim), self.assertRaises(ValueError):
+                self.headers(self.service(repository=claim))
+
+    def test_selected_manifest_identity_must_be_present_nonempty_string(self):
+        for manifest in ({}, {"repo_id": ""}, {"repo_id": "   "}, {"repo_id": 1}):
+            (self.store / "manifest.json").write_text(json.dumps(manifest))
+            self.home.mkdir(exist_ok=True)
+            env = {"KIN_HOME": str(self.home), "KIN_RUNTIME_MODE": "managed"}
+            with self.subTest(manifest=manifest), patch("runtime_fixture._probe", side_effect=self.probe), \
+                    patch("runtime_fixture.urllib.request.urlopen") as opened:
+                with self.assertRaises(ValueError):
+                    native_request_headers(self.cli, env, "http://127.0.0.1:12345/locate", cwd=self.repo)
+            opened.assert_not_called()
+
+    def test_store_config_change_during_metadata_is_refused(self):
+        def replace_manifest():
+            (self.store / "manifest.json").write_text(json.dumps({"repo_id": "changed"}))
+        with self.assertRaisesRegex(ValueError, "changed during metadata"):
+            self.headers(self.service(), on_metadata=replace_manifest)
+
+    def test_same_repo_id_with_replaced_native_store_during_metadata_is_refused(self):
+        def replace_store():
+            self.store.rename(self.root / "retained-original-store")
+            self.store.mkdir()
+            (self.store / "manifest.json").write_text(json.dumps({"repo_id": "legacy/名"}))
+        with self.assertRaisesRegex(ValueError, "changed during metadata"):
+            self.headers(self.service(), on_metadata=replace_store)
+
+    def test_store_replacement_during_anchored_manifest_read_is_refused(self):
+        import os
+        original_fdopen = os.fdopen
+
+        def replace_before_read(descriptor, *args, **kwargs):
+            self.store.rename(self.root / "retained-manifest-store")
+            self.store.mkdir()
+            (self.store / "manifest.json").write_text(json.dumps({"repo_id": "other"}))
+            return original_fdopen(descriptor, *args, **kwargs)
+
+        self.home.mkdir()
+        env = {"KIN_HOME": str(self.home), "KIN_RUNTIME_MODE": "managed"}
+        with patch("runtime_fixture._probe", side_effect=self.probe), \
+                patch("runtime_fixture.os.fdopen", side_effect=replace_before_read), \
+                patch("runtime_fixture.urllib.request.urlopen") as opened:
+            with self.assertRaisesRegex(ValueError, "changed during manifest"):
+                native_request_headers(self.cli, env, "http://127.0.0.1:12345/locate", cwd=self.repo)
+        opened.assert_not_called()
+
+    def test_selected_cli_must_bind_the_intended_working_directory(self):
+        self.home.mkdir()
+        env = {"KIN_HOME": str(self.home), "KIN_RUNTIME_MODE": "managed"}
+
+        def wrong_directory(command, env, cwd=None):
+            value = self.probe(command, env, cwd)
+            if "store" in command:
+                value["working_dir"] = str(self.root)
+            return value
+
+        with patch("runtime_fixture._probe", side_effect=wrong_directory), \
+                patch("runtime_fixture.urllib.request.urlopen") as opened:
+            with self.assertRaisesRegex(ValueError, "intended fixture repository"):
+                native_request_headers(self.cli, env, "http://127.0.0.1:12345/locate", cwd=self.repo)
+        opened.assert_not_called()
+
+    def test_warming_diagnostics_do_not_fabricate_repository_pin(self):
+        for endpoint in ("/health", "/ready", "/readiness", "/auth/rotation", "/runtime/identity",
+                         "/v2/health", "/v2/runtime/identity"):
+            with self.subTest(endpoint=endpoint):
+                self.commands.clear()
+                headers = self.headers(self.service(repository=None), endpoint)
+                self.assertIn(IDENTITY_HEADER, headers)
+                self.assertNotIn(REPOSITORY_IDENTITY_HEADER, headers)
+                self.assertEqual(len(self.commands), 1)
+
+    def test_fixture_peer_metadata_uses_the_selected_actual_store_claim(self):
+        self.home.mkdir()
+        env = {"KIN_RUNTIME_MODE": "managed", "KIN_HOME": str(self.home)}
+        with patch("runtime_fixture._probe", side_effect=self.probe):
+            metadata = fixture_daemon_metadata(self.cli, env, cwd=self.repo)
+        self.assertEqual(metadata["repository"], {"repository_id": "legacy/名",
+                                                "store_namespace": runtime_namespace(self.store)})
 
     def test_header_refuses_wrong_build_mode_namespace_or_hosted_component(self):
         for service in (self.service(identity=dict(IDENTITY, version="0.8.6")),
@@ -163,7 +278,10 @@ class RuntimeFixtureTests(unittest.TestCase):
         with DaemonStub(200, {}, runtime_metadata=service) as peer:
             url = peer.url + "/mcp/tools/call"
             body = json.dumps({"name": "semantic_locate"}).encode()
-            for headers in ({}, {IDENTITY_HEADER: "wrong-generation"}):
+            correct_runtime = runtime_fingerprint(IDENTITY, "managed", runtime_namespace(self.home))
+            for headers in ({}, {IDENTITY_HEADER: "wrong-generation"},
+                            {IDENTITY_HEADER: correct_runtime},
+                            {IDENTITY_HEADER: correct_runtime, REPOSITORY_IDENTITY_HEADER: "wrong-repository"}):
                 request = urllib.request.Request(url, data=body, headers=headers)
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(request, timeout=5)
@@ -171,7 +289,7 @@ class RuntimeFixtureTests(unittest.TestCase):
                 error.exception.close()
                 self.assertEqual(peer.handler_calls, 0)
             with patch("runtime_fixture._probe", side_effect=self.probe):
-                headers = native_request_headers(self.cli, env, url)
+                headers = native_request_headers(self.cli, env, url, cwd=self.repo)
             request = urllib.request.Request(url, data=body, headers=headers)
             with urllib.request.urlopen(request, timeout=5) as response:
                 self.assertEqual(response.status, 200)

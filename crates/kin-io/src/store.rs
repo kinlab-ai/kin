@@ -21,6 +21,14 @@ pub struct StoreDir {
 }
 
 impl StoreDir {
+    /// Adopt a directory capability the caller already retains, without
+    /// reopening the mutable path naming it.
+    pub fn from_retained_directory(root: &Path, directory: cap_std::fs::Dir) -> Self {
+        Self {
+            inner: Confined::from_retained_directory(root, directory),
+        }
+    }
+
     /// Open the store directory at `root`.
     pub fn open(root: &Path, grant: &Grant) -> io::Result<Self> {
         Ok(Self {

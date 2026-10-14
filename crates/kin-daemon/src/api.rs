@@ -2028,9 +2028,47 @@ async fn runtime_identity_for(
     Json<kin_core::runtime_identity::RuntimeServiceIdentity>,
     (StatusCode, String),
 > {
-    kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
-        .map(Json)
-        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))
+    runtime_identity_for_repository(component, None).await
+}
+
+async fn runtime_identity_for_repository(
+    component: &'static str,
+    repository: Option<kin_core::runtime_identity::RuntimeRepositoryBinding>,
+) -> std::result::Result<
+    Json<kin_core::runtime_identity::RuntimeServiceIdentity>,
+    (StatusCode, String),
+> {
+    let mut identity = kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    if let Some(repository) = repository {
+        repository
+            .revalidate()
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+        identity.repository = Some(repository.identity().clone());
+    }
+    Ok(Json(identity))
+}
+
+fn local_runtime_repository_binding(
+    state: &DaemonState,
+) -> std::result::Result<kin_core::runtime_identity::RuntimeRepositoryBinding, String> {
+    let backend = state
+        .local_repository_backend()
+        .ok_or_else(|| "local daemon has no retained startup storage authority".to_string())?;
+    let repository_id = RepositoryId::new(state.cached_repo_id.clone())
+        .map_err(|error| format!("local daemon startup repository identity is invalid: {error}"))?;
+    kin_core::revalidate_pinned_local_namespace(&backend, &repository_id)
+        .map_err(|refusal| refusal.into_error().to_string())?;
+    let binding = kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&state.layout)?;
+    if binding.identity().repository_id != state.cached_repo_id {
+        return Err(
+            "selected store identity differs from the daemon's retained startup repository".into(),
+        );
+    }
+    kin_core::revalidate_pinned_local_namespace(&backend, &repository_id)
+        .map_err(|refusal| refusal.into_error().to_string())?;
+    binding.revalidate()?;
+    Ok(binding)
 }
 
 #[derive(Clone)]
@@ -2038,6 +2076,7 @@ struct RuntimeRequestPolicy {
     require_identity: bool,
     local: bool,
     namespace: Option<kin_core::runtime_identity::RuntimeNamespace>,
+    repository: Option<kin_core::runtime_identity::RuntimeRepositoryBinding>,
 }
 
 async fn validate_runtime_request(
@@ -2074,6 +2113,9 @@ async fn validate_runtime_request(
     {
         return (StatusCode::CONFLICT, "managed semantic requests require the exact runtime identity header; restart the CLI or MCP client using the selected managed runtime").into_response();
     }
+    let has_runtime_claim = request
+        .headers()
+        .contains_key(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER);
     if let Some(claim) = request
         .headers()
         .get(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
@@ -2093,6 +2135,26 @@ async fn validate_runtime_request(
             return (StatusCode::CONFLICT, "runtime generation changed or differs from the caller; reconnect using the same managed CLI and daemon").into_response();
         }
     }
+    if policy.local && !diagnostic && (policy.require_identity || has_runtime_claim) {
+        let Some(repository) = policy.repository.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected local repository identity could not be captured",
+            )
+                .into_response();
+        };
+        if let Err(error) = repository.revalidate() {
+            return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
+        }
+        let expected = repository.fingerprint();
+        let claim = request
+            .headers()
+            .get(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER)
+            .and_then(|value| value.to_str().ok());
+        if claim != Some(expected.as_str()) {
+            return (StatusCode::CONFLICT, "repository identity changed or differs from the caller; reconnect using the intended repository").into_response();
+        }
+    }
     next.run(request).await
 }
 
@@ -2106,6 +2168,11 @@ mod runtime_identity_tests {
     async fn legacy_and_wrong_source_requests_never_reach_the_semantic_handler() {
         let home = tempfile::tempdir().unwrap();
         let namespace = kin_core::runtime_identity::RuntimeNamespace::capture(home.path()).unwrap();
+        let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::capture(
+            &uuid::Uuid::new_v4().to_string(),
+            home.path(),
+        )
+        .unwrap();
         let reached = Arc::new(AtomicUsize::new(0));
         let marker = Arc::clone(&reached);
         let app = Router::new()
@@ -2124,6 +2191,7 @@ mod runtime_identity_tests {
                     require_identity: true,
                     local: true,
                     namespace: Some(namespace.clone()),
+                    repository: Some(repository.clone()),
                 },
                 validate_runtime_request,
             ));
@@ -2132,6 +2200,10 @@ mod runtime_identity_tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/semantic")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
+                    )
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2155,6 +2227,10 @@ mod runtime_identity_tests {
                         kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
                         wrong_source.fingerprint(mode, namespace.token()),
                     )
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
+                    )
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2170,6 +2246,10 @@ mod runtime_identity_tests {
                         kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
                         kin_core::runtime_identity::RuntimeIdentity::current()
                             .fingerprint(mode, namespace.token()),
+                    )
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -2193,6 +2273,11 @@ mod runtime_identity_tests {
             kin_core::runtime_identity::RuntimeNamespace::capture(&other_home).unwrap();
         let identity = kin_core::runtime_identity::RuntimeIdentity::current();
         let mode = kin_core::runtime_identity::RuntimeMode::current().unwrap();
+        let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::capture(
+            &uuid::Uuid::new_v4().to_string(),
+            root.path(),
+        )
+        .unwrap();
         let reached = Arc::new(AtomicUsize::new(0));
         let marker = Arc::clone(&reached);
         let app = Router::new()
@@ -2211,6 +2296,7 @@ mod runtime_identity_tests {
                     require_identity: true,
                     local: true,
                     namespace: Some(namespace.clone()),
+                    repository: Some(repository.clone()),
                 },
                 validate_runtime_request,
             ));
@@ -2222,6 +2308,10 @@ mod runtime_identity_tests {
                     .header(
                         kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
                         identity.fingerprint(mode, other_namespace.token()),
+                    )
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -2238,6 +2328,10 @@ mod runtime_identity_tests {
                     .header(
                         kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
                         identity.fingerprint(mode, namespace.token()),
+                    )
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -2256,6 +2350,10 @@ mod runtime_identity_tests {
                         kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
                         identity.fingerprint(mode, namespace.token()),
                     )
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        repository.fingerprint(),
+                    )
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -2263,6 +2361,218 @@ mod runtime_identity_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod runtime_repository_binding_tests {
+    use super::*;
+    use kin_core::runtime_identity::{
+        RuntimeIdentity, RuntimeMode, RuntimeNamespace, RuntimeRepositoryBinding,
+        RUNTIME_IDENTITY_HEADER, RUNTIME_REPOSITORY_HEADER,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    struct RepositoryFixture {
+        namespace: RuntimeNamespace,
+        repository_a: RuntimeRepositoryBinding,
+        repository_b: RuntimeRepositoryBinding,
+        store_a: PathBuf,
+        store_b: PathBuf,
+        _root: tempfile::TempDir,
+        _environment: kin_core::test_env::EnvVarGuard,
+    }
+
+    impl RepositoryFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("kin-home");
+            let store_a = root.path().join("store-a");
+            let store_b = root.path().join("store-b");
+            for directory in [&home, &store_a, &store_b] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            let mut environment = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &home);
+            environment.apply("KIN_RUNTIME_MODE", Some("development"));
+            let namespace = RuntimeNamespace::current().unwrap();
+            let repository_a =
+                RuntimeRepositoryBinding::capture(&uuid::Uuid::new_v4().to_string(), &store_a)
+                    .unwrap();
+            let repository_b =
+                RuntimeRepositoryBinding::capture(&uuid::Uuid::new_v4().to_string(), &store_b)
+                    .unwrap();
+            Self {
+                namespace,
+                repository_a,
+                repository_b,
+                store_a,
+                store_b,
+                _root: root,
+                _environment: environment,
+            }
+        }
+
+        fn runtime_claim(&self) -> String {
+            RuntimeIdentity::current()
+                .fingerprint(RuntimeMode::current().unwrap(), self.namespace.token())
+        }
+
+        fn app(&self, repository: RuntimeRepositoryBinding) -> (Router, Arc<AtomicUsize>) {
+            let reached = Arc::new(AtomicUsize::new(0));
+            let marker = Arc::clone(&reached);
+            let app = Router::new()
+                .route(
+                    "/mcp/tools/call",
+                    post(move || {
+                        let marker = Arc::clone(&marker);
+                        async move {
+                            marker.fetch_add(1, Ordering::SeqCst);
+                            "selected repository semantic handler"
+                        }
+                    }),
+                )
+                .layer(middleware::from_fn_with_state(
+                    RuntimeRequestPolicy {
+                        require_identity: true,
+                        local: true,
+                        namespace: Some(self.namespace.clone()),
+                        repository: Some(repository),
+                    },
+                    validate_runtime_request,
+                ));
+            (app, reached)
+        }
+    }
+
+    async fn semantic_request(
+        app: Router,
+        runtime_claim: &str,
+        repository_claim: Option<&str>,
+    ) -> StatusCode {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp/tools/call")
+            .header(RUNTIME_IDENTITY_HEADER, runtime_claim)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(repository_claim) = repository_claim {
+            request = request.header(RUNTIME_REPOSITORY_HEADER, repository_claim);
+        }
+        app.oneshot(
+            request
+                .body(axum::body::Body::from(
+                    r#"{"name":"semantic_locate","arguments":{"query":"captured-target"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_matching_request_reaches_handler() {
+        let fixture = RepositoryFixture::new();
+        let (app, reached) = fixture.app(fixture.repository_a.clone());
+        let status = semantic_request(
+            app,
+            &fixture.runtime_claim(),
+            Some(&fixture.repository_a.fingerprint()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_replayed_peer_headers_refuse_replacement_repo() {
+        let fixture = RepositoryFixture::new();
+        let captured_runtime = fixture.runtime_claim();
+        let captured_repository = fixture.repository_a.fingerprint();
+        assert_ne!(
+            fixture.repository_a.identity().repository_id,
+            fixture.repository_b.identity().repository_id
+        );
+        let (app_a, reached_a) = fixture.app(fixture.repository_a.clone());
+        let (app_b, reached_b) = fixture.app(fixture.repository_b.clone());
+        let accepted = semantic_request(app_a, &captured_runtime, Some(&captured_repository)).await;
+        assert_eq!(accepted, StatusCode::OK);
+        assert_eq!(reached_a.load(Ordering::SeqCst), 1);
+        let refused = semantic_request(app_b, &captured_runtime, Some(&captured_repository)).await;
+        assert_eq!(refused, StatusCode::CONFLICT);
+        assert_eq!(reached_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_missing_repository_header_refuses_before_dispatch() {
+        let fixture = RepositoryFixture::new();
+        let (app, reached) = fixture.app(fixture.repository_a.clone());
+        let status = semantic_request(app, &fixture.runtime_claim(), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_wrong_repository_uuid_refuses_before_dispatch() {
+        let fixture = RepositoryFixture::new();
+        let mut wrong_repository = fixture.repository_a.identity().clone();
+        wrong_repository.repository_id = fixture.repository_b.identity().repository_id.clone();
+        assert_eq!(
+            wrong_repository.store_namespace,
+            fixture.repository_a.identity().store_namespace
+        );
+        let (app, reached) = fixture.app(fixture.repository_a.clone());
+        let status = semantic_request(
+            app,
+            &fixture.runtime_claim(),
+            Some(&wrong_repository.fingerprint()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_same_uuid_other_store_refuses_before_dispatch() {
+        let fixture = RepositoryFixture::new();
+        let other_store = RuntimeRepositoryBinding::capture(
+            &fixture.repository_a.identity().repository_id,
+            &fixture.store_b,
+        )
+        .unwrap();
+        assert_eq!(
+            other_store.identity().repository_id,
+            fixture.repository_a.identity().repository_id
+        );
+        assert_ne!(
+            other_store.identity().store_namespace,
+            fixture.repository_a.identity().store_namespace
+        );
+        let (app, reached) = fixture.app(other_store);
+        let status = semantic_request(
+            app,
+            &fixture.runtime_claim(),
+            Some(&fixture.repository_a.fingerprint()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_binding_replaced_store_refuses_before_dispatch() {
+        let fixture = RepositoryFixture::new();
+        let (app, reached) = fixture.app(fixture.repository_a.clone());
+        let captured_runtime = fixture.runtime_claim();
+        let captured_repository = fixture.repository_a.fingerprint();
+        let retired = fixture.store_a.with_file_name("retired-store-a");
+        std::fs::rename(&fixture.store_a, retired).unwrap();
+        std::fs::create_dir(&fixture.store_a).unwrap();
+        fixture.namespace.revalidate().unwrap();
+        assert!(fixture.repository_a.revalidate().is_err());
+        let status = semantic_request(app, &captured_runtime, Some(&captured_repository)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -2280,6 +2590,7 @@ mod hosted_runtime_boundary_tests {
                     require_identity: false,
                     local: false,
                     namespace: None,
+                    repository: None,
                 },
                 validate_runtime_request,
             ));
@@ -3418,6 +3729,11 @@ fn router_with_rotation_tokens(
     } else {
         "daemon"
     };
+    let runtime_repository = if state.publication_control.is_none() {
+        local_runtime_repository_binding(&state).map(Some)
+    } else {
+        Ok(None)
+    };
     let runtime_policy = RuntimeRequestPolicy {
         local: state.publication_control.is_none(),
         require_identity: state.publication_control.is_none()
@@ -3428,6 +3744,7 @@ fn router_with_rotation_tokens(
         } else {
             None
         },
+        repository: runtime_repository.as_ref().ok().cloned().flatten(),
     };
     let daemon_routes = Router::new()
         .merge(routes.clone())
@@ -3457,15 +3774,30 @@ fn router_with_rotation_tokens(
             validate_runtime_request,
         ));
 
+    let versioned_runtime_repository = runtime_repository.clone();
     let app = Router::new()
         .merge(daemon_routes)
         .route(
             "/runtime/identity",
-            get(move || runtime_identity_for(runtime_component)),
+            get(move || {
+                let repository = runtime_repository.clone();
+                async move {
+                    let repository =
+                        repository.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+                    runtime_identity_for_repository(runtime_component, repository).await
+                }
+            }),
         )
         .route(
             "/v2/runtime/identity",
-            get(move || runtime_identity_for(runtime_component)),
+            get(move || {
+                let repository = versioned_runtime_repository.clone();
+                async move {
+                    let repository =
+                        repository.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+                    runtime_identity_for_repository(runtime_component, repository).await
+                }
+            }),
         )
         .merge(cargo_routes)
         .merge(npm_routes)
@@ -32511,6 +32843,34 @@ pub(crate) mod tests {
         std::fs::create_dir(&dir).unwrap();
         let layout = kin_core::init(&dir).unwrap().layout;
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    struct LocalMcpRepositoryBinding {
+        previous_directory: PathBuf,
+    }
+
+    impl LocalMcpRepositoryBinding {
+        fn new(layout: &kin_core::KinLayout) -> Self {
+            kin_cli::daemon_client::install_spawn_registrar();
+            let previous_directory = std::env::current_dir().unwrap();
+            std::env::set_current_dir(layout.working_dir()).unwrap();
+            let binding = Self { previous_directory };
+            let selected = kin_core::KinLayout::discover(layout.working_dir())
+                .expect("the MCP fixture must bind its actual repository");
+            assert_eq!(
+                std::fs::canonicalize(selected.root()).unwrap(),
+                std::fs::canonicalize(layout.root()).unwrap(),
+                "the MCP delegate and the served fixture must select the same store"
+            );
+            binding
+        }
+    }
+
+    impl Drop for LocalMcpRepositoryBinding {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous_directory)
+                .expect("restore the MCP fixture working directory");
+        }
     }
 
     /// The state a hand-built runtime literal cannot reach: a real store with
@@ -69864,6 +70224,8 @@ pub(crate) mod tests {
         let base = format!("http://{addr}");
         let mut daemon_url = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", &base);
 
+        let _repository_binding = LocalMcpRepositoryBinding::new(&layout);
+
         let run_task_str = run_task_id.to_string();
         let do_work_str = do_work_id.to_string();
 
@@ -70043,6 +70405,7 @@ pub(crate) mod tests {
         );
 
         server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -74033,7 +74396,10 @@ pub(crate) mod tests {
     /// its own process, the defect is structurally invisible.
     #[tokio::test]
     async fn mcp_find_references_reports_legacy_xref_payload_as_unavailable() {
-        async fn legacy_xref() -> Json<serde_json::Value> {
+        async fn legacy_xref(
+            Extension(requests): Extension<Arc<std::sync::atomic::AtomicUsize>>,
+        ) -> Json<serde_json::Value> {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Json(serde_json::json!({
                 "version": kin_spine::SPINE_PAYLOAD_VERSION,
                 "edges": [{
@@ -74045,10 +74411,22 @@ pub(crate) mod tests {
             }))
         }
 
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let environment = kin_core::test_env::EnvVarGuard::new();
+        let _repository_binding = LocalMcpRepositoryBinding::new(&state.layout);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_requests = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+            let routes = Router::new()
+                .route("/spine/xref", get(legacy_xref))
+                .layer(Extension(recorded_requests))
+                .fallback_service(router(state));
+            let _ = axum::serve(listener, routes).await;
         });
         let binding = kin_mcp::handlers::entities::AmbientCrossRepoBinding::new(
             Some("provider"),
@@ -74077,25 +74455,44 @@ pub(crate) mod tests {
             .as_str()
             .is_some_and(|reason| reason.contains("malformed spine xref response")));
         assert_eq!(body["total_upstream"], 0);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         server.abort();
+        let _ = server.await;
+        drop(_repository_binding);
+        drop(environment);
     }
 
     /// Names its binding by argument for the reason given on
     /// `mcp_find_references_reports_legacy_xref_payload_as_unavailable`.
     #[tokio::test]
     async fn mcp_find_references_rejects_unanchored_xref_as_inconclusive() {
-        async fn legacy_xref() -> Json<serde_json::Value> {
+        async fn legacy_xref(
+            Extension(requests): Extension<Arc<std::sync::atomic::AtomicUsize>>,
+        ) -> Json<serde_json::Value> {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Json(serde_json::json!({
                 "version": kin_spine::SPINE_PAYLOAD_VERSION,
                 "edges": [],
             }))
         }
 
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let environment = kin_core::test_env::EnvVarGuard::new();
+        let _repository_binding = LocalMcpRepositoryBinding::new(&state.layout);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_requests = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
+            let routes = Router::new()
+                .route("/spine/xref", get(legacy_xref))
+                .layer(Extension(recorded_requests))
+                .fallback_service(router(state));
+            let _ = axum::serve(listener, routes).await;
         });
         let binding = kin_mcp::handlers::entities::AmbientCrossRepoBinding::new(
             Some("provider"),
@@ -74136,8 +74533,12 @@ pub(crate) mod tests {
         assert!(body["negative"]["trust_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         server.abort();
+        let _ = server.await;
+        drop(_repository_binding);
+        drop(environment);
     }
 
     /// Names its binding by argument for the reason given on

@@ -34,6 +34,13 @@ fn too_long(relative: &Path, root: &Path, max_bytes: u64) -> io::Error {
 }
 
 impl Confined {
+    pub(crate) fn from_retained_directory(root: &Path, dir: Dir) -> Self {
+        Self {
+            dir,
+            root: root.to_path_buf(),
+        }
+    }
+
     pub(crate) fn open(root: &Path, _grant: &Grant) -> io::Result<Self> {
         Self::open_held(root)
     }

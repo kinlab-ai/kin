@@ -72,6 +72,22 @@ PRETAG_PAID_RUNNERS = {
     (RC_BUILD, "build"): frozenset({"depot-macos-26", "depot-windows-2022-16"}),
     (RC_BUILD, "image"): frozenset({"depot-ubuntu-24.04-16"}),
 }
+# This boolean selects reviewed literals; it never supplies a runner label.
+# Its scope stays with the two pretag producers, before any immutable tag.
+RC_BUILD_RUNNER_SELECTOR = (
+    "${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && matrix.github_os || matrix.os }}"
+)
+RC_IMAGE_RUNNER_SELECTOR = (
+    "${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && 'ubuntu-latest' "
+    "|| 'depot-ubuntu-24.04-16' }}"
+)
+RC_NATIVE_GITHUB_RUNNERS = {
+    "x86_64-unknown-linux-musl": "ubuntu-latest",
+    "aarch64-unknown-linux-musl": "ubuntu-24.04-arm",
+    "x86_64-apple-darwin": "macos-15-intel",
+    "aarch64-apple-darwin": "macos-latest",
+    "x86_64-pc-windows-msvc": "windows-latest",
+}
 RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
     {
         (RC_BUILD, "build"),
@@ -136,8 +152,20 @@ def assert_release_critical_runner_policy(
                     f"scalar for {workflow.name}:{job_id}; found {runs_on}"
                 )
             runner = runs_on[0]
-            if runner == "${{ matrix.os }}":
-                matrix_key = (workflow, job_id)
+            matrix_key = (workflow, job_id)
+            if matrix_key == (RC_BUILD, "build") and runner != RC_BUILD_RUNNER_SELECTOR:
+                raise AssertionError(
+                    "release-critical runner policy requires the exact RC build selector"
+                )
+            if matrix_key == (RC_BUILD, "image"):
+                if runner != RC_IMAGE_RUNNER_SELECTOR:
+                    raise AssertionError(
+                        "release-critical runner policy requires the exact RC image selector"
+                    )
+                continue
+            if runner == "${{ matrix.os }}" or (
+                matrix_key == (RC_BUILD, "build") and runner == RC_BUILD_RUNNER_SELECTOR
+            ):
                 if matrix_key not in RELEASE_CRITICAL_MATRIX_JOBS:
                     raise AssertionError(
                         "release-critical runner policy rejects an unreviewed runner "
@@ -181,6 +209,37 @@ def assert_release_critical_runner_policy(
                         f"unreviewed matrix labels {rejected} at "
                         f"{workflow.name}:{job_id}"
                     )
+                if matrix_key == (RC_BUILD, "build"):
+                    # Check the native fallback independently of the matrix
+                    # hash, so repinning cannot admit a paid or wrong-arch row.
+                    fallback_rows = re.split(
+                        r"(?m)^ {8}- os: ", matrix_source
+                    )[1:]
+                    fallback_targets: dict[str, str] = {}
+                    for row in fallback_rows:
+                        fields = re.findall(
+                            r"(?m)^ {10}(github_os|target):\s*(\S+)\s*$", row
+                        )
+                        if len(fields) != 2 or {key for key, _ in fields} != {
+                            "github_os", "target"
+                        }:
+                            raise AssertionError(
+                                "release-critical runner policy rejects unreviewed matrix labels "
+                                "or incomplete native fallback routes"
+                            )
+                        values = dict(fields)
+                        target = values["target"]
+                        if target in fallback_targets:
+                            raise AssertionError(
+                                "release-critical runner policy rejects unreviewed matrix labels "
+                                "or duplicate native fallback targets"
+                            )
+                        fallback_targets[target] = values["github_os"]
+                    if fallback_targets != RC_NATIVE_GITHUB_RUNNERS:
+                        raise AssertionError(
+                            "release-critical runner policy rejects unreviewed matrix labels "
+                            "or non-native fallback routes"
+                        )
                 seen_matrix_jobs.add(matrix_key)
                 continue
             admitted = RELEASE_CRITICAL_STANDARD_RUNNERS | PRETAG_PAID_RUNNERS.get(
@@ -496,8 +555,36 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
         (
             "RC image moves onto an unreviewed Depot size",
             RC_BUILD,
-            "    runs-on: depot-ubuntu-24.04-16\n",
-            "    runs-on: depot-ubuntu-24.04-32\n",
+            f"    runs-on: {RC_IMAGE_RUNNER_SELECTOR}\n",
+            "    runs-on: " + RC_IMAGE_RUNNER_SELECTOR.replace(
+                "depot-ubuntu-24.04-16", "depot-ubuntu-24.04-32"
+            ) + "\n",
+        ),
+        (
+            "RC build lets the outage variable name an arbitrary runner",
+            RC_BUILD,
+            f"    runs-on: {RC_BUILD_RUNNER_SELECTOR}\n",
+            "    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS || matrix.os }}\n",
+        ),
+        (
+            "RC image accepts any nonempty outage value",
+            RC_BUILD,
+            f"    runs-on: {RC_IMAGE_RUNNER_SELECTOR}\n",
+            "    runs-on: " + RC_IMAGE_RUNNER_SELECTOR.replace(
+                " == 'true'", ""
+            ) + "\n",
+        ),
+        (
+            "tag mint moves onto the pretag outage selector",
+            RELEASE_TAG,
+            "    runs-on: ubuntu-latest\n",
+            f"    runs-on: {RC_IMAGE_RUNNER_SELECTOR}\n",
+        ),
+        (
+            "RC capability reuses the pretag producer selector",
+            RC_BUILD,
+            "    runs-on: ${{ matrix.os }}\n",
+            f"    runs-on: {RC_BUILD_RUNNER_SELECTOR}\n",
         ),
         (
             "tagged release returns to a paid runner",
@@ -543,6 +630,27 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
             "build",
             "          - os: ubuntu-latest\n",
             "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned RC fallback still rejects a custom runner",
+            RC_BUILD,
+            "build",
+            "            github_os: macos-latest\n",
+            "            github_os: kin-custom-macos\n",
+        ),
+        (
+            "a repinned RC fallback still requires native Intel execution",
+            RC_BUILD,
+            "build",
+            "            github_os: macos-15-intel\n",
+            "            github_os: macos-latest\n",
+        ),
+        (
+            "a repinned RC fallback still requires a runner on every row",
+            RC_BUILD,
+            "build",
+            "            github_os: windows-latest\n",
+            "",
         ),
         (
             "a repinned RC capability matrix still rejects a paid runner",

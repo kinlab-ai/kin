@@ -3032,8 +3032,14 @@ mod tests {
         let supervisor_home = tempfile::tempdir().unwrap();
         let mut env = kin_core::test_env::EnvVarGuard::new();
         without_a_supervisor(&mut env, supervisor_home.path());
-        let identity =
+        let mut identity =
             kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&layout)
+                .expect("capture the fixture daemon's actual selected repository")
+                .identity()
+                .clone(),
+        );
         let app = axum::Router::new()
             .route(
                 "/runtime/identity",

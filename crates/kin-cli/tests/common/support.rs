@@ -937,6 +937,7 @@ pub struct IsolatedDaemonRuntime {
     repository: PathBuf,
     registry_path: PathBuf,
     home_path: PathBuf,
+    kin_home_path: PathBuf,
     owner_token: String,
     owned_children: Mutex<Vec<Arc<Mutex<RuntimeOwnedChildState>>>>,
     containment: RuntimeContainment,
@@ -952,6 +953,9 @@ impl IsolatedDaemonRuntime {
             .tempdir()
             .unwrap_or_else(|error| panic!("create isolated runtime root: {error}"));
         let home_path = runtime_root.path().join("home");
+        let kin_home_path = runtime_root.path().join("kin-home");
+        std::fs::create_dir_all(&kin_home_path)
+            .unwrap_or_else(|error| panic!("create isolated Kin home: {error}"));
         let owner_token = uuid::Uuid::new_v4().to_string();
         let containment = RuntimeContainment::new(runtime_root.path(), &owner_token)
             .unwrap_or_else(|error| panic!("create isolated runtime containment: {error}"));
@@ -959,6 +963,7 @@ impl IsolatedDaemonRuntime {
             repository: repository.to_path_buf(),
             registry_path: runtime_root.path().join("registry.toml"),
             home_path,
+            kin_home_path,
             owner_token,
             owned_children: Mutex::new(Vec::new()),
             containment,
@@ -1055,11 +1060,10 @@ impl IsolatedDaemonRuntime {
         scrub_inherited_kin_authority(command);
         command
             .env("KIN_REGISTRY_PATH", &self.registry_path)
-            // Bind the managed install and store root explicitly. HOME and
-            // USERPROFILE remain a fail-closed fallback for any child boundary
-            // that intentionally rebuilds its environment instead of
-            // inheriting the override.
-            .env("KIN_HOME", self.home_path.join(".kin"))
+            // Development binaries use an explicitly isolated state root.
+            // HOME and USERPROFILE still describe the user configuration home;
+            // their ordinary `.kin` directory is not this runtime's namespace.
+            .env("KIN_HOME", &self.kin_home_path)
             .env("HOME", &self.home_path)
             .env("USERPROFILE", &self.home_path)
             .env("XDG_CONFIG_HOME", self.home_path.join(".config"))

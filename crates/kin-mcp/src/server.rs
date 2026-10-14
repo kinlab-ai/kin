@@ -457,6 +457,7 @@ pub async fn run_stdio_daemon(
     repo_binder: Option<RepoBinder>,
     startup: Option<std::sync::Arc<StartupDaemonBinding>>,
 ) -> Result<()> {
+    daemon_delegate::capture_request_runtime();
     if !config.session_authority_mode.requires_daemon() {
         return Err(McpError::Other(
             "daemon stdio mode requires daemon session authority".to_string(),

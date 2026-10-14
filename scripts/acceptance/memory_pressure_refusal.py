@@ -96,6 +96,7 @@ exists. No binary is built by this script.
 """
 
 import argparse
+import http.client
 import http.server
 import json
 import os
@@ -107,8 +108,10 @@ import sys
 import tempfile
 import threading
 import time
-from runtime_fixture import (IDENTITY_HEADER, fixture_daemon_metadata,
-                             prepare_runtime_fixture, runtime_fingerprint)
+from runtime_fixture import (IDENTITY_HEADER, REPOSITORY_IDENTITY_HEADER,
+                             fixture_daemon_metadata, prepare_runtime_fixture,
+                             repository_fingerprint, runtime_fingerprint,
+                             runtime_namespace)
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -941,6 +944,14 @@ class DaemonStub(object):
                         metadata["identity"], metadata["mode"], metadata["namespace"]):
                     self._json(409, {"error": "controlled peer requires the selected runtime fingerprint"})
                     return
+                try:
+                    expected_repository = repository_fingerprint(metadata.get("repository"))
+                except (TypeError, ValueError):
+                    self._json(409, {"error": "controlled peer has no valid repository descriptor"})
+                    return
+                if self.headers.get(REPOSITORY_IDENTITY_HEADER) != expected_repository:
+                    self._json(409, {"error": "controlled peer requires the selected repository fingerprint"})
+                    return
                 owner.handler_calls += 1
                 if self.path == "/mcp/tools/call":
                     try:
@@ -1005,6 +1016,85 @@ class DaemonStub(object):
             self.server.server_close()
         if self.thread is not None:
             self.thread.join(timeout=5)
+
+
+def daemon_stub_admission_self_test():
+    """Exercise the controlled HTTP boundary, without executing native binaries."""
+    failures = []
+    total = 0
+    with tempfile.TemporaryDirectory(prefix="kin-peer-admission-") as root:
+        home, store, other = (os.path.join(root, name) for name in ("home", "store", "other"))
+        for path in (home, store, other):
+            os.mkdir(path)
+        # Explicit Development metadata is protocol input, not Managed build proof.
+        identity = {"version": "0.0.0-control", "commit_sha": "unknown",
+                    "source_dirty": True, "source_known": False,
+                    "target": "control-target", "build_profile": "debug"}
+        repository = {"repository_id": "fixture-repository-control",
+                      "store_namespace": runtime_namespace(store)}
+        metadata = {"schema": "kin.runtime-service.v1", "component": "daemon",
+                    "identity": identity, "mode": "development",
+                    "namespace": runtime_namespace(home), "repository": repository}
+        source_pin = runtime_fingerprint(identity, "development", metadata["namespace"])
+        repository_pin = repository_fingerprint(repository)
+        accepted = {IDENTITY_HEADER: source_pin, REPOSITORY_IDENTITY_HEADER: repository_pin}
+        other_repository = dict(repository, repository_id="another-repository")
+        other_store = dict(repository, store_namespace=runtime_namespace(other))
+        other_source = runtime_fingerprint(identity, "development", runtime_namespace(other))
+
+        def request(peer, method, path, headers):
+            connection = http.client.HTTPConnection("127.0.0.1", peer.server.server_address[1], timeout=5)
+            try:
+                body = json.dumps({"name": "semantic_locate"}) if method == "POST" else None
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        resource_body = {"error": "original controlled resources failure"}
+        with DaemonStub(503, resource_body, runtime_metadata=metadata) as peer:
+            refused = [
+                ("missing-both", {}),
+                ("missing-source", {REPOSITORY_IDENTITY_HEADER: repository_pin}),
+                ("wrong-source", dict(accepted, **{IDENTITY_HEADER: "wrong-source"})),
+                ("missing-repository", {IDENTITY_HEADER: source_pin}),
+                ("wrong-repository", dict(accepted, **{REPOSITORY_IDENTITY_HEADER: "wrong-repository"})),
+                ("other-repository", dict(accepted, **{REPOSITORY_IDENTITY_HEADER: repository_fingerprint(other_repository)})),
+                ("other-store", dict(accepted, **{REPOSITORY_IDENTITY_HEADER: repository_fingerprint(other_store)})),
+                ("other-home", dict(accepted, **{IDENTITY_HEADER: other_source})),
+            ]
+            for name, headers in refused:
+                total += 1
+                status, _payload = request(peer, "POST", "/mcp/tools/call", headers)
+                if status != 409 or peer.handler_calls != 0:
+                    failures.append("controlled peer %s did not refuse before handlers" % name)
+            for path, expected_status, expected_body in (
+                    ("/mcp/tools/call", 200, None),
+                    ("/commands/resources", 503, resource_body)):
+                total += 1
+                before = peer.handler_calls
+                status, payload = request(peer, "POST", path, accepted)
+                if (status != expected_status or peer.handler_calls != before + 1
+                        or (expected_body is not None and payload != expected_body)
+                        or (expected_body is None and not payload.get("content"))):
+                    failures.append("controlled peer changed the admitted %s payload" % path)
+            for path, expected in (("/runtime/identity", metadata), ("/health", {})):
+                total += 1
+                before = peer.handler_calls
+                status, payload = request(peer, "GET", path, {})
+                if status != 200 or payload != expected or peer.handler_calls != before:
+                    failures.append("controlled peer changed pure %s diagnostics" % path)
+
+        for invalid in (None, dict(repository, repository_id=""),
+                        dict(repository, store_namespace=17)):
+            total += 1
+            with DaemonStub(200, {}, runtime_metadata=dict(metadata, repository=invalid)) as peer:
+                status, _payload = request(peer, "POST", "/mcp/tools/call", accepted)
+                if status != 409 or peer.handler_calls != 0:
+                    failures.append("controlled peer adopted a malformed repository descriptor")
+    return failures, total
+
 
 class Suite(object):
     def __init__(self, kin, workdir, daemon=None, verbose=False):
@@ -2741,7 +2831,7 @@ def self_test():
     opposite verdict. This runs before any build in CI, so a broken grader is
     named in seconds rather than after three minutes of compiling.
     """
-    failures = []
+    failures, admission_cases = daemon_stub_admission_self_test()
 
     row_cases = [
         (True, {"id": ROW_ID, "status": "degraded",
@@ -3245,7 +3335,8 @@ def self_test():
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)
              + len(tail_cases) + len(grade_cases)
              + len(proportional_cases) + len(charge_cases)
-             + len(child_cases) + len(settle_cases) + len(pair_cases))
+             + len(child_cases) + len(settle_cases) + len(pair_cases)
+             + admission_cases)
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0

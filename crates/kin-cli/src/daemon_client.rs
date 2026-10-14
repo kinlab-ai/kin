@@ -454,13 +454,11 @@ pub struct DaemonClient {
     /// HTTP redirect that could redispatch a non-idempotent mutation.
     one_dispatch_client: reqwest::Client,
     runtime_namespace: kin_core::runtime_identity::RuntimeNamespace,
-    /// The store this client's daemon serves, when one was resolvable.
-    ///
-    /// Held so that a request which goes unanswered can ask the store what
-    /// happened to its daemon instead of asserting the ordinary cause. A
-    /// transport error describes a socket; the killer leaves its evidence in
-    /// the repository, and without a root there is nowhere to read it.
-    /// `None` behaves exactly as this client behaved before it had this field.
+    runtime_repository:
+        Option<Result<kin_core::runtime_identity::RuntimeRepositoryBinding, String>>,
+    /// The intended store supplies repository admission and daemon failure
+    /// evidence. Health diagnostics can work without it; semantic requests
+    /// require a captured repository binding.
     kin_root: Option<PathBuf>,
 }
 
@@ -839,7 +837,7 @@ impl DaemonClient {
     ) -> Result<Self> {
         let mut client =
             Self::from_base_url_with_token(base_url, resolve_daemon_auth_token_for_layout(layout))?;
-        client.kin_root = Some(layout.root().to_path_buf());
+        client.bind_repository(layout.root());
         Ok(client)
     }
 
@@ -900,17 +898,66 @@ impl DaemonClient {
             .default_headers(headers)
             .build()
             .context("build one-dispatch daemon client")?;
+        let kin_root = crate::daemon_death::kin_root_from_cwd();
+        let runtime_repository = kin_root
+            .as_deref()
+            .map(kin_core::runtime_identity::RuntimeRepositoryBinding::for_store);
         Ok(Self {
             base_url,
             client,
             one_dispatch_client,
             runtime_namespace,
-            // Discovery from the working directory is the fallback every
-            // constructor but the layout one gets. A caller standing outside a
-            // repository resolves nothing, which is the same reading as a store
-            // that never lost a daemon and leaves every message unchanged.
-            kin_root: crate::daemon_death::kin_root_from_cwd(),
+            runtime_repository,
+            // Layout constructors replace both the discovered root and its
+            // retained binding with the explicitly selected workspace.
+            kin_root,
         })
+    }
+
+    fn bind_repository(&mut self, root: &Path) {
+        self.kin_root = Some(root.to_path_buf());
+        self.runtime_repository =
+            Some(kin_core::runtime_identity::RuntimeRepositoryBinding::for_store(root));
+    }
+
+    async fn request_repository_fingerprint(&self) -> Result<Option<String>> {
+        let identity = read_runtime_endpoint(&self.base_url).await?;
+        let mode = kin_core::runtime_identity::RuntimeMode::current()
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        let fingerprint = identity
+            .admit_daemon_for(
+                &kin_core::runtime_identity::RuntimeIdentity::current(),
+                mode,
+                Some(&self.runtime_namespace),
+            )
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        if fingerprint.is_none() {
+            return Ok(None);
+        }
+        let expected = self.runtime_repository.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RuntimeEndpointRefusal(
+                "repository admission refused: no intended repository is bound".into(),
+            ))
+        })?;
+        let expected = expected.as_ref().map_err(|error| {
+            anyhow::Error::new(RuntimeEndpointRefusal(format!(
+                "repository admission refused: {error}"
+            )))
+        })?;
+        let repository = identity.repository.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RuntimeEndpointRefusal(
+                "repository admission refused: ready service supplied no repository identity"
+                    .into(),
+            ))
+        })?;
+        repository
+            .validate_for(expected)
+            .map(Some)
+            .map_err(|error| {
+                anyhow::Error::new(RuntimeEndpointRefusal(format!(
+                    "repository admission refused: {error}"
+                )))
+            })
     }
 
     /// The store whose records explain a daemon of this endpoint that died.
@@ -940,14 +987,23 @@ impl DaemonClient {
         leaf: &str,
     ) -> Result<reqwest::Response> {
         let expected = self.request_runtime_fingerprint()?;
-        validate_runtime_endpoint(&self.base_url, "daemon").await?;
-        let resp = request
-            .header(
-                kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
-                expected,
-            )
-            .send()
-            .await;
+        let request = request.header(
+            kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+            expected,
+        );
+        let request = if matches!(leaf, "health" | "readiness") {
+            validate_runtime_endpoint(&self.base_url, "daemon").await?;
+            request
+        } else {
+            match self.request_repository_fingerprint().await? {
+                Some(repository) => request.header(
+                    kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                    repository,
+                ),
+                None => request,
+            }
+        };
+        let resp = request.send().await;
         // The daemon answered, or the request failed. Either way the line that
         // said it was ready has done its job, and what prints next is the
         // answer or the error.
@@ -1024,7 +1080,7 @@ impl DaemonClient {
             resolve_daemon_auth_token_for_layout(layout),
             None,
         )?;
-        client.kin_root = Some(layout.root().to_path_buf());
+        client.bind_repository(layout.root());
         let health = client.health().await?;
         match classify_health_repo(&health, layout.root(), layout.working_dir()) {
             RepoIdentity::Matches => Ok(client),
@@ -2437,9 +2493,10 @@ impl DaemonClient {
             Ok(expected) => expected,
             Err(error) => return AdmitDispatch::Refused(error),
         };
-        if let Err(error) = validate_runtime_endpoint(&self.base_url, "daemon").await {
-            return AdmitDispatch::Refused(error);
-        }
+        let repository = match self.request_repository_fingerprint().await {
+            Ok(repository) => repository,
+            Err(error) => return AdmitDispatch::Refused(error),
+        };
         let url = format!("{}/commands/admit", self.base_url.trim_end_matches('/'));
         let payload = match serde_json::to_vec(request) {
             Ok(payload) => payload,
@@ -2449,7 +2506,7 @@ impl DaemonClient {
                 );
             }
         };
-        let response = match self
+        let request = self
             .one_dispatch_client
             .post(&url)
             .header(
@@ -2457,10 +2514,15 @@ impl DaemonClient {
                 expected,
             )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload)
-            .send()
-            .await
-        {
+            .body(payload);
+        let request = match repository {
+            Some(repository) => request.header(
+                kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                repository,
+            ),
+            None => request,
+        };
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 return AdmitDispatch::Unanswered(anyhow::Error::new(error).context(
@@ -8798,6 +8860,19 @@ impl std::error::Error for RuntimeEndpointRefusal {}
 
 pub async fn validate_runtime_endpoint(base_url: &str, component: &str) -> Result<()> {
     let identity = read_runtime_endpoint(base_url).await?;
+    if component == "daemon" {
+        let mode = kin_core::runtime_identity::RuntimeMode::current()
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::current();
+        return identity
+            .admit_daemon_for(
+                &kin_core::runtime_identity::RuntimeIdentity::current(),
+                mode,
+                namespace.as_ref().ok(),
+            )
+            .map(|_| ())
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)));
+    }
     identity
         .validate_for_current(component)
         .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))
@@ -9696,6 +9771,17 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
             )
             .await
         })
+    }
+
+    fn reading_at(
+        &self,
+        kin_root: PathBuf,
+        endpoint: String,
+        budget: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kin_daemon_spawn::RunningDaemonRouteReading> + Send>,
+    > {
+        Box::pin(async move { probe_running_route_within(&kin_root, &endpoint, budget).await })
     }
 }
 
@@ -10698,8 +10784,90 @@ mod tests {
         .unwrap()
     }
 
-    fn with_runtime_identity(app: axum::Router, component: &str) -> axum::Router {
-        let body = runtime_identity_body(component);
+    struct RequestRepositoryFixture {
+        layout: kin_core::layout::KinLayout,
+        _environment: kin_core::test_env::EnvVarGuard,
+        _root: tempfile::TempDir,
+    }
+
+    impl RequestRepositoryFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("isolated protected-request repository");
+            let home = root.path().join("home");
+            let kin_home = root.path().join("kin-home");
+            let working_dir = root.path().join("repo");
+            for directory in [&home, &kin_home, &working_dir] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let environment = kin_core::test_env::EnvVarGuard::set("HOME", &home)
+                .with("USERPROFILE", &home)
+                .with("KIN_HOME", &kin_home)
+                .with("KIN_RUNTIME_MODE", "development")
+                .with("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+                .with("KIN_NO_DAEMON", "1")
+                .without("KIN_DIR")
+                .without("KIN_STORE")
+                .without("KIN_STORE_LAYOUT")
+                .without("KIN_DAEMON_URL")
+                .without("KIN_MCP_REPO")
+                .without("KIN_SESSION_ID");
+            let layout = kin_core::init(&working_dir)
+                .expect("initialize the actual protected-request repository")
+                .layout;
+            kin_core::runtime_identity::RuntimeNamespace::initialize_local_service()
+                .expect("initialize the fixture's actual runtime namespace");
+            Self {
+                layout,
+                _environment: environment,
+                _root: root,
+            }
+        }
+
+        fn client(
+            &self,
+            base_url: String,
+            checkout_token: Option<String>,
+            session_id: Option<&str>,
+        ) -> DaemonClient {
+            let mut client = DaemonClient::from_base_url_with_explicit_authority(
+                base_url,
+                checkout_token,
+                session_id,
+            )
+            .unwrap();
+            client.bind_repository(self.layout.root());
+            client
+        }
+    }
+
+    fn repository_runtime_identity(
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> kin_core::runtime_identity::RuntimeServiceIdentity {
+        let mut identity = kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
+            .expect("the fixture uses its actual isolated runtime namespace");
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(layout)
+                .expect("the fixture's actual repository binding")
+                .identity()
+                .clone(),
+        );
+        identity
+    }
+
+    fn repository_runtime_identity_body(
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> String {
+        serde_json::to_string(&repository_runtime_identity(component, layout)).unwrap()
+    }
+
+    fn with_repository_runtime_identity(
+        app: axum::Router,
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> axum::Router {
+        let body = repository_runtime_identity_body(component, layout);
         app.route(
             "/runtime/identity",
             axum::routing::get(move || {
@@ -10712,6 +10880,405 @@ mod tests {
                 }
             }),
         )
+    }
+
+    async fn spawn_repository_admission_server(
+        identity: kin_core::runtime_identity::RuntimeServiceIdentity,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            routing::{get, post},
+            Router,
+        };
+
+        identity
+            .validate_for_current("daemon")
+            .expect("the peer must share the caller's real source and runtime namespace");
+        let identity_body = serde_json::to_string(&identity).unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new()
+            .route(
+                "/runtime/identity",
+                get(move || {
+                    let body = identity_body.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/commands/test",
+                post(move || {
+                    let requests = handler_requests.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"accepted": true}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    type HostedControlRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, bool, serde_json::Value)>>>;
+
+    fn independent_hosted_identity() -> kin_core::runtime_identity::RuntimeServiceIdentity {
+        let mut peer = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+            .expect("the caller's real isolated runtime identity");
+        peer.component = "hosted-daemon".into();
+        peer.namespace = None;
+        peer.repository = None;
+        peer.identity.commit_sha = if peer.identity.commit_sha == "1".repeat(40) {
+            "2".repeat(40)
+        } else {
+            "1".repeat(40)
+        };
+        peer
+    }
+
+    async fn spawn_hosted_control_server(
+        peer: kin_core::runtime_identity::RuntimeServiceIdentity,
+    ) -> (String, HostedControlRequests, tokio::task::JoinHandle<()>) {
+        let identity = serde_json::to_string(&peer).unwrap();
+        let requests: HostedControlRequests = Default::default();
+        let captured = requests.clone();
+        let operation =
+            move |uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push((
+                        uri.path().to_string(),
+                        headers.contains_key(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER),
+                        body,
+                    ));
+                    axum::Json(if uri.path() == "/commands/admit" {
+                        serde_json::json!({"lines": ["hosted admission control"], "mutated": false})
+                    } else {
+                        serde_json::json!({"accepted": true})
+                    })
+                }
+            };
+        let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            identity,
+                        )
+                    }
+                }),
+            )
+            .route("/commands/test", axum::routing::post(operation.clone()))
+            .route("/commands/admit", axum::routing::post(operation));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn unbound_hosted_client(
+        repository: &RequestRepositoryFixture,
+        base_url: String,
+    ) -> DaemonClient {
+        let mut client = repository.client(base_url, None, None);
+        client.kin_root = None;
+        client.runtime_repository = None;
+        client
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_send_uses_independent_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = independent_hosted_identity();
+        assert_ne!(
+            peer.identity.commit_sha,
+            kin_core::runtime_identity::RuntimeIdentity::current().commit_sha
+        );
+        let (base_url, requests, server) = spawn_hosted_control_server(peer).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let body = serde_json::json!({"control": "independent hosted send"});
+        let response = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&body),
+                "hosted send control",
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"accepted": true})
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![("/commands/test".into(), false, body)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_admit_uses_independent_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) =
+            spawn_hosted_control_server(independent_hosted_identity()).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let request = crate::commands::admit::AdmitRequest::default();
+        let AdmitDispatch::Answered(answer) = client.admit(&request).await else {
+            panic!("eligible independent Hosted authority must answer deliberate admission");
+        };
+        assert_eq!(answer.lines, vec!["hosted admission control"]);
+        assert!(!answer.mutated);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![(
+                "/commands/admit".into(),
+                false,
+                serde_json::to_value(&request).unwrap()
+            )]
+        );
+        server.abort();
+    }
+
+    async fn assert_hosted_client_eligibility_refusal(wrong_mode: bool) {
+        let repository = RequestRepositoryFixture::new();
+        let mut peer = independent_hosted_identity();
+        let reason = if wrong_mode {
+            peer.mode = kin_core::runtime_identity::RuntimeMode::Managed;
+            "mode"
+        } else {
+            peer.identity.source_known = false;
+            "source"
+        };
+        let (base_url, requests, server) = spawn_hosted_control_server(peer).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let error = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&serde_json::json!({"control": "hosted refusal"})),
+                "hosted refusal control",
+            )
+            .await
+            .expect_err("ineligible Hosted authority must refuse ordinary dispatch");
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let AdmitDispatch::Refused(error) = client
+            .admit(&crate::commands::admit::AdmitRequest::default())
+            .await
+        else {
+            panic!("ineligible Hosted authority must refuse deliberate admission");
+        };
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "ineligible Hosted authority must receive no semantic request"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_wrong_mode_refuses_both_dispatches() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        assert_hosted_client_eligibility_refusal(true).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_unknown_source_refuses_both_dispatches() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        assert_hosted_client_eligibility_refusal(false).await;
+    }
+
+    async fn assert_repository_client_refusal(
+        client: &DaemonClient,
+        requests: &std::sync::atomic::AtomicUsize,
+        reason: &str,
+    ) {
+        let error = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&serde_json::json!({"control": "repository admission"})),
+                "repository admission control",
+            )
+            .await
+            .expect_err("repository admission must refuse before semantic dispatch");
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused repository must receive no semantic request"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_unbound_caller_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = repository_runtime_identity("daemon", &repository.layout);
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let mut client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        client.kin_root = None;
+        client.runtime_repository = None;
+        assert_repository_client_refusal(&client, &requests, "no intended repository is bound")
+            .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_missing_peer_repository_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        peer.repository = None;
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "ready service supplied no repository identity",
+        )
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_wrong_repository_id_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let other_dir = repository._root.path().join("other-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = kin_core::init(&other_dir)
+            .expect("initialize the other real repository")
+            .layout;
+        let other_binding =
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&other)
+                .expect("capture the other real repository binding");
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        let claim = peer.repository.as_mut().unwrap();
+        assert_ne!(claim.repository_id, other_binding.identity().repository_id);
+        claim.repository_id = other_binding.identity().repository_id.clone();
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "repository identity differs from the selected repository",
+        )
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_wrong_store_namespace_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let other_dir = repository._root.path().join("other-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = kin_core::init(&other_dir)
+            .expect("initialize the other real repository")
+            .layout;
+        let other_binding =
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&other)
+                .expect("capture the other real repository binding");
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        let claim = peer.repository.as_mut().unwrap();
+        assert_ne!(
+            claim.store_namespace,
+            other_binding.identity().store_namespace
+        );
+        claim.store_namespace = other_binding.identity().store_namespace.clone();
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "repository identity differs from the selected repository",
+        )
+        .await;
+        server.abort();
+    }
+
+    // Unix permits renaming a retained directory; Windows directory handles deny delete sharing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_replaced_retained_store_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = repository_runtime_identity("daemon", &repository.layout);
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        let store = repository.layout.root();
+        let retained = store.with_extension("retained-store");
+        std::fs::rename(store, &retained)
+            .expect("rename the fixture's own store while its admitted capability is retained");
+        std::fs::create_dir(store).expect("create a distinct store object at the original path");
+        assert!(
+            client
+                .runtime_repository
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .revalidate()
+                .is_err(),
+            "the retained capability must detect the replaced object"
+        );
+        assert_repository_client_refusal(&client, &requests, "repository admission refused").await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -10859,6 +11426,7 @@ mod tests {
     }
 
     async fn spawn_fixed_response_server_at(
+        layout: &kin_core::layout::KinLayout,
         route: &'static str,
         status: axum::http::StatusCode,
         body: impl Into<String>,
@@ -10883,7 +11451,7 @@ mod tests {
                 }
             }),
         );
-        let app = with_runtime_identity(app, "daemon");
+        let app = with_repository_runtime_identity(app, "daemon", layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -10893,6 +11461,7 @@ mod tests {
     }
 
     async fn spawn_fixed_response_server(
+        layout: &kin_core::layout::KinLayout,
         status: axum::http::StatusCode,
         body: &'static str,
     ) -> (
@@ -10900,7 +11469,7 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
-        spawn_fixed_response_server_at("/commands/test", status, body).await
+        spawn_fixed_response_server_at(layout, "/commands/test", status, body).await
     }
 
     async fn read_complete_http_request(
@@ -10942,12 +11511,14 @@ mod tests {
         }
     }
 
-    async fn spawn_dropped_ack_server() -> (
+    async fn spawn_dropped_ack_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
-        let runtime_identity = runtime_identity_body("daemon");
+        let runtime_identity = repository_runtime_identity_body("daemon", layout);
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_requests = requests.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10970,14 +11541,16 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
-    async fn spawn_truncated_ack_server() -> (
+    async fn spawn_truncated_ack_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
         use tokio::io::AsyncWriteExt;
 
-        let runtime_identity = runtime_identity_body("daemon");
+        let runtime_identity = repository_runtime_identity_body("daemon", layout);
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_requests = requests.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11006,7 +11579,9 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
-    async fn spawn_redirect_server() -> (
+    async fn spawn_redirect_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
@@ -11040,7 +11615,7 @@ mod tests {
                     }
                 }),
             );
-        let app = with_runtime_identity(app, "daemon");
+        let app = with_repository_runtime_identity(app, "daemon", layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -11079,6 +11654,10 @@ mod tests {
 
     #[tokio::test]
     async fn merge_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let operation_id = stable_test_operation_id();
         let other_operation_id =
             OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
@@ -11101,11 +11680,14 @@ mod tests {
         ];
 
         for (case, body, detail) in cases {
-            let (base_url, requests, server) =
-                spawn_fixed_response_server_at("/commands/merge", axum::http::StatusCode::OK, body)
-                    .await;
-            let client =
-                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let (base_url, requests, server) = spawn_fixed_response_server_at(
+                &repository.layout,
+                "/commands/merge",
+                axum::http::StatusCode::OK,
+                body,
+            )
+            .await;
+            let client = repository.client(base_url, None, None);
             let request = crate::commands::merge::MergeRequest {
                 source: kin_model::RefName::branch(b"source").unwrap(),
                 operation_id,
@@ -11133,6 +11715,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let operation_id = stable_test_operation_id();
         let other_operation_id =
             OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
@@ -11156,13 +11742,13 @@ mod tests {
 
         for (case, body, detail) in cases {
             let (base_url, requests, server) = spawn_fixed_response_server_at(
+                &repository.layout,
                 "/commands/resolve",
                 axum::http::StatusCode::OK,
                 body,
             )
             .await;
-            let client =
-                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let client = repository.client(base_url, None, None);
             let request = crate::commands::resolve::ResolveRequest {
                 operation_id,
                 actor: kin_model::AuthorId::new("ack-test"),
@@ -11191,10 +11777,13 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_serialization_failure_is_direct_and_never_dispatched() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::OK, "{}").await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            spawn_fixed_response_server(&repository.layout, axum::http::StatusCode::OK, "{}").await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11220,9 +11809,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_dropped_ack_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) = spawn_dropped_ack_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_dropped_ack_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11242,9 +11834,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_truncated_body_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) = spawn_truncated_ack_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_truncated_ack_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11265,11 +11860,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_server_error_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::SERVICE_UNAVAILABLE, "try later")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "try later",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11290,10 +11891,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_malformed_success_is_indeterminate_and_dispatched_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::OK, "not-json").await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            spawn_fixed_response_server(&repository.layout, axum::http::StatusCode::OK, "not-json")
+                .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11314,11 +11919,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_client_error_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::CONFLICT, "stale merge record")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::CONFLICT,
+            "stale merge record",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11364,18 +11975,22 @@ mod tests {
     /// it is, once, with the daemon's reason carried through.
     #[tokio::test]
     async fn a_marked_client_error_is_a_refusal_that_wrote_nothing_and_dispatched_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let body = crate::daemon_error::DaemonErrorBody::before_write(
             "merging refs/heads/pretty into refs/heads/main still has 27 unresolved conflict(s)",
         )
         .to_wire();
         let (base_url, requests, server) = spawn_fixed_response_server_at(
+            &repository.layout,
             "/commands/test",
             axum::http::StatusCode::CONFLICT,
             body,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11405,16 +12020,20 @@ mod tests {
     /// one real safety property.
     #[tokio::test]
     async fn a_marked_server_error_is_still_indeterminate() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let body =
             crate::daemon_error::DaemonErrorBody::before_write("nothing was committed").to_wire();
         let (base_url, requests, server) = spawn_fixed_response_server_at(
+            &repository.layout,
             "/commands/test",
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             body,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11438,13 +12057,17 @@ mod tests {
     /// a new CLI must not read silence as a promise.
     #[tokio::test]
     async fn an_unmarked_client_error_body_is_still_indeterminate() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
             axum::http::StatusCode::CONFLICT,
             "repository projection conflict: tracked working-copy path differs",
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11469,13 +12092,16 @@ mod tests {
     /// green while breaking the other.
     #[tokio::test]
     async fn a_client_error_marked_false_is_still_indeterminate() {
-        let (base_url, _requests, server) = spawn_fixed_response_server(
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, _requests, server) = spawn_fixed_response_server(&repository.layout,
             axum::http::StatusCode::BAD_REQUEST,
             r#"{"message":"no recorded merge conflict matches summarize","refused_before_write":false}"#,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11494,11 +12120,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_bad_request_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::BAD_REQUEST, "finalization failed")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::BAD_REQUEST,
+            "finalization failed",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11519,9 +12151,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_does_not_redispatch_through_redirects() {
-        let (base_url, requests, server) = spawn_redirect_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_redirect_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11560,6 +12195,10 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_post_retries_exact_body_with_same_session_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         use axum::{body::Bytes, http::StatusCode, routing::post, Router};
 
         #[derive(Default)]
@@ -11592,18 +12231,17 @@ mod tests {
                 }
             }),
         );
-        let app = with_runtime_identity(app, "daemon");
+        let app = with_repository_runtime_identity(app, "daemon", &repository.layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = DaemonClient::from_base_url_with_explicit_authority(
+        let client = repository.client(
             format!("http://{address}"),
             Some("checkout-token".to_string()),
             Some("session-checkout"),
-        )
-        .unwrap();
+        );
         let request = serde_json::json!({
             "operation_id": "stable-operation",
             "path_hex": "7372632f6c69622e7273"
@@ -12655,6 +13293,58 @@ mod tests {
         )
         .await;
         assert!(matches!(no_budget, Reading::Unresolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn endpoint_route_observer_uses_the_chosen_route_and_preserves_repository_identity() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mine = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = mine.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let own_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own_url = format!("http://{}", own_listener.local_addr().unwrap());
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_url = format!("http://{}", other_listener.local_addr().unwrap());
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_HOME", home.path())
+            .with("KIN_RUNTIME_MODE", "development")
+            .with("KIN_DAEMON_URL", &other_url);
+        kin_core::runtime_identity::RuntimeNamespace::initialize_local_service().unwrap();
+        let own_server = serve_repo_daemon_health(own_listener, mine.path());
+        let other_server = serve_repo_daemon_health(other_listener, other.path());
+
+        let own_reading = kin_daemon_spawn::DaemonSpawnRegistrar::reading_at(
+            &CliSpawnRegistrar,
+            root.clone(),
+            own_url.clone(),
+            Duration::from_millis(500),
+        )
+        .await;
+        let other_reading = kin_daemon_spawn::DaemonSpawnRegistrar::reading_at(
+            &CliSpawnRegistrar,
+            root,
+            other_url,
+            Duration::from_millis(500),
+        )
+        .await;
+        own_server.abort();
+        other_server.abort();
+        let _ = own_server.await;
+        let _ = other_server.await;
+
+        assert_eq!(
+            own_reading,
+            Reading::Serving(own_url),
+            "the chosen endpoint must win over a stale configured route"
+        );
+        assert!(
+            matches!(other_reading, Reading::Unresolved { .. }),
+            "an endpoint serving another repository must stay refused: {other_reading:?}"
+        );
     }
 
     #[tokio::test]

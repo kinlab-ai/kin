@@ -10,6 +10,87 @@ use std::sync::{Arc, OnceLock};
 
 pub const RUNTIME_MODE_ENV: &str = "KIN_RUNTIME_MODE";
 pub const RUNTIME_IDENTITY_HEADER: &str = "x-kin-runtime-identity";
+pub const RUNTIME_REPOSITORY_HEADER: &str = "x-kin-repository-identity";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeRepositoryIdentity {
+    pub repository_id: String,
+    pub store_namespace: String,
+}
+
+impl RuntimeRepositoryIdentity {
+    pub fn fingerprint(&self) -> String {
+        let bytes = serde_json::to_vec(&(
+            "kin.runtime-repository.v1",
+            &self.repository_id,
+            &self.store_namespace,
+        ))
+        .expect("repository identity is serializable");
+        let mut digest = sha2::Sha256::new();
+        digest.update(bytes);
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn validate_for(&self, expected: &RuntimeRepositoryBinding) -> Result<String, String> {
+        expected.revalidate()?;
+        if self != expected.identity() {
+            return Err("repository identity differs from the selected repository; reconnect without changing the intended repository".into());
+        }
+        Ok(expected.fingerprint())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeRepositoryBinding {
+    identity: RuntimeRepositoryIdentity,
+    store: RuntimeNamespace,
+}
+
+impl RuntimeRepositoryBinding {
+    pub fn capture(repository_id: &str, root: &Path) -> Result<Self, String> {
+        Self::from_store_namespace(repository_id, RuntimeNamespace::capture(root)?)
+    }
+
+    fn from_store_namespace(repository_id: &str, store: RuntimeNamespace) -> Result<Self, String> {
+        if repository_id.trim().is_empty() {
+            return Err("selected repository has no logical identity".into());
+        }
+        Ok(Self {
+            identity: RuntimeRepositoryIdentity {
+                repository_id: repository_id.to_owned(),
+                store_namespace: store.token().to_owned(),
+            },
+            store,
+        })
+    }
+
+    pub fn for_store(root: &Path) -> Result<Self, String> {
+        let store = RuntimeNamespace::capture(root)?;
+        let repository_id = store.read_repository_id()?;
+        store.revalidate()?;
+        Self::from_store_namespace(&repository_id, store)
+    }
+
+    pub fn for_layout(layout: &crate::layout::KinLayout) -> Result<Self, String> {
+        Self::for_store(layout.root())
+    }
+
+    pub fn identity(&self) -> &RuntimeRepositoryIdentity {
+        &self.identity
+    }
+
+    pub fn fingerprint(&self) -> String {
+        self.identity.fingerprint()
+    }
+
+    pub fn revalidate(&self) -> Result<(), String> {
+        self.store.revalidate()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +263,29 @@ pub struct RuntimeNamespace {
 static LOCAL_SERVICE_NAMESPACE: OnceLock<RuntimeNamespace> = OnceLock::new();
 
 impl RuntimeNamespace {
+    fn read_repository_id(&self) -> Result<String, String> {
+        #[cfg(any(unix, windows))]
+        {
+            let directory = self._directory.try_clone().map_err(|error| {
+                format!("cannot retain the selected repository directory: {error}")
+            })?;
+            let bytes = crate::store_records::read_retained(
+                &self.selected_home,
+                directory,
+                Path::new("manifest.json"),
+            )
+            .map_err(|error| format!("selected repository identity is unavailable: {error}"))?
+            .ok_or_else(|| "selected repository has no manifest record".to_string())?;
+            let manifest: crate::manifest::KinManifest = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("selected repository manifest is invalid: {error}"))?;
+            Ok(manifest.repo_id)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err("native repository identity is unsupported on this platform".into())
+        }
+    }
+
     pub fn current() -> Result<Self, String> {
         Self::capture(&crate::registry::managed_kin_home())
     }
@@ -319,6 +423,8 @@ pub struct RuntimeServiceIdentity {
     pub pid: u32,
     #[serde(default)]
     pub namespace: Option<String>,
+    #[serde(default)]
+    pub repository: Option<RuntimeRepositoryIdentity>,
 }
 
 impl RuntimeServiceIdentity {
@@ -334,6 +440,7 @@ impl RuntimeServiceIdentity {
             } else {
                 Some(RuntimeNamespace::for_service()?.token().to_owned())
             },
+            repository: None,
         })
     }
 
@@ -344,6 +451,32 @@ impl RuntimeServiceIdentity {
             RuntimeMode::current()?,
             &RuntimeNamespace::current()?,
         )
+    }
+
+    /// Admit a daemon request under its declared local or hosted authority.
+    /// Hosted release authority is independent of this machine's installation.
+    pub fn admit_daemon_for(
+        &self,
+        identity: &RuntimeIdentity,
+        mode: RuntimeMode,
+        namespace: Option<&RuntimeNamespace>,
+    ) -> Result<Option<String>, String> {
+        if self.schema == "kin.runtime-service.v1"
+            && self.component == "hosted-daemon"
+            && self.namespace.is_none()
+        {
+            // Each release must be eligible under the same mode, while the
+            // hosted service's source identity is independent of the client.
+            identity.validate_service(identity, mode, mode)?;
+            self.identity
+                .validate_service(&self.identity, mode, self.mode)?;
+            return Ok(None);
+        }
+        let namespace = namespace.ok_or_else(|| {
+            "local runtime request has no admitted Kin home namespace".to_string()
+        })?;
+        self.validate_for("daemon", identity, mode, namespace)?;
+        Ok(Some(identity.fingerprint(mode, namespace.token())))
     }
 
     fn validate_for(
@@ -369,6 +502,49 @@ impl RuntimeServiceIdentity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repository_binding_retained_manifest_keeps_identity_coherent_across_aba_alias() {
+        let parent = tempfile::tempdir().unwrap();
+        let selected = parent.path().join("selected");
+        let replacement = parent.path().join("replacement");
+        let retired = parent.path().join("retired");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let mut first = crate::manifest::KinManifest::new();
+        first.repo_id = "repository-a".into();
+        first.save(&selected.join("manifest.json")).unwrap();
+        let mut second = crate::manifest::KinManifest::new();
+        second.repo_id = "repository-b".into();
+        second.save(&replacement.join("manifest.json")).unwrap();
+        let retained = super::RuntimeNamespace::capture(&selected).unwrap();
+        let original_namespace = retained.token().to_owned();
+
+        std::fs::rename(&selected, &retired).unwrap();
+        std::fs::rename(&replacement, &selected).unwrap();
+        assert_eq!(
+            crate::manifest::KinManifest::load(&selected.join("manifest.json"))
+                .unwrap()
+                .repo_id,
+            "repository-b",
+            "the mutable path must actually name B during this read"
+        );
+        let retained_id = retained.read_repository_id().unwrap();
+        std::fs::rename(&selected, &replacement).unwrap();
+        std::fs::rename(&retired, &selected).unwrap();
+        retained.revalidate().unwrap();
+
+        let binding =
+            super::RuntimeRepositoryBinding::from_store_namespace(&retained_id, retained).unwrap();
+        assert_eq!(binding.identity().repository_id, "repository-a");
+        assert_eq!(binding.identity().store_namespace, original_namespace);
+        assert_eq!(
+            binding.identity(),
+            super::RuntimeRepositoryBinding::for_store(&selected)
+                .unwrap()
+                .identity()
+        );
+    }
+
     use super::*;
 
     fn clean_identity() -> RuntimeIdentity {
@@ -444,6 +620,7 @@ mod tests {
             component: "daemon".into(),
             pid: std::process::id(),
             namespace: Some(service_namespace.token().to_owned()),
+            repository: None,
         };
         service
             .validate_for(

@@ -994,6 +994,39 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
+        if std::env::var("SOURCE_EXCERPTS_TEST_PARENT").as_deref() != Ok("1") {
+            let home = tempfile::tempdir().unwrap();
+            let repo = home.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "source_pages::tests::a_long_source_read_through_the_daemon_is_served_as_excerpts",
+                    "--nocapture",
+                ])
+                .current_dir(&repo)
+                .env("HOME", home.path().join("private-home"))
+                .env("KIN_HOME", home.path().join("kin-home"))
+                .env("KIN_REGISTRY_PATH", home.path().join("kin-home/registry.toml"))
+                .env("KIN_NO_DAEMON", "1")
+                .env("SOURCE_EXCERPTS_TEST_PARENT", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the fixture process ran nothing: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let repo = std::env::current_dir().unwrap();
+        let runtime = crate::daemon_delegate::RuntimeDaemonFixture::new(&repo);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1041,8 +1074,14 @@ mod tests {
                             break (head, request[end + 4..end + 4 + length].to_vec());
                         }
                     };
-                    // Every other route is one this stand-in has nothing for.
-                    let (status, reply) = if head.starts_with("POST /mcp/tools/call ") {
+                    let target = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default();
+                    let (status, reply) = if let Some(reply) = runtime.route_response(target) {
+                        ("200 OK", reply)
+                    } else if head.starts_with("POST /mcp/tools/call ") {
                         calls
                             .lock()
                             .unwrap()
@@ -1060,17 +1099,11 @@ mod tests {
                 }
             })
         };
-        let home = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", FORWARDING_CHILD, "--ignored", "--nocapture"])
-            .current_dir(home.path())
+            .current_dir(&repo)
             .env("KIN_DAEMON_URL", format!("http://{address}"))
             .env("KIN_DAEMON_AUTH_TOKEN", "isolated-fixture-token")
-            .env("KIN_HOME", home.path().join("private-home"))
-            .env(
-                "KIN_REGISTRY_PATH",
-                home.path().join("private-home/registry.toml"),
-            )
             .env("KIN_NO_DAEMON", "1")
             .env("SOURCE_EXCERPTS_TEST_CHILD", "1")
             .output()
@@ -1111,6 +1144,7 @@ mod tests {
             std::env::var("SOURCE_EXCERPTS_TEST_CHILD").as_deref(),
             Ok("1")
         );
+        crate::daemon_delegate::RuntimeDaemonFixture::install_registrar();
         let body = huge_function();
         let agent = McpServerConfig {
             allowed_tools: Some(crate::tools::name_set(

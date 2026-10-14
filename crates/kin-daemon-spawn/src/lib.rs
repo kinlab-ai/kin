@@ -5861,6 +5861,23 @@ pub trait DaemonSpawnRegistrar: Send + Sync {
             }
         })
     }
+
+    /// Probe this endpoint for this repository without discovering another
+    /// route or starting anything. A legacy registrar cannot certify it.
+    fn reading_at(
+        &self,
+        _kin_root: PathBuf,
+        _endpoint: String,
+        _budget: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunningDaemonRouteReading> + Send>>
+    {
+        Box::pin(async {
+            RunningDaemonRouteReading::Unresolved {
+                detail: "the installed registrar has no endpoint-specific readiness probe"
+                    .to_string(),
+            }
+        })
+    }
 }
 
 /// Resolve the supervisor endpoint through the installed seam, if there is one.
@@ -5892,6 +5909,23 @@ pub async fn running_daemon_route_reading(
     };
     registrar
         .reading_if_running(kin_root.to_path_buf(), budget)
+        .await
+}
+
+/// Certify the caller's chosen endpoint for this repository within `budget`.
+/// This observer never substitutes a configured or discovered route.
+pub async fn running_daemon_route_reading_at(
+    kin_root: &Path,
+    endpoint: &str,
+    budget: std::time::Duration,
+) -> RunningDaemonRouteReading {
+    let Some(registrar) = registrar() else {
+        return RunningDaemonRouteReading::Unresolved {
+            detail: "no daemon registrar is installed in this process".to_string(),
+        };
+    };
+    registrar
+        .reading_at(kin_root.to_path_buf(), endpoint.to_string(), budget)
         .await
 }
 

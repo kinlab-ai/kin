@@ -636,6 +636,16 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         "constructing the isolated runtime created product control state before kin init"
     );
     let isolated_command = runtime.kin_command();
+    let supervisor_pid_path = {
+        let child_kin_home = isolated_command
+            .configured_env_for_test(std::ffi::OsStr::new("KIN_HOME"))
+            .flatten()
+            .expect("the fixture declares its existing Kin home");
+        let _kin_home = EnvVarGuard::set("KIN_HOME", child_kin_home.as_os_str());
+        let _registry = EnvVarGuard::set("KIN_REGISTRY_PATH", runtime.registry_path().as_os_str());
+        let _mode = EnvVarGuard::set("KIN_RUNTIME_MODE", std::ffi::OsStr::new("development"));
+        kin_core::registry::supervisor_root().join("supervisor.pid")
+    };
     for removed in [
         "KIN_STORAGE",
         "KIN_GCS_BUCKET",
@@ -762,11 +772,7 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     );
 
     let worker_pid_path = kin_root.join("daemon.pid");
-    let supervisor_pid_path = runtime
-        .registry_path()
-        .parent()
-        .expect("runtime registry parent")
-        .join("supervisor.pid");
+
     let worker_pid = recorded_pid(&worker_pid_path);
     let supervisor_pid = recorded_pid(&supervisor_pid_path);
     assert!(

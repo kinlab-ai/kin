@@ -20,6 +20,262 @@ use crate::types::{ContentBlock, ToolCallResult};
 /// Cached daemon HTTP client. We only cache positive connectivity so that a
 /// daemon that comes online after MCP startup can still take authority.
 static DAEMON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static REQUEST_RUNTIME: OnceLock<Result<DaemonRequestRuntime, String>> = OnceLock::new();
+
+struct DaemonRequestRuntime {
+    identity: kin_core::runtime_identity::RuntimeIdentity,
+    mode: kin_core::runtime_identity::RuntimeMode,
+    namespace: Result<kin_core::runtime_identity::RuntimeNamespace, String>,
+}
+
+impl DaemonRequestRuntime {
+    fn capture() -> Result<Self, String> {
+        Ok(Self {
+            identity: kin_core::runtime_identity::RuntimeIdentity::current(),
+            mode: kin_core::runtime_identity::RuntimeMode::current()?,
+            namespace: kin_core::runtime_identity::RuntimeNamespace::for_service(),
+        })
+    }
+}
+
+pub(crate) fn capture_request_runtime() {
+    let _ = REQUEST_RUNTIME.get_or_init(DaemonRequestRuntime::capture);
+}
+
+/// Every local HTTP forward admits the peer before sending semantic data.
+pub(crate) async fn send_admitted_daemon_request(
+    operation: &str,
+    base: &str,
+    request: reqwest::RequestBuilder,
+    patience: Duration,
+) -> Result<reqwest::Response, DaemonCallError> {
+    let runtime = REQUEST_RUNTIME
+        .get_or_init(DaemonRequestRuntime::capture)
+        .as_ref()
+        .map_err(|error| {
+            DaemonCallError::DaemonError(format!("runtime admission refused: {error}"))
+        })?;
+    send_admitted_daemon_request_with(
+        operation,
+        base,
+        request,
+        patience,
+        runtime,
+        |remaining| async move {
+            let root = discover_kin_dir().ok_or_else(|| {
+                DaemonCallError::DaemonError(
+                    "runtime admission refused: no intended repository is bound".into(),
+                )
+            })?;
+            let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::for_store(&root)
+                .map_err(|error| {
+                    DaemonCallError::DaemonError(format!(
+                        "runtime admission refused: cannot bind the intended repository ({error})"
+                    ))
+                })?;
+            Ok((
+                kin_daemon_spawn::running_daemon_route_reading_at(&root, base, remaining).await,
+                repository,
+            ))
+        },
+    )
+    .await
+}
+
+async fn read_daemon_runtime_claim(
+    client: &reqwest::Client,
+    base: &str,
+    authorization: Option<&reqwest::header::HeaderValue>,
+    deadline: tokio::time::Instant,
+) -> Result<kin_core::runtime_identity::RuntimeServiceIdentity, DaemonCallError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(DaemonCallError::Timeout(
+            "runtime identity probe exceeded this request's deadline".into(),
+        ));
+    }
+    let metadata_request = client
+        .get(format!("{}/runtime/identity", base.trim_end_matches('/')))
+        .timeout(remaining);
+    let metadata_request = match authorization {
+        Some(value) => metadata_request.header(reqwest::header::AUTHORIZATION, value.clone()),
+        None => metadata_request,
+    };
+    let metadata = metadata_request
+        .send()
+        .await
+        .map_err(|error| classify_send_error("runtime identity probe", error))?;
+    if !metadata.status().is_success() {
+        return Err(DaemonCallError::DaemonError(format!(
+            "runtime admission refused: endpoint returned HTTP {} for its identity claim",
+            metadata.status()
+        )));
+    }
+    metadata
+        .json::<kin_core::runtime_identity::RuntimeServiceIdentity>()
+        .await
+        .map_err(|error| {
+            DaemonCallError::DaemonError(format!(
+                "runtime admission refused: endpoint supplied no valid identity claim ({error})"
+            ))
+        })
+}
+
+async fn send_admitted_daemon_request_with<F, R>(
+    operation: &str,
+    base: &str,
+    request: reqwest::RequestBuilder,
+    patience: Duration,
+    runtime: &DaemonRequestRuntime,
+    repository_probe: F,
+) -> Result<reqwest::Response, DaemonCallError>
+where
+    F: FnOnce(Duration) -> R,
+    R: std::future::Future<
+        Output = Result<
+            (
+                kin_daemon_spawn::RunningDaemonRouteReading,
+                kin_core::runtime_identity::RuntimeRepositoryBinding,
+            ),
+            DaemonCallError,
+        >,
+    >,
+{
+    let deadline = tokio::time::Instant::now() + patience;
+    let mut request = request.build().map_err(|error| {
+        DaemonCallError::DaemonError(format!("cannot build daemon request: {error}"))
+    })?;
+    let selected = reqwest::Url::parse(base).map_err(|error| {
+        DaemonCallError::DaemonError(format!(
+            "runtime admission refused: invalid endpoint ({error})"
+        ))
+    })?;
+    if request.url().origin() != selected.origin() {
+        return Err(DaemonCallError::DaemonError(
+            "runtime admission refused: request addresses a different endpoint".into(),
+        ));
+    }
+    let client = daemon_client().await.ok_or_else(|| {
+        DaemonCallError::DaemonError("cannot construct the admitted daemon HTTP client".into())
+    })?;
+    let mut peer = read_daemon_runtime_claim(
+        &client,
+        base,
+        request.headers().get(reqwest::header::AUTHORIZATION),
+        deadline,
+    )
+    .await?;
+    let mut fingerprint = peer
+        .admit_daemon_for(
+            &runtime.identity,
+            runtime.mode,
+            runtime.namespace.as_ref().ok(),
+        )
+        .map_err(|error| {
+            DaemonCallError::DaemonError(format!("runtime admission refused: {error}"))
+        })?;
+    let mut repository_fingerprint = None;
+    if fingerprint.is_some() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let (route, repository) = tokio::time::timeout(remaining, repository_probe(remaining))
+            .await
+            .map_err(|_| {
+                DaemonCallError::Timeout(
+                    "repository binding probe exceeded this request's deadline".into(),
+                )
+            })??;
+        match route {
+            kin_daemon_spawn::RunningDaemonRouteReading::Serving(_) => {}
+            kin_daemon_spawn::RunningDaemonRouteReading::NotReady {
+                detail,
+                warming: true,
+            } => {
+                return Err(DaemonCallError::Warming(detail));
+            }
+            other => {
+                return Err(DaemonCallError::DaemonError(format!(
+                    "runtime admission refused: endpoint does not serve the intended repository ({other:?})"
+                )));
+            }
+        }
+        if peer.repository.is_none() {
+            // Warming metadata has no bound store. A readiness transition
+            // needs a fresh full identity claim before it can serve this call.
+            peer = read_daemon_runtime_claim(
+                &client,
+                base,
+                request.headers().get(reqwest::header::AUTHORIZATION),
+                deadline,
+            )
+            .await?;
+            fingerprint = peer
+                .admit_daemon_for(
+                    &runtime.identity,
+                    runtime.mode,
+                    runtime.namespace.as_ref().ok(),
+                )
+                .map_err(|error| {
+                    DaemonCallError::DaemonError(format!("runtime admission refused: {error}"))
+                })?;
+            if fingerprint.is_none() {
+                return Err(DaemonCallError::DaemonError(
+                    "runtime admission refused: local service authority changed during repository binding"
+                        .into(),
+                ));
+            }
+        }
+        repository_fingerprint = Some(
+            peer.repository
+                .as_ref()
+                .ok_or_else(|| {
+                    DaemonCallError::DaemonError(
+                        "runtime admission refused: ready service supplied no repository identity"
+                            .into(),
+                    )
+                })?
+                .validate_for(&repository)
+                .map_err(|error| {
+                    DaemonCallError::DaemonError(format!(
+                        "runtime admission refused: repository identity mismatch ({error})"
+                    ))
+                })?,
+        );
+    }
+    if let Some(fingerprint) = fingerprint {
+        let value = reqwest::header::HeaderValue::from_str(&fingerprint).map_err(|error| {
+            DaemonCallError::DaemonError(format!("cannot encode runtime fingerprint: {error}"))
+        })?;
+        request.headers_mut().insert(
+            reqwest::header::HeaderName::from_static(
+                kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+            ),
+            value,
+        );
+    }
+    if let Some(fingerprint) = repository_fingerprint {
+        let value = reqwest::header::HeaderValue::from_str(&fingerprint).map_err(|error| {
+            DaemonCallError::DaemonError(format!("cannot encode repository fingerprint: {error}"))
+        })?;
+        request.headers_mut().insert(
+            reqwest::header::HeaderName::from_static(
+                kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+            ),
+            value,
+        );
+    }
+    // Execute through the same no-redirect client that admitted the endpoint.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(DaemonCallError::Timeout(
+            "runtime admission exceeded this request's deadline".into(),
+        ));
+    }
+    *request.timeout_mut() = Some(remaining);
+    client
+        .execute(request)
+        .await
+        .map_err(|error| classify_send_error(operation, error))
+}
 
 /// Runtime override for the daemon base URL.
 ///
@@ -965,7 +1221,10 @@ async fn fetch_embedding_coverage_from_resources_at(
     )
     .timeout(Duration::from_secs(3))
     .json(&serde_json::json!({ "json": false }));
-    let response = request.send().await.ok()?;
+    let response =
+        send_admitted_daemon_request("embedding coverage", base, request, Duration::from_secs(3))
+            .await
+            .ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -1699,10 +1958,7 @@ impl DaemonCallSeam for RealDaemonSeam {
             .timeout(patience)
             .json(&serde_json::json!({ "name": name, "arguments": args }));
         let request = with_session_header(with_auth(request), args);
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| classify_send_error("MCP tool call", e))?;
+        let resp = send_admitted_daemon_request("MCP tool call", base, request, patience).await?;
         note_session_status(&resp, args);
         if !resp.status().is_success() {
             return Err(daemon_http_error("MCP tool call", resp).await);
@@ -2638,7 +2894,10 @@ where
                     "daemon {operation} failed: could not build an HTTP client"
                 )));
             };
-            send_daemon_json(operation, build(&client, &url).timeout(patience)).await
+            let response =
+                send_admitted_daemon_request(operation, &url, build(&client, &url), patience)
+                    .await?;
+            read_daemon_json_response(operation, response).await
         }
     })
     .await
@@ -2737,6 +2996,7 @@ fn is_warming_refusal(status: reqwest::StatusCode, body: &str) -> bool {
 /// An empty body is `Value::Null`, not an error. Some daemon mutations answer
 /// `204 No Content`, and the callers that expect it (intent release) synthesize
 /// their own result.
+#[cfg(test)]
 async fn send_daemon_json(
     operation: &str,
     request: reqwest::RequestBuilder,
@@ -2745,6 +3005,13 @@ async fn send_daemon_json(
         .send()
         .await
         .map_err(|e| classify_send_error(operation, e))?;
+    read_daemon_json_response(operation, resp).await
+}
+
+async fn read_daemon_json_response(
+    operation: &str,
+    resp: reqwest::Response,
+) -> Result<serde_json::Value, DaemonCallError> {
     if !resp.status().is_success() {
         return Err(daemon_http_error(operation, resp).await);
     }
@@ -3440,12 +3707,14 @@ pub async fn fetch_health_snapshot() -> Option<serde_json::Value> {
     // Its own deadline, not the client backstop: this is an envelope-decorating
     // probe whose answer is optional, so it must never inherit the patience a
     // forwarded tool call is entitled to.
-    let resp = client
-        .get(format!("{}/health", base))
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?;
+    let resp = send_admitted_daemon_request(
+        "daemon health snapshot",
+        &base,
+        with_auth(client.get(format!("{}/health", base))),
+        Duration::from_secs(3),
+    )
+    .await
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -3470,6 +3739,7 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
     }
 
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         // Slow is not dead. A daemon fresh off a clone spends its first minute
         // on enrichment and spine work, and a legitimate tool call inside that
         // window can take well over five seconds; a 5 s total-request timeout
@@ -3685,8 +3955,198 @@ pub async fn forward_check_traffic(
 }
 
 #[cfg(test)]
+pub(crate) use tests::RuntimeDaemonFixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    pub(crate) struct RuntimeDaemonFixture {
+        pub(crate) store_root: std::path::PathBuf,
+        _repository: kin_core::runtime_identity::RuntimeRepositoryBinding,
+        identity: String,
+        health: String,
+    }
+
+    impl RuntimeDaemonFixture {
+        pub(crate) fn new(repo: &Path) -> Self {
+            let layout = kin_core::init(repo)
+                .expect("initialize the fixture repository")
+                .layout;
+            let repository =
+                kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&layout)
+                    .expect("capture the fixture repository binding");
+            let mut identity =
+                kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+                    .expect("capture the fixture runtime identity");
+            identity.repository = Some(repository.identity().clone());
+            let health = serde_json::json!({
+                "status": "ok",
+                "version": identity.identity.version,
+                "uptime_seconds": 0,
+                "graph_entity_count": 0,
+                "graph_loaded": true,
+                "reconciliation_status": "idle",
+                "repo_root": repo.canonicalize().unwrap(),
+                "pid": std::process::id(),
+            })
+            .to_string();
+            Self {
+                store_root: layout.root().to_path_buf(),
+                _repository: repository,
+                identity: serde_json::to_string(&identity).unwrap(),
+                health,
+            }
+        }
+
+        pub(crate) fn route_response(&self, target: &str) -> Option<String> {
+            match target {
+                "/runtime/identity" => Some(self.identity.clone()),
+                "/readiness" => Some(r#"{"ready":true,"warming":false}"#.to_string()),
+                "/health" => Some(self.health.clone()),
+                _ => None,
+            }
+        }
+
+        pub(crate) fn install_registrar() {
+            kin_daemon_spawn::install_registrar(std::sync::Arc::new(FixtureSpawnRegistrar));
+        }
+    }
+
+    pub(super) fn fixture_home(repo: &Path) -> kin_core::test_env::EnvVarGuard {
+        let home = repo.join("private-home");
+        std::fs::create_dir_all(&home).unwrap();
+        kin_core::test_env::EnvVarGuard::set("HOME", repo)
+            .with("USERPROFILE", repo)
+            .with("KIN_HOME", &home)
+            .with("KIN_REGISTRY_PATH", home.join("registry.toml"))
+            .with("KIN_RUNTIME_MODE", "development")
+            .with("KIN_STORE_LAYOUT", "in-tree")
+    }
+
+    struct FixtureSpawnRegistrar;
+
+    impl kin_daemon_spawn::DaemonSpawnRegistrar for FixtureSpawnRegistrar {
+        fn supervisor_url(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            Box::pin(async { None })
+        }
+
+        fn register(
+            &self,
+            _: std::path::PathBuf,
+            _: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            Box::pin(async { Err("the fixture registrar cannot start or register daemons".into()) })
+        }
+
+        fn route_if_running(
+            &self,
+            _: std::path::PathBuf,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            Box::pin(async { None })
+        }
+
+        fn reading_at(
+            &self,
+            root: std::path::PathBuf,
+            endpoint: String,
+            budget: Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = kin_daemon_spawn::RunningDaemonRouteReading>
+                    + Send,
+            >,
+        > {
+            Box::pin(async move {
+                use kin_daemon_spawn::RunningDaemonRouteReading;
+
+                #[derive(serde::Deserialize)]
+                struct Readiness {
+                    ready: bool,
+                    warming: bool,
+                }
+                #[derive(serde::Deserialize)]
+                struct Health {
+                    status: String,
+                    version: String,
+                    uptime_seconds: u64,
+                    graph_entity_count: u64,
+                    graph_loaded: bool,
+                    reconciliation_status: String,
+                    repo_root: std::path::PathBuf,
+                    pid: u32,
+                }
+
+                let probe = async {
+                    let binding =
+                        kin_core::runtime_identity::RuntimeRepositoryBinding::for_store(&root)?;
+                    let working_dir = kin_core::KinLayout::new(root)
+                        .working_dir()
+                        .canonicalize()
+                        .map_err(|error| error.to_string())?;
+                    let client = reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .map_err(|error| error.to_string())?;
+                    let readiness: Readiness =
+                        with_auth(client.get(format!("{endpoint}/readiness")))
+                            .send()
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .error_for_status()
+                            .map_err(|error| error.to_string())?
+                            .json()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    if !readiness.ready {
+                        return Ok(RunningDaemonRouteReading::NotReady {
+                            detail: "fixture endpoint is not ready".into(),
+                            warming: readiness.warming,
+                        });
+                    }
+                    let health: Health = with_auth(client.get(format!("{endpoint}/health")))
+                        .send()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .error_for_status()
+                        .map_err(|error| error.to_string())?
+                        .json()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let _ = (health.uptime_seconds, health.graph_entity_count);
+                    if health.status != "ok"
+                        || health.version
+                            != kin_core::runtime_identity::RuntimeIdentity::current().version
+                        || !health.graph_loaded
+                        || health.reconciliation_status != "idle"
+                        || health.pid == 0
+                        || health
+                            .repo_root
+                            .canonicalize()
+                            .map_err(|error| error.to_string())?
+                            != working_dir
+                    {
+                        return Err(
+                            "fixture health does not certify the intended repository".to_string()
+                        );
+                    }
+                    binding.revalidate()?;
+                    Ok::<_, String>(RunningDaemonRouteReading::Serving(endpoint))
+                };
+                match tokio::time::timeout(budget, probe).await {
+                    Ok(Ok(reading)) => reading,
+                    Ok(Err(detail)) => RunningDaemonRouteReading::Unresolved { detail },
+                    Err(_) => RunningDaemonRouteReading::Unresolved {
+                        detail: "fixture endpoint readiness probe timed out".into(),
+                    },
+                }
+            })
+        }
+    }
 
     /// A store an older Kin build wrote names `kin upgrade` when no ready route
     /// serves it, because a daemon cannot serve it until it is re-derived. The
@@ -4555,8 +5015,46 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), handle)
     }
 
-    /// One-shot responder that also returns the exact HTTP request it received.
+    async fn admitted_stub_daemon_raw(
+        runtime: RuntimeDaemonFixture,
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let admitted = runtime.route_response(target);
+                let (status, reason, body) = match admitted.as_deref() {
+                    Some(body) => (200, "OK", body),
+                    None => (status, reason, body),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// Respond to admission probes, then capture the semantic resources request.
     async fn capturing_resources_daemon(
+        runtime: RuntimeDaemonFixture,
         body: &'static str,
     ) -> (
         String,
@@ -4568,51 +5066,78 @@ mod tests {
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0u8; 2048];
-                let read = socket.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
+            let mut request_tx = Some(request_tx);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 2048];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&chunk[..read]);
-                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let target = request
                     .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let admitted = runtime.route_response(target);
+                if admitted.is_none() {
+                    let _ = request_tx.take().unwrap().send(request);
+                }
+                let response_body = admitted.as_deref().unwrap_or(body);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+                if admitted.is_none() {
                     break;
                 }
             }
-            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            let _ = socket.shutdown().await;
         });
         (format!("http://127.0.0.1:{port}"), request_rx, handle)
     }
 
     #[tokio::test]
     async fn resources_observation_preserves_refusal_on_legacy_and_error_shapes() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let _home = fixture_home(repo.path());
+        let _working_dir = TestWorkingDir::enter(repo.path());
+        let runtime = RuntimeDaemonFixture::new(repo.path());
+        RuntimeDaemonFixture::install_registrar();
         let client = probe_client();
         let arguments = HashMap::new();
 
-        let (exact, exact_handle) = stub_daemon(
+        let (exact, exact_handle) = admitted_stub_daemon_raw(
+            runtime.clone(), 200, "OK",
             r#"{"embed_runtime":{"embeddings_pending":0,"embeddings_indexed":4,"embeddings_total":4}}"#,
         )
         .await;
@@ -4622,8 +5147,13 @@ mod tests {
         );
         exact_handle.abort();
 
-        let (legacy, legacy_handle) =
-            stub_daemon(r#"{"embed_runtime":{"embeddings_indexed":4}}"#).await;
+        let (legacy, legacy_handle) = admitted_stub_daemon_raw(
+            runtime.clone(),
+            200,
+            "OK",
+            r#"{"embed_runtime":{"embeddings_indexed":4}}"#,
+        )
+        .await;
         assert_eq!(
             fetch_embedding_coverage_from_resources_at(&client, &legacy, &arguments).await,
             None,
@@ -4631,15 +5161,21 @@ mod tests {
         );
         legacy_handle.abort();
 
-        let (malformed, malformed_handle) = stub_daemon("not json").await;
+        let (malformed, malformed_handle) =
+            admitted_stub_daemon_raw(runtime.clone(), 200, "OK", "not json").await;
         assert_eq!(
             fetch_embedding_coverage_from_resources_at(&client, &malformed, &arguments).await,
             None
         );
         malformed_handle.abort();
 
-        let (failed, failed_handle) =
-            stub_daemon_raw(500, "Internal Server Error", r#"{"error":"old daemon"}"#).await;
+        let (failed, failed_handle) = admitted_stub_daemon_raw(
+            runtime,
+            500,
+            "Internal Server Error",
+            r#"{"error":"old daemon"}"#,
+        )
+        .await;
         assert_eq!(
             fetch_embedding_coverage_from_resources_at(&client, &failed, &arguments).await,
             None
@@ -4649,6 +5185,14 @@ mod tests {
 
     #[tokio::test]
     async fn resources_observation_posts_the_default_request_for_the_callers_session() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let _home = fixture_home(repo.path());
+        let _working_dir = TestWorkingDir::enter(repo.path());
+        let runtime = RuntimeDaemonFixture::new(repo.path());
+        RuntimeDaemonFixture::install_registrar();
         let client = probe_client();
         let mut arguments = HashMap::new();
         arguments.insert(
@@ -4656,6 +5200,7 @@ mod tests {
             serde_json::json!("session-selected-graph"),
         );
         let (base, request_rx, handle) = capturing_resources_daemon(
+            runtime,
             r#"{"embed_runtime":{"embeddings_pending":0,"embeddings_indexed":4,"embeddings_total":4}}"#,
         )
         .await;
@@ -5189,9 +5734,17 @@ mod tests {
     /// the direct Axum route test cannot cover.
     #[tokio::test]
     async fn expired_session_404_reaches_the_final_mcp_tool_result() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let _home = fixture_home(repo.path());
+        let _working_dir = TestWorkingDir::enter(repo.path());
+        let runtime = RuntimeDaemonFixture::new(repo.path());
+        RuntimeDaemonFixture::install_registrar();
         let body = "session not found: dead-session. It expired after its idle timeout. \
                     Call kin_session_start for a new session id.";
-        let (base, handle) = stub_daemon_raw(404, "Not Found", body).await;
+        let (base, handle) = admitted_stub_daemon_raw(runtime, 404, "Not Found", body).await;
 
         let forwarded = session_heartbeat_request(&base, "dead-session")
             .await
@@ -5831,7 +6384,14 @@ mod tests {
     /// the listener until the child has finished and aborts it even on failure.
     #[tokio::test]
     async fn traffic_scope_forwarding_preserves_one_decoded_path_segment() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let repo = tempfile::tempdir().unwrap();
+        let _home = fixture_home(repo.path());
+        let runtime = RuntimeDaemonFixture::new(repo.path());
 
         struct ServerGuard(tokio::task::JoinHandle<()>);
         impl Drop for ServerGuard {
@@ -5869,6 +6429,15 @@ mod tests {
                     .split_whitespace()
                     .nth(1)
                     .unwrap();
+                if let Some(body) = runtime.route_response(target) {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
                 let scope = target
                     .strip_prefix("/traffic/")
                     .filter(|segment| !segment.is_empty() && !segment.contains(['/', '?']))
@@ -5896,6 +6465,7 @@ mod tests {
                     "daemon_delegate::tests::traffic_scope_forwarding_child",
                     "--nocapture",
                 ])
+                .current_dir(repo.path())
                 .env("TRAFFIC_SCOPE_FORWARDING_TEST_CHILD", "1")
                 .env("KIN_DAEMON_URL", base)
                 .kill_on_drop(true)
@@ -5924,6 +6494,7 @@ mod tests {
         if std::env::var("TRAFFIC_SCOPE_FORWARDING_TEST_CHILD").as_deref() != Ok("1") {
             return;
         }
+        RuntimeDaemonFixture::install_registrar();
         for scope in TRAFFIC_SCOPE_CASES {
             let result = forward_check_traffic(&[scope.to_string()])
                 .await
@@ -6173,16 +6744,22 @@ mod tests {
     // auth and process-global state cannot contaminate concurrently running tests.
     #[test]
     fn precommit_source_failures_are_rechecked_without_a_semantic_commit() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
 
         for marker in [Some("4\n"), None, Some("unreadable-generation\n")] {
             let repo = tempfile::tempdir().unwrap();
-            let kin_dir = repo.path().join(".kin");
-            std::fs::create_dir_all(kin_dir.join("kindb")).unwrap();
+            let _home = fixture_home(repo.path());
+            let runtime = RuntimeDaemonFixture::new(repo.path());
+            let kin_dir = runtime.store_root.clone();
             if let Some(marker) = marker {
                 std::fs::write(kin_dir.join("kindb/head-generation"), marker).unwrap();
+            } else if kin_dir.join("kindb/head-generation").exists() {
+                std::fs::remove_file(kin_dir.join("kindb/head-generation")).unwrap();
             }
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -6207,7 +6784,7 @@ mod tests {
                         .set_read_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
                     let mut request = Vec::new();
-                    loop {
+                    let admitted = loop {
                         let mut chunk = [0; 1024];
                         let received = socket.read(&mut chunk).unwrap();
                         assert!(received > 0, "fixture request ended before its body");
@@ -6216,7 +6793,17 @@ mod tests {
                         if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
                         {
                             let headers = std::str::from_utf8(&request[..end]).unwrap();
-                            assert!(headers.starts_with("POST /mcp/tools/call "));
+                            let target = headers
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap();
+                            let admitted = runtime.route_response(target);
+                            if admitted.is_none() {
+                                assert!(headers.starts_with("POST /mcp/tools/call "));
+                            }
                             let length: usize = headers
                                 .lines()
                                 .find_map(|line| {
@@ -6224,15 +6811,21 @@ mod tests {
                                     key.eq_ignore_ascii_case("content-length")
                                         .then(|| value.trim().parse().unwrap())
                                 })
-                                .unwrap();
+                                .unwrap_or(0);
                             if request.len() >= end + 4 + length {
-                                let body: serde_json::Value =
-                                    serde_json::from_slice(&request[end + 4..end + 4 + length])
-                                        .unwrap();
-                                assert!(body["arguments"]["entity_id"].as_str().is_some());
-                                break;
+                                if admitted.is_none() {
+                                    let body: serde_json::Value =
+                                        serde_json::from_slice(&request[end + 4..end + 4 + length])
+                                            .unwrap();
+                                    assert!(body["arguments"]["entity_id"].as_str().is_some());
+                                }
+                                break admitted;
                             }
                         }
+                    };
+                    if let Some(body) = admitted {
+                        write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        continue;
                     }
                     let call = server_calls.fetch_add(1, Ordering::SeqCst);
                     let result = if call % 2 == 0 {
@@ -6296,6 +6889,7 @@ mod tests {
             std::env::var("SOURCE_FORWARDING_TEST_CHILD").as_deref(),
             Ok("1")
         );
+        RuntimeDaemonFixture::install_registrar();
         for (index, name) in ["get_entity_source", "get_entity_source", "get_entity_body"]
             .into_iter()
             .enumerate()
@@ -7919,46 +8513,78 @@ mod connection_session_tests {
     /// marks the tag, which is how the server knows to open a new one.
     #[tokio::test]
     async fn a_daemon_that_does_not_hold_the_session_is_heard() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         if launcher_session_set() {
             return;
         }
+        let repo = tempfile::tempdir().unwrap();
+        let _home = tests::fixture_home(repo.path());
+        let _working_dir = TestWorkingDir::enter(repo.path());
+        let runtime = RuntimeDaemonFixture::new(repo.path());
+        RuntimeDaemonFixture::install_registrar();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
         let server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0u8; 4096];
-                let read = socket.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
+            let mut request_tx = Some(request_tx);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&chunk[..read]);
-                let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-                let length = head
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let target = request
                     .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                if request.len() >= end + 4 + length {
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let admitted = runtime.route_response(target);
+                if admitted.is_none() {
+                    let _ = request_tx.take().unwrap().send(request);
+                }
+                let body = admitted
+                    .as_deref()
+                    .unwrap_or(r#"{"content":[{"type":"text","text":"{}"}]}"#);
+                let session_status = if admitted.is_none() {
+                    "x-kin-session-status: unknown\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 {session_status}content-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+                if admitted.is_none() {
                     break;
                 }
             }
-            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
-            let body = r#"{"content":[{"type":"text","text":"{}"}]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                 x-kin-session-status: unknown\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            let _ = socket.shutdown().await;
         });
         let tag = ConnectionSessionTag::new("stale-session".to_string());
         let answered = with_connection_session(Some(tag.clone()), async {
@@ -7980,5 +8606,729 @@ mod connection_session_tests {
         );
         assert!(tag.gone(), "the daemon said it does not hold the session");
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod runtime_request_admission_tests {
+    use super::{send_admitted_daemon_request_with, DaemonCallError, DaemonRequestRuntime};
+    use kin_core::runtime_identity::{
+        RuntimeIdentity, RuntimeMode, RuntimeNamespace, RuntimeRepositoryBinding,
+        RuntimeServiceIdentity, RUNTIME_IDENTITY_HEADER, RUNTIME_REPOSITORY_HEADER,
+    };
+    use kin_daemon_spawn::RunningDaemonRouteReading;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const AUTHORIZATION: &str = "Bearer admission-fixture-token";
+    const PATIENCE: Duration = Duration::from_secs(3);
+
+    #[derive(Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    struct HttpFixture {
+        base: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        server: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl HttpFixture {
+        async fn start(metadata: Vec<serde_json::Value>) -> Self {
+            assert!(!metadata.is_empty());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind admission fixture");
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let seen_requests = requests.clone();
+            let seen_events = events.clone();
+            let metadata: Vec<String> = metadata
+                .iter()
+                .map(|value| serde_json::to_string(value).unwrap())
+                .collect();
+            let server = tokio::spawn(async move {
+                let mut metadata_readings = 0_usize;
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let request =
+                        match tokio::time::timeout(PATIENCE, read_request(&mut socket)).await {
+                            Ok(Some(request)) => request,
+                            _ => continue,
+                        };
+                    let (status, body, event) =
+                        match (request.method.as_str(), request.path.as_str()) {
+                            ("GET", "/runtime/identity") => {
+                                let body = &metadata[metadata_readings.min(metadata.len() - 1)];
+                                metadata_readings += 1;
+                                ("200 OK", body.as_str(), "metadata")
+                            }
+                            ("POST", "/mcp/tools/call") => {
+                                ("200 OK", r#"{"result":"fixture-answer"}"#, "operation")
+                            }
+                            _ => ("404 Not Found", "{}", "unexpected"),
+                        };
+                    seen_requests.lock().unwrap().push(request);
+                    seen_events.lock().unwrap().push(event);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                base,
+                requests,
+                events,
+                server: Some(server),
+            }
+        }
+
+        async fn finish(mut self) -> (Vec<RecordedRequest>, Vec<&'static str>) {
+            if let Some(server) = self.server.take() {
+                server.abort();
+                let _ = server.await;
+            }
+            let requests = std::mem::take(&mut *self.requests.lock().unwrap());
+            let events = std::mem::take(&mut *self.events.lock().unwrap());
+            (requests, events)
+        }
+    }
+
+    impl Drop for HttpFixture {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                server.abort();
+            }
+        }
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<RecordedRequest> {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(index) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.ok()?;
+            if count == 0 || bytes.len() + count > 65536 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        };
+        let head = std::str::from_utf8(&bytes[..header_end]).ok()?;
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next()?.split_whitespace();
+        let method = request_line.next()?.to_string();
+        let path = request_line.next()?.to_string();
+        let headers: BTreeMap<String, String> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let content_length = headers
+            .get("content-length")
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        if content_length > 65536 {
+            return None;
+        }
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Some(RecordedRequest {
+            method,
+            path,
+            headers,
+            body: bytes[header_end..header_end + content_length].to_vec(),
+        })
+    }
+
+    fn local_runtime() -> (tempfile::TempDir, DaemonRequestRuntime) {
+        let home = tempfile::tempdir().expect("create isolated admission namespace");
+        let namespace = RuntimeNamespace::capture(home.path()).unwrap();
+        let identity = RuntimeIdentity {
+            version: "0.8.6".into(),
+            commit_sha: "a".repeat(40),
+            source_dirty: false,
+            source_known: true,
+            target: "aarch64-apple-darwin".into(),
+            build_profile: "release".into(),
+        };
+        identity.require_managed().unwrap();
+        let runtime = DaemonRequestRuntime {
+            identity,
+            mode: RuntimeMode::Managed,
+            namespace: Ok(namespace),
+        };
+        (home, runtime)
+    }
+
+    fn local_repository() -> (tempfile::TempDir, RuntimeRepositoryBinding) {
+        let fixture = tempfile::tempdir().expect("create isolated repository fixture");
+        let home = fixture.path().join("home");
+        let kin_home = fixture.path().join("kin-home");
+        let repo = fixture.path().join("repository");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&kin_home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let layout = {
+            let _env = kin_core::test_env::EnvVarGuard::set("HOME", &home)
+                .with("USERPROFILE", &home)
+                .with("KIN_HOME", &kin_home)
+                .with("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+                .with("KIN_RUNTIME_MODE", "development");
+            kin_core::init(&repo)
+                .expect("initialize the fixture repository")
+                .layout
+        };
+        let binding = RuntimeRepositoryBinding::for_store(layout.root())
+            .expect("capture the initialized repository binding");
+        (fixture, binding)
+    }
+
+    fn local_peer(
+        runtime: &DaemonRequestRuntime,
+        binding: &RuntimeRepositoryBinding,
+    ) -> RuntimeServiceIdentity {
+        RuntimeServiceIdentity {
+            schema: "kin.runtime-service.v1".into(),
+            identity: runtime.identity.clone(),
+            mode: runtime.mode,
+            component: "daemon".into(),
+            pid: std::process::id(),
+            namespace: Some(runtime.namespace.as_ref().unwrap().token().into()),
+            repository: Some(binding.identity().clone()),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RepositoryRoute {
+        Serving,
+        Unresolved,
+        Warming,
+    }
+
+    struct Observation {
+        answer: Result<serde_json::Value, DaemonCallError>,
+        requests: Vec<RecordedRequest>,
+        events: Vec<&'static str>,
+        repository_probes: usize,
+    }
+
+    async fn observe_request(
+        runtime: &DaemonRequestRuntime,
+        metadata: serde_json::Value,
+        serves_repository: bool,
+        binding: &RuntimeRepositoryBinding,
+    ) -> Observation {
+        observe_metadata_sequence(
+            runtime,
+            vec![metadata],
+            if serves_repository {
+                RepositoryRoute::Serving
+            } else {
+                RepositoryRoute::Unresolved
+            },
+            binding,
+        )
+        .await
+    }
+
+    async fn observe_metadata_sequence(
+        runtime: &DaemonRequestRuntime,
+        metadata: Vec<serde_json::Value>,
+        route: RepositoryRoute,
+        binding: &RuntimeRepositoryBinding,
+    ) -> Observation {
+        let fixture = HttpFixture::start(metadata).await;
+        let events = fixture.events.clone();
+        let repository_probes = Arc::new(AtomicUsize::new(0));
+        let probes = repository_probes.clone();
+        let selected = fixture.base.clone();
+        let binding = binding.clone();
+        let request = reqwest::Client::new()
+            .post(format!("{}/mcp/tools/call", fixture.base))
+            .header(reqwest::header::AUTHORIZATION, AUTHORIZATION)
+            .json(&serde_json::json!({
+                "name": "semantic_locate",
+                "arguments": { "query": "fixture-target" },
+            }));
+        let answer = send_admitted_daemon_request_with(
+            "admission fixture",
+            &fixture.base,
+            request,
+            PATIENCE,
+            runtime,
+            move |remaining| async move {
+                assert!(remaining > Duration::ZERO && remaining <= PATIENCE);
+                probes.fetch_add(1, Ordering::SeqCst);
+                events.lock().unwrap().push("repository");
+                let route = match route {
+                    RepositoryRoute::Serving => RunningDaemonRouteReading::Serving(selected),
+                    RepositoryRoute::Unresolved => RunningDaemonRouteReading::Unresolved {
+                        detail: "selected endpoint does not bind the intended repository".into(),
+                    },
+                    RepositoryRoute::Warming => RunningDaemonRouteReading::NotReady {
+                        detail: "the intended repository is still opening".into(),
+                        warming: true,
+                    },
+                };
+                Ok((route, binding))
+            },
+        )
+        .await;
+        let answer = match answer {
+            Ok(response) => {
+                assert!(response.status().is_success());
+                Ok(response.json::<serde_json::Value>().await.unwrap())
+            }
+            Err(error) => Err(error),
+        };
+        let (requests, events) = fixture.finish().await;
+        Observation {
+            answer,
+            requests,
+            events,
+            repository_probes: repository_probes.load(Ordering::SeqCst),
+        }
+    }
+
+    fn assert_refused(observation: &Observation, repository_probes: usize) {
+        assert_refused_after_metadata(observation, repository_probes, 1);
+    }
+
+    fn assert_refused_after_metadata(
+        observation: &Observation,
+        repository_probes: usize,
+        metadata_readings: usize,
+    ) {
+        assert!(
+            matches!(&observation.answer, Err(DaemonCallError::DaemonError(detail)) if detail.contains("runtime admission refused")),
+            "{:?}",
+            observation.answer
+        );
+        assert_eq!(observation.repository_probes, repository_probes);
+        assert_eq!(
+            observation.requests.len(),
+            metadata_readings,
+            "{:?}",
+            observation.requests
+        );
+        for request in &observation.requests {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/runtime/identity");
+            assert!(request.body.is_empty());
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some(AUTHORIZATION)
+            );
+            assert!(!request.headers.contains_key(RUNTIME_IDENTITY_HEADER));
+            assert!(!request.headers.contains_key(RUNTIME_REPOSITORY_HEADER));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_matching_managed_peer_dispatches_after_proof() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let peer = local_peer(&runtime, &binding);
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_eq!(observation.answer.unwrap()["result"], "fixture-answer");
+        assert_eq!(observation.repository_probes, 1);
+        assert_eq!(observation.events, ["metadata", "repository", "operation"]);
+        assert_eq!(observation.requests.len(), 2);
+        let metadata = &observation.requests[0];
+        let operation = &observation.requests[1];
+        assert_eq!(
+            (metadata.method.as_str(), metadata.path.as_str()),
+            ("GET", "/runtime/identity")
+        );
+        assert_eq!(
+            (operation.method.as_str(), operation.path.as_str()),
+            ("POST", "/mcp/tools/call")
+        );
+        for request in [&metadata, &operation] {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some(AUTHORIZATION)
+            );
+        }
+        let expected = runtime
+            .identity
+            .fingerprint(runtime.mode, runtime.namespace.as_ref().unwrap().token());
+        assert_eq!(
+            operation.headers.get(RUNTIME_IDENTITY_HEADER),
+            Some(&expected)
+        );
+        assert_eq!(
+            operation.headers.get(RUNTIME_REPOSITORY_HEADER),
+            Some(&binding.fingerprint())
+        );
+        assert!(!metadata.headers.contains_key(RUNTIME_IDENTITY_HEADER));
+        assert!(!metadata.headers.contains_key(RUNTIME_REPOSITORY_HEADER));
+        let body: serde_json::Value = serde_json::from_slice(&operation.body).unwrap();
+        assert_eq!(body["name"], "semantic_locate");
+        assert_eq!(body["arguments"]["query"], "fixture-target");
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_same_version_other_source_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.identity.commit_sha = "b".repeat(40);
+        assert_eq!(peer.identity.version, runtime.identity.version);
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 0);
+        assert_eq!(observation.events, ["metadata"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_wrong_mode_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.mode = RuntimeMode::Development;
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_other_namespace_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let other_home = tempfile::tempdir().unwrap();
+        let other_namespace = RuntimeNamespace::capture(other_home.path()).unwrap();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.namespace = Some(other_namespace.token().into());
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_missing_metadata_claim_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut metadata = serde_json::to_value(local_peer(&runtime, &binding)).unwrap();
+        metadata.as_object_mut().unwrap().remove("identity");
+        let observation = observe_request(&runtime, metadata, true, &binding).await;
+        assert_refused(&observation, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_wrong_repository_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let peer = local_peer(&runtime, &binding);
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            false,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 1);
+        assert_eq!(observation.events, ["metadata", "repository"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_missing_repository_claim_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.repository = None;
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused_after_metadata(&observation, 1, 2);
+        assert_eq!(observation.events, ["metadata", "repository", "metadata"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_other_repository_metadata_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let (_other_repository, other) = local_repository();
+        let peer = local_peer(&runtime, &other);
+        assert_ne!(
+            other.identity().repository_id,
+            binding.identity().repository_id
+        );
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 1);
+        assert_eq!(observation.events, ["metadata", "repository"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_other_store_metadata_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let (_other_repository, other) = local_repository();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.repository.as_mut().unwrap().store_namespace =
+            other.identity().store_namespace.clone();
+        assert_eq!(
+            peer.repository.as_ref().unwrap().repository_id,
+            binding.identity().repository_id
+        );
+        assert_ne!(
+            other.identity().store_namespace,
+            binding.identity().store_namespace
+        );
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            true,
+            &binding,
+        )
+        .await;
+        assert_refused(&observation, 1);
+        assert_eq!(observation.events, ["metadata", "repository"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_late_repository_claim_dispatches_after_refresh() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let peer = local_peer(&runtime, &binding);
+        let mut opening = peer.clone();
+        opening.repository = None;
+        let observation = observe_metadata_sequence(
+            &runtime,
+            vec![
+                serde_json::to_value(opening).unwrap(),
+                serde_json::to_value(peer).unwrap(),
+            ],
+            RepositoryRoute::Serving,
+            &binding,
+        )
+        .await;
+        assert_eq!(observation.answer.unwrap()["result"], "fixture-answer");
+        assert_eq!(observation.repository_probes, 1);
+        assert_eq!(
+            observation.events,
+            ["metadata", "repository", "metadata", "operation"]
+        );
+        assert_eq!(observation.requests.len(), 3);
+        for metadata in &observation.requests[..2] {
+            assert_eq!(metadata.method, "GET");
+            assert_eq!(metadata.path, "/runtime/identity");
+            assert!(metadata.body.is_empty());
+            assert!(!metadata.headers.contains_key(RUNTIME_IDENTITY_HEADER));
+            assert!(!metadata.headers.contains_key(RUNTIME_REPOSITORY_HEADER));
+        }
+        let operation = &observation.requests[2];
+        assert_eq!(operation.method, "POST");
+        assert_eq!(operation.path, "/mcp/tools/call");
+        assert_eq!(
+            operation.headers.get(RUNTIME_REPOSITORY_HEADER),
+            Some(&binding.fingerprint())
+        );
+        let expected = runtime
+            .identity
+            .fingerprint(runtime.mode, runtime.namespace.as_ref().unwrap().token());
+        assert_eq!(
+            operation.headers.get(RUNTIME_IDENTITY_HEADER),
+            Some(&expected)
+        );
+        for request in &observation.requests {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some(AUTHORIZATION)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_refreshed_other_repository_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let (_other_repository, other) = local_repository();
+        let mut opening = local_peer(&runtime, &binding);
+        opening.repository = None;
+        let peer = local_peer(&runtime, &other);
+        let observation = observe_metadata_sequence(
+            &runtime,
+            vec![
+                serde_json::to_value(opening).unwrap(),
+                serde_json::to_value(peer).unwrap(),
+            ],
+            RepositoryRoute::Serving,
+            &binding,
+        )
+        .await;
+        assert_refused_after_metadata(&observation, 1, 2);
+        assert_eq!(observation.events, ["metadata", "repository", "metadata"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_refreshed_other_source_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut opening = local_peer(&runtime, &binding);
+        opening.repository = None;
+        let mut peer = local_peer(&runtime, &binding);
+        peer.identity.commit_sha = "b".repeat(40);
+        let observation = observe_metadata_sequence(
+            &runtime,
+            vec![
+                serde_json::to_value(opening).unwrap(),
+                serde_json::to_value(peer).unwrap(),
+            ],
+            RepositoryRoute::Serving,
+            &binding,
+        )
+        .await;
+        assert_refused_after_metadata(&observation, 1, 2);
+        assert_eq!(observation.events, ["metadata", "repository", "metadata"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_warming_repository_sends_no_operation() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let peer = local_peer(&runtime, &binding);
+        let observation = observe_metadata_sequence(
+            &runtime,
+            vec![serde_json::to_value(peer).unwrap()],
+            RepositoryRoute::Warming,
+            &binding,
+        )
+        .await;
+        assert!(matches!(
+            observation.answer,
+            Err(DaemonCallError::Warming(_))
+        ));
+        assert_eq!(observation.repository_probes, 1);
+        assert_eq!(observation.events, ["metadata", "repository"]);
+        assert_eq!(observation.requests.len(), 1);
+        assert_eq!(observation.requests[0].method, "GET");
+        assert_eq!(observation.requests[0].path, "/runtime/identity");
+        assert!(observation.requests[0].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_hosted_clean_source_is_independent() {
+        let (_home, mut runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut peer = local_peer(&runtime, &binding);
+        peer.component = "hosted-daemon".into();
+        peer.namespace = None;
+        peer.repository = None;
+        peer.identity.commit_sha = "b".repeat(40);
+        peer.identity.version = "0.9.0".into();
+        peer.identity.require_managed().unwrap();
+        runtime.namespace = Err("hosted caller has no local namespace".into());
+        let observation = observe_request(
+            &runtime,
+            serde_json::to_value(peer).unwrap(),
+            false,
+            &binding,
+        )
+        .await;
+        assert_eq!(observation.answer.unwrap()["result"], "fixture-answer");
+        assert_eq!(observation.repository_probes, 0);
+        assert_eq!(observation.events, ["metadata", "operation"]);
+        assert_eq!(observation.requests.len(), 2);
+        for request in &observation.requests {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some(AUTHORIZATION)
+            );
+            assert!(!request.headers.contains_key(RUNTIME_IDENTITY_HEADER));
+            assert!(!request.headers.contains_key(RUNTIME_REPOSITORY_HEADER));
+        }
+        assert_eq!(observation.requests[1].method, "POST");
+    }
+
+    #[tokio::test]
+    async fn runtime_request_admission_hosted_requires_a_qualified_mode_and_claim() {
+        let (_home, runtime) = local_runtime();
+        let (_repository, binding) = local_repository();
+        let mut qualified = local_peer(&runtime, &binding);
+        qualified.component = "hosted-daemon".into();
+        qualified.namespace = None;
+        qualified.repository = None;
+        let mut unknown = qualified.clone();
+        unknown.identity.source_known = false;
+        let mut dirty = qualified.clone();
+        dirty.identity.source_dirty = true;
+        let mut development = qualified.clone();
+        development.mode = RuntimeMode::Development;
+        let mut local_namespace = qualified.clone();
+        local_namespace.namespace = Some(runtime.namespace.as_ref().unwrap().token().into());
+        let mut wrong_schema = qualified.clone();
+        wrong_schema.schema = "kin.runtime-service.v0".into();
+        let mut wrong_component = qualified;
+        wrong_component.component = "hosted-supervisor".into();
+        for (case, peer) in [
+            ("unknown source", unknown),
+            ("dirty source", dirty),
+            ("development mode", development),
+            ("local namespace", local_namespace),
+            ("wrong schema", wrong_schema),
+            ("wrong component", wrong_component),
+        ] {
+            let observation = observe_request(
+                &runtime,
+                serde_json::to_value(peer).unwrap(),
+                true,
+                &binding,
+            )
+            .await;
+            assert_refused(&observation, 0);
+            assert_eq!(observation.events, ["metadata"], "{case}");
+        }
     }
 }

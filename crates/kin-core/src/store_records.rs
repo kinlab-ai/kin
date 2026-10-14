@@ -56,6 +56,15 @@ pub(crate) fn read(root: &Path, path: &Path) -> io::Result<Option<Vec<u8>>> {
     store.read_record(relative(root, path)?, MAX_RECORD_BYTES)
 }
 
+#[cfg(any(unix, windows))]
+pub(crate) fn read_retained(
+    root: &Path,
+    directory: cap_std::fs::Dir,
+    name: &Path,
+) -> io::Result<Option<Vec<u8>>> {
+    StoreDir::from_retained_directory(root, directory).read_record(name, MAX_RECORD_BYTES)
+}
+
 /// Replace the record at `path` in the store at `root` atomically and
 /// durably, creating the store and the record's directory when they are
 /// missing. A reader sees the previous record or this one, never a torn one.

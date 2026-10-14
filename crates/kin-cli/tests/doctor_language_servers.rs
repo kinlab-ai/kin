@@ -12,6 +12,9 @@
 //!
 //! Nothing below needs a daemon, a network or a repository.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -19,13 +22,44 @@ mod common;
 
 use common::Command;
 
-/// A `kin` invocation with its own `HOME`, so a `--fix` run repairs a temporary
-/// directory rather than the machine running the suite.
+/// A development invocation with isolated home and configuration roots.
 fn kin_command(home: &std::path::Path, cwd: &std::path::Path) -> Command<'static> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
-    command.env("HOME", home);
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("APPDATA", home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", home.join("AppData/Local"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("KIN_HOME", home.join("development-runtime"))
+        .env("KIN_RUNTIME_MODE", "development");
     command.current_dir(cwd);
     command
+}
+
+fn home_contents(home: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut contents = BTreeMap::new();
+    let mut directories = vec![home.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read isolated home") {
+            let entry = entry.expect("read isolated home entry");
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(home)
+                .expect("owned home path")
+                .to_path_buf();
+            let kind = entry.file_type().expect("read isolated home entry type");
+            if kind.is_dir() {
+                contents.insert(relative, None);
+                directories.push(path);
+            } else {
+                assert!(kind.is_file(), "unexpected isolated home entry: {path:?}");
+                contents.insert(relative, Some(std::fs::read(path).expect("read fixture")));
+            }
+        }
+    }
+    contents
 }
 
 /// A `HOME` and a working directory that is definitely not a Kin repository.
@@ -52,6 +86,11 @@ fn the_flag_without_fix_says_what_it_needs_instead_of_exiting_quietly() {
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "the read-only notice must run. status={} stderr={stderr} stdout={stdout}",
+        output.status
+    );
     assert!(
         stderr.contains("Nothing installed."),
         "the no-op has to be stated. stderr={stderr} stdout={stdout}"
@@ -103,8 +142,14 @@ fn the_notice_leaves_json_stdout_parseable() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let report: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|e| panic!("doctor --json stdout must parse: {e}. stdout={stdout}"));
+    assert!(
+        output.status.success(),
+        "the read-only JSON report must run. status={} stderr={stderr} stdout={stdout}",
+        output.status
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!("doctor --json stdout must parse: {e}. stderr={stderr} stdout={stdout}")
+    });
     assert!(
         report["checks"].is_array(),
         "the report is still the report. stdout={stdout}"
@@ -115,32 +160,44 @@ fn the_notice_leaves_json_stdout_parseable() {
     );
 }
 
-/// Hole two, the half a stranger can reach without building a scratch repo.
-/// Outside a repository the coverage row reads `Unsupported`, the gate stays
-/// shut, and this command used to download nothing and print not one word.
+/// Development builds must refuse global repairs before they write any
+/// configuration. The language-server decision unit tests cover the managed
+/// repair's outside-repository notice independently.
 #[test]
-fn outside_a_repository_the_fix_run_says_where_to_run_it_instead() {
+fn development_doctor_repairs_refuse_global_writes() {
     let (_root, home, cwd) = scratch();
+    std::fs::write(home.join(".zshrc"), "# retain shell configuration\n")
+        .expect("write shell fixture");
+    let client = home.join(".config/kin-client");
+    std::fs::create_dir_all(&client).expect("create client fixture");
+    std::fs::write(client.join("config.json"), "{\"retain\":true}\n")
+        .expect("write client fixture");
+    let before = home_contents(&home);
 
-    let output = kin_command(&home, &cwd)
-        .args(["doctor", "--fix", "--install-language-servers"])
-        .output()
-        .expect("run kin doctor --fix --install-language-servers");
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert!(
-        stderr.contains("not inside a Kin repository"),
-        "the reader has to be told which state they are in. stderr={stderr} stdout={stdout}"
-    );
-    // The scoping nuance the stranger had to reverse-engineer with a scratch
-    // repository: the servers install per host, the gap is measured per repo.
-    assert!(
-        stderr.contains("per repository") && stderr.contains("per host"),
-        "both scopes have to be named or the reader guesses. stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("rust, python, typescript, javascript, go"),
-        "it has to name what it would have checked. stderr={stderr}"
-    );
+    for args in [
+        vec!["doctor", "--fix"],
+        vec!["doctor", "--fix", "--install-language-servers"],
+    ] {
+        let output = kin_command(&home, &cwd)
+            .args(&args)
+            .output()
+            .expect("run development doctor repair");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            !output.status.success(),
+            "development repair must refuse. args={args:?} stderr={stderr} stdout={stdout}"
+        );
+        assert!(
+            stderr.contains("development mode cannot run setup or doctor repairs")
+                && stderr.contains("use the admitted managed runtime"),
+            "the refusal must identify the required runtime. args={args:?} stderr={stderr}"
+        );
+        assert!(stdout.is_empty(), "repair must not start: {stdout}");
+        assert_eq!(
+            home_contents(&home),
+            before,
+            "repair changed the owned home"
+        );
+    }
 }

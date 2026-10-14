@@ -44,9 +44,17 @@ fn seed_git_repo(path: &Path) {
     run_git(path, &["commit", "-m", "second"]);
 }
 
+fn fixture_kin_home(home: &Path) -> std::path::PathBuf {
+    let kin_home = home.join("kin-home");
+    fs::create_dir_all(&kin_home).expect("create isolated Kin home");
+    kin_home
+}
+
 fn fixture_layout(repo: &Path, home: &Path) -> kin_core::KinLayout {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
-    command.env("HOME", home).env("KIN_HOME", home.join(".kin"));
+    command
+        .env("HOME", home)
+        .env("KIN_HOME", fixture_kin_home(home));
     common::repository_layout(command, repo)
 }
 
@@ -56,7 +64,7 @@ fn kin_init(repo: &Path, home: &Path, extra: &[&str]) -> std::process::Output {
         .arg(repo)
         .args(extra)
         .env("HOME", home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(home))
         .output()
         .expect("run kin init")
 }
@@ -65,7 +73,7 @@ fn kin_graph_materialize(repo: &Path, home: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["graph", "materialize", "--json"])
         .env("HOME", home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(home))
         .env("KIN_EMBED_BACKEND", "cpu")
         .env("KIN_NO_DAEMON", "1")
         .env("KIN_SESSION_ID", uuid::Uuid::new_v4().to_string())
@@ -114,7 +122,7 @@ fn explicit_in_tree_init_keeps_the_store_out_of_git_status() {
         .args(["init"])
         .arg(&repo)
         .env("HOME", &home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(&home))
         .env("KIN_STORE_LAYOUT", "in-tree")
         .output()
         .expect("initialize explicit in-tree store");
@@ -311,7 +319,7 @@ fn kin_in(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(args)
         .env("HOME", home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(home))
         .env("KIN_EMBED_BACKEND", "cpu")
         .env("KIN_NO_DAEMON", "1")
         .current_dir(repo)
@@ -567,7 +575,13 @@ fn a_worked_in_git_repository_names_the_delta_in_human_output() {
     fs::write(repo.join("scratch.log"), "log\n").expect("untracked file");
 
     let output = kin_init(&repo, &home, &[]);
-    assert!(output.status.success(), "init must succeed");
+    assert!(
+        output.status.success(),
+        "init must succeed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let printed = String::from_utf8_lossy(&output.stdout);
     assert!(
         printed.contains("Uncommitted changes: 1 path(s) differ"),
@@ -619,7 +633,7 @@ fn init_and_status_report_the_same_admission_enrichment() {
     let status = Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["status", "--json"])
         .env("HOME", &home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(&home))
         .env_remove("KIN_DAEMON_URL")
         .current_dir(&repo)
         .output()
@@ -689,7 +703,13 @@ fn existing_repository_is_not_rebuilt_from_the_working_tree() {
     fs::create_dir_all(&home).expect("create home");
 
     let first = kin_init(&repo, &home, &[]);
-    assert!(first.status.success());
+    assert!(
+        first.status.success(),
+        "first init failed: status={} stdout={} stderr={}",
+        first.status,
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
     let manifest_before =
         fs::read(fixture_layout(&repo, &home).manifest_path()).expect("read initial manifest");
 
@@ -699,7 +719,8 @@ fn existing_repository_is_not_rebuilt_from_the_working_tree() {
     let second = kin_init(&repo, &home, &[]);
     assert!(
         second.status.success(),
-        "stdout={} stderr={}",
+        "second init failed: status={} stdout={} stderr={}",
+        second.status,
         String::from_utf8_lossy(&second.stdout),
         String::from_utf8_lossy(&second.stderr)
     );
@@ -722,7 +743,13 @@ fn existing_repository_is_not_rebuilt_from_the_working_tree() {
 
     // `--json` callers parse one result shape, so they keep the refusal.
     let json = kin_init(&repo, &home, &["--json"]);
-    assert!(!json.status.success());
+    assert!(
+        !json.status.success(),
+        "JSON rebuild unexpectedly succeeded: status={} stdout={} stderr={}",
+        json.status,
+        String::from_utf8_lossy(&json.stdout),
+        String::from_utf8_lossy(&json.stderr)
+    );
     assert!(String::from_utf8_lossy(&json.stderr)
         .contains("never rebuilds graph authority from the working tree"));
     assert_eq!(
@@ -740,7 +767,12 @@ fn pre_release_init_flags_are_not_accepted() {
     for flag in ["--git-history", "--no-lsp", "--force"] {
         let repo = root.path().join(flag.trim_start_matches('-'));
         let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
-        command.arg("init").arg(&repo).arg(flag).env("HOME", &home);
+        command
+            .arg("init")
+            .arg(&repo)
+            .arg(flag)
+            .env("HOME", &home)
+            .env("KIN_HOME", fixture_kin_home(&home));
         if flag == "--git-history" {
             command.arg("full");
         }
@@ -775,7 +807,7 @@ fn non_git_existing_content_starts_unborn_and_is_reported_as_uncommitted_work() 
         .arg(&repo)
         .arg("--json")
         .env("HOME", &home)
-        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_HOME", fixture_kin_home(&home))
         .env("KIN_NO_DAEMON", "1")
         .output()
         .expect("run kin init");
@@ -863,7 +895,13 @@ fn git_init_states_the_store_size_and_its_ratio_to_the_git_object_store() {
     seed_git_repo(&repo);
 
     let output = kin_init(&repo, &home, &[]);
-    assert!(output.status.success(), "init failed");
+    assert!(
+        output.status.success(),
+        "init failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
@@ -979,7 +1017,13 @@ fn init_json_carries_the_measured_store_and_git_object_bytes() {
     seed_git_repo(&repo);
 
     let output = kin_init(&repo, &home, &["--json"]);
-    assert!(output.status.success(), "init --json failed");
+    assert!(
+        output.status.success(),
+        "init --json failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
 
@@ -1015,7 +1059,13 @@ fn native_init_reports_a_store_size_with_no_comparison() {
     fs::create_dir_all(&home).expect("create home");
 
     let output = kin_init(&repo, &home, &[]);
-    assert!(output.status.success(), "native init failed");
+    assert!(
+        output.status.success(),
+        "native init failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("Store size:") && stdout.contains("no Git object store"),
