@@ -1977,7 +1977,7 @@ pub(crate) enum RequestGraphAuthority {
 /// The spine build a read started on a task of its own.
 #[derive(Debug, Default)]
 struct SpineBackgroundBuild {
-    running: bool,
+    active: Option<tokio::sync::watch::Receiver<bool>>,
     /// When the last one ended without a spine, as one does when a
     /// repository moved while the others were read.
     ended_without_spine_at: Option<Instant>,
@@ -1986,6 +1986,13 @@ struct SpineBackgroundBuild {
 /// How long a spine build that ended without a spine keeps a read from
 /// starting another. Each opens every sibling repository's authority.
 const SPINE_BACKGROUND_RETRY: Duration = Duration::from_secs(60);
+
+/// How long a read waits for the background spine build to land before
+/// answering without cross-repository references. Short enough that the
+/// workspace entity page's 20 s timeout still receives a response when
+/// large siblings take minutes to open, while ordinary sibling sets finish
+/// in place so the first reference read certifies.
+const SPINE_BACKGROUND_READ_WAIT: Duration = Duration::from_secs(10);
 
 /// Why a read while the spine builds has no references from the other
 /// repositories on this machine.
@@ -9883,53 +9890,72 @@ impl DaemonState {
             && self.spine.get().is_none()
             && self.spine_peer_repositories() > 0
         {
-            self.build_spine_in_background();
-            return None;
+            let mut rx = self.build_spine_in_background()?;
+            let wait = self.spine_background_read_wait();
+            if !wait.is_zero() {
+                let _ = tokio::time::timeout(wait, rx.wait_for(|done| *done)).await;
+            }
+            self.spine.get()?;
         }
         self.acquire_spine_read_authority().await
+    }
+
+    fn spine_background_read_wait(&self) -> Duration {
+        #[cfg(test)]
+        if self
+            .spine_initialization_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return Duration::ZERO;
+        }
+        SPINE_BACKGROUND_READ_WAIT
     }
 
     /// Start the spine's first build on a blocking task, unless one is
     /// running or the last ended without a spine less than
     /// [`SPINE_BACKGROUND_RETRY`] ago.
-    fn build_spine_in_background(self: &Arc<Self>) {
+    fn build_spine_in_background(self: &Arc<Self>) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let mut build = self
+            .spine_background_build
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = build.active.as_ref() {
+            return Some(active.clone());
+        }
+        if build
+            .ended_without_spine_at
+            .is_some_and(|ended| ended.elapsed() < SPINE_BACKGROUND_RETRY)
         {
-            let mut build = self
+            return None;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return None;
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        build.active = Some(rx.clone());
+        self.record_spine_unavailable(SPINE_BUILDING_REASON.to_string());
+        let state = Arc::clone(self);
+        drop(runtime.spawn_blocking(move || {
+            let started = Instant::now();
+            let built = state.ensure_spine().is_some();
+            info!(
+                built,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                siblings = state.spine_peer_repositories(),
+                "spine build a read started has ended"
+            );
+            let mut build = state
                 .spine_background_build
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if build.running {
-                return;
-            }
-            if build
-                .ended_without_spine_at
-                .is_some_and(|ended| ended.elapsed() < SPINE_BACKGROUND_RETRY)
-            {
-                return;
-            }
-            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-                return;
-            };
-            build.running = true;
-            self.record_spine_unavailable(SPINE_BUILDING_REASON.to_string());
-            let state = Arc::clone(self);
-            drop(runtime.spawn_blocking(move || {
-                let started = Instant::now();
-                let built = state.ensure_spine().is_some();
-                info!(
-                    built,
-                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    siblings = state.spine_peer_repositories(),
-                    "spine build a read started has ended"
-                );
-                let mut build = state
-                    .spine_background_build
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                build.running = false;
-                build.ended_without_spine_at = (!built).then(Instant::now);
-            }));
-        }
+            build.active = None;
+            build.ended_without_spine_at = (!built).then(Instant::now);
+            drop(build);
+            let _ = tx.send(true);
+        }));
+        Some(rx)
     }
 
     /// Acquire one query authority that remains stable through the caller's
@@ -14768,7 +14794,7 @@ impl DaemonState {
             .vector_checkpoint_authority_match
             .holds(generation, &live_tree)
         {
-            let authority_graph = self.load_committed_authority_graph(generation)?;
+            let (authority_graph, _) = self.load_committed_authority_graph(generation)?;
             // The reopen is linear in store size, and this path holds only
             // `persist_lock` while commit and reconcile exclude on the
             // coordination gate, so the live graph can move while it runs.
@@ -14979,8 +15005,13 @@ impl DaemonState {
             )));
         }
 
-        let authority_graph = self.load_committed_authority_graph(generation)?;
-        self.finalize_generation_from_graph(generation, authority_graph.as_ref())?;
+        let (authority_graph, workspace_matches_committed_base) =
+            self.load_committed_authority_graph(generation)?;
+        self.finalize_generation_from_graph(
+            generation,
+            authority_graph.as_ref(),
+            workspace_matches_committed_base,
+        )?;
         Ok(())
     }
 
@@ -14997,7 +15028,7 @@ impl DaemonState {
     /// Reopening the same authority here doubles graph memory and repeats
     /// remote snapshot I/O on every healthy restart.
     fn finalize_loaded_generation(&self, generation: u64) -> Result<()> {
-        self.finalize_generation_from_graph(generation, self.graph.as_ref())
+        self.finalize_generation_from_graph(generation, self.graph.as_ref(), false)
     }
 
     /// A locate-only graph is intentionally incomplete for general-purpose
@@ -15014,6 +15045,7 @@ impl DaemonState {
         &self,
         generation: u64,
         authority_graph: &kin_db::InMemoryGraph,
+        workspace_matches_committed_base: bool,
     ) -> Result<()> {
         // A live graph ahead of this immutable authority deliberately remains
         // unproven. Only exact semantic equality rebinds its admitted witness.
@@ -15030,10 +15062,11 @@ impl DaemonState {
         }
         self.persisted_entity_count
             .store(persisted_entity_count, Ordering::SeqCst);
-        if live_matches_authority {
+        if live_matches_authority && workspace_matches_committed_base {
             // The exact witness restoration established this levelling. Read
             // both counts from its held authority, never from a live graph
-            // that an independent writer may have advanced during finalization.
+            // that an independent writer may have advanced during finalization,
+            // and never when the workspace holds uncommitted working-copy changes.
             self.record_durable_entity_count(persisted_entity_count);
             self.record_durable_relation_count(authority_graph.relation_count() as u64);
         }
@@ -15048,7 +15081,7 @@ impl DaemonState {
         generation: u64,
         authority_graph: &kin_db::InMemoryGraph,
     ) -> Result<()> {
-        self.finalize_generation_from_graph(generation, authority_graph)
+        self.finalize_generation_from_graph(generation, authority_graph, true)
     }
 
     /// Retire the read index a committed generation left stale, and leave its
@@ -16172,37 +16205,43 @@ impl DaemonState {
     fn load_committed_authority_graph(
         &self,
         generation: u64,
-    ) -> Result<Arc<kin_db::InMemoryGraph>> {
-        let authority_graph = if let Some(backend) = &self.storage_backend {
-            match kin_db::load_recovered_snapshot(backend.as_ref(), &self.cached_repo_id)
+    ) -> Result<(Arc<kin_db::InMemoryGraph>, bool)> {
+        let (authority_graph, workspace_matches_committed_base) = if let Some(backend) =
+            &self.storage_backend
+        {
+            let graph = match kin_db::load_recovered_snapshot(
+                    backend.as_ref(),
+                    &self.cached_repo_id,
+                )
                 .map_err(DaemonError::from)?
-            {
-                Some(recovered) => {
-                    if recovered.generation != generation {
+                {
+                    Some(recovered) => {
+                        if recovered.generation != generation {
+                            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                                format!(
+                                    "post-commit authority moved for repo {}: expected generation {generation}, recovered {}; reopen before finalizing derived indexes",
+                                    self.cached_repo_id, recovered.generation
+                                ),
+                            )));
+                        }
+                        let (query_snapshot, _) =
+                            materialize_hosted_repository_snapshot(recovered.snapshot)?;
+                        Arc::new(
+                            kin_db::InMemoryGraph::from_snapshot_without_text_index(query_snapshot)
+                                .map_err(DaemonError::from)?,
+                        )
+                    }
+                    None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
+                    None => {
                         return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                             format!(
-                                "post-commit authority moved for repo {}: expected generation {generation}, recovered {}; reopen before finalizing derived indexes",
-                                self.cached_repo_id, recovered.generation
+                                "committed generation {generation} for repo {} is missing during read-index finalization",
+                                self.cached_repo_id
                             ),
-                        )));
+                        )))
                     }
-                    let (query_snapshot, _) =
-                        materialize_hosted_repository_snapshot(recovered.snapshot)?;
-                    Arc::new(
-                        kin_db::InMemoryGraph::from_snapshot_without_text_index(query_snapshot)
-                            .map_err(DaemonError::from)?,
-                    )
-                }
-                None if generation == kin_db::GENERATION_INIT => Arc::clone(&self.graph),
-                None => {
-                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                        format!(
-                            "committed generation {generation} for repo {} is missing during read-index finalization",
-                            self.cached_repo_id
-                        ),
-                    )))
-                }
-            }
+                };
+            (graph, true)
         } else {
             let binding = self.local_repository_authority_binding()?;
             let authority = self.held_local_repository_authority()?;
@@ -16210,32 +16249,35 @@ impl DaemonState {
             let observed_generation = lease.roots().generation;
             if observed_generation != generation {
                 return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "post-commit authority moved for repo {}: expected generation {generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
-                        self.cached_repo_id
-                    ),
-                )));
+                        format!(
+                            "post-commit authority moved for repo {}: expected generation {generation}, recovered {observed_generation}; reopen before finalizing derived indexes",
+                            self.cached_repo_id
+                        ),
+                    )));
             }
+            let workspace_id = binding.workspace_id();
+            let matches_committed_base = lease.workspace_matches_committed_base(&workspace_id);
             let snapshot = lease
-                .workspace_graph_snapshot(&binding.workspace_id())
-                .map_err(DaemonError::from)?
-                .ok_or_else(|| {
-                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
-                        "repository {} authority has no manifest workspace {} during read-index finalization",
-                        self.cached_repo_id,
-                        binding.workspace_id()
-                    )))
-                })?;
+                    .workspace_graph_snapshot(&workspace_id)
+                    .map_err(DaemonError::from)?
+                    .ok_or_else(|| {
+                        DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                            "repository {} authority has no manifest workspace {} during read-index finalization",
+                            self.cached_repo_id,
+                            workspace_id
+                        )))
+                    })?;
             // Its readers take a tree, entity and relation counts, a read
             // index built from its entities, and its binding-history
             // capability. None of them searches it, so it carries no text
             // index.
-            Arc::new(
+            let graph = Arc::new(
                 kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)
                     .map_err(DaemonError::from)?,
-            )
+            );
+            (graph, matches_committed_base)
         };
-        Ok(authority_graph)
+        Ok((authority_graph, workspace_matches_committed_base))
     }
 
     fn stage_read_index_from_graph(

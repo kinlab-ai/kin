@@ -1485,6 +1485,20 @@ impl RepositoryAuthorityState {
             .map_or(&[], |workspace| workspace.enrichment_marks.as_slice())
     }
 
+    /// Whether the workspace's working tree matches its committed base tree.
+    pub fn workspace_matches_committed_base(&self, workspace_id: &WorkspaceId) -> bool {
+        self.snapshot
+            .repository_authority
+            .as_ref()
+            .and_then(|authority| {
+                authority
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == *workspace_id)
+            })
+            .is_some_and(|workspace| workspace.base_tree_hash == Some(workspace.tree_hash))
+    }
+
     /// The durable bytes this exact state was loaded from or written as, once
     /// the persistence that read or wrote them has bound them.
     fn durable_identity(&self) -> Option<&DurableAuthorityIdentity> {
