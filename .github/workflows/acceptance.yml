@@ -957,7 +957,7 @@ jobs:
           set -uo pipefail
           mkdir -p acceptance
           rc=0
-          docker run --rm --memory=2g --workdir /w \
+          docker run --rm --network=host --memory=2g --workdir /w \
             -v "$PWD:/w" \
             -e KIN_ACCEPTANCE_LABEL \
             ubuntu:24.04 /bin/bash -c '
