@@ -621,21 +621,17 @@ def check_diverged(suite):
     # The real daemon refuses an unauthenticated non-loopback bind before it
     # creates a socket. Explicitly disable default loopback-token enforcement,
     # or its auto-provisioned token would make this a healthy authenticated bind.
-    # The report is stdout alone. Diagnostics such as an environment audit
-    # warning go to stderr and are not part of the JSON a script parses.
-    stop = subprocess.run([suite.kin, "daemon", "stop", "--json"], cwd=suite.repo,
-                          env=suite.env, timeout=900, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, text=True)
-    rc, out = stop.returncode, stop.stdout
-    suite.log("kin daemon stop --json -> %d" % rc)
+    rc, out = suite.kin_run(["daemon", "stop", "--json"])
     try:
-        stopped = json.loads(out)
+        start = out.find("{")
+        end = out.rfind("}")
+        stopped = json.loads(out[start : end + 1]) if start != -1 and end != -1 else {}
     except (TypeError, ValueError):
         stopped = {}
     if (rc != 0 or stopped.get("schema") != "kin.daemon-stop.v1"
             or stopped.get("scope") != "current-repo" or stopped.get("all_stopped") is not True):
         result.unknown("the control could not establish absence of its existing daemon: %s"
-                       % tail(out + stop.stderr, 300))
+                       % tail(out, 300))
         return result
     restore = suite.env
     suite.env = dict(restore)
