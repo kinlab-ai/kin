@@ -2071,6 +2071,58 @@ fn local_runtime_repository_binding(
     Ok(binding)
 }
 
+/// Whether a development daemon holds its local requests to the managed
+/// admission contract.
+///
+/// A managed daemon always refuses a local request that lacks the caller's
+/// runtime identity and the repository it means. A development one checks the
+/// claims a request carries but does not demand them, so a client path that
+/// sends none passes every development run and is refused on the first release
+/// build. Setting `KIN_DAEMON_REQUIRE_RUNTIME_IDENTITY` truthy makes a debug
+/// build demand them too. It can only make the daemon stricter.
+fn development_requires_runtime_identity() -> bool {
+    std::env::var("KIN_DAEMON_REQUIRE_RUNTIME_IDENTITY").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Whether a request is a remote peer's on a repository transfer or range-read
+/// route.
+///
+/// Native push, pull, fetch, clone and remote range readings between Kin peers
+/// call these routes on the other repository's daemon with that daemon's
+/// bearer credential and none of the caller's local runtime claims. An
+/// unauthenticated request, or one that carries local runtime claims, stays on
+/// the local admission path and keeps every local runtime check.
+fn is_remote_peer_request(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    let Some(rest) = path.strip_prefix("/repos/") else {
+        return false;
+    };
+    let is_peer_route = if let Some((repository, leaf)) = rest.split_once("/transfer/") {
+        !repository.is_empty()
+            && !repository.contains('/')
+            && matches!(leaf, "advertise" | "status" | "export" | "receive")
+    } else if let Some(repository) = rest.strip_suffix("/semantic-diff") {
+        *method == axum::http::Method::GET && !repository.is_empty() && !repository.contains('/')
+    } else {
+        false
+    };
+    is_peer_route
+        && !headers.contains_key(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
+        && !headers.contains_key(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER)
+        && headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("Bearer "))
+}
+
 #[derive(Clone)]
 struct RuntimeRequestPolicy {
     require_identity: bool,
@@ -2105,6 +2157,16 @@ async fn validate_runtime_request(
         .strip_prefix("/v2")
         .unwrap_or(request.uri().path());
     let diagnostic = matches!(path, "/health" | "/ready" | "/readiness" | "/auth/rotation");
+    // A peer Kin reaching this repository's transfer or range-read routes is a
+    // remote boundary, as hosted authority is. It authenticates with this
+    // daemon's bearer credential, which the auth layer inside still checks,
+    // and the runtime generation, home and repository a local CLI or MCP
+    // request is bound to are the peer's own: a peer serving another
+    // repository cannot present this one's fingerprint. Every other request
+    // stays bound.
+    if policy.local && is_remote_peer_request(request.method(), path, request.headers()) {
+        return next.run(request).await;
+    }
     if policy.require_identity
         && !diagnostic
         && !request
@@ -2163,6 +2225,146 @@ mod runtime_identity_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// A peer Kin's transfer or range-read request is a remote boundary on a
+    /// managed local daemon, and nothing else is.
+    ///
+    /// Native push, pull, fetch, clone and remote range readings call the
+    /// other repository's daemon on its transfer or `semantic-diff` routes
+    /// with that daemon's bearer credential and none of the local runtime
+    /// claims, which a peer serving another repository could not present
+    /// anyway. Such a request reaches the handler. The credential still
+    /// applies: a wrong token is refused by the auth layer, and a request with
+    /// no credential is not a peer at all and keeps every local check. A local
+    /// request without the runtime headers is still refused before any handler
+    /// runs, on a semantic route and on a repository route that is not a peer
+    /// boundary.
+    #[tokio::test]
+    async fn a_peer_transfer_request_is_a_remote_boundary_and_a_local_request_stays_bound() {
+        const TOKEN: &str = "peer-transfer-test-token";
+        let home = tempfile::tempdir().unwrap();
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::capture(home.path()).unwrap();
+        let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::capture(
+            &uuid::Uuid::new_v4().to_string(),
+            home.path(),
+        )
+        .unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counted = |reached: &Arc<AtomicUsize>| {
+            let reached = Arc::clone(reached);
+            move || {
+                let reached = Arc::clone(&reached);
+                async move {
+                    reached.fetch_add(1, Ordering::SeqCst);
+                    "handler reached"
+                }
+            }
+        };
+        let routes = Router::new()
+            .route(
+                "/repos/{repo_id}/transfer/advertise",
+                get(counted(&reached)),
+            )
+            .route("/repos/{repo_id}/transfer/receive", post(counted(&reached)))
+            .route(
+                "/repos/{repo_id}/semantic-diff",
+                get(counted(&reached)).post(counted(&reached)),
+            )
+            .route("/repos/{repo_id}/refs", get(counted(&reached)))
+            .route("/semantic", get(counted(&reached)));
+        let app = Router::new()
+            .merge(routes.clone())
+            .nest("/v2", routes)
+            .layer(middleware::from_fn_with_state(
+                DaemonAuthState {
+                    tokens: crate::auth_rotation::RotationTokens::primary_only(Some(
+                        TOKEN.to_string(),
+                    )),
+                    publication_control_auth_token: None,
+                },
+                daemon_auth,
+            ))
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: true,
+                    local: true,
+                    namespace: Some(namespace),
+                    repository: Some(repository),
+                },
+                validate_runtime_request,
+            ));
+        let send = |method: &str, uri: &str, token: Option<&str>| {
+            let mut builder = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            app.clone()
+                .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+        };
+
+        for (method, uri) in [
+            ("GET", "/repos/peer-repository/transfer/advertise"),
+            ("POST", "/repos/peer-repository/transfer/receive"),
+            ("GET", "/v2/repos/peer-repository/transfer/advertise"),
+            ("GET", "/repos/peer-repository/semantic-diff?base=a&head=b"),
+        ] {
+            let before = reached.load(Ordering::SeqCst);
+            let response = send(method, uri, Some(TOKEN)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "an authenticated peer {method} {uri} must reach the handler"
+            );
+            assert_eq!(reached.load(Ordering::SeqCst), before + 1);
+        }
+
+        let before = reached.load(Ordering::SeqCst);
+        let wrong = send(
+            "GET",
+            "/repos/peer-repository/transfer/advertise",
+            Some("not-this-daemons-token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wrong.status(),
+            StatusCode::UNAUTHORIZED,
+            "the peer boundary still requires this daemon's credential"
+        );
+        let anonymous = send("GET", "/repos/peer-repository/transfer/advertise", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::CONFLICT,
+            "a transfer request with no credential is not a peer and keeps the local checks"
+        );
+        let anonymous_diff = send("GET", "/repos/peer-repository/semantic-diff", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            anonymous_diff.status(),
+            StatusCode::CONFLICT,
+            "a range read with no credential is not a peer and keeps the local checks"
+        );
+        for (method, uri) in [
+            ("GET", "/semantic"),
+            ("GET", "/repos/peer-repository/refs"),
+            ("POST", "/repos/peer-repository/semantic-diff"),
+        ] {
+            let response = send(method, uri, Some(TOKEN)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "a local request to {method} {uri} without the runtime headers must stay refused"
+            );
+        }
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            before,
+            "no refused request may reach a handler"
+        );
+    }
 
     #[tokio::test]
     async fn legacy_and_wrong_source_requests_never_reach_the_semantic_handler() {
@@ -3737,8 +3939,9 @@ fn router_with_rotation_tokens(
     let runtime_policy = RuntimeRequestPolicy {
         local: state.publication_control.is_none(),
         require_identity: state.publication_control.is_none()
-            && kin_core::runtime_identity::RuntimeMode::current().ok()
-                != Some(kin_core::runtime_identity::RuntimeMode::Development),
+            && (kin_core::runtime_identity::RuntimeMode::current().ok()
+                != Some(kin_core::runtime_identity::RuntimeMode::Development)
+                || development_requires_runtime_identity()),
         namespace: if state.publication_control.is_none() {
             kin_core::runtime_identity::RuntimeNamespace::for_service().ok()
         } else {
@@ -44613,6 +44816,52 @@ pub(crate) mod tests {
             .iter()
             .map(|repository_ref| repository_ref.name.clone())
             .collect()
+    }
+
+    /// A drift observation survives a publication that lands right after it
+    /// bound the held authority.
+    ///
+    /// The daemon's own workspace admission publishes through an authority it
+    /// opens for itself, not the held one, so a drift request bound just
+    /// before such a publication holds a manager that no longer names the
+    /// persisted head. Every retry against that one bind refused with "persisted
+    /// authority moved", and `kin doctor --heal` failed over an ordinary
+    /// watcher admission. Each attempt now binds again, so the second attempt
+    /// observes the publication the first one missed and reports it.
+    #[tokio::test]
+    async fn drift_rebinds_after_another_writer_publishes_under_its_first_bind() {
+        let state = committed_test_state();
+        let before = crate::repository_drift::execute(&state)
+            .expect("the fixture's projection is observable")
+            .report
+            .expect("drift reports a body");
+        assert!(before.clean, "the fixture must start clean: {before:?}");
+
+        let writer = Arc::clone(&state);
+        let published = std::rc::Rc::new(std::cell::Cell::new(None));
+        let recorded = std::rc::Rc::clone(&published);
+        crate::repository_drift::after_bind_hook::arm_once(move || {
+            recorded.set(Some(publish_ref_as_another_writer(
+                &writer,
+                b"published-under-a-drift-bind",
+            )));
+        });
+        let after = crate::repository_drift::execute(&state)
+            .expect("a publication under the first bind must be re-observed, not refused")
+            .report
+            .expect("drift reports a body");
+        let external_generation = published
+            .get()
+            .expect("the hook must have published inside the first attempt");
+        assert_eq!(external_generation, before.authority_generation + 1);
+        assert_eq!(
+            after.authority_generation, external_generation,
+            "the report must describe the generation the other writer published"
+        );
+        assert!(
+            after.clean,
+            "a ref publication moves no tracked bytes: {after:?}"
+        );
     }
 
     /// Branch commands commit through the authority the daemon holds, and the

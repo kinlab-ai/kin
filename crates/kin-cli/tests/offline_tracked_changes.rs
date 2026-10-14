@@ -129,6 +129,11 @@ fn mcp_answers(
     home: &Path,
     calls: &[(&str, Value)],
 ) -> Vec<Value> {
+    let kin_home = runtime
+        .kin_command()
+        .configured_env_for_test(std::ffi::OsStr::new("KIN_HOME"))
+        .flatten()
+        .expect("the owned daemon runtime supplies its existing isolated Kin home");
     let port = fs::read_to_string(runtime.layout_for(repo).root().join("daemon.port"))
         .expect("a daemon serves the repository")
         .trim()
@@ -162,6 +167,13 @@ fn mcp_answers(
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("USERPROFILE", home)
+        // The client has its own configuration home and shares the daemon's
+        // admitted runtime namespace after clearing inherited authority.
+        .env("KIN_HOME", kin_home)
+        .env(
+            "KIN_RUNTIME_MODE",
+            kin_core::runtime_identity::RuntimeMode::Development.as_str(),
+        )
         .env("TMPDIR", std::env::temp_dir())
         .env("KIN_VFS_DISABLE", "1")
         .env("KIN_REGISTRY_PATH", runtime.registry_path())

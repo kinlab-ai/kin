@@ -21,11 +21,11 @@ use crate::state::DaemonState;
 
 /// Attempts allowed to take one generation-bound observation.
 ///
-/// Each attempt is independently pinned to the generation it was taken
-/// against; a retry re-observes from scratch rather than stitching a report
-/// across generations. Retrying only absorbs a benign race with concurrent
-/// authority movement, and a report is still refused rather than published if
-/// authority never holds still.
+/// Each attempt binds the authority afresh and is pinned to the generation it
+/// was taken against; a retry re-observes from scratch rather than stitching a
+/// report across generations. Retrying only absorbs a benign race with
+/// concurrent authority movement, and a report is still refused rather than
+/// published if authority never holds still.
 const OBSERVATION_ATTEMPTS: usize = 4;
 
 /// Linear backoff between observation attempts, so a repository still settling
@@ -35,10 +35,21 @@ const OBSERVATION_BACKOFF: std::time::Duration = std::time::Duration::from_milli
 pub(crate) fn execute(
     state: &DaemonState,
 ) -> std::result::Result<DriftResponse, (StatusCode, String)> {
-    let authority =
-        ActiveLocalRepositoryAuthority::open_bound(state).map_err(drift_bind_refusal)?;
     let mut last_conflict = None;
     for attempt in 0..OBSERVATION_ATTEMPTS {
+        // Bind on every attempt, not once ahead of the loop. Authority can
+        // move through a manager this bind does not hold: the daemon's own
+        // workspace admission publishes through an open of its own, and so do
+        // the CLI and a second daemon. The bound manager then still reads the
+        // generation it was loaded at, every retry against it freezes a head
+        // that no longer matches, and one admission landing inside the first
+        // observation used up all the attempts. A fresh bind reuses the held
+        // authority while the publication record is unchanged and loads the
+        // new publication otherwise.
+        let authority =
+            ActiveLocalRepositoryAuthority::open_bound(state).map_err(drift_bind_refusal)?;
+        #[cfg(test)]
+        after_bind_hook::run();
         match report(state, &authority) {
             Ok(response) => return Ok(response),
             Err(error) if is_authority_movement(&error) => {
@@ -182,6 +193,28 @@ fn classify_drift_error(error: anyhow::Error) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         crate::error::cause_first(&error),
     )
+}
+
+/// A test seam that runs once, right after an observation attempt binds its
+/// authority, so a test can publish as another writer inside the window the
+/// bind does not guard.
+#[cfg(test)]
+pub(crate) mod after_bind_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm_once(hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run() {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 fn drift_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {

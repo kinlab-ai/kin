@@ -3,20 +3,21 @@
 
 use anyhow::{Context, Result};
 
-async fn daemon_base_url() -> Result<String> {
+/// The daemon serving this repository, with the authority and runtime
+/// admission it checks on every request.
+async fn daemon() -> Result<crate::daemon_client::DaemonClient> {
     let layout = crate::commands::require_repository_layout()?;
-    crate::daemon_client::resolve_daemon_url(&layout)
+    let url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| crate::daemon_client::daemon_required_error("intent commands", &layout))
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("intent commands", &layout))?;
+    crate::daemon_client::DaemonClient::from_base_url_for_layout(url, &layout)
 }
 
 /// `kin intent list` — Show all active intents via daemon API.
 pub async fn list() -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
-    let resp = client
-        .get(format!("{}/intent", daemon_url))
-        .send()
+    let daemon = daemon().await?;
+    let resp = daemon
+        .send_untyped(reqwest::Method::GET, "/intent", "intent list", None)
         .await
         .context("query daemon intent endpoint")?;
     if resp.status().is_success() {
@@ -64,8 +65,7 @@ pub async fn register(
     task: String,
     session: Option<String>,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
+    let daemon = daemon().await?;
 
     let body = serde_json::json!({
         "scope": scope,
@@ -74,10 +74,13 @@ pub async fn register(
         "session_id": session,
     });
 
-    let resp = client
-        .post(format!("{}/intent/register", daemon_url))
-        .json(&body)
-        .send()
+    let resp = daemon
+        .send_untyped(
+            reqwest::Method::POST,
+            "/intent/register",
+            "intent register",
+            Some(&body),
+        )
         .await
         .context("query daemon intent register endpoint")?;
     if resp.status().is_success() {
@@ -131,12 +134,15 @@ pub async fn register(
 
 /// `kin intent release <intent-id>` — Release an intent via daemon API.
 pub async fn release(intent_id: String) -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
+    let daemon = daemon().await?;
 
-    let resp = client
-        .delete(format!("{}/intent/{}", daemon_url, intent_id))
-        .send()
+    let resp = daemon
+        .send_untyped(
+            reqwest::Method::DELETE,
+            &format!("/intent/{intent_id}"),
+            "intent release",
+            None,
+        )
         .await
         .context("query daemon intent release endpoint")?;
     if resp.status().is_success() {
@@ -151,12 +157,15 @@ pub async fn release(intent_id: String) -> Result<()> {
 
 /// `kin intent clear <session-id>` — Clear all intents for a session via daemon API.
 pub async fn clear(session_id: String) -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
+    let daemon = daemon().await?;
 
-    let resp = client
-        .delete(format!("{}/session/{}/intents", daemon_url, session_id))
-        .send()
+    let resp = daemon
+        .send_untyped(
+            reqwest::Method::DELETE,
+            &format!("/session/{session_id}/intents"),
+            "intent clear",
+            None,
+        )
         .await
         .context("query daemon intent clear endpoint")?;
     if resp.status().is_success() {

@@ -981,28 +981,77 @@ impl DaemonClient {
             .fingerprint(mode, selected.token()))
     }
 
+    /// Attach the admission a local daemon checks before any handler runs.
+    ///
+    /// A managed daemon refuses a request that does not carry this process's
+    /// runtime identity and, for anything but a health probe, the repository
+    /// it means. Everything this client sends passes through here. A command
+    /// that builds its own request, for a deadline or a redirect policy this
+    /// client does not carry, passes it through [`admit_daemon_request`]
+    /// rather than sending it bare.
+    ///
+    /// Reading the repository the endpoint serves is itself a request to it.
+    /// When that read never reaches the daemon, the command has lost its
+    /// request exactly as if the request itself had been sent, so it reads the
+    /// same way, with the store's account of why the daemon is gone.
+    pub(crate) async fn admitted_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        leaf: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        Ok(request.headers(self.admission_headers(leaf).await?))
+    }
+
+    /// The headers [`Self::admitted_request`] attaches, for a caller that
+    /// sends the same request more than once.
+    pub(crate) async fn admission_headers(&self, leaf: &str) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+            reqwest::header::HeaderValue::from_str(&self.request_runtime_fingerprint()?)
+                .context("runtime fingerprint is not a header value")?,
+        );
+        let repository = if matches!(leaf, "health" | "readiness") {
+            validate_runtime_endpoint(&self.base_url, "daemon")
+                .await
+                .map(|()| None)
+        } else {
+            self.request_repository_fingerprint().await
+        }
+        .map_err(|error| self.lost_admission_probe(error, leaf))?;
+        if let Some(repository) = repository {
+            headers.insert(
+                kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                reqwest::header::HeaderValue::from_str(&repository)
+                    .context("repository fingerprint is not a header value")?,
+            );
+        }
+        Ok(headers)
+    }
+
+    /// Explain an admission probe the endpoint never answered as the lost
+    /// request it is. A refusal the endpoint did answer stays its own error.
+    fn lost_admission_probe(&self, error: anyhow::Error, leaf: &str) -> anyhow::Error {
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
+        {
+            error.context(daemon_send_failure_message(
+                &self.base_url,
+                leaf,
+                self.kin_root(),
+            ))
+        } else {
+            error
+        }
+    }
+
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
         leaf: &str,
     ) -> Result<reqwest::Response> {
-        let expected = self.request_runtime_fingerprint()?;
-        let request = request.header(
-            kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
-            expected,
-        );
-        let request = if matches!(leaf, "health" | "readiness") {
-            validate_runtime_endpoint(&self.base_url, "daemon").await?;
-            request
-        } else {
-            match self.request_repository_fingerprint().await? {
-                Some(repository) => request.header(
-                    kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
-                    repository,
-                ),
-                None => request,
-            }
-        };
+        let request = self.admitted_request(request, leaf).await?;
         let resp = request.send().await;
         // The daemon answered, or the request failed. Either way the line that
         // said it was ready has done its job, and what prints next is the
@@ -1012,6 +1061,24 @@ impl DaemonClient {
             .with_context(|| daemon_send_failure_message(&self.base_url, leaf, self.kin_root()))?;
         check_response_build_match(resp.headers())?;
         Ok(resp)
+    }
+
+    /// Send a request this client has no typed method for, with the bearer
+    /// token and runtime admission every request of this client carries.
+    pub async fn send_untyped(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        leaf: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let request = self.client.request(method, url);
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        self.send(request, leaf).await
     }
 
     /// Turn a non-success daemon response into the error the user reads.
@@ -2489,14 +2556,6 @@ impl DaemonClient {
     /// ran. One dispatch keeps the two facts apart, and the caller waits by
     /// asking again on purpose rather than by being retried silently.
     pub async fn admit(&self, request: &crate::commands::admit::AdmitRequest) -> AdmitDispatch {
-        let expected = match self.request_runtime_fingerprint() {
-            Ok(expected) => expected,
-            Err(error) => return AdmitDispatch::Refused(error),
-        };
-        let repository = match self.request_repository_fingerprint().await {
-            Ok(repository) => repository,
-            Err(error) => return AdmitDispatch::Refused(error),
-        };
         let url = format!("{}/commands/admit", self.base_url.trim_end_matches('/'));
         let payload = match serde_json::to_vec(request) {
             Ok(payload) => payload,
@@ -2509,18 +2568,13 @@ impl DaemonClient {
         let request = self
             .one_dispatch_client
             .post(&url)
-            .header(
-                kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
-                expected,
-            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload);
-        let request = match repository {
-            Some(repository) => request.header(
-                kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
-                repository,
-            ),
-            None => request,
+        // Nothing was dispatched when admission itself fails, so that is a
+        // refusal rather than an unanswered request.
+        let request = match self.admitted_request(request, "admit").await {
+            Ok(request) => request,
+            Err(error) => return AdmitDispatch::Refused(error),
         };
         let response = match request.send().await {
             Ok(response) => response,
@@ -8857,6 +8911,35 @@ impl std::fmt::Display for RuntimeEndpointRefusal {
 }
 
 impl std::error::Error for RuntimeEndpointRefusal {}
+
+/// Attach the admission a local daemon requires to a request built outside
+/// [`DaemonClient`].
+///
+/// Some commands send to the daemon on an HTTP client of their own, for a
+/// deadline or a retry policy the shared client does not carry. A managed
+/// daemon refuses every such request that lacks this process's runtime
+/// identity and the repository it means, before the handler runs, so each one
+/// passes through here with the layout it addresses.
+pub async fn admit_daemon_request(
+    request: reqwest::RequestBuilder,
+    base_url: &str,
+    layout: &KinLayout,
+    leaf: &str,
+) -> Result<reqwest::RequestBuilder> {
+    Ok(request.headers(daemon_admission_headers(base_url, layout, leaf).await?))
+}
+
+/// The headers [`admit_daemon_request`] attaches, for a caller that sends the
+/// same request more than once.
+pub async fn daemon_admission_headers(
+    base_url: &str,
+    layout: &KinLayout,
+    leaf: &str,
+) -> Result<reqwest::header::HeaderMap> {
+    DaemonClient::from_base_url_for_layout(base_url.to_string(), layout)?
+        .admission_headers(leaf)
+        .await
+}
 
 pub async fn validate_runtime_endpoint(base_url: &str, component: &str) -> Result<()> {
     let identity = read_runtime_endpoint(base_url).await?;

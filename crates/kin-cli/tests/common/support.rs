@@ -1846,6 +1846,10 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         // per-command configuration rather than repository or session
         // authority, so carrying it costs the isolation boundary nothing.
         "KIN_DAEMON_AUTO_EMBED",
+        // Holds a development daemon to the managed admission contract, so a
+        // test can prove a command sends the runtime claims a release daemon
+        // refuses requests without. It can only make admission stricter.
+        "KIN_DAEMON_REQUIRE_RUNTIME_IDENTITY",
         // The runtime's three seconds are a default for daemons its Drop has to
         // stop. A test about what a daemon finishes inside its shutdown budget
         // needs to set that budget, and it waits for its daemon to end before

@@ -722,6 +722,12 @@ def check_2(suite):
     env["HOME"] = home
     env["PATH"] = binpath
     env["KIN_HOME"] = os.path.join(home, ".kin")
+    # The built PATH is the only place a server may be found. Kin otherwise
+    # also searches the usual install places, and a runner image that ships
+    # the servers in /usr/local/bin or a rustup proxy under CARGO_HOME then
+    # reads every recipe as installed, so nothing is attempted and this check
+    # grades silence.
+    env["KIN_LANGUAGE_TOOL_SEARCH"] = "0"
     # A real npm against a port nothing listens on: the error text is npm's own,
     # not this script's. A stubbed npm printing the words the classifier looks
     # for would be a check that cannot fail.
@@ -752,7 +758,7 @@ def check_2(suite):
     keep_probe_output(
         work, "install-language-servers", command, rc, out, err,
         {name: env.get(name) for name in (
-            "HOME", "KIN_HOME", "PATH", "npm_config_registry",
+            "HOME", "KIN_HOME", "PATH", "KIN_LANGUAGE_TOOL_SEARCH", "npm_config_registry",
             "KIN_LANGUAGE_SERVER_ASSET_BASE", "npm_config_prefix",
             "npm_config_fetch_retries")})
     ok, detail = grade_network_diagnosis(out + "\n" + err)

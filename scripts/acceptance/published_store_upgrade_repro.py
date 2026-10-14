@@ -495,6 +495,16 @@ class Suite(object):
             env.pop(name, None)
         os.makedirs(env["KIN_HOME"], exist_ok=True)
         os.makedirs(env["HOME"], exist_ok=True)
+        # The private configuration home still carries an author, as every
+        # operator's does. Without one neither build can name who admits the
+        # working copy, and `kin status` reports it unmeasured (exit 9), so
+        # the upgrade is never reached. It is the identity the fixture's own
+        # commits are made under.
+        gitconfig = os.path.join(env["HOME"], ".gitconfig")
+        if not os.path.exists(gitconfig):
+            with open(gitconfig, "w") as handle:
+                handle.write("[user]\n\tname = kin-published-store-upgrade\n"
+                             "\temail = repro@example.invalid\n")
         return env
 
     def published(self, args, timeout=900):

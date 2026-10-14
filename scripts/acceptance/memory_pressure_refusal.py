@@ -901,11 +901,16 @@ class DaemonStub(object):
     competing for the shared daemon/GPU.
     """
     def __init__(self, resources_status, resources_body, graph_status_coverage=None,
-                 runtime_metadata=None):
+                 runtime_metadata=None, health=None):
         self.resources_status = resources_status
         self.resources_body = resources_body
         self.graph_status_coverage = graph_status_coverage
         self.runtime_metadata = runtime_metadata
+        # The repository's own daemon's /health, replayed. A client admits a
+        # local endpoint only once it reads ready and names the repository it
+        # serves, so a stub that answers neither is refused before any tool
+        # call reaches it.
+        self.health = health
         self.handler_calls = 0
         self.requests = []
         self.server = None
@@ -996,7 +1001,10 @@ class DaemonStub(object):
                     self._json(200, owner.runtime_metadata)
                     return
                 if self.path == "/health":
-                    self._json(200, {})
+                    self._json(200, owner.health if owner.health is not None else {})
+                    return
+                if self.path == "/readiness" and owner.health is not None:
+                    self._json(200, {"ready": True, "warming": False})
                     return
                 self._json(404, {"error": "unknown stub route"})
 
@@ -1226,6 +1234,27 @@ class Suite(object):
                 return True
             time.sleep(0.2)
         return False
+
+    def served_health(self, repo):
+        """The /health this repository's own daemon answers, for a stub to replay.
+
+        Starts a daemon when none serves the repository, the way any command
+        that needs one does.
+        """
+        self.kin_run(["graph", "status"], repo)
+        endpoint = self.daemon_endpoint(repo)
+        if endpoint is None:
+            raise RuntimeError("no daemon published an endpoint for %s" % repo)
+        connection = http.client.HTTPConnection(endpoint[len("http://"):], timeout=30)
+        try:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            body = response.read()
+        finally:
+            connection.close()
+        if response.status != 200:
+            raise RuntimeError("the repository daemon's /health answered HTTP %d" % response.status)
+        return json.loads(body)
 
     def daemon_endpoint(self, repo):
         """The endpoint this store's daemon published, or None.
@@ -2619,6 +2648,11 @@ def check_13(suite):
         "MCP suppresses only exact embedding completion and qualifies the selected session",
     )
     repo = suite.fixture("mcp-pressure-response")
+    try:
+        served_health = suite.served_health(repo)
+    except (OSError, RuntimeError, ValueError) as error:
+        result.unknown("could not read the repository daemon's health to replay: %s" % error)
+        return result
     run([suite.kin, "daemon", "stop"], cwd=repo, env=suite.env, timeout=180)
     runtime_metadata = fixture_daemon_metadata(suite.kin, suite.env, cwd=repo)
 
@@ -2699,7 +2733,8 @@ def check_13(suite):
                 embed_refusal,
             )
         session_id = "memory-pressure-%s" % name
-        with DaemonStub(status, body, runtime_metadata=runtime_metadata) as daemon:
+        with DaemonStub(status, body, runtime_metadata=runtime_metadata,
+                        health=served_health) as daemon:
             try:
                 payload = suite.mcp(
                     repo,
@@ -2775,7 +2810,7 @@ def check_13(suite):
                 embed_refusal,
             )
         with DaemonStub(status, body, graph_status_coverage=coverage,
-                        runtime_metadata=runtime_metadata) as daemon:
+                        runtime_metadata=runtime_metadata, health=served_health) as daemon:
             try:
                 payload = suite.mcp(
                     repo,

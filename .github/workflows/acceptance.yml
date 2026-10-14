@@ -963,8 +963,17 @@ jobs:
             ubuntu:24.04 /bin/bash -c '
               set -e
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends git python3
+              # A runner whose nested containers resolve names intermittently
+              # lets apt-get update finish with warnings and no index, and the
+              # install then finds nothing. The suite needs both tools, so the
+              # pair is retried as one rather than the update alone.
+              for attempt in 1 2 3 4 5; do
+                if apt-get update -qq && apt-get install -y -qq --no-install-recommends git python3; then
+                  break
+                fi
+                if [ "$attempt" -eq 5 ]; then exit 1; fi
+                sleep 15
+              done
               git config --global user.name "Kin CI"
               git config --global user.email "ci@kinlab.ai"
               exec python3 scripts/acceptance/memory_pressure_refusal.py \

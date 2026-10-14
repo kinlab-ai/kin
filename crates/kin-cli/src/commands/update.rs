@@ -20619,7 +20619,6 @@ cwd = {:?}
             &evidence
         )
         .unwrap());
-        let mut record = record;
         record.runtime_obligations[0].expected_identity.sha256 = "e".repeat(64);
         assert!(
             validate_quiescent_legacy_restart(&record, &kin_home, LINUX_COMPONENTS, &[]).is_err()

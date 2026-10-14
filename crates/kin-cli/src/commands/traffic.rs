@@ -3,21 +3,27 @@
 
 use anyhow::{Context, Result};
 
-async fn daemon_base_url() -> Result<String> {
+/// The daemon serving this repository, with the authority and runtime
+/// admission it checks on every request.
+async fn daemon() -> Result<crate::daemon_client::DaemonClient> {
     let layout = crate::commands::require_repository_layout()?;
-    crate::daemon_client::resolve_daemon_url(&layout)
+    let url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| crate::daemon_client::daemon_required_error("traffic commands", &layout))
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("traffic commands", &layout))?;
+    crate::daemon_client::DaemonClient::from_base_url_for_layout(url, &layout)
 }
 
 /// `kin traffic show <scope>` — Show active traffic via daemon API.
 pub async fn run(scope: String) -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
+    let daemon = daemon().await?;
 
-    let resp = client
-        .get(format!("{}/traffic/{}", daemon_url, urlencoded(&scope)))
-        .send()
+    let resp = daemon
+        .send_untyped(
+            reqwest::Method::GET,
+            &format!("/traffic/{}", urlencoded(&scope)),
+            "traffic",
+            None,
+        )
         .await
         .context("query daemon traffic endpoint")?;
     if resp.status().is_success() {
@@ -106,12 +112,10 @@ pub async fn run(scope: String) -> Result<()> {
 
 /// `kin traffic sessions` — List active sessions via daemon API.
 pub async fn sessions() -> Result<()> {
-    let client = reqwest::Client::new();
-    let daemon_url = daemon_base_url().await?;
+    let daemon = daemon().await?;
 
-    let resp = client
-        .get(format!("{}/session", daemon_url))
-        .send()
+    let resp = daemon
+        .send_untyped(reqwest::Method::GET, "/session", "sessions", None)
         .await
         .context("query daemon sessions endpoint")?;
     if resp.status().is_success() {

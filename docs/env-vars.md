@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (612 total, 398 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (615 total, 398 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -56,6 +56,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_ACCEPTANCE_LABEL` | string | *(unset)* | diagnostic | dev/test tooling: the label the product acceptance scripts stamp on their reports, set once for a whole acceptance job; Kin itself does not read it |
 | `KIN_ACTOR` | string | *(unset)* | operational | actor identity recorded in provenance |
 | `KIN_AGENT_BELT` | string | default | operational | how much of the server's tool surface `kin agent run` puts on the model: default (the tools an agent needs to answer, edit and publish) or wide (everything the profile serves that the harness does not own) |
 | `KIN_AGENT_CONTEXT_ACCOUNTING` | enum | heuristic | correctness | agent request accounting: heuristic estimates the prepared request; llama_cpp uses the selected server's rendered prompt and tokenizer |
@@ -72,6 +73,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_CI_LANGUAGE_SERVERS_INSTALLED` | enum | *(unset)* | diagnostic | dev/test tooling: `1` once scripts/ci-install-language-servers.sh has installed and proved the language servers, so the kin-daemon reference-enrichment tests require them instead of skipping; Kin itself does not read it |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_EPHEMERAL_RUNNER` | string | *(unset)* | diagnostic | dev/test tooling: `true` when a CI job runs on a runner that lasts one job, so the CI target scripts restore a cached build target instead of keeping one; Kin itself does not read it |
 | `KIN_LANGUAGE_SERVER_ASSET_BASE` | url | GitHub Releases | operational | base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture |
 | `KIN_LANGUAGE_SERVER_ASSET_SHA256` | string | *(unset)* | operational | sha256 an overridden language-server asset is verified against; IGNORED unless KIN_LANGUAGE_SERVER_ASSET_BASE is also set, so it can never relax the pinned release check |
 | `KIN_LANGUAGE_TOOL_SEARCH` | bool | true | operational | look for language servers and the programs they run on beyond the PATH a process inherited: in the directories `kin setup` and `kin doctor --fix` recorded from the shell they ran in, then in the usual per-user install places (rustup's and Go's bin directories, npm's global prefix, nvm, volta, fnm, pyenv, asdf, mise, ~/.local/bin, Homebrew). Each goes behind the inherited entries and ahead of Kin's own tool directories, so a server the operator installed wins. Set falsy to search only the inherited PATH and Kin's own tool directories. Read at process start, so a daemon keeps the value it started with |
@@ -183,6 +185,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_PASS_STALL_SECS` | seconds>=0 | 600 | operational | how long a background pass may run without recording durable progress before the daemon stops it; 0 disables stopping |
 | `KIN_DAEMON_PERIODIC_FLUSH_SECS` | seconds>=0 | 30 | operational | maximum interval before dirty graph state is flushed |
 | `KIN_DAEMON_READY_TIMEOUT_SECS` | seconds>=0 | 300 | operational | how long to wait for a starting daemon to become ready |
+| `KIN_DAEMON_REQUIRE_RUNTIME_IDENTITY` | bool | false | operational | make a development daemon refuse a local request that lacks the caller's runtime identity and repository claims, as a managed daemon always does; it can only make admission stricter, and exists so a debug build can prove a client sends what a release daemon requires. Read by the daemon at process start |
 | `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |
 | `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS` | seconds>=0 | 8 | operational | bound on tokio runtime teardown waiting for blocking tasks |
 | `KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for a daemon-side scope graph build |

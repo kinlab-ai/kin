@@ -16,7 +16,7 @@
 //! the same `kin_mcp` delegate a `kin mcp start` session uses, which holds and
 //! renews the floor itself.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,7 @@ fn spawn_daemon(repository: &common::NativeDaemonRepository) -> DaemonChild {
         .arg(repository.layout.working_dir())
         .arg("--port")
         .arg("0")
+        .env("KIN_RUNTIME_MODE", "development")
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_AUTO_EMBED", "0")
         .env(
@@ -127,6 +128,34 @@ async fn graph_status_call() -> Result<(), String> {
     Ok(())
 }
 
+struct McpRepositoryBinding {
+    previous_directory: PathBuf,
+}
+
+impl McpRepositoryBinding {
+    fn new(repository: &common::NativeDaemonRepository) -> Self {
+        kin_cli::daemon_client::install_spawn_registrar();
+        let previous_directory = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository.working_dir()).unwrap();
+        let binding = Self { previous_directory };
+        let selected = kin_core::KinLayout::discover(repository.working_dir())
+            .expect("the MCP fixture must bind its actual repository");
+        assert_eq!(
+            selected.root().canonicalize().unwrap(),
+            repository.root().canonicalize().unwrap(),
+            "the MCP peer and native daemon must select the same store"
+        );
+        binding
+    }
+}
+
+impl Drop for McpRepositoryBinding {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.previous_directory)
+            .expect("restore the MCP fixture working directory");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_mcp_session_keeps_a_short_window_daemon_alive_until_it_ends() {
     let repo = tempfile::tempdir().unwrap();
@@ -138,16 +167,25 @@ async fn an_attached_mcp_session_keeps_a_short_window_daemon_alive_until_it_ends
 
     // This test binary is the MCP session. The environment is what `kin mcp
     // start` leaves behind once it binds a daemon: the delegate URL and the
-    // bearer token. `KIN_NO_DAEMON` keeps a failed call from reviving a
-    // replacement, so a daemon that idled out stays visibly dead rather than
-    // being papered over by a fresh one.
+    // bearer token, selected home and actual repository. `KIN_NO_DAEMON` keeps
+    // a failed call from reviving a replacement, so a daemon that idled out
+    // stays visibly dead rather than being papered over by a fresh one.
     // Held for the whole test, so the writes are serialized with every other
     // environment-mutating test and restored when it ends.
     let _environment = kin_core::test_env::EnvVarGuard::new()
+        .with("KIN_RUNTIME_MODE", "development")
+        .with("KIN_HOME", repository.home.path())
+        .with(
+            "KIN_REGISTRY_PATH",
+            repository.home.path().join("registry.toml"),
+        )
+        .with("KIN_STORE", repository.root())
+        .with("KIN_MCP_REPO", repository.working_dir())
         .with("KIN_DAEMON_URL", &base)
         .with("KIN_DAEMON_AUTH_TOKEN", TOKEN)
         .with("KIN_NO_DAEMON", "1")
         .without("KIN_DAEMON_IDLE_TIMEOUT_SECS");
+    let _repository_binding = McpRepositoryBinding::new(&repository);
     kin_mcp::session_idle_floor::enable();
 
     let outcome =

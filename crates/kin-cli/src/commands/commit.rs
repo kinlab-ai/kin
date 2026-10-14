@@ -452,6 +452,11 @@ async fn send_commit(
     if let Some(session_id) = session {
         request = request.header("X-Kin-Session", session_id);
     }
+    // Not dispatched yet, so a refused admission is a commit that did not run.
+    let request =
+        crate::daemon_client::admit_daemon_request(request, &daemon_url, layout, "commit")
+            .await
+            .map_err(CommitStop::NotDispatched)?;
 
     let kin_root = layout.root().to_path_buf();
     // Opened before the request so the first phase the daemon enters is already

@@ -394,6 +394,11 @@ fn run_mcp_session(
     port: u16,
 ) -> Vec<(u64, serde_json::Value)> {
     let started = Instant::now();
+    let kin_home = runtime
+        .kin_command()
+        .configured_env_for_test(std::ffi::OsStr::new("KIN_HOME"))
+        .flatten()
+        .expect("the owned daemon runtime supplies its existing isolated Kin home");
     // The stdio client uses a private home and the daemon runtime's registry.
     // Its central store must resolve exactly as the initialization did.
     let home = tempdir().expect("private MCP client home");
@@ -409,6 +414,13 @@ fn run_mcp_session(
         .env("HOME", home.path())
         .env("KIN_REGISTRY_PATH", runtime.registry_path())
         .env("USERPROFILE", home.path())
+        // Keep the client's configuration home separate while sharing the
+        // admitted namespace of the daemon that serves this repository.
+        .env("KIN_HOME", kin_home)
+        .env(
+            "KIN_RUNTIME_MODE",
+            kin_core::runtime_identity::RuntimeMode::Development.as_str(),
+        )
         .env("TMPDIR", std::env::temp_dir())
         .env("KIN_VFS_DISABLE", "1")
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
