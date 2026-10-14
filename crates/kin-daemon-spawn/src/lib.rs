@@ -5821,6 +5821,19 @@ pub enum RunningDaemonRouteReading {
     Absent,
 }
 
+/// What became of asking this process's client to replace the daemon at an
+/// endpoint that refused it as another release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupersededReplacement {
+    /// The older daemon is gone. The caller starts, or reaches, this
+    /// release's.
+    Replaced,
+    /// It was left running, and the sentence says why: a newer release, a
+    /// development build, a client an update replaced, a daemon still
+    /// finishing its work, or one that is not this repository's to replace.
+    Refused(String),
+}
+
 pub trait DaemonSpawnRegistrar: Send + Sync {
     /// The supervisor endpoint a daemon about to be spawned should be told
     /// about, starting the supervisor if it is not already up.
@@ -5879,6 +5892,22 @@ pub trait DaemonSpawnRegistrar: Send + Sync {
             }
         })
     }
+
+    /// Replace the daemon at `endpoint`, serving `kin_root`, which refused this
+    /// client as another release: only when it is an older release this client
+    /// supersedes, within `budget`. Starts nothing; the caller does.
+    fn replace_superseded(
+        &self,
+        _kin_root: PathBuf,
+        _endpoint: String,
+        _budget: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SupersededReplacement> + Send>> {
+        Box::pin(async {
+            SupersededReplacement::Refused(
+                "the installed registrar cannot replace a daemon of another release".to_string(),
+            )
+        })
+    }
 }
 
 /// Resolve the supervisor endpoint through the installed seam, if there is one.
@@ -5927,6 +5956,24 @@ pub async fn running_daemon_route_reading_at(
     };
     registrar
         .reading_at(kin_root.to_path_buf(), endpoint.to_string(), budget)
+        .await
+}
+
+/// Replace the daemon at `endpoint`, which refused this client as another
+/// release, through the installed seam. A missing seam replaces nothing.
+pub async fn replace_superseded_daemon(
+    kin_root: &Path,
+    endpoint: &str,
+    budget: std::time::Duration,
+) -> SupersededReplacement {
+    let Some(registrar) = registrar() else {
+        return SupersededReplacement::Refused(
+            "no daemon registrar is installed in this process to replace a daemon of another release"
+                .to_string(),
+        );
+    };
+    registrar
+        .replace_superseded(kin_root.to_path_buf(), endpoint.to_string(), budget)
         .await
 }
 

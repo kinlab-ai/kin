@@ -2163,11 +2163,32 @@ struct RuntimeRequestPolicy {
     repository: Option<kin_core::runtime_identity::RuntimeRepositoryBinding>,
 }
 
+/// Whether `path` asks this daemon process to stop or retire.
+///
+/// These routes are bound to the daemon's own process incarnation, which their
+/// handlers check against the identity the caller sends. They touch no
+/// semantic store, so the caller's runtime generation, home and repository
+/// claims are not theirs to check. A client of another release, older or
+/// newer, is exactly who has to retire a daemon, and `kin daemon stop` sends no
+/// runtime claim at all.
+fn is_process_lifecycle_route(path: &str) -> bool {
+    matches!(
+        path.strip_prefix("/v2").unwrap_or(path),
+        "/shutdown" | "/retire"
+    )
+}
+
 async fn validate_runtime_request(
     State(policy): State<RuntimeRequestPolicy>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Ahead of every runtime check, including the home revalidation: a daemon
+    // whose home was replaced is superseded, and it must still take the request
+    // that retires it. The bearer token and the incarnation still apply.
+    if is_process_lifecycle_route(request.uri().path()) {
+        return next.run(request).await;
+    }
     let namespace = if policy.local {
         let Some(namespace) = policy.namespace.as_ref() else {
             return (
@@ -2911,10 +2932,16 @@ async fn request_daemon_shutdown(
 /// Bound to the process incarnation the caller attributed, exactly as
 /// `/shutdown` is, so a retirement meant for a daemon that has since been
 /// replaced never reaches its successor.
+///
+/// A client of another release sends the incarnation inside a replacement
+/// envelope naming itself. The daemon then makes way rather than waiting to be
+/// unused: see `DaemonState::request_replacement`. A bare incarnation is the
+/// plain retirement every daemon with this route has taken.
 async fn request_daemon_retirement(
     State(state): State<Arc<DaemonState>>,
-    Json(expected): Json<kin_cli::daemon_client::ProcessIdentity>,
+    Json(request): Json<kin_cli::daemon_client::replacement::RetirementRequest>,
 ) -> Response {
+    let (expected, replacement) = request.into_parts();
     let current = match kin_cli::daemon_client::current_process_identity() {
         Ok(current) => current,
         Err(error) => {
@@ -2932,15 +2959,71 @@ async fn request_daemon_retirement(
         )
             .into_response();
     }
-    state.request_retirement();
+    match replacement {
+        Some(claim) => {
+            if state.request_replacement(&claim.successor) {
+                info!(
+                    successor = %claim.successor,
+                    "another release asked this daemon to make way for it"
+                );
+            }
+        }
+        None => {
+            state.request_retirement();
+        }
+    }
     // This request is itself in flight, so it leaves itself out of the count.
-    let blocked_by: Vec<&'static str> = crate::daemon::retirement_blockers(&state, 1)
-        .into_iter()
-        .map(crate::daemon::ShutdownBlocker::describe)
-        .collect();
+    let blockers = crate::daemon::retirement_blockers(&state, 1);
+    let replacing = state.replacement();
     (
         StatusCode::ACCEPTED,
-        Json(json!({"retiring": true, "blocked_by": blocked_by})),
+        Json(kin_cli::daemon_client::replacement::RetirementReply {
+            retiring: true,
+            blocked_by: blockers
+                .iter()
+                .map(|blocker| blocker.describe().to_string())
+                .collect(),
+            blockers: Some(
+                blockers
+                    .iter()
+                    .map(|blocker| blocker.code().to_string())
+                    .collect(),
+            ),
+            replacing: replacing.is_some(),
+            successor: replacing.map(|replacement| replacement.successor),
+        }),
+    )
+        .into_response()
+}
+
+/// Answer every new request with 503 `daemon_replacing` once this daemon is
+/// making way for another release, so the requests already in flight can
+/// finish and nothing new starts behind them.
+///
+/// The client is told which release replaced this one and to restart, which is
+/// the whole answer for a client of the replaced release: the successor will
+/// not serve it either. Probes and the lifecycle routes still pass, so a
+/// supervisor can watch the drain and the replacing client can ask again.
+async fn refuse_new_requests_while_replacing(
+    State(state): State<Arc<DaemonState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(replacement) = state.replacement() else {
+        return next.run(request).await;
+    };
+    let path = request.uri().path();
+    if is_process_lifecycle_route(path)
+        || is_process_liveness_route(path)
+        || is_readiness_route(path)
+    {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(kin_cli::daemon_client::replacement::ReplacingRefusal::new(
+            &replacement.successor,
+        )),
     )
         .into_response()
 }
@@ -3975,6 +4058,7 @@ fn router_with_rotation_tokens(
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let admission_state = Arc::clone(&state);
     let prepared_state = Arc::clone(&state);
+    let replacing_state = Arc::clone(&state);
     let runtime_component = if state.publication_control.is_some() {
         "hosted-daemon"
     } else {
@@ -4002,6 +4086,10 @@ fn router_with_rotation_tokens(
         .merge(routes.clone())
         .nest("/v2", routes)
         .layer(Extension(DaemonShutdownControl(shutdown)))
+        .layer(middleware::from_fn_with_state(
+            replacing_state,
+            refuse_new_requests_while_replacing,
+        ))
         .layer(middleware::from_fn_with_state(
             prepared_state,
             crate::prepared_publication::serving,
@@ -11939,6 +12027,38 @@ struct GraphEventsParams {
     types: Option<String>,
 }
 
+/// The successor's name, once this daemon is making way for another release.
+/// Never resolves otherwise, so an event stream can wait on it beside its
+/// events.
+async fn replaced_successor(
+    watch: &mut tokio::sync::watch::Receiver<Option<crate::state::Replacement>>,
+) -> String {
+    let successor = match watch.wait_for(Option::is_some).await {
+        Ok(current) => current
+            .as_ref()
+            .map(|replacement| replacement.successor.clone()),
+        Err(_) => None,
+    };
+    match successor {
+        Some(successor) => successor,
+        None => std::future::pending().await,
+    }
+}
+
+/// The last frame an event stream sends when its daemon is replaced: the same
+/// out-of-band shape as `connected` and `lagged`, naming the successor and
+/// telling the subscriber to restart, since the successor will not serve a
+/// client of this release either.
+fn replaced_frame(successor: &str) -> String {
+    let frame = json!({
+        "type": "replaced",
+        "code": kin_cli::daemon_client::replacement::DAEMON_REPLACING,
+        "successor": successor,
+        "message": kin_cli::daemon_client::replacement::replaced_message(successor),
+    });
+    format!("data: {frame}\n\n")
+}
+
 /// GET /graph/events: the graph-facing view of the daemon event bus.
 ///
 /// The same broadcast channel `/vfs/subscribe` serves, which is left exactly as
@@ -11964,6 +12084,7 @@ async fn graph_events(
         .filter(|names| !names.is_empty());
 
     let mut rx = state.event_tx.subscribe();
+    let mut replaced = state.replacement_watch();
     let root_hash = hex::encode(state.graph.compute_root_hash());
     let entity_count = state.graph.entity_count();
     let seq = state.current_event_seq();
@@ -12023,6 +12144,12 @@ async fn graph_events(
                 }
                 _ = heartbeat.tick() => {
                     yield Ok(": heartbeat\n\n".to_string());
+                }
+                successor = replaced_successor(&mut replaced) => {
+                    // Never filtered, like a gap: it is the last thing this
+                    // stream says.
+                    yield Ok(replaced_frame(&successor));
+                    break;
                 }
             }
         }
@@ -27491,6 +27618,7 @@ async fn vfs_readdir(
 /// to keep the connection alive through proxies/load balancers.
 async fn vfs_subscribe(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let mut rx = state.event_tx.subscribe();
+    let mut replaced = state.replacement_watch();
 
     let stream = async_stream::stream! {
         // Send initial connected event
@@ -27531,6 +27659,10 @@ async fn vfs_subscribe(State(state): State<Arc<DaemonState>>) -> impl IntoRespon
                 }
                 _ = heartbeat.tick() => {
                     yield Ok(": heartbeat\n\n".to_string());
+                }
+                successor = replaced_successor(&mut replaced) => {
+                    yield Ok(replaced_frame(&successor));
+                    break;
                 }
             }
         }
@@ -77762,6 +77894,362 @@ pub(crate) mod tests {
             !waiting.contains(&crate::daemon::ShutdownBlocker::RequestInFlight.describe()),
             "the retirement request itself must not be named as in flight: {body}"
         );
+    }
+
+    /// A managed daemon still takes `/shutdown` and `/retire` from a client
+    /// that sends no runtime identity, or another release's. Those routes are
+    /// bound to the daemon's own process incarnation, which the handler checks,
+    /// and a client of an older or newer release is exactly who has to retire
+    /// it. Semantic routes keep refusing a missing identity.
+    #[tokio::test]
+    async fn managed_lifecycle_routes_are_bound_to_the_incarnation_not_the_runtime_header() {
+        let home = tempfile::tempdir().unwrap();
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::capture(home.path()).unwrap();
+        let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::capture(
+            &uuid::Uuid::new_v4().to_string(),
+            home.path(),
+        )
+        .unwrap();
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // The production route table, under the production runtime policy of a
+        // managed local daemon.
+        let app = Router::new()
+            .merge(api_routes())
+            .nest("/v2", api_routes())
+            .layer(Extension(DaemonShutdownControl(Some(shutdown_tx))))
+            .with_state(Arc::clone(&state))
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: true,
+                    local: true,
+                    namespace: Some(namespace),
+                    repository: Some(repository),
+                },
+                validate_runtime_request,
+            ));
+        let post = |path: &str, body: String| {
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let json_body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            })
+        };
+
+        let rejected = app
+            .clone()
+            .oneshot(post("/retire", stale.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let body = json_body(rejected).await;
+        assert_eq!(
+            body["error"], "daemon process incarnation changed",
+            "the handler, not the runtime header check, must answer a stale incarnation: {body}"
+        );
+        assert!(!state.retirement_requested());
+
+        let accepted = app
+            .clone()
+            .oneshot(post("/retire", serde_json::to_string(&identity).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = json_body(accepted).await;
+        assert_eq!(body["retiring"], true, "{body}");
+        assert!(body["blocked_by"].is_array(), "{body}");
+        assert!(state.retirement_requested());
+
+        // A client of another release sends its own runtime identity, which
+        // this daemon does not share, and no repository claim. The incarnation
+        // still decides.
+        let foreign = app
+            .clone()
+            .oneshot(
+                Request::post("/v2/shutdown")
+                    .header("content-type", "application/json")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+                        "another-release",
+                    )
+                    .body(Body::from(serde_json::to_vec(&identity).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::ACCEPTED);
+        assert!(*shutdown_rx.borrow(), "the matching incarnation must stop");
+
+        let semantic = app
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            semantic.status(),
+            StatusCode::CONFLICT,
+            "a semantic route still requires the runtime identity header"
+        );
+    }
+
+    /// A replacement is bound to the incarnation like any retirement, drops the
+    /// attached client from what it waits on, answers in stable codes, and from
+    /// then on refuses new requests with the successor's name while probes and
+    /// the lifecycle routes still pass. The first successor named stays.
+    #[tokio::test]
+    async fn a_replacement_answers_in_codes_and_refuses_new_requests_with_the_successor() {
+        use kin_cli::daemon_client::replacement::{
+            blocker, ReplacementClaim, RetirementReply, RetirementRequest, DAEMON_REPLACING,
+        };
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "attached-editor",
+                kin_model::SessionTransport::Mcp,
+                Some(std::process::id()),
+                state.layout.working_dir().to_path_buf(),
+                kin_model::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let app = router_with_auth(Arc::clone(&state), Some("retire-token".to_string()));
+        let retire = |body: serde_json::Value| {
+            Request::post("/retire")
+                .header("authorization", "Bearer retire-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let replacement = |identity: serde_json::Value, successor: &str| json!({"identity": identity, "replacement": {"successor": successor}});
+
+        let rejected = app
+            .clone()
+            .oneshot(retire(replacement(stale, "Kin 9.9.9 (0123abc)")))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(state.replacement().is_none() && !state.retirement_requested());
+
+        let request = RetirementRequest::Replacement {
+            identity: identity.clone(),
+            replacement: ReplacementClaim {
+                successor: "Kin 9.9.9 (0123abc)".to_string(),
+            },
+        };
+        let accepted = app
+            .clone()
+            .oneshot(retire(serde_json::to_value(&request).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let reply: RetirementReply = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(reply.retiring && reply.replacing, "{reply:?}");
+        assert_eq!(reply.successor.as_deref(), Some("Kin 9.9.9 (0123abc)"));
+        let codes = reply
+            .blockers
+            .clone()
+            .expect("a replacing daemon sends codes");
+        assert!(
+            !codes.iter().any(|code| code == blocker::ATTACHED_SESSION),
+            "an attached client must not hold a replacement: {reply:?}"
+        );
+        assert!(
+            !codes.iter().any(|code| code == blocker::REQUEST_IN_FLIGHT),
+            "the replacement request itself must not be named as in flight: {reply:?}"
+        );
+        assert_eq!(reply.blocked_by.len(), codes.len());
+        assert!(state.retirement_requested());
+
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retire-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(refused.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], DAEMON_REPLACING);
+        assert_eq!(
+            body["error"],
+            "Kin was replaced by Kin 9.9.9 (0123abc); restart this client"
+        );
+
+        let probe = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK, "probes see the drain");
+
+        // A later plain retirement, or another successor, changes nothing.
+        let again = app
+            .clone()
+            .oneshot(retire(serde_json::to_value(&identity).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::ACCEPTED);
+        let other = app
+            .oneshot(retire(replacement(
+                serde_json::to_value(&identity).unwrap(),
+                "Kin 10.0.0 (fedcba9)",
+            )))
+            .await
+            .unwrap();
+        let reply: RetirementReply = serde_json::from_slice(
+            &axum::body::to_bytes(other.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(reply.replacing);
+        assert_eq!(reply.successor.as_deref(), Some("Kin 9.9.9 (0123abc)"));
+    }
+
+    /// A plain retirement still answers in codes beside its sentences, so a
+    /// client of this release reads it without the sentence table.
+    #[tokio::test]
+    async fn a_plain_retirement_names_its_blockers_by_code_and_keeps_serving() {
+        use kin_cli::daemon_client::replacement::{blocker, RetirementReply};
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "attached-editor",
+                kin_model::SessionTransport::Mcp,
+                Some(std::process::id()),
+                state.layout.working_dir().to_path_buf(),
+                kin_model::SessionCapabilities::default(),
+            )
+            .unwrap();
+        let app = router(Arc::clone(&state));
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/retire")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&identity).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let reply: RetirementReply = serde_json::from_slice(
+            &axum::body::to_bytes(accepted.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(reply.retiring && !reply.replacing && reply.successor.is_none());
+        assert_eq!(
+            reply.blockers.as_deref(),
+            Some(&[blocker::ATTACHED_SESSION.to_string()][..])
+        );
+        assert_eq!(
+            reply.blocked_by,
+            vec![crate::daemon::ShutdownBlocker::AttachedSession
+                .describe()
+                .to_string()]
+        );
+        let served = app
+            .oneshot(Request::get("/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "a retiring daemon keeps serving its clients"
+        );
+    }
+
+    /// Both event streams end with one frame naming the successor once their
+    /// daemon is replaced, so a subscriber of the replaced release is told to
+    /// restart instead of finding its stream cut.
+    #[tokio::test]
+    async fn event_streams_end_with_the_successor_when_their_daemon_is_replaced() {
+        async fn next_frame(
+            body: &mut axum::body::BodyDataStream,
+        ) -> Option<Result<axum::body::Bytes, axum::Error>> {
+            tokio::time::timeout(Duration::from_secs(10), futures_util::StreamExt::next(body))
+                .await
+                .expect("the stream must answer, not hang")
+        }
+        for path in ["/vfs/subscribe", "/graph/events"] {
+            let state = test_state();
+            let response = router(Arc::clone(&state))
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let connected = next_frame(&mut body)
+                .await
+                .expect("connected frame")
+                .unwrap();
+            assert!(String::from_utf8_lossy(&connected).contains("\"connected\""));
+            assert_eq!(state.event_tx.receiver_count(), 1);
+
+            assert!(state.request_replacement("Kin 9.9.9 (0123abc)"));
+            let last = next_frame(&mut body)
+                .await
+                .expect("the replaced frame")
+                .unwrap();
+            let text = String::from_utf8(last.to_vec()).unwrap();
+            let frame: serde_json::Value =
+                serde_json::from_str(text.trim_start_matches("data: ").trim()).unwrap();
+            assert_eq!(frame["type"], "replaced", "{path}: {frame}");
+            assert_eq!(frame["successor"], "Kin 9.9.9 (0123abc)");
+            assert_eq!(
+                frame["message"],
+                "Kin was replaced by Kin 9.9.9 (0123abc); restart this client"
+            );
+            assert!(
+                next_frame(&mut body).await.is_none(),
+                "{path} must end after the replaced frame"
+            );
+            assert_eq!(
+                state.event_tx.receiver_count(),
+                0,
+                "{path} must let go of its subscription"
+            );
+        }
     }
 
     #[tokio::test]

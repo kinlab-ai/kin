@@ -307,8 +307,8 @@ pub async fn run_bootstrap_published(
         );
     }
     refuse_restart_marker_before_remote_preflight(&inspected_home)?;
-    ensure_no_active_managed_runtimes(&inspected_home, spec).context(
-        "published bootstrap requires managed serving executables to be stopped before release preflight",
+    ensure_no_active_runtimes_but_daemons(&inspected_home, spec).context(
+        "published bootstrap requires managed VFS servers to be stopped before release preflight",
     )?;
     let authority = BootstrapInstallAuthority::capture(&inspected_home, spec)?;
     authority.validate_legacy_target(spec, &pins.release.version)?;
@@ -325,15 +325,15 @@ pub async fn run_bootstrap_published(
     if !transaction_dirs(lock.root())?.is_empty() {
         anyhow::bail!("another native update interrupted the captured bootstrap generation");
     }
-    ensure_no_active_managed_runtimes(lock.root(), spec).context(
-        "published bootstrap install phase requires managed serving executables to remain stopped",
+    ensure_no_active_runtimes_but_daemons(lock.root(), spec).context(
+        "published bootstrap install phase requires managed VFS servers to remain stopped",
     )?;
     cleanup_stale_staging_dirs(&lock)?;
     authority.verify_locked(&lock, spec)?;
     let locked_channel =
         resolve_channel_locked(lock.root(), Some(channel), false, true, Some(&lock));
     ensure_pinned_channel_unchanged(channel, locked_channel)?;
-    install_bootstrap_prepared_release(&lock, &prepared, &authority, spec)?;
+    install_bootstrap_prepared_release(&lock, &prepared, &authority, spec).await?;
     drop(lock);
     // Only a fresh invocation of the exact installed CLI can clear the native
     // restart fence; the incoming bootstrap process never acknowledges itself.
@@ -343,7 +343,7 @@ pub async fn run_bootstrap_published(
     Ok(())
 }
 
-fn install_bootstrap_prepared_release(
+async fn install_bootstrap_prepared_release(
     lock: &InstallRootLock,
     prepared: &PreparedPinnedRelease,
     authority: &BootstrapInstallAuthority,
@@ -367,6 +367,7 @@ fn install_bootstrap_prepared_release(
         true,
     )?;
     validate_staged_static_build_identity(staging.path(), spec, &latest, &prepared.provenance)?;
+    replace_daemons_for_release(lock.root(), &latest, &prepared.commit_sha).await?;
     authority.verify_locked(lock, spec)?;
     let pending = restart_pending_record(
         lock.root(),

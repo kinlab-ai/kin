@@ -724,6 +724,9 @@ The checks (IDs as emitted in `--json`):
 | --- | --- |
 | `kin_binary` | The `kin` binary resolved (reports version + path). |
 | `kin_daemon_binary` | `kin-daemon` found beside `kin` or on `PATH`. |
+| `launcher_version_stamp` | The npm launcher's version stamp, `~/.kin/bin/.kinlab-kin-version`, names the release that is installed. **n/a** when there is no stamp, which is what an install the npm launcher did not provision looks like. **STALE** when it names another release; `kin doctor --fix` rewrites it. |
+| `other_kin_copies` | No other copy of Kin can run on this machine. Every `kin`, `kin-daemon` and `kin-mcp` on `PATH`, in Cargo's and Homebrew's directories, in npm global prefixes and in `/usr/local/bin` is named with what it is. A link to the managed Kin, an npm launcher at least as new as it, a release from 0.8.7 on (which hands its commands to the managed Kin) and a development build are named without being flagged. **STALE** names each older or unidentified copy and the uninstall that removes it. |
+| `live_daemons_by_release` | Every running `kin-daemon` runs the managed Kin. **STALE** names, by release, each one that runs another copy or a managed release that has since been replaced, with its process id and repository. |
 | `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib`, and the `kin-vfs` driver beside `kin`, in `~/.kin/bin`, or on PATH runs when probed (macOS/Linux). A driver that is present but will not load is **MISCONFIGURED** and the row quotes the loader; no driver and no shim is **n/a**. On native Windows this is **unsupported**; use WSL2. |
 | `projection_mode` | Which projection is in force and whether it works, read `mode/mounted/readable/writable/degraded` from a live probe across the shim, an NFS mount, a FUSE mount and Windows ProjFS. **n/a** when no projection is available and none is configured, which is what an install that ships without one looks like; Windows never gets that reading, because ProjFS is on every SKU and only needs enabling. A configured mode that is not running is **MISCONFIGURED**. A shim that is installed but not injected into this process is **STALE**, which is what running `kin` from a shell without the hook looks like. |
 | `repo_init` | The current directory is inside a Kin repository. |
@@ -747,6 +750,13 @@ Each failing/incomplete check prints its own `fix:` line. The most common ones:
 - **`projection_mode` MISCONFIGURED** → run `kin vfs status` for each mode's probe result,
   then `kin vfs on` to engage one. See [Filesystem projection](projection.md).
 - **`kin_daemon_binary` MISSING** → reinstall Kin so `kin-daemon` lands beside `kin`.
+- **`launcher_version_stamp` STALE** → run `kin doctor --fix`, which rewrites the stamp to the
+  installed release under the install lock. `kin update` keeps it current from then on.
+- **`other_kin_copies` STALE** → run `kin setup`, which asks about each copy and defaults to
+  keeping it, or `kin setup doctor --fix --remove-other-copies` to remove every one that has its
+  own uninstall. Development builds and the managed Kin home are never touched.
+- **`live_daemons_by_release` STALE** → run `kin daemon stop` in each repository the row names;
+  the managed Kin starts its own daemon on the next command there.
 - **`commit_identity` MISCONFIGURED** → set `git config --global user.name` and
   `git config --global user.email`, or put `default_author = "Your Name <you@example.com>"`
   in `.kin/config.toml`. Kin refuses to commit rather than attribute a change to nobody,

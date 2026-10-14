@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kin doctor` names every other copy of Kin this machine can run: each `kin`, `kin-daemon`
+  and `kin-mcp` on `PATH`, in Cargo's and Homebrew's directories, in npm global prefixes and
+  in `/usr/local/bin`, with what it is (the managed pair, a link to it, an npm launcher and its
+  version, a release that hands its commands to the managed pair, a separate older copy, a
+  development build) and the uninstall that removes it. A second row names every running
+  `kin-daemon` by the release it runs.
+- `kin setup` asks about each copy it can remove, defaulting to keep it, and a run with no
+  terminal only names them. `kin setup doctor --fix --remove-other-copies` removes them all
+  with each channel's own uninstall. Neither ever touches a development build or the managed
+  Kin home, and `--fix` alone removes nothing, because `kin update` runs it unattended.
+
+### Fixed
+
+- `kin update` writes the installed release into the npm launcher's version stamp inside the
+  same transaction as the binaries, and a rollback puts the old stamp back byte for byte.
+  Every update used to leave the stamp naming the release it replaced, and launchers older
+  than September 2026 read the stamp as the installed version and could reinstall their own
+  older release over a newer one. Recovery and `kin doctor --fix` rewrite a stamp an older
+  updater left behind. An install without a stamp still gets none.
+- The npm launcher replaces its version stamp by rename, so a reader never sees it empty or
+  half-written.
+
 ## [0.8.7] - 2026-10-14
 
 ### Changed

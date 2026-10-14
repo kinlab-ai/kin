@@ -33,7 +33,9 @@ use uuid::Uuid;
 mod attach_env;
 pub(crate) mod probe_process;
 pub(crate) mod process_executable;
+pub mod replacement;
 mod starting_owner;
+pub mod succession;
 #[cfg(all(test, unix))]
 pub(crate) use starting_owner::stand_in_as_starting_daemon_for_test;
 pub use starting_owner::{
@@ -78,6 +80,11 @@ pub enum AutoStartError {
     StartupTimeout(String),
     #[error("invalid .kin layout: {0}")]
     InvalidLayout(String),
+    /// An older release's daemon serves this repository. The caller replaces
+    /// it under the startup lock and starts this release's; it reaches a
+    /// caller of the crate only if that replacement could not be made.
+    #[error("an older Kin daemon (pid {pid}) serves this repository and must be replaced first")]
+    Superseded { pid: u32 },
 }
 
 impl AutoStartError {
@@ -1146,6 +1153,63 @@ impl DaemonClient {
     pub async fn connect_for_workspace(command: &str, layout: &KinLayout) -> Result<Self> {
         let discovered = Self::connect_for_command(command, layout).await?;
         Self::from_running_workspace(discovered.base_url, layout).await
+    }
+
+    /// A known workspace endpoint for a page of `kin ui`, which never works
+    /// beside a daemon of another release.
+    ///
+    /// Like [`Self::from_running_workspace`], except that the endpoint must
+    /// admit this client's release first. A daemon of an older release this
+    /// client supersedes is not used: the page goes through
+    /// [`Self::connect_for_workspace`], which replaces it and starts this
+    /// release's, within `budget`. A newer release, a development build, and a
+    /// client an update has replaced are refused in their own words.
+    pub async fn for_workspace_page(
+        command: &str,
+        base_url: impl Into<String>,
+        layout: &KinLayout,
+        budget: Duration,
+    ) -> Result<Self> {
+        let base_url = base_url.into();
+        if let Err(error) = validate_runtime_endpoint(&base_url, "daemon").await {
+            if error.downcast_ref::<RuntimeEndpointRefusal>().is_none() {
+                return Err(error);
+            }
+            let (pid, port) = repo_daemon_recorded_endpoint(layout.root());
+            let recorded = pid.filter(|_| {
+                port.is_some_and(|port| {
+                    base_url.trim_end_matches('/') == format!("http://127.0.0.1:{port}")
+                })
+            });
+            let judged = match recorded {
+                Some(pid) => {
+                    judge_daemon_of_another_release(
+                        &base_url,
+                        pid,
+                        budget.min(Duration::from_secs(5)),
+                    )
+                    .await
+                }
+                None => None,
+            };
+            return match judged {
+                Some(kin_core::runtime_identity::Succession::Replace) => {
+                    let replacing = "Kin is replacing an older daemon for this repository; \
+                                     reload in a moment";
+                    tokio::time::timeout(budget, Self::connect_for_workspace(command, layout))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(replacing)))
+                }
+                Some(refused) => Err(anyhow::anyhow!(
+                    "{}",
+                    refused
+                        .refusal()
+                        .unwrap_or("the workspace daemon was refused")
+                )),
+                None => Err(error),
+            };
+        }
+        Self::from_running_workspace(base_url, layout).await
     }
 
     /// Verify a known endpoint without starting a daemon or adopting ambient scope.
@@ -5378,6 +5442,19 @@ pub fn read_supervisor_owner_record() -> Option<EndpointOwnerRecord> {
     read_supervisor_owner_record_in_dir(&supervisor_dir())
 }
 
+/// The supervisor endpoint recorded in `dir`: its pid, port and owner record,
+/// with no liveness probe.
+///
+/// A supervisor from 0.8.6 or older recorded its endpoint in `.kin` under the
+/// real home, or beside an explicit `KIN_REGISTRY_PATH`, rather than in the
+/// managed services directory, and the updater reads it there to retire it.
+pub fn supervisor_endpoint_in_dir(
+    dir: &Path,
+) -> (Option<u32>, Option<u16>, Option<EndpointOwnerRecord>) {
+    let recorded = supervisor_endpoint_snapshot(dir);
+    (recorded.pid, recorded.port, recorded.owner)
+}
+
 fn read_supervisor_owner_record_in_dir(dir: &Path) -> Option<EndpointOwnerRecord> {
     let raw = std::fs::read_to_string(dir.join(SUPERVISOR_OWNER_FILE)).ok()?;
     let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
@@ -6313,10 +6390,55 @@ async fn attach_to_existing_daemon(
     kin_root: &Path,
     base_url: &str,
 ) -> std::result::Result<(), AutoStartError> {
-    validate_runtime_endpoint(base_url, "daemon")
-        .await
-        .map_err(AutoStartError::spawn)?;
+    if let Err(error) = validate_runtime_endpoint(base_url, "daemon").await {
+        if error.downcast_ref::<RuntimeEndpointRefusal>().is_some() {
+            // Only the repository's own recorded daemon can be replaced from
+            // here: its incarnation is what the replacement is bound to.
+            let recorded = daemon_endpoint_snapshot(kin_root);
+            if let (Some(pid), Some(port)) = (recorded.pid, recorded.port) {
+                if base_url.trim_end_matches('/') == format!("http://127.0.0.1:{port}") {
+                    match judge_daemon_of_another_release(base_url, pid, Duration::from_secs(5))
+                        .await
+                    {
+                        Some(kin_core::runtime_identity::Succession::Replace) => {
+                            return Err(AutoStartError::Superseded { pid })
+                        }
+                        Some(refused) => {
+                            if let Some(message) = refused.refusal() {
+                                return Err(AutoStartError::SpawnFailed(message.to_string()));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        return Err(AutoStartError::spawn(error));
+    }
     report_behavior_env_ignored_by_existing_daemon(kin_root, base_url).await
+}
+
+/// What a managed client does about the daemon at `base_url`, which refused
+/// it as another release, or `None` for a development client, which keeps the
+/// refusal it always had.
+///
+/// Only the refusals that say something new are worth their words here: a
+/// newer release, a development build, and a client an update has replaced.
+/// The rest keep the admission's own refusal.
+async fn judge_daemon_of_another_release(
+    base_url: &str,
+    pid: u32,
+    budget: Duration,
+) -> Option<kin_core::runtime_identity::Succession> {
+    use kin_core::runtime_identity::Succession;
+    let client = succession::current_succession_client().ok()?;
+    if client.mode != kin_core::runtime_identity::RuntimeMode::Managed {
+        return None;
+    }
+    match succession::judge_running_daemon(base_url, pid, budget).await {
+        Succession::Attach | Succession::Refuse(_) => None,
+        judged => Some(judged),
+    }
 }
 
 /// Say so when this command sets behavior levers the attached daemon cannot
@@ -7834,28 +7956,39 @@ pub enum InstalledStartupProtocol {
 
 /// Installed kin binaries on this host that are not the running one.
 ///
-/// Candidates are whatever `PATH` resolves for `kin`, plus the Kin home's
-/// `bin`. That is deliberately the set an operator actually invokes rather than
-/// a filtered notion of an install: `PATH` is what decides which binary runs, so
-/// a build tree reachable through it is probed like any other install and
-/// diagnosed on the same evidence. Paths are canonicalized so one binary
-/// reachable by two names is probed once, and so the running binary is excluded
-/// even when it was invoked through a symlink.
+/// The candidates are every native `kin` the full copy enumeration finds:
+/// each one on `PATH`, Cargo's and Homebrew's, `/usr/local/bin`, the managed
+/// pair, and anything the managed home links to. npm launchers are left out,
+/// because they run the managed pair and carry no daemon of their own, and so
+/// are copies that cannot be identified. Paths are canonicalized so one binary
+/// reachable by two names is probed once, and so the running binary is
+/// excluded even when it was invoked through a symlink.
 fn other_installed_kin_binaries() -> Vec<PathBuf> {
+    use crate::commands::kin_copies::{scan, CopyKind, ScanRoots};
+
     let running = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    let mut candidates = Vec::new();
-    if let Some(path) = crate::commands::setup::check_binary_in_path("kin") {
-        candidates.push(path);
-    }
-    if let Ok(home) = crate::commands::setup::kin_dir() {
-        candidates.push(home.join("bin").join("kin"));
-    }
-
+    let Ok(roots) = ScanRoots::from_environment() else {
+        return Vec::new();
+    };
+    // Only the startup protocol probe below runs anything; identifying a copy
+    // never does here.
+    let roots = ScanRoots {
+        probe_versions: false,
+        ..roots
+    };
     let mut found: Vec<PathBuf> = Vec::new();
-    for candidate in candidates {
-        let Ok(resolved) = candidate.canonicalize() else {
+    for copy in scan(&roots).copies {
+        if copy.program != "kin"
+            || matches!(
+                copy.kind,
+                CopyKind::NpmLauncher { .. } | CopyKind::Unknown(_)
+            )
+        {
+            continue;
+        }
+        let Ok(resolved) = copy.path.canonicalize() else {
             continue;
         };
         if running.as_ref() == Some(&resolved) || found.contains(&resolved) {
@@ -8757,6 +8890,20 @@ enum ExistingDaemon {
     /// one would lose the singleton flock, so the caller must report this
     /// instead.
     LiveNotReady(String),
+    /// A live daemon of an older release owns this repo. The caller replaces
+    /// it under the startup lock, then starts this release's.
+    Superseded(u32),
+}
+
+/// How the administrative identity handshake with a recorded daemon ended.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityHandshake {
+    /// It runs this client's release.
+    Admitted,
+    /// The recorded endpoint changed or its owner exited while waiting.
+    EndpointChanged,
+    /// It runs an older release this client replaces.
+    Superseded,
 }
 
 /// Resolve the endpoint recorded for this repo, escalating patience — never
@@ -8810,7 +8957,7 @@ async fn wait_for_existing_daemon_identity(
     deadline: Instant,
     patience: Duration,
     silence_bound: Option<Duration>,
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<IdentityHandshake, String> {
     let started = Instant::now();
     let base_url = format!("http://127.0.0.1:{}", endpoint.port);
     let mut detail = "the runtime identity endpoint has not answered".to_string();
@@ -8820,7 +8967,7 @@ async fn wait_for_existing_daemon_identity(
             || recorded.port != Some(endpoint.port)
             || process_liveness(endpoint.pid).authorizes_cleanup()
         {
-            return Ok(false);
+            return Ok(IdentityHandshake::EndpointChanged);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         let silence_remaining = silence_bound.map(|bound| bound.saturating_sub(started.elapsed()));
@@ -8849,12 +8996,23 @@ async fn wait_for_existing_daemon_identity(
             || recorded.port != Some(endpoint.port)
             || process_liveness(endpoint.pid).authorizes_cleanup()
         {
-            return Ok(false);
+            return Ok(IdentityHandshake::EndpointChanged);
         }
         match handshake {
-            Ok(Ok(())) => return Ok(true),
+            Ok(Ok(())) => return Ok(IdentityHandshake::Admitted),
             Ok(Err(error)) if error.downcast_ref::<RuntimeEndpointRefusal>().is_some() => {
-                return Err(format!("{error:#}; existing daemon pid {} was left running and its endpoint files were preserved", endpoint.pid));
+                let budget = deadline.saturating_duration_since(Instant::now());
+                return match judge_daemon_of_another_release(&base_url, endpoint.pid, budget)
+                    .await
+                {
+                    Some(kin_core::runtime_identity::Succession::Replace) => {
+                        Ok(IdentityHandshake::Superseded)
+                    }
+                    Some(refused) if refused.refusal().is_some() => {
+                        Err(refused.refusal().unwrap_or_default().to_string())
+                    }
+                    _ => Err(format!("{error:#}; existing daemon pid {} was left running and its endpoint files were preserved", endpoint.pid)),
+                };
             }
             Ok(Err(error)) => detail = format!("{error:#}"),
             Err(_) => {
@@ -8961,12 +9119,13 @@ async fn inspect_existing_daemon_once(
     match wait_for_existing_daemon_identity(kin_root, existing, deadline, patience, silence_bound)
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(IdentityHandshake::Admitted) => {}
+        Ok(IdentityHandshake::EndpointChanged) => {
             return ExistingDaemon::Starting(
                 "the daemon endpoint changed while its runtime identity was pending".to_string(),
             )
         }
+        Ok(IdentityHandshake::Superseded) => return ExistingDaemon::Superseded(pid),
         Err(message) => return ExistingDaemon::LiveNotReady(message),
     }
     let short_deadline = (Instant::now() + short).min(deadline);
@@ -10183,6 +10342,63 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
     > {
         Box::pin(async move { probe_running_route_within(&kin_root, &endpoint, budget).await })
     }
+
+    fn replace_superseded(
+        &self,
+        kin_root: PathBuf,
+        endpoint: String,
+        budget: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kin_daemon_spawn::SupersededReplacement> + Send>,
+    > {
+        Box::pin(async move { replace_superseded_endpoint(&kin_root, &endpoint, budget).await })
+    }
+}
+
+/// Replace the daemon recorded for `kin_root` at `endpoint`, which refused
+/// this client as another release, when it is an older one this client
+/// supersedes. Holds the repository's startup lock while it does, and starts
+/// nothing.
+async fn replace_superseded_endpoint(
+    kin_root: &Path,
+    endpoint: &str,
+    budget: Duration,
+) -> kin_daemon_spawn::SupersededReplacement {
+    use kin_daemon_spawn::SupersededReplacement;
+    let deadline = Instant::now() + budget;
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    let Some(pid) = recorded.pid.filter(|_| {
+        recorded.port.is_some_and(|port| {
+            endpoint.trim_end_matches('/') == format!("http://127.0.0.1:{port}")
+        })
+    }) else {
+        return SupersededReplacement::Refused(format!(
+            "{endpoint} is not the daemon recorded for this repository, so it was left running"
+        ));
+    };
+    match judge_daemon_of_another_release(endpoint, pid, budget.min(Duration::from_secs(5))).await {
+        Some(kin_core::runtime_identity::Succession::Replace) => {}
+        Some(refused) => {
+            return SupersededReplacement::Refused(
+                refused.refusal().unwrap_or_default().to_string(),
+            )
+        }
+        None => {
+            return SupersededReplacement::Refused(format!(
+                "Kin daemon pid {pid} runs another Kin, and this client does not replace it; it \
+                 was left running"
+            ))
+        }
+    }
+    let _startup_lock = match acquire_startup_lock(kin_root).await {
+        Ok(lock) => lock,
+        Err(error) => return SupersededReplacement::Refused(format!("{error:#}")),
+    };
+    let mut replaced = None;
+    match replace_superseded_daemon_once_until(kin_root, pid, &mut replaced, deadline).await {
+        Ok(()) => SupersededReplacement::Replaced,
+        Err(error) => SupersededReplacement::Refused(error.to_string()),
+    }
 }
 
 /// Publish this crate's supervisor access to every daemon spawn in this
@@ -10222,8 +10438,12 @@ async fn ensure_daemon_running_inner(
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(kin_root, &base_url).await?;
-        return Ok(base_url);
+        match attach_to_existing_daemon(kin_root, &base_url).await {
+            Ok(()) => return Ok(base_url),
+            // Replaced under the startup lock below.
+            Err(AutoStartError::Superseded { .. }) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     match wait_for_existing_daemon(kin_root).await {
@@ -10231,34 +10451,59 @@ async fn ensure_daemon_running_inner(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(kin_root, &base_url).await?;
-            return Ok(base_url);
+            match attach_to_existing_daemon(kin_root, &base_url).await {
+                Ok(()) => return Ok(base_url),
+                Err(AutoStartError::Superseded { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
             return Err(AutoStartError::SpawnFailed(message));
         }
-        ExistingDaemon::None => {}
+        // Replaced under the startup lock below, where no other command of
+        // this release can start a daemon in the meantime.
+        ExistingDaemon::Superseded(_) | ExistingDaemon::None => {}
     }
 
     let _startup_lock = acquire_startup_lock(kin_root)
         .await
         .map_err(AutoStartError::spawn)?;
-    if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(kin_root, &base_url).await?;
-        return Ok(base_url);
-    }
-    match wait_for_existing_daemon(kin_root).await {
-        ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
-                .await
-                .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(kin_root, &base_url).await?;
-            return Ok(base_url);
+    // One replacement per call. A second older daemon after it means
+    // something keeps starting one, and replacing it again would only race
+    // that.
+    let mut replaced: Option<u32> = None;
+    loop {
+        if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+            match attach_to_existing_daemon(kin_root, &base_url).await {
+                Ok(()) => return Ok(base_url),
+                Err(AutoStartError::Superseded { pid }) => {
+                    replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
-            return Err(AutoStartError::SpawnFailed(message));
+        match wait_for_existing_daemon(kin_root).await {
+            ExistingDaemon::Connected(base_url) => {
+                register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
+                    .await
+                    .map_err(AutoStartError::spawn)?;
+                match attach_to_existing_daemon(kin_root, &base_url).await {
+                    Ok(()) => return Ok(base_url),
+                    Err(AutoStartError::Superseded { pid }) => {
+                        replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
+                return Err(AutoStartError::SpawnFailed(message));
+            }
+            ExistingDaemon::Superseded(pid) => {
+                replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+            }
+            ExistingDaemon::None => break,
         }
-        ExistingDaemon::None => {}
     }
 
     // Everything above this line either attached to a live daemon or proved
@@ -10360,6 +10605,76 @@ async fn ensure_daemon_running_inner(
     kin_daemon_spawn::clear_daemon_death_note(kin_root);
     info!(daemon = %base_url, "daemon is up and ready");
     Ok(base_url)
+}
+
+/// Replace the older daemon at `pid` that serves `kin_root`, once per call.
+///
+/// The caller holds the repository's startup lock. Waits as long as a daemon
+/// start may take for it to finish its writes and go. A daemon still working
+/// at the end, or one that is not this client's to replace, is refused in its
+/// own words, and nothing is started or attached. A second older daemon after
+/// the first is refused by the process that started it.
+async fn replace_superseded_daemon_once(
+    kin_root: &Path,
+    pid: u32,
+    replaced: &mut Option<u32>,
+) -> std::result::Result<(), AutoStartError> {
+    let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
+    replace_superseded_daemon_once_until(kin_root, pid, replaced, deadline).await
+}
+
+/// [`replace_superseded_daemon_once`] within the caller's `deadline`.
+async fn replace_superseded_daemon_once_until(
+    kin_root: &Path,
+    pid: u32,
+    replaced: &mut Option<u32>,
+    deadline: Instant,
+) -> std::result::Result<(), AutoStartError> {
+    use crate::commands::daemon::ReplacementOutcome;
+    if let Some(previous) = *replaced {
+        return Err(AutoStartError::SpawnFailed(format!(
+            "Kin replaced the older daemon pid {previous} for this repository, and another older              daemon, pid {pid}, took its place, started by {}. Kin will not replace it again in              one command; stop whatever keeps starting it",
+            describe_parent_process(pid)
+        )));
+    }
+    let successor =
+        crate::commands::daemon::ReplacementSuccessor::current().map_err(AutoStartError::spawn)?;
+    let outcome =
+        crate::commands::daemon::retire_for_replacement(kin_root, pid, &successor, deadline)
+            .await
+            .map_err(AutoStartError::spawn)?;
+    *replaced = Some(pid);
+    match outcome {
+        ReplacementOutcome::Replaced { .. }
+        | ReplacementOutcome::NotRunning
+        | ReplacementOutcome::AlreadySuccessor => {
+            info!(pid, successor = %successor.label(), "replaced an older Kin daemon");
+            Ok(())
+        }
+        ReplacementOutcome::Waiting(holding) => Err(AutoStartError::SpawnFailed(format!(
+            "Kin is replacing the older daemon pid {pid} with {}, and it is still finishing: {}.              Nothing was started or attached; run the command again once it has finished",
+            successor.label(),
+            holding.join("; ")
+        ))),
+        ReplacementOutcome::Refused(reason) => Err(AutoStartError::SpawnFailed(reason)),
+    }
+}
+
+/// The process that started `pid`, for a refusal to name: its pid and
+/// executable, or that it could not be read.
+fn describe_parent_process(pid: u32) -> String {
+    let mut system = sysinfo::System::new();
+    let target = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    match system.process(target).and_then(|process| process.parent()) {
+        Some(parent) => format!(
+            "pid {} ({})",
+            parent.as_u32(),
+            process_executable_path(parent.as_u32())
+                .unwrap_or_else(|| "executable unknown".to_string())
+        ),
+        None => "a process that could not be read".to_string(),
+    }
 }
 
 /// Refuse a `.kin/` store this build cannot serve before anything is spawned.
@@ -11813,6 +12128,213 @@ mod tests {
             std::fs::read_to_string(fixture.path().join("daemon.port")).unwrap(),
             port_text
         );
+    }
+
+    /// A managed Kin 0.8.7 client, for the replacement tests. Test builds are
+    /// development clients, which never replace anything.
+    #[cfg(unix)]
+    fn managed_client_0_8_7() -> impl Drop {
+        succession::stand_in_client_for_test(
+            kin_core::runtime_identity::SuccessionClient {
+                identity: kin_core::runtime_identity::RuntimeIdentity {
+                    version: "0.8.7".into(),
+                    commit_sha: "a".repeat(40),
+                    source_dirty: false,
+                    source_known: true,
+                    target: "aarch64-apple-darwin".into(),
+                    build_profile: "release".into(),
+                },
+                mode: kin_core::runtime_identity::RuntimeMode::Managed,
+                namespace: None,
+            },
+            None,
+        )
+    }
+
+    /// A live stand-in daemon from before runtime identity, published for a
+    /// repository, whose endpoint reports `health` and ends the stand-in when
+    /// it is asked to stop. Counts every request that is not a read.
+    #[cfg(unix)]
+    struct LegacyDaemonFixture {
+        root: tempfile::TempDir,
+        pid: u32,
+        identity: ProcessIdentity,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _server: tokio::task::JoinHandle<()>,
+        child: std::process::Child,
+    }
+
+    #[cfg(unix)]
+    impl LegacyDaemonFixture {
+        async fn start(version: &str, dirty: bool) -> Self {
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let identity = process_identity(pid).unwrap().unwrap();
+            let input = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));
+            let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let health = serde_json::json!({
+                "version": version,
+                "pid": pid,
+                "build": {"sha": "b".repeat(40), "dirty": dirty, "source_known": true, "built_at": "then"},
+            });
+            let retire_writes = writes.clone();
+            let shutdown_writes = writes.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/health",
+                    axum::routing::get(move || {
+                        let health = health.clone();
+                        async move { axum::Json(health) }
+                    }),
+                )
+                .route(
+                    "/retire",
+                    axum::routing::post(move |body: String| {
+                        let writes = retire_writes.clone();
+                        async move {
+                            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if body.contains("\"replacement\"") {
+                                (axum::http::StatusCode::UNPROCESSABLE_ENTITY, String::new())
+                            } else {
+                                (
+                                    axum::http::StatusCode::ACCEPTED,
+                                    r#"{"retiring":true,"blocked_by":["a client session is attached"]}"#
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/shutdown",
+                    axum::routing::post(move || {
+                        let writes = shutdown_writes.clone();
+                        let input = input.clone();
+                        async move {
+                            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            drop(input.lock().unwrap().take());
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                repo_daemon_owner_path(root.path()),
+                serde_json::to_vec(&EndpointOwnerRecord::for_identity(identity.clone())).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.path().join("daemon.pid"), pid.to_string()).unwrap();
+            std::fs::write(root.path().join("daemon.port"), port.to_string()).unwrap();
+            Self {
+                root,
+                pid,
+                identity,
+                writes,
+                _server: server,
+                child,
+            }
+        }
+
+        async fn existing(&self) -> ExistingDaemon {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_existing_daemon_within(
+                    self.root.path(),
+                    Duration::from_millis(20),
+                    Duration::from_secs(60),
+                    None,
+                ),
+            )
+            .await
+            .expect("a release decision must not wait out startup patience")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LegacyDaemonFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// An older release's daemon is named superseded rather than refused,
+    /// replaced through its incarnation, and then the repository has no
+    /// daemon, which is where the spawn path starts this release's. A second
+    /// older daemon in the same command is refused by who started it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_daemon_is_replaced_and_then_the_spawn_path_runs() {
+        let _client = managed_client_0_8_7();
+        let daemon = LegacyDaemonFixture::start("0.8.6", false).await;
+        let ExistingDaemon::Superseded(pid) = daemon.existing().await else {
+            panic!("an older release must be named superseded");
+        };
+        assert_eq!(pid, daemon.pid);
+
+        let mut replaced = None;
+        replace_superseded_daemon_once(daemon.root.path(), pid, &mut replaced)
+            .await
+            .expect("the older daemon must be replaced");
+        assert_eq!(replaced, Some(pid));
+        assert!(
+            !process_identity_is_current(&daemon.identity).unwrap(),
+            "the older daemon must be gone"
+        );
+        assert!(
+            matches!(daemon.existing().await, ExistingDaemon::None),
+            "with the older daemon replaced, nothing serves the repository and the spawn path runs"
+        );
+
+        let AutoStartError::SpawnFailed(message) =
+            replace_superseded_daemon_once(daemon.root.path(), 424_242, &mut replaced)
+                .await
+                .unwrap_err()
+        else {
+            panic!("a second older daemon must be refused");
+        };
+        assert!(
+            message.contains(&format!("pid {pid}")) && message.contains("started by"),
+            "{message}"
+        );
+    }
+
+    /// A newer release and a development build are refused by pid and path,
+    /// and never asked to retire or stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_newer_or_development_daemon_is_refused_and_never_asked_to_go() {
+        let _client = managed_client_0_8_7();
+        for (version, dirty, named) in [
+            ("0.9.0", false, "Kin 0.9.0"),
+            ("0.8.6", true, "uncommitted source changes"),
+        ] {
+            let daemon = LegacyDaemonFixture::start(version, dirty).await;
+            let ExistingDaemon::LiveNotReady(message) = daemon.existing().await else {
+                panic!("{version}: the daemon must be refused");
+            };
+            assert!(
+                message.contains(&format!("pid {}", daemon.pid)) && message.contains("/bin/cat"),
+                "{message}"
+            );
+            assert!(message.contains(named), "{message}");
+            assert_eq!(
+                daemon.writes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{version}: nothing may be asked of a daemon that is not replaced"
+            );
+            assert!(process_identity_is_current(&daemon.identity).unwrap());
+        }
     }
 
     async fn write_fixture_json_response(

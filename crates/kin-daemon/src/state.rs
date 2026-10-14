@@ -4428,6 +4428,16 @@ pub struct SweepLanguageSkip {
     pub reason: String,
 }
 
+/// A client of another release asked this daemon to make way for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// The release replacing this daemon, as every client is told it.
+    pub successor: String,
+    /// When the first request arrived. The background grace runs from here,
+    /// so a repeated request never extends it.
+    pub requested_at: Instant,
+}
+
 pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
@@ -4979,6 +4989,11 @@ pub struct DaemonState {
     /// needs it. The idle monitor then treats the window as zero, so the exit
     /// still waits on every gate an idle exit waits on.
     retirement_requested: AtomicBool,
+    /// Set once a client of another release has asked this daemon to make
+    /// way for it. Implies `retirement_requested`, and changes which gates
+    /// hold the exit: see `crate::daemon::retirement_blockers`. A watch rather
+    /// than a flag, so an event stream can end itself with the reason.
+    replacement: tokio::sync::watch::Sender<Option<Replacement>>,
     /// Set when this daemon stops serving so that its successor can attach the
     /// complete history a worker staged. See [`crate::history_schedule`].
     history_handoff: AtomicBool,
@@ -7894,6 +7909,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
+            replacement: tokio::sync::watch::channel(None).0,
             history_handoff: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -8418,6 +8434,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
+            replacement: tokio::sync::watch::channel(None).0,
             history_handoff: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -16625,13 +16642,6 @@ impl DaemonState {
         self.active_requests.load(Ordering::SeqCst)
     }
 
-    /// Ask this daemon to exit as soon as nothing needs it. Returns whether
-    /// this call was the one that asked.
-    ///
-    /// Not a stop. The idle monitor keeps every gate an idle exit has: an
-    /// attached client, a request in flight, a pending publication, running
-    /// enrichment or embedding, and an unflushed graph all keep the daemon up,
-    /// and it exits on the first check after the last of them clears.
     /// Stop this daemon serving now, through the same cancel channel a
     /// cooperative stop request sends on. Answers whether a channel was there to
     /// send on; a state no daemon loop runs (a test's) has none.
@@ -16641,8 +16651,49 @@ impl DaemonState {
             .is_some_and(|cancel| cancel.send(true).is_ok())
     }
 
+    /// Ask this daemon to exit as soon as nothing needs it. Returns whether
+    /// this call was the one that asked.
+    ///
+    /// Not a stop. The idle monitor keeps every gate an idle exit has: an
+    /// attached client, a request in flight, a pending publication, running
+    /// enrichment or embedding, and an unflushed graph all keep the daemon up,
+    /// and it exits on the first check after the last of them clears.
     pub fn request_retirement(&self) -> bool {
         !self.retirement_requested.swap(true, Ordering::SeqCst)
+    }
+
+    /// Ask this daemon to make way for `successor`, a client of another
+    /// release. Returns whether this call was the one that asked; the first
+    /// successor named is the one every client is told about.
+    ///
+    /// A retirement with different gates. Writes, a publication being
+    /// prepared and the first scan still finish. Background passes get
+    /// [`kin_cli::daemon_client::replacement::REPLACEMENT_BACKGROUND_GRACE`].
+    /// Attached clients and event subscribers no longer hold it: new requests
+    /// are refused with the successor's name, so they learn to restart.
+    pub fn request_replacement(&self, successor: &str) -> bool {
+        self.retirement_requested.store(true, Ordering::SeqCst);
+        let successor = kin_cli::daemon_client::replacement::bounded_successor_label(successor);
+        self.replacement.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(Replacement {
+                successor,
+                requested_at: Instant::now(),
+            });
+            true
+        })
+    }
+
+    /// The replacement this daemon is making way for, if one was asked.
+    pub fn replacement(&self) -> Option<Replacement> {
+        self.replacement.borrow().clone()
+    }
+
+    /// A receiver that sees the replacement the moment one is asked.
+    pub fn replacement_watch(&self) -> tokio::sync::watch::Receiver<Option<Replacement>> {
+        self.replacement.subscribe()
     }
 
     /// Whether a caller has asked this daemon to exit once nothing needs it.

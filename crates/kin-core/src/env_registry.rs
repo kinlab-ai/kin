@@ -396,6 +396,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_ACCEPTANCE_LABEL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "dev/test tooling: the label the product acceptance scripts stamp on their reports, set once for a whole acceptance job; Kin itself does not read it" },
     EnvVarSpec { name: "KIN_EPHEMERAL_RUNNER", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "dev/test tooling: `true` when a CI job runs on a runner that lasts one job, so the CI target scripts restore a cached build target instead of keeping one; Kin itself does not read it" },
     EnvVarSpec { name: "KIN_CI_LANGUAGE_SERVERS_INSTALLED", kind: Kind::OneOf(&["1"]), default: "", sensitivity: Sensitivity::Diagnostic, summary: "dev/test tooling: `1` once scripts/ci-install-language-servers.sh has installed and proved the language servers, so the kin-daemon reference-enrichment tests require them instead of skipping; Kin itself does not read it" },
+    EnvVarSpec { name: "KIN_DEV_TARGET_ROOT", kind: Kind::Path, default: "", sensitivity: Sensitivity::Diagnostic, summary: "dev/test tooling: root directory holding cargo target trees outside the checkout; daemon succession treats an executable under it as a development build and leaves it running" },
 ];
 
 /// Behavior levers **read by sibling first-party crates** that are linked into, or

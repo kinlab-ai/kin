@@ -426,7 +426,7 @@ async fn branch_preview(
         let (_, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         let port = port.filter(|port| *port != 0)
             .context("No daemon endpoint is recorded. Open repository content before requesting a branch preview.")?;
-        DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), &state.layout)
+        DaemonClient::for_workspace_page("branch preview", format!("http://127.0.0.1:{port}"), &state.layout, Duration::from_secs(30))
             .await?.branch_switch_preview(&request).await
     }.await;
     match answer {
@@ -633,10 +633,12 @@ async fn merge_preview(
     };
     let answer = async {
         // Preview observes a running, verified runtime. It must not start a
-        // daemon or open repository recovery as a side effect of previewing.
+        // daemon or open repository recovery as a side effect of previewing,
+        // except to replace a daemon of an older release, which this release
+        // never previews through.
         let (_, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         let port = port.filter(|port| *port != 0).context("No daemon endpoint is recorded. Open repository content before requesting a merge preview.")?;
-        DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), &state.layout)
+        DaemonClient::for_workspace_page("merge preview", format!("http://127.0.0.1:{port}"), &state.layout, Duration::from_secs(30))
             .await?
             .merge_preview(&super::merge::MergePreviewRequest { source })
             .await
@@ -983,9 +985,11 @@ async fn session(State(state): State<Arc<UiState>>) -> Response {
         let (pid, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         match (pid, port) {
             (Some(_), Some(port)) if port != 0 => {
-                let client = DaemonClient::from_running_workspace(
+                let client = DaemonClient::for_workspace_page(
+                    "local UI",
                     format!("http://127.0.0.1:{port}"),
                     &state.layout,
+                    Duration::from_secs(5),
                 )
                 .await?;
                 let health = client.health().await?;

@@ -14772,6 +14772,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // decision some installs never get to make.
     ask_embedding_model(&opts, interactive, &mut skipped);
     ask_embedding_provider(&opts, interactive, &mut skipped);
+    offer_other_copy_removals_in_wizard(interactive, &mut skipped);
 
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
@@ -14798,6 +14799,103 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     match failed_clients_error(&applied.failed_clients) {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// What setup did about the other copies of Kin it found.
+#[derive(Debug, Default)]
+pub(crate) struct CopyRemovals {
+    pub(crate) removed: Vec<crate::commands::kin_copies::RemovalOffer>,
+    /// Offers left in place: declined, or never asked because no one is there.
+    pub(crate) kept: Vec<crate::commands::kin_copies::RemovalOffer>,
+    pub(crate) failed: Vec<(crate::commands::kin_copies::RemovalOffer, String)>,
+}
+
+/// Offer each other copy of Kin for removal, one at a time.
+///
+/// The default is always to keep it, and a run with no one at the terminal
+/// asks nothing and removes nothing: it only names the copies and the command
+/// that removes each. `ask` answers for one offer by its position, and
+/// `remove` runs it, so the rule is testable without a terminal or a package
+/// manager.
+pub(crate) fn offer_other_copy_removals<A, R>(
+    scan: &crate::commands::kin_copies::CopyScan,
+    interactive: bool,
+    mut ask: A,
+    mut remove: R,
+) -> CopyRemovals
+where
+    A: FnMut(usize, &crate::commands::kin_copies::RemovalOffer) -> bool,
+    R: FnMut(&crate::commands::kin_copies::RemovalOffer) -> Result<()>,
+{
+    let mut outcome = CopyRemovals::default();
+    for (index, offer) in scan.removal_offers().into_iter().enumerate() {
+        if !interactive || !ask(index, &offer) {
+            outcome.kept.push(offer);
+            continue;
+        }
+        match remove(&offer) {
+            Ok(()) => outcome.removed.push(offer),
+            Err(error) => outcome.failed.push((offer, format!("{error:#}"))),
+        }
+    }
+    outcome
+}
+
+/// The full-record wizard's step for other copies of Kin.
+fn offer_other_copy_removals_in_wizard(interactive: bool, skipped: &mut Vec<SkippedDecision>) {
+    let Ok(roots) = crate::commands::kin_copies::ScanRoots::from_environment() else {
+        return;
+    };
+    let scan = crate::commands::kin_copies::scan(&roots);
+    if scan.others().next().is_none() {
+        return;
+    }
+    say!();
+    say!("Other copies of Kin on this machine:");
+    for line in scan
+        .others()
+        .map(|copy| copy.describe(scan.managed_version.as_deref()))
+    {
+        say!("  {line}");
+    }
+    let outcome = offer_other_copy_removals(
+        &scan,
+        interactive,
+        |_, offer| {
+            prompt_yn(
+                &format!(
+                    "  Remove the {} with `{}`?",
+                    offer.what,
+                    offer.removal.command_line()
+                ),
+                false,
+                true,
+            )
+        },
+        |offer| crate::commands::kin_copies::remove(offer, &roots),
+    );
+    for offer in &outcome.removed {
+        say!("  {} removed the {}", style("✓").green(), offer.what);
+    }
+    for (offer, reason) in &outcome.failed {
+        say!(
+            "  {} could not remove the {}: {reason}",
+            style("✗").red(),
+            offer.what
+        );
+        say!("      remove it by hand: {}", offer.removal.command_line());
+    }
+    if !interactive && !outcome.kept.is_empty() {
+        say!("  This run is not interactive, so it removed nothing. Each one's own uninstall:");
+        for offer in &outcome.kept {
+            say!("    {}", offer.removal.command_line());
+        }
+        skipped.push(SkippedDecision {
+            decision: "Other copies of Kin",
+            value: format!("kept {}", outcome.kept.len()),
+            give_back: "kin setup doctor --fix --remove-other-copies".to_string(),
+        });
     }
 }
 
@@ -17056,6 +17154,53 @@ struct UnfinishedRepair {
     requested: bool,
 }
 
+/// `--remove-other-copies`: run every removal Kin offers for another copy.
+///
+/// Each removal is its own channel's uninstall, and each one that fails is
+/// reported with that command, because the person asked for all of them.
+fn remove_other_kin_copies(applied: &mut Vec<String>, unfinished: &mut Vec<UnfinishedRepair>) {
+    let roots = match crate::commands::kin_copies::ScanRoots::from_environment() {
+        Ok(roots) => roots,
+        Err(error) => {
+            unfinished.push(UnfinishedRepair {
+                what: "find the other copies of Kin".to_string(),
+                reason: format!("{error:#}"),
+                remediation: vec!["kin doctor --verbose names each copy it found".to_string()],
+                requested: true,
+            });
+            return;
+        }
+    };
+    let offers = crate::commands::kin_copies::scan(&roots).removal_offers();
+    if offers.is_empty() {
+        say!("  No other copy of Kin has an uninstall Kin can run.");
+        return;
+    }
+    for offer in offers {
+        match crate::commands::kin_copies::remove(&offer, &roots) {
+            Ok(()) => applied.push(format!(
+                "removed {} ({})",
+                offer.what,
+                offer.removal.command_line()
+            )),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                say!(
+                    "  {} could not remove {}: {reason}",
+                    style("✗").red(),
+                    offer.what
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("remove {}", offer.what),
+                    reason,
+                    remediation: vec![offer.removal.command_line()],
+                    requested: true,
+                });
+            }
+        }
+    }
+}
+
 /// Print what could not be repaired, with the commands that close it.
 fn print_unfinished_repairs(unfinished: &[UnfinishedRepair]) {
     if unfinished.is_empty() {
@@ -17812,15 +17957,21 @@ fn observe_language_server_request(
 }
 
 pub async fn doctor(fix: bool, install_language_servers: bool, json: bool) -> Result<()> {
-    doctor_with(fix, install_language_servers, json, false).await
+    doctor_with(fix, install_language_servers, json, false, false).await
 }
 
 /// `kin doctor`, with `verbose` asking for every check on a terminal.
+///
+/// `remove_other_copies` is the one repair `--fix` never makes by itself:
+/// `kin update` runs `kin setup doctor --fix` unattended at the end of its
+/// chain, and removing a package someone installed is not something an
+/// unattended run decides. It takes this flag, typed by a person.
 pub async fn doctor_with(
     fix: bool,
     install_language_servers: bool,
     json: bool,
     verbose: bool,
+    remove_other_copies: bool,
 ) -> Result<()> {
     // The run's one graph status, kept so the language census below reads the
     // answer the report already fetched rather than asking the daemon again.
@@ -17905,6 +18056,41 @@ pub async fn doctor_with(
                     remediation: vec![
                         "fix the owner and mode of the path named above, then run `kin doctor \
                          --fix` again"
+                            .to_string(),
+                    ],
+                    requested: false,
+                });
+            }
+        }
+    }
+
+    let stamp_needs_fix = report.checks.iter().any(|c| {
+        c.id == "launcher_version_stamp"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if stamp_needs_fix {
+        use crate::commands::update::LauncherStampRepair;
+        match crate::commands::update::repair_launcher_stamp() {
+            Ok(LauncherStampRepair::Rewritten { from, to }) => applied.push(format!(
+                "rewrote the launcher version stamp from {from} to {to}, the installed release"
+            )),
+            Ok(LauncherStampRepair::Left(reason)) => say!(
+                "  {} left the launcher version stamp as it is: {reason}",
+                style("!").yellow()
+            ),
+            Ok(LauncherStampRepair::Absent | LauncherStampRepair::Current) => {}
+            Err(e) => {
+                let reason = format!("{e:#}");
+                say!(
+                    "  {} launcher version stamp repair failed: {reason}",
+                    style("✗").red()
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: "rewrite the launcher version stamp".to_string(),
+                    reason,
+                    remediation: vec![
+                        "run `kin update`, which rewrites the stamp under its install lock"
                             .to_string(),
                     ],
                     requested: false,
@@ -18113,6 +18299,10 @@ pub async fn doctor_with(
         if !config_dir.exists() && kin_core::registry::create_kin_dir_all(&config_dir).is_ok() {
             applied.push(format!("created config dir ({})", config_dir.display()));
         }
+    }
+
+    if remove_other_copies {
+        remove_other_kin_copies(&mut applied, &mut unfinished);
     }
 
     // Clean orphaned daemon PID/port files across registered repos.

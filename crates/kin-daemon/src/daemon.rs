@@ -2762,6 +2762,39 @@ impl ShutdownBlocker {
             Self::SweepWaiter => "a command is waiting to read a language-server sweep's result",
         }
     }
+
+    /// The stable name a client reads this blocker by. Sentences may be
+    /// reworded; these never change meaning.
+    pub(crate) fn code(self) -> &'static str {
+        use kin_cli::daemon_client::replacement::blocker;
+        match self {
+            Self::PreparedPublication => blocker::PREPARED_PUBLICATION,
+            Self::RequestInFlight => blocker::REQUEST_IN_FLIGHT,
+            Self::FirstScan => blocker::FIRST_SCAN,
+            Self::Reconciliation => blocker::RECONCILIATION,
+            Self::Embedding => blocker::EMBEDDING,
+            Self::EmbeddingHeldForMemory => blocker::EMBEDDING_HELD_FOR_MEMORY,
+            Self::Enrichment => blocker::ENRICHMENT,
+            Self::EventSubscriber => blocker::EVENT_SUBSCRIBER,
+            Self::AttachedSession => blocker::ATTACHED_SESSION,
+            Self::SweepWaiter => blocker::SWEEP_WAITER,
+        }
+    }
+
+    /// Whether this blocker still holds a replacement asked at `requested_at`,
+    /// judged at `now`.
+    fn holds_replacement(self, requested_at: Instant, now: Instant) -> bool {
+        use kin_cli::daemon_client::replacement::{
+            replacement_wait, ReplacementWait, REPLACEMENT_BACKGROUND_GRACE,
+        };
+        match replacement_wait(self.code()) {
+            ReplacementWait::Always => true,
+            ReplacementWait::Bounded => {
+                now.saturating_duration_since(requested_at) < REPLACEMENT_BACKGROUND_GRACE
+            }
+            ReplacementWait::Never => false,
+        }
+    }
 }
 
 /// Work a shutdown would destroy rather than merely interrupt, independent of
@@ -2834,13 +2867,39 @@ fn client_blockers(state: &DaemonState) -> Vec<ShutdownBlocker> {
 
 /// Everything keeping this daemon from retiring right now, for the caller
 /// that asked it to. See [`work_blockers`] for `requests_to_ignore`.
+///
+/// A daemon making way for another release keeps fewer: see
+/// [`replacement_blockers`].
 pub(crate) fn retirement_blockers(
     state: &DaemonState,
     requests_to_ignore: u64,
 ) -> Vec<ShutdownBlocker> {
+    if let Some(replacement) = state.replacement() {
+        return replacement_blockers(state, requests_to_ignore, &replacement, Instant::now());
+    }
     let mut blockers = work_blockers(state, requests_to_ignore);
     blockers.extend(client_blockers(state));
     blockers
+}
+
+/// What still holds a daemon that a client of another release asked to make
+/// way for it, judged at `now`.
+///
+/// Writes, a publication being prepared and the first scan always finish,
+/// because an interruption loses them. Background passes the successor redoes
+/// hold it only for the grace after the request. Attached clients and event
+/// subscribers never do: they belong to the release being replaced, which the
+/// successor would refuse anyway, and they are told to restart.
+fn replacement_blockers(
+    state: &DaemonState,
+    requests_to_ignore: u64,
+    replacement: &crate::state::Replacement,
+    now: Instant,
+) -> Vec<ShutdownBlocker> {
+    work_blockers(state, requests_to_ignore)
+        .into_iter()
+        .filter(|blocker| blocker.holds_replacement(replacement.requested_at, now))
+        .collect()
 }
 
 fn ready_for_idle_shutdown(
@@ -2848,6 +2907,11 @@ fn ready_for_idle_shutdown(
     idle_timeout: Duration,
     control_plane: ControlPlane,
 ) -> bool {
+    if let Some(replacement) = state.replacement() {
+        // The window is zero and the client gates are gone; only what a
+        // replacement waits for is left to decide.
+        return replacement_blockers(state, 0, &replacement, Instant::now()).is_empty();
+    }
     if work_would_be_lost_by_shutdown(state) {
         return false;
     }
@@ -3688,7 +3752,12 @@ async fn run_idle_monitor(
                     }
                 }
             }
-            if retiring {
+            if let Some(replacement) = state.replacement() {
+                info!(
+                    successor = %replacement.successor,
+                    "daemon replaced by another release and its work is finished, shutting down"
+                );
+            } else if retiring {
                 info!("daemon asked to retire and nothing needs it now, shutting down");
             } else {
                 info!(
@@ -20136,6 +20205,118 @@ while True:
             .expect("an unused daemon asked to retire must go")
             .expect("the idle monitor must not panic");
         assert!(*cancel_tx.borrow());
+    }
+
+    /// What holds a daemon making way for another release: the first scan
+    /// always, background passes only for the grace after the request, and an
+    /// attached client never, though that client still holds a plain
+    /// retirement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_waits_for_the_first_scan_bounds_background_work_and_skips_clients() {
+        use super::ShutdownBlocker;
+        use kin_cli::daemon_client::replacement::REPLACEMENT_BACKGROUND_GRACE;
+        let (_repo, state) = open_idle_daemon(Some(Duration::from_secs(3600))).await;
+        let client = StandInClient::spawn();
+        client.attach(&state);
+        state.is_initialized.store(false, Ordering::Relaxed);
+        state
+            .reconciliation_status
+            .store(crate::state::RECON_PROCESSING, Ordering::Relaxed);
+        assert!(
+            super::retirement_blockers(&state, 0).contains(&ShutdownBlocker::AttachedSession),
+            "an attached client holds a plain retirement"
+        );
+
+        assert!(state.request_replacement("Kin 9.9.9 (0123abc)"));
+        let replacement = state.replacement().expect("the replacement is recorded");
+        let asked = replacement.requested_at;
+        assert_eq!(
+            super::replacement_blockers(&state, 0, &replacement, asked),
+            vec![ShutdownBlocker::FirstScan, ShutdownBlocker::Reconciliation],
+            "inside the grace the background pass still holds it; the client never does"
+        );
+        assert_eq!(
+            super::retirement_blockers(&state, 0),
+            vec![ShutdownBlocker::FirstScan, ShutdownBlocker::Reconciliation],
+            "the /retire answer reads the same gates"
+        );
+        let after_grace = asked + REPLACEMENT_BACKGROUND_GRACE;
+        assert_eq!(
+            super::replacement_blockers(&state, 0, &replacement, after_grace),
+            vec![ShutdownBlocker::FirstScan],
+            "the first scan does not resume, so it outlasts the grace"
+        );
+        state.is_initialized.store(true, Ordering::Relaxed);
+        assert!(super::replacement_blockers(&state, 0, &replacement, after_grace).is_empty());
+        assert!(
+            !super::ready_for_idle_shutdown(&state, Duration::ZERO, ControlPlane::Ours),
+            "on the real clock the grace has not run out yet"
+        );
+        state
+            .reconciliation_status
+            .store(RECON_IDLE, Ordering::Relaxed);
+        assert!(super::ready_for_idle_shutdown(
+            &state,
+            Duration::ZERO,
+            ControlPlane::Ours
+        ));
+        drop(client);
+    }
+
+    /// Asked to make way for another release, a daemon goes with a client
+    /// still attached, but only once the request already in flight has
+    /// finished, and it flushes its graph on the way out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacing_daemon_finishes_its_write_flushes_and_goes_under_an_attached_client() {
+        use super::ShutdownBlocker;
+        let window = Duration::from_secs(3600);
+        let (_repo, state) = open_idle_daemon(Some(window)).await;
+        let client = StandInClient::spawn();
+        client.attach(&state);
+        state.mark_dirty();
+        // A write that started before the replacement was asked.
+        state.begin_request();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&state),
+            Some(window),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+
+        assert!(state.request_replacement("Kin 9.9.9 (0123abc)"));
+        assert!(
+            !state.request_replacement("Kin 10.0.0 (fedcba9)"),
+            "a repeat changes nothing"
+        );
+        assert_eq!(
+            state.replacement().map(|replacement| replacement.successor),
+            Some("Kin 9.9.9 (0123abc)".to_string())
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a replacing daemon went with a write still in flight"
+        );
+        assert_eq!(
+            super::retirement_blockers(&state, 0),
+            vec![ShutdownBlocker::RequestInFlight]
+        );
+
+        state.end_request();
+        tokio::time::timeout(Duration::from_secs(10), monitor)
+            .await
+            .expect("a replacing daemon must go once its write has finished")
+            .expect("the idle monitor must not panic");
+        assert!(*cancel_tx.borrow());
+        assert!(
+            !state.is_dirty(),
+            "a replacing daemon flushes its graph before it goes"
+        );
+        drop(client);
     }
 
     #[tokio::test]

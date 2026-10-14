@@ -105,6 +105,12 @@ async fn read_daemon_runtime_claim(
         .send()
         .await
         .map_err(|error| classify_send_error("runtime identity probe", error))?;
+    if metadata.status() == reqwest::StatusCode::NOT_FOUND {
+        // Every release before runtime identity answers this way.
+        return Err(DaemonCallError::Superseded(
+            "runtime admission refused: the daemon predates runtime identity".into(),
+        ));
+    }
     if !metadata.status().is_success() {
         return Err(DaemonCallError::DaemonError(format!(
             "runtime admission refused: endpoint returned HTTP {} for its identity claim",
@@ -172,7 +178,7 @@ where
             runtime.namespace.as_ref().ok(),
         )
         .map_err(|error| {
-            DaemonCallError::DaemonError(format!("runtime admission refused: {error}"))
+            DaemonCallError::Superseded(format!("runtime admission refused: {error}"))
         })?;
     let mut repository_fingerprint = None;
     if fingerprint.is_some() {
@@ -1845,6 +1851,10 @@ pub(crate) enum DaemonCallError {
     /// HTTP-level or protocol failure — the daemon responded but signalled an
     /// error.  Revival is not attempted; the error is surfaced immediately.
     DaemonError(String),
+    /// The daemon runs another release and refused this client's. One Kin
+    /// serves a repository: an older release is replaced once and the call
+    /// retried on this release's daemon, and any other is refused by name.
+    Superseded(String),
 }
 
 /// Classify a `reqwest` send failure.
@@ -1893,6 +1903,19 @@ pub(crate) trait DaemonReviver: Sync {
     /// connections and answer a probe.
     async fn is_provably_alive(&self, base: &str) -> bool {
         daemon_is_provably_alive(base).await
+    }
+
+    /// Replace the daemon at `base`, which refused this client as another
+    /// release, when it is an older one this client supersedes. Starts
+    /// nothing: [`Self::revive`] does, once it is gone.
+    async fn replace_superseded(&self, base: &str, budget: Duration) -> Result<(), String> {
+        let Some(kin_root) = discover_kin_dir() else {
+            return Err("no repository is bound, so no daemon was replaced".to_string());
+        };
+        match kin_daemon_spawn::replace_superseded_daemon(&kin_root, base, budget).await {
+            kin_daemon_spawn::SupersededReplacement::Replaced => Ok(()),
+            kin_daemon_spawn::SupersededReplacement::Refused(reason) => Err(reason),
+        }
     }
 }
 
@@ -2818,6 +2841,12 @@ where
     let first_err = match attempt_through_warmup(&attempt, daemon_url, fast, deadline).await {
         Ok(result) => return Ok(result),
         Err(DaemonCallError::DaemonError(e)) => return Err(e),
+        Err(DaemonCallError::Superseded(refusal)) => {
+            return replace_then_retry(
+                operation, daemon_url, reviver, &attempt, fast, deadline, refusal,
+            )
+            .await;
+        }
         // `attempt_through_warmup` resolves every warming answer, so this arm
         // exists to make the class impossible to lose rather than because it is
         // reachable today: a warming report is evidence of life, and grouping
@@ -2833,6 +2862,12 @@ where
     let retry_err = match attempt_through_warmup(&attempt, daemon_url, fast, deadline).await {
         Ok(result) => return Ok(result),
         Err(DaemonCallError::DaemonError(e)) => return Err(e),
+        Err(DaemonCallError::Superseded(refusal)) => {
+            return replace_then_retry(
+                operation, daemon_url, reviver, &attempt, fast, deadline, refusal,
+            )
+            .await;
+        }
         // The endpoint went from refusing connections to accepting one and
         // taking its time: it is coming up, not going down.
         Err(DaemonCallError::Timeout(e)) | Err(DaemonCallError::Warming(e)) => {
@@ -2893,12 +2928,7 @@ where
             match attempt_through_warmup(&attempt, &new_url, fast, deadline).await {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    let detail = match e {
-                        DaemonCallError::ConnectionLost(s)
-                        | DaemonCallError::Timeout(s)
-                        | DaemonCallError::Warming(s)
-                        | DaemonCallError::DaemonError(s) => s,
-                    };
+                    let detail = call_error_detail(e);
                     Err(revived_retry_failed_message(
                         operation,
                         &new_url,
@@ -2909,6 +2939,65 @@ where
             }
         }
     }
+}
+
+fn call_error_detail(error: DaemonCallError) -> String {
+    match error {
+        DaemonCallError::ConnectionLost(detail)
+        | DaemonCallError::Timeout(detail)
+        | DaemonCallError::Warming(detail)
+        | DaemonCallError::DaemonError(detail)
+        | DaemonCallError::Superseded(detail) => detail,
+    }
+}
+
+/// Replace a daemon of another release once, then retry on this release's.
+///
+/// One Kin serves a repository. A daemon of an older release is asked to make
+/// way, this release's is started through the ordinary revival, and the call
+/// is retried there exactly once. Any other release, a development build, or
+/// an update that replaced this client is refused in the replacement's own
+/// words, with nothing retried.
+async fn replace_then_retry<T, A, Fut>(
+    operation: &str,
+    daemon_url: &str,
+    reviver: &impl DaemonReviver,
+    attempt: &A,
+    fast: Duration,
+    deadline: tokio::time::Instant,
+    refusal: String,
+) -> Result<T, String>
+where
+    A: Fn(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
+{
+    if let Err(reason) = reviver
+        .replace_superseded(daemon_url, remaining_until(deadline))
+        .await
+    {
+        tracing::warn!(
+            operation,
+            daemon_url,
+            refusal = refusal.as_str(),
+            "daemon of another release left running"
+        );
+        return Err(format!("{operation}: {reason}"));
+    }
+    let new_url = reviver.revive().await.map_err(|error| {
+        format!(
+            "{operation}: Kin replaced the older daemon for this repository, and starting this \
+             release's failed: {error}"
+        )
+    })?;
+    attempt_through_warmup(attempt, &new_url, fast, deadline)
+        .await
+        .map_err(|error| {
+            format!(
+                "{operation}: Kin replaced the older daemon for this repository, and this \
+                 release's did not answer: {}",
+                call_error_detail(error)
+            )
+        })
 }
 
 /// Spend the rest of this call's patience on a daemon that answered late.
@@ -8088,6 +8177,105 @@ mod tests {
         DaemonCallError::Timeout("operation timed out".to_string())
     }
 
+    fn superseded() -> DaemonCallError {
+        DaemonCallError::Superseded(
+            "runtime admission refused: the daemon predates runtime identity".to_string(),
+        )
+    }
+
+    /// A reviver that counts replacement requests and revivals, and answers a
+    /// replacement with `replace`.
+    struct ReplacingReviver {
+        replace: Result<(), String>,
+        replaces: std::sync::atomic::AtomicUsize,
+        revives: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReplacingReviver {
+        fn new(replace: Result<(), String>) -> Self {
+            Self {
+                replace,
+                replaces: std::sync::atomic::AtomicUsize::new(0),
+                revives: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.replaces.load(std::sync::atomic::Ordering::SeqCst),
+                self.revives.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl DaemonReviver for ReplacingReviver {
+        async fn revive(&self) -> Result<String, String> {
+            self.revives
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("http://127.0.0.1:2".to_string())
+        }
+
+        async fn is_provably_alive(&self, _base: &str) -> bool {
+            false
+        }
+
+        async fn replace_superseded(&self, _base: &str, _budget: Duration) -> Result<(), String> {
+            self.replaces
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.replace.clone()
+        }
+    }
+
+    /// A daemon of another release is replaced once and the call retried once
+    /// on this release's. A refused replacement is the answer, with nothing
+    /// started or retried, and a second refusal after a replacement is never
+    /// a second replacement.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_of_another_release_is_replaced_once_and_the_call_retried_once() {
+        async fn call(
+            attempts: &ScriptedAttempts,
+            reviver: &ReplacingReviver,
+        ) -> Result<u32, String> {
+            attempt_with_revival_within(
+                "tool semantic_locate",
+                "http://127.0.0.1:1",
+                reviver,
+                |url, budget| attempts.attempt(url, budget),
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+            )
+            .await
+        }
+
+        let attempts = ScriptedAttempts::new(vec![superseded()]);
+        let reviver = ReplacingReviver::new(Ok(()));
+        assert_eq!(call(&attempts, &reviver).await, Ok(7));
+        assert_eq!(reviver.counts(), (1, 1), "one replacement, one start");
+        assert_eq!(attempts.budgets().len(), 2, "one retry");
+
+        let attempts = ScriptedAttempts::new(vec![superseded()]);
+        let newer = "Kin daemon pid 9 (/opt/homebrew/bin/kin-daemon) runs Kin 0.9.0, newer than \
+                     Kin 0.8.7 (aaaaaaa). An older release never retires a newer one; run `kin update`";
+        let reviver = ReplacingReviver::new(Err(newer.to_string()));
+        let error = call(&attempts, &reviver).await.unwrap_err();
+        assert!(error.contains(newer), "{error}");
+        assert_eq!(
+            reviver.counts(),
+            (1, 0),
+            "a refused replacement starts nothing"
+        );
+        assert_eq!(attempts.budgets().len(), 1, "and retries nothing");
+
+        let attempts = ScriptedAttempts::new(vec![superseded(), superseded()]);
+        let reviver = ReplacingReviver::new(Ok(()));
+        assert!(call(&attempts, &reviver).await.is_err());
+        assert_eq!(
+            reviver.counts(),
+            (1, 1),
+            "never a second replacement in one call"
+        );
+    }
+
     /// A call waiting on a daemon that is open and still loading tells a
     /// client that asked for progress how far it has come, paced so a long
     /// wait is a handful of notifications rather than one per poll.
@@ -9216,7 +9404,11 @@ mod runtime_request_admission_tests {
         metadata_readings: usize,
     ) {
         assert!(
-            matches!(&observation.answer, Err(DaemonCallError::DaemonError(detail)) if detail.contains("runtime admission refused")),
+            matches!(
+                &observation.answer,
+                Err(DaemonCallError::DaemonError(detail) | DaemonCallError::Superseded(detail))
+                    if detail.contains("runtime admission refused")
+            ),
             "{:?}",
             observation.answer
         );

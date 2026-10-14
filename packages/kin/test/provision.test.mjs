@@ -1122,6 +1122,30 @@ test('matching paired identity is reused without touching network or launcher st
   assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
 });
 
+// Launchers before the probe-first rule read the stamp as the installed
+// version, so a stamp left at 0.3.6 beside a 0.8.6 runtime told them the
+// install was older than their pin and they reinstalled their own release over
+// it. A current launcher, whatever release it pins, asks the runtime and
+// leaves a newer one alone even when the stamp disagrees.
+test('a stale low stamp never makes a launcher replace a newer managed runtime', async t => {
+  const { env, report, cliPath, daemonPath } = managedFixture(t, '0.8.6');
+  writeLauncherStamp('0.3.6', env);
+  const calls = [];
+  const selected = await ensureProvisioned({
+    env,
+    minimumVersion: '0.6.6',
+    fetchImpl: async () => { throw new Error('no download expected'); },
+    spawnImpl: (binary, args) => {
+      calls.push(args);
+      return { status: 0, stdout: args[0] === '--version' ? `kin ${report.cli.version}\n` : JSON.stringify(report) };
+    },
+  });
+  assert.equal(selected, cliPath);
+  assert.equal(calls.some(args => args[0] === 'update'), false, 'no update or reinstall was attempted');
+  assert.equal(fs.readFileSync(cliPath, 'utf8'), 'preserve-cli');
+  assert.equal(fs.readFileSync(daemonPath, 'utf8'), 'preserve-daemon');
+});
+
 test('an old managed runtime delegates upgrade exclusively to the native updater', async t => {
   const { env, report, cliPath, daemonPath } = managedFixture(t, '99.0.0', 'linux');
   const calls = [];

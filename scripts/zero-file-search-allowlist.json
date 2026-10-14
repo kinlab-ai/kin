@@ -1366,6 +1366,12 @@
       "expiration": "2027-04-23"
     },
     {
+      "file": "crates/kin-cli/src/commands/kin_copies.rs",
+      "reason": "Install-inventory boundary for one Kin per machine. It finds every executable named kin, kin-daemon or kin-mcp on PATH, in the Cargo home, npm global prefixes, Homebrew and /usr/local/bin, and classifies each from install metadata: directory entries and links, an npm package.json, the Cargo install record, Cargo's target-directory markers, and the static build identity an executable carries in its own bytes. It reads the process table for running kin-daemon executables, and removes a copy only through that copy's own uninstall (npm, cargo, brew) or by deleting a standalone release file, when a person or an explicit doctor flag asks. Its subject is the installation, the same boundary as setup.rs and update.rs; it reads no repository content and answers no locate, search, context, trace, review or xref query.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30"
+    },
+    {
       "file": "crates/kin-cli/src/commands/update.rs",
       "reason": "The updater: downloads, verifies and swaps the installed binaries, holding file locks over the install root. 359 sites, all install-time IO, and it resolves no semantic query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
       "owner": "kin-cli",
@@ -3366,6 +3372,22 @@
         "let canonical = home.canonicalize().map_err(refusal)?;",
         "if home.canonicalize().map_err(refusal)? != canonical",
         "pid: std::process::id(),"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client/succession.rs",
+      "reason": "Daemon process lifecycle and managed-generation succession boundary. runs_from_managed_generation canonicalizes only the peer daemon's executable path (or its parent directory when an update has already unlinked the replaced binary) and the configured managed Kin home directory so a client can tell whether a running daemon comes from an older generation of that managed install. These path comparisons precede graph access, never read repository content, and cannot produce, rank, fill or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression with counts so any additional filesystem primitive in this module fails the guard.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30",
+      "allow_match": [
+        {
+          "expr": "path.canonicalize()",
+          "count": 1
+        },
+        {
+          "expr": "parent.canonicalize().map(|parent| parent.join(name))",
+          "count": 1
+        }
       ]
     }
   ]

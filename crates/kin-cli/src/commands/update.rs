@@ -1021,6 +1021,452 @@ fn detect_install_method(kin_home: &Path) -> InstallMethod {
     )
 }
 
+/// A launcher stamp larger than this is not one any launcher wrote.
+const MAX_LAUNCHER_STAMP_BYTES: usize = 256;
+/// The permission bits of a stamp the updater writes.
+const LAUNCHER_STAMP_MODE: u32 = 0o644;
+
+/// The stamp's bytes for `version`, in the form the npm launcher writes.
+fn launcher_stamp_bytes(version: &str) -> Vec<u8> {
+    format!("{version}\n").into_bytes()
+}
+
+/// The release a stamp records, when it records a readable one.
+fn launcher_stamp_version(bytes: &[u8]) -> Option<Version> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    parse_release_version(text.trim()).ok()
+}
+
+/// What sits where the npm launcher keeps its version stamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LauncherStampFile {
+    Absent,
+    Recorded {
+        bytes: Vec<u8>,
+        /// Permission bits, where the platform has them.
+        mode: Option<u32>,
+    },
+    /// Something no launcher writes there: a link, a directory, or a file
+    /// larger than any version. It is reported and never rewritten.
+    Unusable(String),
+}
+
+fn launcher_stamp_path(kin_home: &Path) -> PathBuf {
+    kin_home.join("bin").join(NPM_LAUNCHER_STAMP)
+}
+
+/// Read the stamp by path. The transaction uses its anchored twin on Unix;
+/// this one serves the read-only health report and the non-Unix updater.
+fn read_launcher_stamp_path(path: &Path) -> Result<LauncherStampFile> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(LauncherStampFile::Absent)
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect the launcher stamp {}", path.display())
+            })
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(LauncherStampFile::Unusable(
+            "it is not a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > MAX_LAUNCHER_STAMP_BYTES as u64 {
+        return Ok(LauncherStampFile::Unusable(format!(
+            "it holds {} bytes, more than any version",
+            metadata.len()
+        )));
+    }
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open the launcher stamp {}", path.display()))?;
+    let bytes = read_bounded_archive_entry(
+        &mut file,
+        metadata.len(),
+        MAX_LAUNCHER_STAMP_BYTES as u64,
+        "launcher stamp",
+    )?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+    Ok(LauncherStampFile::Recorded { bytes, mode })
+}
+
+#[cfg(unix)]
+fn read_launcher_stamp_at(bin: &AnchoredDir) -> Result<LauncherStampFile> {
+    let Some(stat) = bin.stat_entry(NPM_LAUNCHER_STAMP)? else {
+        return Ok(LauncherStampFile::Absent);
+    };
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        return Ok(LauncherStampFile::Unusable(
+            "it is not a regular file".to_string(),
+        ));
+    }
+    if stat.st_size as u64 > MAX_LAUNCHER_STAMP_BYTES as u64 {
+        return Ok(LauncherStampFile::Unusable(format!(
+            "it holds {} bytes, more than any version",
+            stat.st_size
+        )));
+    }
+    let Some((mut file, opened)) = bin.open_regular(NPM_LAUNCHER_STAMP, "launcher stamp")? else {
+        return Ok(LauncherStampFile::Absent);
+    };
+    let bytes = read_bounded_archive_entry(
+        &mut file,
+        opened.st_size as u64,
+        MAX_LAUNCHER_STAMP_BYTES as u64,
+        "launcher stamp",
+    )?;
+    bin.ensure_regular_binding(
+        NPM_LAUNCHER_STAMP,
+        opened.st_dev as u64,
+        opened.st_ino as u64,
+    )?;
+    Ok(LauncherStampFile::Recorded {
+        bytes,
+        mode: Some(opened.st_mode as u32 & 0o777),
+    })
+}
+
+/// Remove scratch files an interrupted stamp write left in `bin/`.
+///
+/// Only the updater's own scratch names are touched, and only under the
+/// install lock, which every updater stamp write holds. A launcher's scratch
+/// file is named differently and may belong to a write in progress.
+#[cfg(unix)]
+fn remove_stale_launcher_stamp_scratch_at(install: &InstallLayout) -> Result<()> {
+    let prefix = format!(".{NPM_LAUNCHER_STAMP}.tmp-");
+    for name in install.bin.entry_names()? {
+        if !is_canonical_random_uuid_suffix(&name, &prefix) {
+            continue;
+        }
+        let Some(stat) = install.bin.stat_entry(&name)? else {
+            continue;
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+            continue;
+        }
+        install.ensure_bound()?;
+        install
+            .bin
+            .ensure_regular_binding(&name, stat.st_dev as u64, stat.st_ino as u64)?;
+        install.bin.unlink_file(&name)?;
+    }
+    Ok(())
+}
+
+/// The build identity a Kin executable carries in its bytes.
+///
+/// Read from the static identity the release build embeds, so the executable
+/// is never run. Builds older than that identity, and anything that is not a
+/// Kin executable, answer an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutableBuildIdentity {
+    pub(crate) version: String,
+    pub(crate) commit: String,
+    pub(crate) clean: bool,
+    pub(crate) source_known: bool,
+}
+
+impl From<StaticBuildIdentity> for ExecutableBuildIdentity {
+    fn from(identity: StaticBuildIdentity) -> Self {
+        Self {
+            version: identity.version,
+            commit: identity.commit,
+            clean: identity.clean,
+            source_known: identity.source_known,
+        }
+    }
+}
+
+/// Read the static build identity of the executable at `path`.
+///
+/// A release executable is tens of megabytes, and one `kin doctor` asks about
+/// the managed CLI from several rows, so answers are kept for the life of the
+/// process under the file's size, modification time and, on Unix, its inode.
+/// A file replaced by an update is a different key and is read again.
+pub(crate) fn executable_build_identity(path: &Path) -> Result<ExecutableBuildIdentity> {
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>, u64, u64);
+    static ANSWERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<Key, std::result::Result<ExecutableBuildIdentity, String>>>,
+    > = std::sync::OnceLock::new();
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect executable {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (0, 0);
+    let key: Key = (
+        path.to_path_buf(),
+        metadata.len(),
+        metadata.modified().ok(),
+        device,
+        inode,
+    );
+    let answers = ANSWERS.get_or_init(Default::default);
+    if let Some(answer) = answers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return answer.clone().map_err(anyhow::Error::msg);
+    }
+    let answer = (|| -> Result<ExecutableBuildIdentity> {
+        let mut file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let bytes = read_bounded_archive_entry(
+            &mut file,
+            metadata.len(),
+            MAX_ARCHIVE_ENTRY_BYTES,
+            &format!("executable {}", path.display()),
+        )?;
+        Ok(parse_static_build_identity(&bytes)?.into())
+    })()
+    .map_err(|error| format!("{error:#}"));
+    answers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, answer.clone());
+    answer.map_err(anyhow::Error::msg)
+}
+
+fn installed_cli_component(spec: &[ComponentSpec]) -> Result<ComponentSpec> {
+    let (cli_name, _) = static_identity_component_names(spec)?;
+    spec.iter()
+        .copied()
+        .find(|component| component.name == cli_name)
+        .context("platform bundle contract has no CLI component")
+}
+
+/// The release of the CLI installed in the locked root, from its own bytes.
+#[cfg(unix)]
+fn installed_cli_version_at(install: &InstallLayout, spec: &[ComponentSpec]) -> Result<Version> {
+    let component = installed_cli_component(spec)?;
+    let directory = install.component_dir(component);
+    let Some((mut file, stat)) = directory.open_regular(component.name, "installed CLI")? else {
+        anyhow::bail!("no CLI is installed");
+    };
+    let bytes = read_bounded_archive_entry(
+        &mut file,
+        stat.st_size as u64,
+        MAX_ARCHIVE_ENTRY_BYTES,
+        "installed CLI",
+    )?;
+    directory.ensure_regular_binding(component.name, stat.st_dev as u64, stat.st_ino as u64)?;
+    parse_release_version(&parse_static_build_identity(&bytes)?.version)
+}
+
+/// What the stamp says beside what is installed, read without any lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LauncherStampInspection {
+    /// No stamp: the platform installer put this Kin here, and nothing reads
+    /// a version from a file.
+    Absent,
+    /// The stamp names the installed release.
+    Current { path: PathBuf, version: String },
+    /// The stamp names another release, or none it can parse.
+    Disagrees {
+        path: PathBuf,
+        recorded: String,
+        installed: String,
+    },
+    /// The installed CLI carries no build identity this Kin can read, so the
+    /// stamp cannot be checked against it.
+    Unverifiable {
+        path: PathBuf,
+        recorded: String,
+        reason: String,
+    },
+    /// Something other than a stamp sits at the stamp's path.
+    Unusable { path: PathBuf, reason: String },
+}
+
+fn recorded_stamp_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "nothing".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Compare the launcher stamp with the installed CLI, reading both from disk.
+pub(crate) fn inspect_launcher_stamp(kin_home: &Path) -> LauncherStampInspection {
+    let path = launcher_stamp_path(kin_home);
+    let bytes = match read_launcher_stamp_path(&path) {
+        Ok(LauncherStampFile::Absent) => return LauncherStampInspection::Absent,
+        Ok(LauncherStampFile::Unusable(reason)) => {
+            return LauncherStampInspection::Unusable { path, reason }
+        }
+        Err(error) => {
+            return LauncherStampInspection::Unusable {
+                path,
+                reason: format!("{error:#}"),
+            }
+        }
+        Ok(LauncherStampFile::Recorded { bytes, .. }) => bytes,
+    };
+    let recorded = recorded_stamp_text(&bytes);
+    let installed = platform_bundle_spec(std::env::consts::OS)
+        .and_then(installed_cli_component)
+        .and_then(|component| executable_build_identity(&component_path(kin_home, component)))
+        .and_then(|identity| parse_release_version(&identity.version));
+    match installed {
+        Err(error) => LauncherStampInspection::Unverifiable {
+            path,
+            recorded,
+            reason: format!("{error:#}"),
+        },
+        Ok(installed) if launcher_stamp_version(&bytes).as_ref() == Some(&installed) => {
+            LauncherStampInspection::Current {
+                path,
+                version: installed.to_string(),
+            }
+        }
+        Ok(installed) => LauncherStampInspection::Disagrees {
+            path,
+            recorded,
+            installed: installed.to_string(),
+        },
+    }
+}
+
+/// What a locked stamp repair did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LauncherStampRepair {
+    /// There is no stamp, and none is created.
+    Absent,
+    /// The stamp already names the installed release.
+    Current,
+    /// The stamp named `from` and now names the installed release `to`.
+    Rewritten { from: String, to: String },
+    /// Left as it is, and why.
+    Left(String),
+}
+
+/// Make an existing stamp name the release installed in the locked root.
+///
+/// Runs under the install lock after every recovery, so a stamp an older
+/// updater left behind, or one a recovery could not reach, is corrected the
+/// next time anything takes the lock. A stamp is never created, and anything
+/// at its path that is not a stamp is left for a person.
+fn repair_launcher_stamp_locked(
+    lock: &InstallRootLock,
+    spec: &[ComponentSpec],
+) -> Result<LauncherStampRepair> {
+    #[cfg(unix)]
+    {
+        let install = lock.install()?;
+        remove_stale_launcher_stamp_scratch_at(install)?;
+        let bytes = match read_launcher_stamp_at(&install.bin)? {
+            LauncherStampFile::Absent => return Ok(LauncherStampRepair::Absent),
+            LauncherStampFile::Unusable(reason) => return Ok(LauncherStampRepair::Left(reason)),
+            LauncherStampFile::Recorded { bytes, .. } => bytes,
+        };
+        let installed = match installed_cli_version_at(install, spec) {
+            Ok(installed) => installed,
+            Err(error) => {
+                return Ok(LauncherStampRepair::Left(format!(
+                    "the installed CLI's release could not be read: {error:#}"
+                )))
+            }
+        };
+        if launcher_stamp_version(&bytes).as_ref() == Some(&installed) {
+            return Ok(LauncherStampRepair::Current);
+        }
+        install.ensure_bound()?;
+        install
+            .bin
+            .atomic_write_checked(
+                NPM_LAUNCHER_STAMP,
+                &launcher_stamp_bytes(&installed.to_string()),
+                LAUNCHER_STAMP_MODE,
+                || install.ensure_bound(),
+            )
+            .context("failed to rewrite the launcher version stamp")?;
+        Ok(LauncherStampRepair::Rewritten {
+            from: recorded_stamp_text(&bytes),
+            to: installed.to_string(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let path = launcher_stamp_path(lock.root());
+        let bytes = match read_launcher_stamp_path(&path)? {
+            LauncherStampFile::Absent => return Ok(LauncherStampRepair::Absent),
+            LauncherStampFile::Unusable(reason) => return Ok(LauncherStampRepair::Left(reason)),
+            LauncherStampFile::Recorded { bytes, .. } => bytes,
+        };
+        let installed = match installed_cli_component(spec)
+            .and_then(|component| {
+                executable_build_identity(&component_path(lock.root(), component))
+            })
+            .and_then(|identity| parse_release_version(&identity.version))
+        {
+            Ok(installed) => installed,
+            Err(error) => {
+                return Ok(LauncherStampRepair::Left(format!(
+                    "the installed CLI's release could not be read: {error:#}"
+                )))
+            }
+        };
+        if launcher_stamp_version(&bytes).as_ref() == Some(&installed) {
+            return Ok(LauncherStampRepair::Current);
+        }
+        write_file_atomically(
+            &path,
+            &launcher_stamp_bytes(&installed.to_string()),
+            LAUNCHER_STAMP_MODE,
+        )
+        .context("failed to rewrite the launcher version stamp")?;
+        Ok(LauncherStampRepair::Rewritten {
+            from: recorded_stamp_text(&bytes),
+            to: installed.to_string(),
+        })
+    }
+}
+
+/// `kin doctor --fix`'s stamp repair: take the install lock and correct it.
+///
+/// An interrupted update owns the stamp until it is recovered, and a running
+/// install mutation writes the stamp itself, so both leave it alone and say
+/// so rather than racing them.
+pub(crate) fn repair_launcher_stamp() -> Result<LauncherStampRepair> {
+    let requested_home = crate::commands::setup::kin_dir()?;
+    let spec = platform_bundle_spec(std::env::consts::OS)?;
+    let lock = match InstallRootLock::acquire_existing(&requested_home) {
+        Ok(lock) => lock,
+        Err(error) if error.downcast_ref::<InstallLockContended>().is_some() => {
+            return Ok(LauncherStampRepair::Left(
+                "another Kin install is running, and it writes the stamp itself".to_string(),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    if !transaction_dirs(lock.root())?.is_empty() {
+        return Ok(LauncherStampRepair::Left(
+            "an interrupted update needs recovery first; `kin update` recovers it and then the \
+             stamp"
+                .to_string(),
+        ));
+    }
+    repair_launcher_stamp_locked(&lock, spec)
+}
+
 /// Why a check-only report has no verdict, as a stable code and a sentence a
 /// person can act on. The codes are the contract; the sentences may change.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1384,9 +1830,14 @@ async fn run_update_flow(
         // after authenticated preflight closes the race before mutation.
         refuse_restart_marker_before_remote_preflight(&inspected_home)?;
     }
-    if !check_only {
+    if !check_only && !stale.is_empty() {
+        // Recovery moves managed bytes, so it never runs under a daemon.
         ensure_no_active_managed_runtimes(&inspected_home, spec).context(
-            "initial update preflight requires every managed serving executable to be stopped; no recovery, cleanup, repair, preference mutation, or release download was attempted",
+            "recovering an interrupted update requires every managed serving executable to be stopped; no recovery, cleanup, repair, preference mutation, or release download was attempted",
+        )?;
+    } else if !check_only {
+        ensure_no_active_runtimes_but_daemons(&inspected_home, spec).context(
+            "initial update preflight requires every managed VFS server to be stopped; no recovery, cleanup, repair, preference mutation, or release download was attempted",
         )?;
     }
 
@@ -1504,7 +1955,8 @@ async fn run_update_flow(
                 .as_ref()
                 .context("pinned updater lost its startup authority")?,
             spec,
-        );
+        )
+        .await;
     }
 
     let release = resolve_release(&client, channel).await?;
@@ -1609,8 +2061,8 @@ async fn run_update_flow(
 
     print_available_runtime_update(&latest, &release_commit_sha);
 
-    ensure_no_active_managed_runtimes(&kin_home, spec).context(
-        "update preflight requires every managed serving executable to be stopped; no release archive was downloaded or staged",
+    ensure_no_active_runtimes_but_daemons(&kin_home, spec).context(
+        "update preflight requires every managed VFS server to be stopped; no release archive was downloaded or staged",
     )?;
 
     println!("Downloading {}...", asset.name);
@@ -1660,6 +2112,7 @@ async fn run_update_flow(
         !skip_verify,
     )?;
     validate_staged_static_build_identity(staging.path(), spec, &latest, &provenance)?;
+    replace_daemons_for_release(&kin_home, &latest, &release_commit_sha).await?;
     start_authority
         .as_ref()
         .context("mutating updater lost its startup authority")?
@@ -1682,7 +2135,7 @@ async fn run_update_flow(
     report_successful_install(lock, &kin_home, &latest, outcome)
 }
 
-fn install_prepared_release(
+async fn install_prepared_release(
     lock: &InstallRootLock,
     prepared: &PreparedPinnedRelease,
     start_authority: &UpdaterStartAuthority,
@@ -1700,6 +2153,7 @@ fn install_prepared_release(
         true,
     )?;
     validate_staged_static_build_identity(staging.path(), spec, &latest, &prepared.provenance)?;
+    replace_daemons_for_release(kin_home, &latest, &prepared.commit_sha).await?;
     start_authority.verify_locked(lock, spec)?;
     let pending_record = restart_pending_record(
         kin_home,
@@ -1717,6 +2171,30 @@ fn install_prepared_release(
         &pending_record,
     )?;
     report_successful_install(lock, kin_home, &latest, outcome)
+}
+
+/// Replace every daemon this install runs with the release about to be
+/// committed.
+///
+/// Called once the release is staged and verified, so a release that fails
+/// either never costs a running daemon, and before the commit's own final check
+/// that nothing managed is serving, which still refuses anything that appeared
+/// since. A daemon still finishing its work, a newer one, or a development
+/// build fails the update by name, and nothing is installed.
+pub(crate) async fn replace_daemons_for_release(
+    kin_home: &Path,
+    version: &str,
+    commit: &str,
+) -> Result<()> {
+    let successor = crate::commands::daemon::ReplacementSuccessor::new(version, commit)?
+        .replacing_install(kin_home);
+    for action in
+        crate::commands::daemon::replace_install_owned_daemons_for_update(kin_home, &successor)
+            .await?
+    {
+        println!("  {action}");
+    }
+    Ok(())
 }
 
 /// The managed `kin` the chain re-invokes. Deliberately the installed path
@@ -2248,9 +2726,15 @@ fn probe_machine_activity(kin_home: &Path, spec: &[ComponentSpec]) -> MachineAct
 /// supervisor may register unrelated candidate binaries, so its topology is
 /// not installation ownership. Daemon stops retain exact incarnation/image
 /// checks; an unverified or surviving daemon fails the update.
+///
+/// With a `successor`, the release this update installs, daemons are replaced
+/// rather than stopped: each finishes its writes and is told what replaced it
+/// (see `replace_install_owned_daemons_for_update`). Without one, a repair of
+/// the installed release, they are stopped as before.
 async fn stop_managed_runtimes_for_update(
     kin_home: &Path,
     spec: &[ComponentSpec],
+    successor: Option<&crate::commands::daemon::ReplacementSuccessor>,
 ) -> Result<Vec<String>> {
     let mut actions = Vec::new();
     // Say what is being kept, before anything is signalled. These hold no
@@ -2272,8 +2756,16 @@ async fn stop_managed_runtimes_for_update(
             ));
         }
     }
-    crate::commands::daemon::stop_install_owned_daemons_for_update(kin_home)?;
-    actions.push("stopped only this installation's daemon runtimes".to_string());
+    match successor {
+        Some(successor) => actions.extend(
+            crate::commands::daemon::replace_install_owned_daemons_for_update(kin_home, successor)
+                .await?,
+        ),
+        None => {
+            crate::commands::daemon::stop_install_owned_daemons_for_update(kin_home)?;
+            actions.push("stopped only this installation's daemon runtimes".to_string());
+        }
+    }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     let mut signaled: HashSet<u32> = HashSet::new();
@@ -2474,13 +2966,21 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
             Ok((authority, prepared))
         }
         .await;
+        let successor = preflight.as_ref().ok().and_then(|(_, prepared)| {
+            crate::commands::daemon::ReplacementSuccessor::new(
+                &prepared.version.to_string(),
+                &prepared.commit_sha,
+            )
+            .ok()
+            .map(|successor| successor.replacing_install(&kin_home))
+        });
         apply_prepared_unattended_release(
             &requested_home,
             spec,
             channel,
             preflight,
             &mut entry.steps,
-            || stop_managed_runtimes_for_update(&kin_home, spec),
+            || stop_managed_runtimes_for_update(&kin_home, spec, successor.as_ref()),
         )
         .await
         .and_then(|()| run_chain_tail())
@@ -2490,7 +2990,7 @@ pub async fn run_unattended(force_window: bool) -> Result<()> {
             spec,
             UpdaterStartAuthority::capture(&kin_home, spec),
             &mut entry.steps,
-            || stop_managed_runtimes_for_update(&kin_home, spec),
+            || stop_managed_runtimes_for_update(&kin_home, spec, None),
         )
         .await
         // Availability already selected no new release. Repair only the
@@ -2633,7 +3133,7 @@ where
     authority.verify_locked(&lock, spec)?;
     cleanup_stale_staging_dirs(&lock)?;
     attempt_pending_mcp_repair(&lock)?;
-    install_prepared_release(&lock, &prepared, &authority, spec)
+    install_prepared_release(&lock, &prepared, &authority, spec).await
 }
 
 fn report_successful_install(
@@ -2918,12 +3418,18 @@ fn enter_pinned_install_phase<T>(
     // preflight interval behind a newer concurrent install cannot use its old
     // embedded CURRENT_VERSION to overwrite the new full bundle generation.
     start_authority.verify_locked(&lock, spec)?;
+    if !transaction_dirs(lock.root())?.is_empty() {
+        // Recovery moves managed bytes, so it never runs under a daemon.
+        ensure_no_active_managed_runtimes(lock.root(), spec).context(
+            "recovering an interrupted update requires every managed serving executable to be stopped",
+        )?;
+    }
     recover_stale_transactions(&lock, spec)?;
     refuse_new_update_while_restart_marker_exists(&lock)?;
     cleanup_stale_staging_dirs(&lock)?;
     start_authority.verify_locked(&lock, spec)?;
-    ensure_no_active_managed_runtimes(lock.root(), spec).context(
-        "pinned update install phase requires every managed serving executable to remain stopped",
+    ensure_no_active_runtimes_but_daemons(lock.root(), spec).context(
+        "pinned update install phase requires every managed VFS server to remain stopped",
     )?;
     attempt_pending_mcp_repair(&lock)?;
     Ok((lock, prepared))
@@ -3660,6 +4166,29 @@ fn ensure_mutating_update_supported(os: &str, check_only: bool) -> Result<()> {
 /// create a second inode that another process could lock concurrently. Windows
 /// uses a persistent current-user-only sibling lock because an open descendant
 /// handle prevents atomic install-root retirement there.
+/// Another process holds the install lock right now.
+///
+/// Typed so a caller that can step aside, such as `kin doctor --fix`'s stamp
+/// repair, tells contention apart from a lock it cannot take at all.
+#[derive(Debug)]
+pub(crate) struct InstallLockContended {
+    root: PathBuf,
+    lock: PathBuf,
+}
+
+impl std::fmt::Display for InstallLockContended {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "another Kin install mutation is already active for {} (lock: {})",
+            self.root.display(),
+            self.lock.display()
+        )
+    }
+}
+
+impl std::error::Error for InstallLockContended {}
+
 pub(crate) struct InstallRootLock {
     file: File,
     root: PathBuf,
@@ -3888,11 +4417,11 @@ impl InstallRootLock {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => {}
                 Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-                    anyhow::bail!(
-                        "another Kin install mutation is already active for {} (lock: {})",
-                        kin_home.display(),
-                        authority_path.display()
-                    );
+                    return Err(InstallLockContended {
+                        root: kin_home.to_path_buf(),
+                        lock: authority_path.clone(),
+                    }
+                    .into());
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -3953,11 +4482,11 @@ impl InstallRootLock {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => {}
                 Err(err) if err.kind() == fs2::lock_contended_error().kind() => {
-                    anyhow::bail!(
-                        "another Kin install mutation is already active for {} (lock: {})",
-                        root.display(),
-                        path.display()
-                    );
+                    return Err(InstallLockContended {
+                        root: root.clone(),
+                        lock: path.clone(),
+                    }
+                    .into());
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -9313,6 +9842,57 @@ struct TransactionJournal {
     notifier_bundle: JournalBundle,
     restart_pending: RestartPending,
     mcp_repair_pending: McpRepairPending,
+    /// The launcher version stamp this transaction replaces, when the install
+    /// had one.
+    ///
+    /// Absent from every journal written before the stamp joined the
+    /// transaction, and from every transaction on an install that has no
+    /// stamp. It is additive rather than a schema change: an older CLI that
+    /// recovers this journal ignores the field and leaves the stamp alone,
+    /// and the next recovery by a CLI that knows it rewrites a stamp that
+    /// disagrees with the installed release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher_stamp: Option<JournalLauncherStamp>,
+}
+
+/// The npm launcher's version stamp, as one transaction found and replaces it.
+///
+/// The stamp says which release sits in `bin/`. Launchers older than the
+/// probe-first rule trusted it as the installed version and reinstalled their
+/// own release over anything that read older, so a stamp left behind by an
+/// update is how a newer install gets replaced by an older one. The
+/// transaction therefore writes the installed version with the bundle and puts
+/// the exact old bytes back when it rolls back. It never creates a stamp: an
+/// install the launcher did not provision has none, and gains none here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct JournalLauncherStamp {
+    /// The stamp's bytes before the transaction, hex encoded so any bytes
+    /// round-trip exactly.
+    original_hex: String,
+    /// Its permission bits before the transaction, restored with the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_mode: Option<u32>,
+    /// The release the transaction installs, which is what it writes.
+    installed_version: String,
+}
+
+impl JournalLauncherStamp {
+    fn original_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = hex::decode(&self.original_hex)
+            .context("update journal launcher stamp bytes are not hex")?;
+        if bytes.len() > MAX_LAUNCHER_STAMP_BYTES {
+            anyhow::bail!("update journal launcher stamp is larger than any launcher writes");
+        }
+        Ok(bytes)
+    }
+
+    fn installed_bytes(&self) -> Vec<u8> {
+        launcher_stamp_bytes(&self.installed_version)
+    }
+
+    fn restore_mode(&self) -> u32 {
+        self.original_mode.unwrap_or(LAUNCHER_STAMP_MODE) & 0o777
+    }
 }
 
 #[cfg(test)]
@@ -9545,6 +10125,10 @@ where
         // transaction directory. A malformed/unsupported marker or an
         // unbound managed client therefore fails without journalless residue.
         let mcp_repair_pending = mcp_repair_pending_record(lock, target_version)?;
+        let launcher_stamp = journal_launcher_stamp(
+            read_launcher_stamp_path(&launcher_stamp_path(kin_home))?,
+            target_version,
+        );
         let transaction_root = create_transaction_root(kin_home)?;
         let backup_root = transaction_root.join("old");
         // The schema is what this build writes, not what this platform happens
@@ -9560,6 +10144,7 @@ where
             notifier_bundle: JournalBundle::default(),
             restart_pending: restart_pending.clone(),
             mcp_repair_pending,
+            launcher_stamp,
         };
         if let Err(err) = persist_journal(&transaction_root, &journal) {
             let _ = durable_remove_dir_all(&transaction_root);
@@ -9656,6 +10241,26 @@ where
             }
             maybe_crash_at(&format!("after-install-{install_index}"));
             install_index += 1;
+        }
+
+        maybe_crash_at("before-launcher-stamp");
+        if let Some(stamp) = journal.launcher_stamp.clone() {
+            if let Err(err) = write_file_atomically(
+                &launcher_stamp_path(kin_home),
+                &stamp.installed_bytes(),
+                LAUNCHER_STAMP_MODE,
+            )
+            .context("failed to write the installed release to the launcher stamp")
+            {
+                return rollback_after_failure(
+                    err,
+                    &mut journal,
+                    &transaction_root,
+                    kin_home,
+                    spec,
+                );
+            }
+            maybe_crash_at("after-install-launcher-stamp");
         }
 
         if let Err(err) = validate_installed_bundle(kin_home, &journal, spec) {
@@ -10068,6 +10673,10 @@ where
     // Resolve the durable repair manifest before transaction creation so a
     // fallible config/ledger read cannot strand an unjournaled directory.
     let mcp_repair_pending = mcp_repair_pending_record(lock, target_version)?;
+    // The stamp is read here for the same reason, and only a stamp that is
+    // already there joins the transaction.
+    let launcher_stamp =
+        journal_launcher_stamp(read_launcher_stamp_at(&install.bin)?, target_version);
     let transaction = TransactionLayout::create(install)?;
     let transaction_root = kin_home.join(&transaction.name);
     let mut journal = TransactionJournal {
@@ -10078,6 +10687,7 @@ where
         notifier_bundle,
         restart_pending: restart_pending.clone(),
         mcp_repair_pending,
+        launcher_stamp,
     };
     if let Err(error) = persist_journal_at(install, &transaction, &journal) {
         let _ = cleanup_transaction_at(install, &transaction, &journal, spec);
@@ -10272,6 +10882,28 @@ where
             }
             maybe_crash_at(&format!("after-install-{install_index}"));
             install_index += 1;
+        }
+
+        // The stamp says what is installed, so it changes with the bundle and
+        // inside the same rollback boundary.
+        maybe_crash_at("before-launcher-stamp");
+        if let Some(stamp) = &journal.launcher_stamp {
+            install.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            install
+                .bin
+                .atomic_write_checked(
+                    NPM_LAUNCHER_STAMP,
+                    &stamp.installed_bytes(),
+                    LAUNCHER_STAMP_MODE,
+                    || {
+                        install.ensure_bound()?;
+                        transaction.ensure_bound(install)
+                    },
+                )
+                .context("failed to write the installed release to the launcher stamp")?;
+            after_precommit_mutation("after-install-mutation-launcher-stamp")?;
+            maybe_crash_at("after-install-launcher-stamp");
         }
 
         validate_installed_bundle_at(install, &journal, spec)?;
@@ -10528,9 +11160,68 @@ fn rollback_transaction_at(
         }
     }
     rollback_notifier_bundle_at(install, transaction, journal)?;
+    rollback_launcher_stamp_at(install, transaction, journal)?;
     journal.phase = TransactionPhase::RolledBack;
     persist_journal_at(install, transaction, journal)?;
     cleanup_transaction_at(install, transaction, journal, spec)
+}
+
+/// The stamp's part of a transaction, from what was found before it began.
+///
+/// Only a stamp that is already a stamp joins: an absent one stays absent, and
+/// anything else at its path is left for a person.
+fn journal_launcher_stamp(
+    found: LauncherStampFile,
+    target_version: &str,
+) -> Option<JournalLauncherStamp> {
+    match found {
+        LauncherStampFile::Recorded { bytes, mode } => Some(JournalLauncherStamp {
+            original_hex: hex::encode(bytes),
+            original_mode: mode,
+            installed_version: target_version.to_string(),
+        }),
+        LauncherStampFile::Absent | LauncherStampFile::Unusable(_) => None,
+    }
+}
+
+/// Put the stamp's journaled bytes back, last, because it was written last.
+///
+/// Like the bundle, the decision reads what is on disk, so a rollback that was
+/// itself interrupted finishes the same way. Bytes and mode already restored
+/// are left alone. Something that is no longer a stamp is left alone too:
+/// replacing it would destroy what a person put there, and the stamp is a
+/// receipt rather than an executable the install depends on.
+#[cfg(unix)]
+fn rollback_launcher_stamp_at(
+    install: &InstallLayout,
+    transaction: &TransactionLayout,
+    journal: &TransactionJournal,
+) -> Result<()> {
+    let Some(stamp) = &journal.launcher_stamp else {
+        return Ok(());
+    };
+    let original = stamp.original_bytes()?;
+    let mode = stamp.restore_mode();
+    match read_launcher_stamp_at(&install.bin)? {
+        LauncherStampFile::Recorded {
+            bytes,
+            mode: current_mode,
+        } if bytes == original && current_mode.is_none_or(|current| current == mode) => {
+            return Ok(())
+        }
+        LauncherStampFile::Unusable(_) => return Ok(()),
+        LauncherStampFile::Recorded { .. } | LauncherStampFile::Absent => {}
+    }
+    transaction.ensure_bound(install)?;
+    install
+        .bin
+        .atomic_write_checked(NPM_LAUNCHER_STAMP, &original, mode, || {
+            install.ensure_bound()?;
+            transaction.ensure_bound(install)
+        })
+        .context("failed to restore the launcher stamp")?;
+    maybe_crash_at("after-rollback-restore-launcher-stamp");
+    Ok(())
 }
 
 /// Reverse the bundle swap, last, because it moved first.
@@ -10843,6 +11534,17 @@ fn validate_journal(journal: &TransactionJournal, spec: &[ComponentSpec]) -> Res
     }
     validate_restart_record_schema(&journal.restart_pending)?;
     validate_mcp_repair_record(&journal.mcp_repair_pending)?;
+    if let Some(stamp) = &journal.launcher_stamp {
+        stamp.original_bytes()?;
+        if parse_release_version(&stamp.installed_version)?
+            != parse_release_version(&journal.target_version)?
+        {
+            anyhow::bail!("update journal launcher stamp does not name its target version");
+        }
+        if stamp.original_mode.is_some_and(|mode| mode & !0o777 != 0) {
+            anyhow::bail!("update journal launcher stamp mode is not a permission mode");
+        }
+    }
     let runtime_kinds = journal
         .restart_pending
         .runtime_obligations
@@ -11151,9 +11853,29 @@ fn rollback_transaction(
             }
         }
     }
+    rollback_launcher_stamp(kin_home, journal)?;
     journal.phase = TransactionPhase::RolledBack;
     persist_journal(transaction_root, journal)?;
     cleanup_transaction_root(transaction_root)
+}
+
+/// [`rollback_launcher_stamp_at`] by path, for the non-Unix transaction.
+#[cfg(not(unix))]
+fn rollback_launcher_stamp(kin_home: &Path, journal: &TransactionJournal) -> Result<()> {
+    let Some(stamp) = &journal.launcher_stamp else {
+        return Ok(());
+    };
+    let original = stamp.original_bytes()?;
+    let path = launcher_stamp_path(kin_home);
+    match read_launcher_stamp_path(&path)? {
+        LauncherStampFile::Recorded { bytes, .. } if bytes == original => return Ok(()),
+        LauncherStampFile::Unusable(_) => return Ok(()),
+        LauncherStampFile::Recorded { .. } | LauncherStampFile::Absent => {}
+    }
+    write_file_atomically(&path, &original, stamp.restore_mode())
+        .context("failed to restore the launcher stamp")?;
+    maybe_crash_at("after-rollback-restore-launcher-stamp");
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -11213,7 +11935,20 @@ fn transaction_dirs(kin_home: &Path) -> Result<Vec<PathBuf>> {
     Ok(transactions)
 }
 
+/// Finish or reverse every interrupted transaction, then make the launcher
+/// stamp name what is installed.
+///
+/// The stamp repair runs last and on every recovery, interrupted transaction
+/// or not: an updater from before the stamp joined the transaction left it
+/// naming the release it replaced, and this is the first locked moment a
+/// newer CLI gets to correct that.
 fn recover_stale_transactions(lock: &InstallRootLock, spec: &[ComponentSpec]) -> Result<()> {
+    recover_stale_transaction_dirs(lock, spec)?;
+    repair_launcher_stamp_locked(lock, spec)?;
+    Ok(())
+}
+
+fn recover_stale_transaction_dirs(lock: &InstallRootLock, spec: &[ComponentSpec]) -> Result<()> {
     #[cfg(unix)]
     {
         return recover_stale_transactions_unix(lock, spec);
@@ -12884,11 +13619,31 @@ fn reject_active_managed_runtime(
 /// gate reads the same predicate, so this can never reject a machine the gate
 /// called idle.
 fn ensure_no_active_managed_runtimes(kin_home: &Path, spec: &[ComponentSpec]) -> Result<()> {
+    ensure_no_active_runtimes_of(kin_home, spec, true)
+}
+
+/// [`ensure_no_active_managed_runtimes`] for the checks an update makes before
+/// its release is staged and verified. A running daemon passes them: the update
+/// replaces it once the release is verified (see
+/// [`replace_daemons_for_release`]), and the full check still runs before the
+/// commit. Anything else that would refuse the commit refuses here, before any
+/// download.
+fn ensure_no_active_runtimes_but_daemons(kin_home: &Path, spec: &[ComponentSpec]) -> Result<()> {
+    ensure_no_active_runtimes_of(kin_home, spec, false)
+}
+
+fn ensure_no_active_runtimes_of(
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+    including_daemons: bool,
+) -> Result<()> {
     for pass in 0..3 {
         let system = managed_runtime_process_table();
         let paths = ProcessPathCache::default();
         for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
-            if !kind.blocks_managed_byte_movement() {
+            if !kind.blocks_managed_byte_movement()
+                || (kind == RuntimeKind::Daemon && !including_daemons)
+            {
                 continue;
             }
             for component in spec
@@ -14380,6 +15135,24 @@ fn parse_release_version(value: &str) -> Result<Version> {
     Version::parse(value).with_context(|| format!("'{value}' is not valid semantic version syntax"))
 }
 
+/// Bytes that read as a Kin executable of `version`, for tests elsewhere in
+/// the crate that classify installed copies.
+#[cfg(test)]
+pub(crate) fn test_binary_with_build_identity(version: &str, clean: bool) -> Vec<u8> {
+    tests::bytes_with_static_build_identity(
+        b"fixture-kin-executable",
+        &StaticBuildIdentity {
+            schema: STATIC_BUILD_IDENTITY_SCHEMA.to_string(),
+            version: version.to_string(),
+            commit: "a".repeat(40),
+            clean,
+            source_known: true,
+            dependency_provenance: "b".repeat(64),
+            graph_snapshot_version: 1,
+        },
+    )
+}
+
 #[cfg(test)]
 fn is_newer(latest: &str, current: &str) -> Result<bool> {
     Ok(parse_release_version(latest)? > parse_release_version(current)?)
@@ -14663,7 +15436,10 @@ mod tests {
         }
     }
 
-    fn bytes_with_static_build_identity(prefix: &[u8], identity: &StaticBuildIdentity) -> Vec<u8> {
+    pub(super) fn bytes_with_static_build_identity(
+        prefix: &[u8],
+        identity: &StaticBuildIdentity,
+    ) -> Vec<u8> {
         fn put_ascii(target: &mut [u8], value: &str) {
             assert!(value.len() <= target.len());
             target[..value.len()].copy_from_slice(value.as_bytes());
@@ -16325,6 +17101,7 @@ cwd = {:?}
                 repair_required: false,
                 targets: Vec::new(),
             },
+            launcher_stamp: None,
         };
         // Fix the staged identities the restart obligations pin.
         for (name, bytes) in [
@@ -16341,6 +17118,30 @@ cwd = {:?}
         }
         validate_journal(&journal, LINUX_COMPONENTS)
             .expect("a schema 2 journal predates the bundle and must still recover");
+
+        // The launcher stamp record is additive. A journal without it carries
+        // no key at all, so the bytes an older CLI reads are unchanged, and
+        // one with it must name the release the transaction installs.
+        let serialized = serde_json::to_value(&journal).unwrap();
+        assert!(serialized.get("launcher_stamp").is_none(), "{serialized}");
+        let mut stamped = journal.clone();
+        stamped.launcher_stamp = journal_launcher_stamp(
+            LauncherStampFile::Recorded {
+                bytes: b"0.6.6\n".to_vec(),
+                mode: Some(0o664),
+            },
+            "0.2.22",
+        );
+        validate_journal(&stamped, LINUX_COMPONENTS).expect("a stamp naming the target is valid");
+        let reread: TransactionJournal =
+            serde_json::from_value(serde_json::to_value(&stamped).unwrap()).unwrap();
+        assert_eq!(reread.launcher_stamp, stamped.launcher_stamp);
+        stamped.launcher_stamp.as_mut().unwrap().installed_version = "0.2.21".to_string();
+        let error = validate_journal(&stamped, LINUX_COMPONENTS).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not name its target version"),
+            "{error:#}"
+        );
 
         // The same schema claiming a bundle record it cannot describe is not a
         // journal this build wrote, so it is refused rather than guessed at.
@@ -16553,6 +17354,7 @@ cwd = {:?}
                     repair_required: false,
                     targets: Vec::new(),
                 },
+                launcher_stamp: None,
             }
         };
 
@@ -17080,6 +17882,393 @@ cwd = {:?}
             !custom_home.join("bin/kin-mcp").exists(),
             "obsolete standalone MCP binary must not survive the bundle update"
         );
+    }
+
+    fn write_launcher_stamp_for_test(kin_home: &Path, bytes: &[u8], mode: u32) {
+        let path = launcher_stamp_path(kin_home);
+        fs::write(&path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+
+    #[cfg(unix)]
+    fn launcher_stamp_mode(kin_home: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(launcher_stamp_path(kin_home))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn scratch_entries(kin_home: &Path) -> Vec<String> {
+        fs::read_dir(kin_home.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
+    }
+
+    /// The marker beside a 0.8.6 binary read 0.6.6 because only the npm
+    /// launcher wrote it and every `kin update` left it behind. An install
+    /// now writes the release it installs into a stamp that is already there.
+    #[test]
+    #[serial]
+    fn an_install_writes_the_installed_release_into_an_existing_launcher_stamp() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        let _cwd = CwdGuard::set(tmp.path());
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        write_launcher_stamp_for_test(&kin_home, b"0.6.6\n", 0o664);
+        stage_archive(
+            &full_linux_archive("kin-linux-x86_64"),
+            "kin-linux-x86_64.tar.gz",
+            &stage,
+            LINUX_COMPONENTS,
+        )
+        .unwrap();
+
+        install_staged_bundle(
+            &kin_home,
+            &stage,
+            LINUX_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"new-kin");
+        assert_eq!(
+            fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+            b"0.2.22\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(launcher_stamp_mode(&kin_home), LAUNCHER_STAMP_MODE);
+        assert!(scratch_entries(&kin_home).is_empty());
+        assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+    }
+
+    /// An install the npm launcher never provisioned has no stamp, and neither
+    /// the transaction nor recovery gives it one.
+    #[test]
+    #[serial]
+    fn an_install_without_a_launcher_stamp_never_gains_one() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        let _cwd = CwdGuard::set(tmp.path());
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        fs::write(
+            kin_home.join("bin/kin"),
+            test_binary_with_build_identity("0.2.21", true),
+        )
+        .unwrap();
+        stage_archive(
+            &full_linux_archive("kin-linux-x86_64"),
+            "kin-linux-x86_64.tar.gz",
+            &stage,
+            LINUX_COMPONENTS,
+        )
+        .unwrap();
+
+        install_staged_bundle(
+            &kin_home,
+            &stage,
+            LINUX_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+        )
+        .unwrap();
+        assert!(!launcher_stamp_path(&kin_home).exists());
+
+        fs::write(
+            kin_home.join("bin/kin"),
+            test_binary_with_build_identity("0.2.22", true),
+        )
+        .unwrap();
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, LINUX_COMPONENTS).unwrap();
+        assert_eq!(
+            repair_launcher_stamp_locked(&lock, LINUX_COMPONENTS).unwrap(),
+            LauncherStampRepair::Absent
+        );
+        assert!(!launcher_stamp_path(&kin_home).exists());
+    }
+
+    /// A transaction that fails after the stamp was written puts back the
+    /// exact bytes and permission bits it journaled.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_failed_install_restores_the_exact_launcher_stamp() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        for failure_point in [
+            "after-install-mutation-0",
+            "after-install-mutation-launcher-stamp",
+            "precommit-validated",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            let _environment = isolated_update_environment(tmp.path(), &kin_home);
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+            let old = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
+            write_launcher_stamp_for_test(&kin_home, b"v0.6.6 from a launcher\n", 0o664);
+            stage_archive(
+                &full_linux_archive("kin-linux-x86_64"),
+                "kin-linux-x86_64.tar.gz",
+                &stage,
+                LINUX_COMPONENTS,
+            )
+            .unwrap();
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            let staged_identities = staged_identities_for_test(&stage, LINUX_COMPONENTS).unwrap();
+            let mut stamp_seen_during_install = None;
+
+            let error = install_staged_bundle_unix_with_hooks(
+                &lock,
+                &StagingLayout::open(&stage).unwrap(),
+                LINUX_COMPONENTS,
+                &staged_identities,
+                "0.2.22",
+                &test_restart_pending("0.2.22"),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |point| {
+                    if point == failure_point {
+                        stamp_seen_during_install =
+                            Some(fs::read(launcher_stamp_path(&kin_home)).unwrap());
+                        anyhow::bail!("injected failure at {point}");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("the injected failure must abort the transaction");
+            assert!(
+                format!("{error:#}").contains("previous bundle was restored"),
+                "{error:#}"
+            );
+            let expected_during = if failure_point == "after-install-mutation-0" {
+                b"v0.6.6 from a launcher\n".to_vec()
+            } else {
+                b"0.2.22\n".to_vec()
+            };
+            assert_eq!(
+                stamp_seen_during_install,
+                Some(expected_during),
+                "{failure_point}"
+            );
+            assert_bundle_matches(&kin_home, LINUX_COMPONENTS, &old);
+            assert_eq!(
+                fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+                b"v0.6.6 from a launcher\n",
+                "{failure_point}"
+            );
+            assert_eq!(launcher_stamp_mode(&kin_home), 0o664, "{failure_point}");
+            assert!(scratch_entries(&kin_home).is_empty());
+            assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+        }
+    }
+
+    /// Kill a real update between the bundle and the stamp, after the stamp,
+    /// and after commit. However it stopped, recovery ends with the stamp
+    /// naming the release that is actually installed.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_around_the_launcher_stamp_recovers_to_the_installed_release() {
+        for (point, committed, stamp_at_crash) in [
+            ("before-launcher-stamp", false, b"0.6.6\n".as_slice()),
+            (
+                "after-install-launcher-stamp",
+                false,
+                b"0.2.22\n".as_slice(),
+            ),
+            ("after-commit", true, b"0.2.22\n".as_slice()),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+            let old_cli = test_binary_with_build_identity("0.2.21", true);
+            fs::write(kin_home.join("bin/kin"), &old_cli).unwrap();
+            write_launcher_stamp_for_test(&kin_home, b"0.6.6\n", 0o644);
+            stage_archive(
+                &full_linux_archive("kin-linux-x86_64"),
+                "kin-linux-x86_64.tar.gz",
+                &stage,
+                LINUX_COMPONENTS,
+            )
+            .unwrap();
+
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::update::tests::crash_recovery_worker",
+                    "--nocapture",
+                ])
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("KIN_HOME", &kin_home)
+                .env_remove("KIN_DIR")
+                .env_remove("KIN_MCP_REPO")
+                .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
+                .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
+                .env("KIN_UPDATE_TEST_CRASH_POINT", point);
+            let output =
+                test_subprocess_output(command, &format!("stamp crash worker at {point}")).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "worker output: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!transaction_dirs(&kin_home).unwrap().is_empty());
+            assert_eq!(
+                fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+                stamp_at_crash,
+                "{point}"
+            );
+
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            recover_stale_transactions(&lock, LINUX_COMPONENTS).unwrap();
+            if committed {
+                assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"new-kin");
+                // The new fixture CLI carries no build identity, so recovery
+                // keeps the stamp the committed transaction wrote.
+                assert_eq!(
+                    fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+                    b"0.2.22\n"
+                );
+            } else {
+                assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), old_cli);
+                // Rollback put 0.6.6 back; the stamp repair then named the
+                // release that rollback left installed.
+                assert_eq!(
+                    fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+                    b"0.2.21\n",
+                    "{point}"
+                );
+            }
+            assert!(scratch_entries(&kin_home).is_empty());
+            assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+        }
+    }
+
+    /// Updaters from before the stamp joined the transaction left it naming
+    /// the release they replaced. The first locked recovery by this build
+    /// corrects it, clears an interrupted write's scratch file, and leaves
+    /// alone a stamp it cannot check.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rewrites_a_stamp_an_older_updater_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        fs::write(
+            kin_home.join("bin/kin"),
+            test_binary_with_build_identity("0.8.6", true),
+        )
+        .unwrap();
+        write_launcher_stamp_for_test(&kin_home, b"0.6.6\n", 0o644);
+        let scratch = format!(".{NPM_LAUNCHER_STAMP}.tmp-{}", uuid::Uuid::new_v4());
+        fs::write(kin_home.join("bin").join(&scratch), b"0.8.").unwrap();
+        // A launcher's own scratch name may belong to a write in progress.
+        let launcher_scratch = format!(".{NPM_LAUNCHER_STAMP}.tmp-4242-{}", uuid::Uuid::new_v4());
+        fs::write(kin_home.join("bin").join(&launcher_scratch), b"0.8.").unwrap();
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, LINUX_COMPONENTS).unwrap();
+        assert_eq!(
+            fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+            b"0.8.6\n"
+        );
+        assert!(!kin_home.join("bin").join(&scratch).exists());
+        assert!(kin_home.join("bin").join(&launcher_scratch).exists());
+        assert_eq!(
+            repair_launcher_stamp_locked(&lock, LINUX_COMPONENTS).unwrap(),
+            LauncherStampRepair::Current
+        );
+
+        fs::write(kin_home.join("bin/kin"), b"a CLI with no build identity").unwrap();
+        write_launcher_stamp_for_test(&kin_home, b"0.6.6\n", 0o644);
+        let repair = repair_launcher_stamp_locked(&lock, LINUX_COMPONENTS).unwrap();
+        assert!(matches!(repair, LauncherStampRepair::Left(_)), "{repair:?}");
+        assert_eq!(
+            fs::read(launcher_stamp_path(&kin_home)).unwrap(),
+            b"0.6.6\n"
+        );
+    }
+
+    #[test]
+    fn the_health_inspection_compares_the_stamp_with_the_installed_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let spec = platform_bundle_spec(std::env::consts::OS).unwrap();
+        let cli = installed_cli_component(spec).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::write(
+            component_path(&kin_home, cli),
+            test_binary_with_build_identity("0.8.6", true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_launcher_stamp(&kin_home),
+            LauncherStampInspection::Absent
+        );
+
+        write_launcher_stamp_for_test(&kin_home, b"0.6.6\n", 0o644);
+        assert_eq!(
+            inspect_launcher_stamp(&kin_home),
+            LauncherStampInspection::Disagrees {
+                path: launcher_stamp_path(&kin_home),
+                recorded: "0.6.6".to_string(),
+                installed: "0.8.6".to_string(),
+            }
+        );
+
+        write_launcher_stamp_for_test(&kin_home, b"v0.8.6\n", 0o644);
+        assert_eq!(
+            inspect_launcher_stamp(&kin_home),
+            LauncherStampInspection::Current {
+                path: launcher_stamp_path(&kin_home),
+                version: "0.8.6".to_string(),
+            }
+        );
+
+        fs::write(component_path(&kin_home, cli), b"no identity here").unwrap();
+        assert!(matches!(
+            inspect_launcher_stamp(&kin_home),
+            LauncherStampInspection::Unverifiable { .. }
+        ));
+
+        fs::remove_file(launcher_stamp_path(&kin_home)).unwrap();
+        fs::create_dir(launcher_stamp_path(&kin_home)).unwrap();
+        assert!(matches!(
+            inspect_launcher_stamp(&kin_home),
+            LauncherStampInspection::Unusable { .. }
+        ));
     }
 
     #[cfg(not(unix))]

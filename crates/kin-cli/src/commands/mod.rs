@@ -55,6 +55,7 @@ pub mod hosted_publication;
 pub mod impact;
 pub mod init;
 pub mod intent;
+pub(crate) mod kin_copies;
 pub mod language_server_release;
 pub mod language_servers;
 pub mod languages;

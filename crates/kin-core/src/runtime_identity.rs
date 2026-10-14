@@ -500,6 +500,260 @@ impl RuntimeServiceIdentity {
     }
 }
 
+/// Where a running daemon's executable lives, as far as replacing it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerLocation {
+    /// The executable could not be read.
+    Unknown,
+    /// An installed release outside the managed home, such as an npm,
+    /// Homebrew or cargo install.
+    Installed,
+    /// The managed home's own binaries, or an update's backup of them: an
+    /// older generation of the managed install.
+    ManagedGeneration,
+    /// A build directory rather than an installed release, and why.
+    BuildDirectory(String),
+}
+
+/// What a running daemon says about the release it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerReport {
+    /// It serves `/runtime/identity`.
+    Identified {
+        identity: RuntimeIdentity,
+        mode: RuntimeMode,
+        namespace: Option<String>,
+    },
+    /// A release from before runtime identity, as its `/health` reads.
+    Legacy {
+        version: Option<String>,
+        commit: Option<String>,
+        dirty: bool,
+        source_known: Option<bool>,
+    },
+}
+
+/// A running daemon of some release, read before a client of another release
+/// decides whether to replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRelease {
+    pub pid: u32,
+    pub executable: Option<PathBuf>,
+    pub location: PeerLocation,
+    pub report: PeerReport,
+}
+
+impl PeerRelease {
+    fn named(&self) -> String {
+        format!(
+            "Kin daemon pid {} ({})",
+            self.pid,
+            self.executable.as_deref().map_or_else(
+                || "executable unknown".to_string(),
+                |path| path.display().to_string()
+            )
+        )
+    }
+
+    fn version(&self) -> Option<&str> {
+        match &self.report {
+            PeerReport::Identified { identity, .. } => Some(&identity.version),
+            PeerReport::Legacy { version, .. } => version.as_deref(),
+        }
+    }
+
+    fn commit(&self) -> Option<&str> {
+        match &self.report {
+            PeerReport::Identified { identity, .. } => Some(&identity.commit_sha),
+            PeerReport::Legacy { commit, .. } => commit.as_deref(),
+        }
+    }
+
+    /// Why this daemon is a development build, when it is one.
+    fn development(&self) -> Option<String> {
+        let reported = match &self.report {
+            PeerReport::Identified {
+                mode: RuntimeMode::Development,
+                ..
+            } => Some("it runs in development mode".to_string()),
+            PeerReport::Identified { identity, .. } => identity
+                .require_managed()
+                .err()
+                .map(|_| "it is not a clean release build".to_string()),
+            PeerReport::Legacy { dirty: true, .. } => {
+                Some("its build has uncommitted source changes".to_string())
+            }
+            PeerReport::Legacy {
+                source_known: Some(false),
+                ..
+            } => Some("its build does not know its source commit".to_string()),
+            PeerReport::Legacy { .. } => None,
+        };
+        reported.or_else(|| match &self.location {
+            PeerLocation::BuildDirectory(why) => Some(why.clone()),
+            _ => None,
+        })
+    }
+}
+
+/// The client deciding whether a running daemon may stay, be attached to or
+/// be replaced: its own release, mode and Kin home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuccessionClient {
+    pub identity: RuntimeIdentity,
+    pub mode: RuntimeMode,
+    /// The Kin home namespace it serves, when it has one to compare.
+    pub namespace: Option<String>,
+}
+
+/// What a client does about a running daemon of a release that is not
+/// exactly its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Succession {
+    /// The daemon runs this client's release: use it.
+    Attach,
+    /// The daemon runs an older release this client supersedes: retire it and
+    /// start this release's.
+    Replace,
+    /// A newer release. An older one never retires it.
+    Newer(String),
+    /// A development build. It is never replaced, only stopped by whoever
+    /// runs it.
+    Development(String),
+    /// This client is not the installed release, a long-running client of a
+    /// release an update replaced. It retires nothing and is told to restart.
+    ClientSuperseded(String),
+    /// Anything else that refuses, as before: a development client meeting a
+    /// managed daemon, another Kin home, an unreadable release.
+    Refuse(String),
+}
+
+impl Succession {
+    /// The sentence a refusal is told in, or `None` for attach and replace.
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Attach | Self::Replace => None,
+            Self::Newer(message)
+            | Self::Development(message)
+            | Self::ClientSuperseded(message)
+            | Self::Refuse(message) => Some(message),
+        }
+    }
+}
+
+/// `Kin 0.8.7 (0123abc)`.
+pub fn release_label(version: &str, commit: &str) -> String {
+    let commit: String = commit.chars().take(7).collect();
+    if commit.is_empty() {
+        format!("Kin {version}")
+    } else {
+        format!("Kin {version} ({commit})")
+    }
+}
+
+fn same_commit(left: &str, right: &str) -> bool {
+    let (left, right) = (left.to_ascii_lowercase(), right.to_ascii_lowercase());
+    left.len().min(right.len()) >= 7 && (left.starts_with(&right) || right.starts_with(&left))
+}
+
+/// Whether `client` attaches to, replaces or leaves the daemon `peer`.
+/// `installed` is the managed pair on disk, when it was read: one Kin per
+/// machine, and the client that is not it retires nothing.
+///
+/// Only an older release is ever replaced. A newer release, a development
+/// build, a daemon whose release cannot be read, another Kin home, and every
+/// daemon a development client meets are left running, and each refusal names
+/// the daemon's pid and executable.
+pub fn succession(
+    client: &SuccessionClient,
+    installed: Option<&RuntimeIdentity>,
+    peer: &PeerRelease,
+) -> Succession {
+    if let PeerReport::Identified {
+        identity,
+        mode,
+        namespace,
+    } = &peer.report
+    {
+        if identity == &client.identity
+            && *mode == client.mode
+            && (client.namespace.is_none() || namespace == &client.namespace)
+        {
+            return Succession::Attach;
+        }
+    }
+    let named = peer.named();
+    if let Some(why) = peer.development() {
+        return Succession::Development(format!(
+            "{named} was left running: {why}, and a development build is never replaced. \
+             Stop it with `kin daemon stop` in its repository"
+        ));
+    }
+    if client.mode != RuntimeMode::Managed {
+        return Succession::Refuse(format!(
+            "{named} runs another Kin, and a development build never replaces a release; \
+             it was left running"
+        ));
+    }
+    if let PeerReport::Identified {
+        namespace: Some(namespace),
+        ..
+    } = &peer.report
+    {
+        if client
+            .namespace
+            .as_ref()
+            .is_some_and(|own| own != namespace)
+        {
+            return Succession::Refuse(format!(
+                "{named} serves another Kin home and was left running"
+            ));
+        }
+    }
+    if let Some(installed) = installed.filter(|installed| **installed != client.identity) {
+        return Succession::ClientSuperseded(format!(
+            "Kin was updated to {}; restart this client, which is {}",
+            release_label(&installed.version, &installed.commit_sha),
+            release_label(&client.identity.version, &client.identity.commit_sha)
+        ));
+    }
+    let Some(version) = peer.version() else {
+        return Succession::Refuse(format!(
+            "{named} does not report which release it runs and was left running"
+        ));
+    };
+    let parse = |version: &str| semver::Version::parse(version.trim().trim_start_matches('v'));
+    let (Ok(peer_version), Ok(client_version)) = (parse(version), parse(&client.identity.version))
+    else {
+        return Succession::Refuse(format!(
+            "{named} reports release {version:?}, which cannot be ordered against this Kin; \
+             it was left running"
+        ));
+    };
+    let client_label = release_label(&client.identity.version, &client.identity.commit_sha);
+    match peer_version.cmp(&client_version) {
+        std::cmp::Ordering::Less => Succession::Replace,
+        std::cmp::Ordering::Greater => Succession::Newer(format!(
+            "{named} runs Kin {peer_version}, newer than {client_label}. An older release never \
+             retires a newer one; run `kin update`"
+        )),
+        std::cmp::Ordering::Equal
+            if peer
+                .commit()
+                .is_some_and(|commit| same_commit(commit, &client.identity.commit_sha)) =>
+        {
+            Succession::Attach
+        }
+        std::cmp::Ordering::Equal if peer.location == PeerLocation::ManagedGeneration => {
+            Succession::Replace
+        }
+        std::cmp::Ordering::Equal => Succession::Refuse(format!(
+            "{named} runs another build of Kin {peer_version}, and two builds of one version \
+             cannot be ordered; it was left running"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -634,5 +888,207 @@ mod tests {
             .validate_for("daemon", &identity, RuntimeMode::Managed, &caller_namespace)
             .unwrap_err()
             .contains("namespace differs"));
+    }
+
+    fn managed_client(version: &str) -> SuccessionClient {
+        SuccessionClient {
+            identity: RuntimeIdentity {
+                version: version.into(),
+                ..clean_identity()
+            },
+            mode: RuntimeMode::Managed,
+            namespace: Some("home-a".into()),
+        }
+    }
+
+    fn identified(version: &str, commit: &str, mode: RuntimeMode, home: &str) -> PeerRelease {
+        PeerRelease {
+            pid: 4242,
+            executable: Some(PathBuf::from("/home/someone/.kin/bin/kin-daemon")),
+            location: PeerLocation::ManagedGeneration,
+            report: PeerReport::Identified {
+                identity: RuntimeIdentity {
+                    version: version.into(),
+                    commit_sha: commit.into(),
+                    ..clean_identity()
+                },
+                mode,
+                namespace: Some(home.into()),
+            },
+        }
+    }
+
+    fn legacy(version: &str, location: PeerLocation) -> PeerRelease {
+        PeerRelease {
+            pid: 4242,
+            executable: Some(PathBuf::from("/opt/homebrew/bin/kin-daemon")),
+            location,
+            report: PeerReport::Legacy {
+                version: Some(version.into()),
+                commit: Some("b".repeat(40)),
+                dirty: false,
+                source_known: Some(true),
+            },
+        }
+    }
+
+    /// Every row of the replacement rule, as the outcome each must reach.
+    #[test]
+    fn succession_follows_the_one_kin_per_machine_rule_row_by_row() {
+        let client = managed_client("0.8.7");
+        let installed = client.identity.clone();
+        let a = "a".repeat(40);
+        let c = "c".repeat(40);
+        let rows: Vec<(
+            &str,
+            SuccessionClient,
+            Option<RuntimeIdentity>,
+            PeerRelease,
+            &str,
+        )> = vec![
+            (
+                "the daemon is this client's release",
+                client.clone(),
+                Some(installed.clone()),
+                identified("0.8.7", &a, RuntimeMode::Managed, "home-a"),
+                "attach",
+            ),
+            (
+                "an older managed daemon of this home",
+                client.clone(),
+                Some(installed.clone()),
+                identified("0.8.6", &c, RuntimeMode::Managed, "home-a"),
+                "replace",
+            ),
+            (
+                "an older clean release from before runtime identity",
+                client.clone(),
+                Some(installed.clone()),
+                legacy("0.8.6", PeerLocation::Installed),
+                "replace",
+            ),
+            (
+                "another build of this version from the managed install",
+                client.clone(),
+                Some(installed.clone()),
+                legacy("0.8.7", PeerLocation::ManagedGeneration),
+                "replace",
+            ),
+            (
+                "another build of this version from somewhere else",
+                client.clone(),
+                Some(installed.clone()),
+                legacy("0.8.7", PeerLocation::Installed),
+                "refuse",
+            ),
+            (
+                "a newer release",
+                client.clone(),
+                Some(installed.clone()),
+                legacy("0.9.0", PeerLocation::Installed),
+                "newer",
+            ),
+            (
+                "a daemon in development mode",
+                client.clone(),
+                Some(installed.clone()),
+                identified("0.8.6", &c, RuntimeMode::Development, "home-a"),
+                "development",
+            ),
+            (
+                "a legacy daemon from a build directory",
+                client.clone(),
+                Some(installed.clone()),
+                legacy(
+                    "0.8.6",
+                    PeerLocation::BuildDirectory("it runs from a cargo target directory".into()),
+                ),
+                "development",
+            ),
+            (
+                "a client of a release an update replaced",
+                managed_client("0.8.6"),
+                Some(installed.clone()),
+                legacy("0.8.5", PeerLocation::Installed),
+                "client superseded",
+            ),
+            (
+                "a development client meeting a managed daemon",
+                SuccessionClient {
+                    mode: RuntimeMode::Development,
+                    ..client.clone()
+                },
+                None,
+                legacy("0.8.6", PeerLocation::Installed),
+                "refuse",
+            ),
+            (
+                "a daemon of another Kin home",
+                client.clone(),
+                Some(installed.clone()),
+                identified("0.8.6", &c, RuntimeMode::Managed, "home-b"),
+                "refuse",
+            ),
+            (
+                "a daemon that does not say its release",
+                client.clone(),
+                None,
+                PeerRelease {
+                    report: PeerReport::Legacy {
+                        version: None,
+                        commit: None,
+                        dirty: false,
+                        source_known: None,
+                    },
+                    ..legacy("0.0.0", PeerLocation::Installed)
+                },
+                "refuse",
+            ),
+        ];
+        for (row, client, installed, peer, expected) in rows {
+            let outcome = succession(&client, installed.as_ref(), &peer);
+            let reached = match &outcome {
+                Succession::Attach => "attach",
+                Succession::Replace => "replace",
+                Succession::Newer(_) => "newer",
+                Succession::Development(_) => "development",
+                Succession::ClientSuperseded(_) => "client superseded",
+                Succession::Refuse(_) => "refuse",
+            };
+            assert_eq!(reached, expected, "{row}: {outcome:?}");
+            if let Some(refusal) = outcome.refusal() {
+                if !matches!(outcome, Succession::ClientSuperseded(_)) {
+                    assert!(
+                        refusal.contains("pid 4242") && refusal.contains("kin-daemon"),
+                        "{row}: a refusal names the daemon's pid and executable: {refusal}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_superseded_client_is_told_which_release_replaced_it() {
+        let client = managed_client("0.8.6");
+        let installed = managed_client("0.8.7").identity;
+        let Succession::ClientSuperseded(message) = succession(
+            &client,
+            Some(&installed),
+            &legacy("0.8.5", PeerLocation::Installed),
+        ) else {
+            panic!("a client that is not the installed release retires nothing");
+        };
+        assert_eq!(
+            message,
+            "Kin was updated to Kin 0.8.7 (aaaaaaa); restart this client, which is Kin 0.8.6 (aaaaaaa)"
+        );
+        let Succession::Newer(newer) = succession(
+            &managed_client("0.8.7"),
+            None,
+            &legacy("0.9.0", PeerLocation::Installed),
+        ) else {
+            panic!("a newer daemon is never retired");
+        };
+        assert!(newer.contains("run `kin update`"), "{newer}");
     }
 }

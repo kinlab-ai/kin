@@ -4048,7 +4048,17 @@ kin setup doctor [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--fix` |  | Apply safe automatic repairs (shell hook, MCP configs, config dirs) |
+| `--remove-other-copies` |  | With `--fix`: also remove every other copy of Kin that has its own uninstall |
 | `--json` |  | Emit the machine-readable health report as JSON |
+
+`--remove-other-copies` runs each copy's own channel: `npm uninstall --global --prefix <prefix>
+<package>` for an npm launcher older than the managed Kin, `cargo uninstall --root <root>
+<package>` for a `cargo install`, `brew uninstall <formula>` for a Homebrew formula, and a plain
+delete for a standalone release file placed by hand. It never removes a development build or
+anything inside the managed Kin home, and it proves each path is gone afterwards. `--fix` alone
+never removes a copy, because `kin update` runs `kin setup doctor --fix` unattended at the end of
+its chain. `kin setup` asks about each copy instead, defaulting to keep it, and a run with no
+terminal only names them.
 
 #### `kin setup clients`
 
@@ -4104,6 +4114,7 @@ kin doctor [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--fix` |  | Apply safe automatic repairs (shell hook, MCP configs, config dirs) |
+| `--remove-other-copies` |  | With `--fix`: also remove every other copy of Kin that has its own uninstall (see `kin setup doctor`) |
 | `--json` |  | Emit the machine-readable health report as JSON |
 | `--drift` |  | Compare an explicit projection observation with graph truth |
 | `--heal` |  | Rematerialize the derived projection from graph truth, DISCARDING uncommitted changes to tracked files that diverge from it |

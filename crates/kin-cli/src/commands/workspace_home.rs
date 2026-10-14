@@ -2429,14 +2429,21 @@ struct Observed {
 }
 
 /// The daemon already serving `layout`, when its recorded endpoint answers
-/// and proves it is that repository's. Reads recorded endpoint metadata and
-/// verifies health without discovery, cleanup, startup or process control.
+/// and proves it is that repository's and this release's. Reads recorded
+/// endpoint metadata and verifies health without discovery, cleanup, startup
+/// or process control, except to replace a daemon of an older release, which
+/// the page never reads through.
 async fn running_daemon(layout: &kin_core::KinLayout) -> Option<DaemonClient> {
     let (pid, port) = crate::daemon_client::repo_daemon_recorded_endpoint(layout.root());
     let port = pid.and(port).filter(|port| *port != 0)?;
-    DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), layout)
-        .await
-        .ok()
+    DaemonClient::for_workspace_page(
+        "local UI",
+        format!("http://127.0.0.1:{port}"),
+        layout,
+        Duration::from_secs(10),
+    )
+    .await
+    .ok()
 }
 
 /// Who the daemon lists as connected, by the names a reader knows them by.

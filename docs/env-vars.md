@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (615 total, 398 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (616 total, 398 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -72,6 +72,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_CI_LANGUAGE_SERVERS_INSTALLED` | enum | *(unset)* | diagnostic | dev/test tooling: `1` once scripts/ci-install-language-servers.sh has installed and proved the language servers, so the kin-daemon reference-enrichment tests require them instead of skipping; Kin itself does not read it |
+| `KIN_DEV_TARGET_ROOT` | path | *(unset)* | diagnostic | dev/test tooling: root directory holding cargo target trees outside the checkout; daemon succession treats an executable under it as a development build and leaves it running |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
 | `KIN_EPHEMERAL_RUNNER` | string | *(unset)* | diagnostic | dev/test tooling: `true` when a CI job runs on a runner that lasts one job, so the CI target scripts restore a cached build target instead of keeping one; Kin itself does not read it |
 | `KIN_LANGUAGE_SERVER_ASSET_BASE` | url | GitHub Releases | operational | base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture |

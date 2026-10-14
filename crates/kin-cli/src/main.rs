@@ -1905,6 +1905,19 @@ enum Command {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// With --fix: also remove every other copy of Kin that has its own
+        /// uninstall
+        ///
+        /// Runs each copy's own channel (npm, cargo, Homebrew), or deletes a
+        /// standalone release file. Never removes a development build or
+        /// anything in the managed Kin home. `--fix` alone never removes a
+        /// copy, because `kin update` runs it unattended.
+        #[arg(
+            long = "remove-other-copies",
+            requires = "fix",
+            default_value_t = false
+        )]
+        remove_other_copies: bool,
         /// Install the missing language servers this repository's languages need
         ///
         /// Only for the languages the repository uses. An install can write
@@ -3373,6 +3386,19 @@ enum SetupAction {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// With --fix: also remove every other copy of Kin that has its own
+        /// uninstall
+        ///
+        /// Runs each copy's own channel (npm, cargo, Homebrew), or deletes a
+        /// standalone release file. Never removes a development build or
+        /// anything in the managed Kin home. `--fix` alone never removes a
+        /// copy, because `kin update` runs it unattended.
+        #[arg(
+            long = "remove-other-copies",
+            requires = "fix",
+            default_value_t = false
+        )]
+        remove_other_copies: bool,
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -5852,6 +5878,7 @@ fn run() -> Result<()> {
                 },
                 Command::Doctor {
                     fix,
+                    remove_other_copies,
                     install_language_servers,
                     json,
                     verbose,
@@ -5883,8 +5910,14 @@ fn run() -> Result<()> {
                         // for.
                         commands::health::reclaim_stranded_stages(json)
                     } else {
-                        commands::setup::doctor_with(fix, install_language_servers, json, verbose)
-                            .await
+                        commands::setup::doctor_with(
+                            fix,
+                            install_language_servers,
+                            json,
+                            verbose,
+                            remove_other_copies,
+                        )
+                        .await
                     }
                 }
                 Command::Vfs { action } => match action {
@@ -5974,8 +6007,19 @@ fn run() -> Result<()> {
                         Some(SetupAction::Status { json, verbose }) => {
                             commands::setup::status(json, verbose).await
                         }
-                        Some(SetupAction::Doctor { fix, json }) => {
-                            commands::setup::doctor(fix, install_language_servers, json).await
+                        Some(SetupAction::Doctor {
+                            fix,
+                            remove_other_copies,
+                            json,
+                        }) => {
+                            commands::setup::doctor_with(
+                                fix,
+                                install_language_servers,
+                                json,
+                                false,
+                                remove_other_copies,
+                            )
+                            .await
                         }
                         Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
                         Some(SetupAction::Uninstall {
