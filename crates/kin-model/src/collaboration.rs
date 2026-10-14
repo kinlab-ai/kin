@@ -279,6 +279,29 @@ impl CollaborationDelta {
 /// entries under one key are ambiguous on arrival whatever their values are,
 /// and ordering by the whole entry would admit that pair as strictly
 /// increasing.
+/// Keyed entries in the one order a delta admits: strictly increasing by the
+/// canonical encoding of their key, which is the order [`CollaborationDelta::validate`]
+/// holds every keyed collection to. Of two entries under one key, the later
+/// is kept.
+pub fn in_canonical_key_order<K: Serialize, V>(
+    entries: Vec<Keyed<K, V>>,
+) -> Result<Vec<Keyed<K, V>>> {
+    let mut encoded = Vec::with_capacity(entries.len());
+    for entry in entries {
+        encoded.push((canonical_json_bytes(&entry.key)?, entry));
+    }
+    // Stable, so of two entries under one key the later stays the later.
+    encoded.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut ordered: Vec<(Vec<u8>, Keyed<K, V>)> = Vec::with_capacity(encoded.len());
+    for (key, entry) in encoded {
+        match ordered.last_mut() {
+            Some((previous, kept)) if *previous == key => *kept = entry,
+            _ => ordered.push((key, entry)),
+        }
+    }
+    Ok(ordered.into_iter().map(|(_, entry)| entry).collect())
+}
+
 fn keyed_order<K: Serialize, V>(collection: &str, entries: &[Keyed<K, V>]) -> Result<()> {
     let mut previous: Option<Vec<u8>> = None;
     for entry in entries {
@@ -384,6 +407,7 @@ pub(crate) mod tests {
             authored_by: who(),
             created_at: at(),
             staleness: StalenessState::Fresh,
+            review: None,
         }
     }
 
@@ -485,6 +509,8 @@ pub(crate) mod tests {
                     duration_ms: None,
                     evidence_blob: None,
                     exit_code: None,
+                    ran_against: Vec::new(),
+                    proof: None,
                 },
             )],
             mock_hints: vec![MockHint {
@@ -512,6 +538,7 @@ pub(crate) mod tests {
                     kind: ActorKind::Human,
                     display_name: "actor".to_string(),
                     external_refs: Vec::new(),
+                    agent_session: None,
                 },
             )],
             delegations: vec![Delegation {

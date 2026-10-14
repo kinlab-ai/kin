@@ -30,7 +30,8 @@ pub use change_shape::{
 pub use contract::{signature_changed, tokens_unchanged, ConsumerReach, ContractChange};
 pub use diff::{
     compute_diff, diff_from_change, diff_from_changes, diff_from_entity_ids, diff_from_files,
-    is_semantic_modification, EntityChange, EntityChangeKind, SemanticDiff,
+    documentation_agrees, is_documentation_reread, is_semantic_modification, EntityChange,
+    EntityChangeKind, SemanticDiff,
 };
 pub use error::ReviewError;
 pub use format::{
@@ -47,10 +48,11 @@ pub use inline::{
 };
 pub use override_callers::{OverrideCall, OverrideCaller, OverrideCallers};
 pub use ranked_impact::{
-    inbound_impact_relations, is_impact_relation, rank_impact, rank_impact_at, CandidateLocation,
-    ImpactBucket, PriorityScoreComponents, RankedImpactCandidate, RankedImpactReport,
-    RelationPathStep, StableEntityIdentity, IMPACT_MAX_DEPTH, PRIORITY_SCORE_FORMULA,
-    RANKED_IMPACT_SCHEMA_VERSION,
+    inbound_impact_relation_refs, inbound_impact_relations, is_call_route, is_impact_relation,
+    is_test_unit, rank_impact, rank_impact_at, test_reach_order, test_unit_holding,
+    CandidateLocation, ImpactBucket, PriorityScoreComponents, RankedImpactCandidate,
+    RankedImpactReport, RelationPathStep, StableEntityIdentity, TestReach, IMPACT_MAX_DEPTH,
+    PRIORITY_SCORE_FORMULA, RANKED_IMPACT_SCHEMA_VERSION,
 };
 pub use ref_graph::GraphAtRef;
 pub use release_gate::{

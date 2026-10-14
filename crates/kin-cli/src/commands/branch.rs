@@ -123,6 +123,12 @@ impl BranchRequest {
 pub struct BranchListEntry {
     pub name: RefName,
     pub target: RefTarget,
+    /// The semantic change `target` resolves to. A branch imported from Git
+    /// targets its Git commit, which resolves through the commit's alias; a
+    /// native branch targets its change directly. Absent when the authority
+    /// cannot resolve the target to an admitted change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<SemanticChangeId>,
     pub active: bool,
     pub default: bool,
 }

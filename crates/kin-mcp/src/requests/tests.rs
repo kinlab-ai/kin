@@ -982,7 +982,9 @@ fn only_values_copied_from_a_reply_drop_their_bound_from_the_agent_listing() {
                 // Only a handle or a returned UUID: a value a caller writes
                 // keeps its bound wherever it is served.
                 assert!(
-                    field.name == "cursor" || field.doc.contains("UUID"),
+                    field.name == "cursor"
+                        || field.name.ends_with("_cursor")
+                        || field.doc.contains("UUID"),
                     "{tool}.{} is marked as copied from a reply and is neither a cursor nor \
                      a returned UUID",
                     field.name
@@ -993,8 +995,9 @@ fn only_values_copied_from_a_reply_drop_their_bound_from_the_agent_listing() {
             }
         }
     }
-    // impact, refs, status and trace cursors, and the refs receiver UUID.
-    assert_eq!(copied, 5, "the sweep did not reach the copied values");
+    // impact, refs, status and trace cursors, status's review-flags cursor,
+    // and the refs receiver UUID.
+    assert_eq!(copied, 6, "the sweep did not reach the copied values");
 }
 
 /// `trace`'s `scope` says what to pass where an agent fills it in: a dotted

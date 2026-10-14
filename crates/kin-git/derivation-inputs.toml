@@ -13,6 +13,8 @@ files = [
     "src/authority.rs",
     "src/lib.rs",
     "src/lossless.rs",
+    # Chooses the fetched ref and complete ancestor closure fed into exact semantic admission.
+    "src/lossless/capture_ref.rs",
     "src/preflight.rs",
     "src/semantic_import.rs",
 ]

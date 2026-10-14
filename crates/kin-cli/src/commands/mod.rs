@@ -4,6 +4,7 @@
 pub mod absence_qualifier;
 pub mod admit;
 pub mod agent;
+pub mod agent_edits;
 pub mod agents;
 pub mod allow;
 pub mod approvals;
@@ -39,6 +40,7 @@ pub mod diff;
 pub mod drift;
 pub mod eject;
 pub mod embed;
+pub mod entity_work;
 pub mod external_symbols;
 pub mod git;
 pub mod graph;
@@ -92,6 +94,7 @@ pub mod repository_authority;
 pub mod resolve;
 pub mod resources;
 pub mod review;
+pub mod review_flags;
 pub mod review_guide;
 pub mod review_ui;
 pub mod rollback;
@@ -131,10 +134,14 @@ pub mod work;
 mod workspace_agents;
 mod workspace_conflicts;
 mod workspace_explore;
+mod workspace_flags;
+mod workspace_git_remote;
 mod workspace_graph;
 mod workspace_home;
+mod workspace_remotes;
 pub mod workspace_tip;
 pub mod workspace_ui;
+mod workspace_verify;
 pub mod write_back;
 pub mod xref;
 
@@ -188,6 +195,9 @@ pub(crate) fn require_repository_layout_at(
     start: &std::path::Path,
 ) -> anyhow::Result<kin_core::KinLayout> {
     if let Some(layout) = kin_core::KinLayout::discover(start) {
+        // Before anything reads the store: a history attach a crash
+        // interrupted leaves it without the records every command opens with.
+        history_derive::finish_interrupted_attach(&layout);
         return Ok(layout);
     }
     use kin_core::layout::{StoreMiss, StoreStanding};

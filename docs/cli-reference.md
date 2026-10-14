@@ -70,7 +70,12 @@ kin init [path] [options]
   `refs`, `context`, `impact` and `trace` answer as soon as it is published, and derives the full
   history afterwards in a worker at background priority with a quarter of the machine's threads
   and a third of its memory ceiling. The derivation is staged beside the repository and replaces
-  the store the next time no daemon is serving it; a daemon that restarts resumes it.
+  the store when no daemon is serving it. A daemon that is serving finds the staged history
+  within seconds and switches at its first quiet point: when no request is being answered and
+  the store holds no open work (a merge, a stash, an agent's transaction, an unapplied entity
+  draft or a release being recorded), it stops, and the daemon that takes its place attaches the
+  history as it starts. Until then `kin status` says what the switch is waiting for. A daemon
+  that restarts resumes a derivation that was still running.
 - `none` admits the checked-out commit only and never derives history, for CI jobs, containers
   and agent sandboxes. It also admits a shallow clone.
 - `full` admits the whole reachable history before the store is published, as `kin init` always
@@ -270,6 +275,8 @@ The commit lands in Kin's own authority, not in Git. Nothing is written to `.git
 
 `kin commit --amend` replaces the current change with the full working state and keeps that change's parents. The message is kept unless `-m` supplies a new one. The replaced change stays immutable in history with its author, and the amend is recorded as the caller's operation. An amend is refused while a merge is open and when the selected head moved since it was read. A detached workspace amends only its own workspace and moves no ref. A plain `kin commit` with nothing to record still refuses as before.
 
+`kin commit --entity <id>` records only the named entities' uncommitted changes and leaves every other change uncommitted. Repeat the flag to choose more entities. The ids are the ones a review guide of uncommitted work gives each step, and an unparsed entity is chosen by its own id and recorded whole. The working copy is not written: the change holds the last commit plus the chosen work, and everything else is still uncommitted afterwards, exactly as it was. Text no entity holds, such as an import between declarations, is recorded once every changed entity around it is chosen. Kin records nothing and says why in one sentence when a chosen entity's change shares lines with one that was not chosen, when recording it alone would leave code that does not parse, when it sits beside an unchosen entity in content no commit holds yet, or when the entity has no uncommitted change of its own.
+
 A commit records its author, so with no author configured it refuses and exits 10. The first line names what is missing, such as `Git has no user.name and no user.email`, and the lines after it give the `git config` commands that set them and the Kin-only alternative. Every command that records an author refuses the same way with the same status. Measuring the working copy never needs one: `kin status`, `kin diff`, `kin admit` and the review guide work with no Git identity configured.
 
 ```
@@ -281,6 +288,7 @@ kin commit [options]
 | `-m, --message <message>` |  | Commit message; amend preserves the existing message when omitted |
 | `--amend` |  | Replace the current change with the full working state, preserving its parents |
 | `-q, --quiet` |  | Suppress progress output (only print final summary) |
+| `--entity <entity-id>` |  | Commit only this entity's uncommitted change, leaving every other change uncommitted (repeat for more entities). Conflicts with `--amend`. |
 
 ### `kin log`
 
@@ -1102,6 +1110,8 @@ nothing pending. Language-server enrichment derived for the previous state is re
 
 Restore an exact path or subtree from immutable repository-v6 history
 
+`kin checkout --entity <id>` restores one entity instead of a path. Its source goes back to what it was at the head, or at `--change`, as an uncommitted edit, and nothing else in the working copy moves. An entity removed since then comes back, and one added since then is removed. `--expected source:<body_hash>` takes the exact entity span hash a review guide reports in `after.body_hash`, and refuses if that source changed after it was read, including comments and formatting. `--expected absent` guards the restoration of a removed entity. A restore replaces the entity's whole source, so a semantic fingerprint such as `behavior` or `ast` is refused even while it matches: it stays the same when a comment or spacing changes, so it cannot show that nothing was written after the read. An unparsed entity is restored whole, and its fingerprint is its content address.
+
 ```
 kin checkout [path] [options]
 ```
@@ -1114,6 +1124,8 @@ kin checkout [path] [options]
 | --- | --- | --- |
 | `--path-hex <path-hex>` |  | Byte-exact repository path as canonical lowercase hexadecimal. Conflicts with `[path]`. |
 | `--change <change>` |  | Change ID (defaults to current branch head) |
+| `--entity <entity-id>` |  | Restore one entity's source, as an uncommitted edit, instead of a path. Conflicts with `[path]` and `--path-hex`. |
+| `--expected <fingerprint>` |  | Refuse unless the entity's source is exactly as last read: `source:<body_hash>` from a review, or `absent`. Requires `--entity`. |
 
 ### `kin merge`
 
@@ -1688,6 +1700,34 @@ recorded consumers outside the change it covers. The summary counts each
 recorded consumer once, under the most any change it reaches asks of it, in
 `consumers_not_updated`, `consumers_may_need_review` and
 `consumers_need_no_update`, which add up to `recorded_consumers`.
+
+A step an agent wrote carries `authored_by`, one entry per agent session,
+newest first: `name` (such as `Codex` or `Claude Code`), `session`, `at` and
+`through`. The summary's `authors` lists those sessions with how many steps
+each wrote. A step nobody is named on was changed by a person, or by a tool
+that told Kin nothing.
+
+`through` is `kin` for a write the agent made through Kin. It names only the
+entity the agent's own operation named or created, so an edit that came along
+in the same change, or an entity whose place only moved, carries none. A write
+through Kin is recorded as a change the moment it lands, so it appears on a
+change or a range guide and never on uncommitted work.
+
+`through` is `client` for an edit the agent made with its client's own edit
+tools, which is how most agents edit. The client runs Kin's paired edit hooks before and after
+each edit. They carry the same tool operation id, and the hooks tell the repository's daemon which session made the edit
+and what it replaced. The daemon names the agent on the entities whose
+content that edit changed. It does so only when the reported edit, applied to
+what the entity's source held before, gives exactly what it holds after: an
+edit that reached Kin together with someone else's change, or that a formatter
+rewrote first, names nobody. `session` is then the client's own session, and
+`kin_session` is the Kin session the same agent was connected through when
+exactly one session of that client was connected. Such an edit appears on
+uncommitted work until a change records it, and on that change and the ranges
+that hold it afterwards.
+
+The daemon keeps both records in the store, so they survive a restart: the
+newest 512 writes through Kin and the newest 2048 edits clients reported.
 
 #### `kin review open`
 
@@ -3934,7 +3974,7 @@ kin setup [<subcommand>] [options]
 | `--auto-daemon` |  | Start the Kin daemon on its own when you enter a Kin repository |
 | `--no-interactive` |  | Ask nothing: use the defaults and any flags given |
 | `--skip-mcp-check` |  | Skip the test call that proves each connected AI client can reach Kin (for a scripted install outside a repository) |
-| `--clients <id,...>` |  | Connect only these AI clients, by the ids `kin setup clients` lists, leaving every other client as it is. An empty list (`--clients ""`) runs the rest of setup and connects none |
+| `--clients <id,...>` |  | Connect only these AI clients, by the ids `kin setup clients` lists, leaving every other client as it is. An empty list (`--clients ""`) runs the rest of setup and connects none. Connecting Claude Code also writes Kin's edit hook into its user settings, beside the hooks already there: paired `PreToolUse` and `PostToolUse` groups around `Edit`, `Write` and `MultiEdit`, so a review can name Claude Code on the entities it edited. `kin setup uninstall` removes it with the rest |
 | `--shell-only` |  | Add kin to your shell and nothing else: only setup's shell step (the shell hook, and the line that puts Kin's bin directory on PATH). It asks nothing, connects no AI client, and leaves the daemon, the prompt hook and language servers as they are. Exits 1 when the profile cannot be written |
 | `--json` |  | With `--shell-only`: print the result as one JSON object, `kin.setup-shell.v1` |
 | `--install-language-servers` |  | Install missing language servers without asking: inside a repository, only the servers its languages need; outside one, the servers for the languages Kin supports. An install can write outside Kin's directory, and the run says so before it does, so an interactive run asks first and a scripted one needs this flag |

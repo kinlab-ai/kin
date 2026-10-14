@@ -106,6 +106,33 @@ pub fn acquire_repository_runtime_authority_within(
     })
 }
 
+/// Whether some process holds the repository's runtime authority right now,
+/// without taking it.
+///
+/// A store with no `daemon.lock` has never had a holder. The probe takes the
+/// lock and gives it back at once when it is free, and writes nothing, so the
+/// owner stamp of a holder that comes next is the holder's own; a starter that
+/// meets the probe in that instant retries, as it retries any contention.
+pub fn repository_runtime_authority_is_held(kin_root: &Path) -> std::io::Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(kin_root.join("daemon.lock"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&file)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 fn try_acquire_repository_runtime_authority(
     kin_root: &Path,
     deadline: Instant,
@@ -200,6 +227,34 @@ mod tests {
     /// that while its tolerance stays far below the interval a defect would
     /// hold for. Several retry intervals is the width that answers both.
     const REACQUIRE_BUDGET: Duration = Duration::from_millis(1_000);
+
+    #[test]
+    fn a_probe_sees_a_holder_and_never_takes_the_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        assert!(!repository_runtime_authority_is_held(&root).unwrap());
+        assert!(
+            !root.join("daemon.lock").exists(),
+            "a probe created the lock"
+        );
+
+        let held = acquire_repository_runtime_authority(&root, "owner-a")
+            .unwrap()
+            .expect("the first holder acquires");
+        assert!(repository_runtime_authority_is_held(&root).unwrap());
+        drop(held);
+        assert!(!repository_runtime_authority_is_held(&root).unwrap());
+        // The probe left the lock free and unstamped for the next holder.
+        let next = acquire_repository_runtime_authority_within(&root, REACQUIRE_BUDGET, "owner-b")
+            .unwrap()
+            .expect("the authority is free after a probe");
+        let mut owner_stamp = String::new();
+        let mut reader = &next.file;
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_string(&mut owner_stamp).unwrap();
+        assert_eq!(owner_stamp, "owner-b");
+    }
 
     #[test]
     fn authority_is_canonical_exclusive_and_never_unlinks_its_inode() {

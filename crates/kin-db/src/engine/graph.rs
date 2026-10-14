@@ -1211,6 +1211,116 @@ fn verification_relation_id(kind: RelationKind, src: GraphNodeId, dst: GraphNode
     ))
 }
 
+/// Whether `relation` is part of the semantic workspace: both of its ends are
+/// nodes a semantic observation carries. The remaining links belong to
+/// verification and work records.
+pub fn is_semantic_relation(relation: &Relation) -> bool {
+    fn semantic(node: GraphNodeId) -> bool {
+        match node {
+            GraphNodeId::Entity(_)
+            | GraphNodeId::Artifact(_)
+            | GraphNodeId::ExternalReference(_) => true,
+            GraphNodeId::Test(_)
+            | GraphNodeId::Contract(_)
+            | GraphNodeId::Work(_)
+            | GraphNodeId::VerificationRun(_) => false,
+        }
+    }
+    semantic(relation.src) && semantic(relation.dst)
+}
+
+/// The record links a transaction retires with the entities it removes.
+///
+/// A link from a verification or work record, such as a run's proof of an
+/// entity or a test case's coverage of one, is that record projected onto the
+/// entities the graph holds. The record owns it, not the source: a semantic
+/// transition never carries it ([`is_semantic_relation`]), and a workspace
+/// materialization projects it only onto targets that are present
+/// ([`InMemoryGraph::restore_verification_proof_relations`]). So when a
+/// transaction removes an entity, every record link naming that entity leaves
+/// with it, and the record itself keeps its history. Without this, an edit that
+/// deleted an entity a recorded test run had proved was refused as a stranded
+/// endpoint, because the delta that removed the entity could not name a link it
+/// is not allowed to carry.
+///
+/// Only record links are retired here. A semantic relation left naming a
+/// removed entity is still the planner's to collect, and the gate still refuses
+/// it. A link the delta already names is left to the delta.
+fn record_links_retired_with(
+    ent: &EntityData,
+    delta: &TransactionDelta,
+    prospective_entity_ids: &HashSet<EntityId>,
+) -> Vec<RelationDelta> {
+    let departing: Vec<GraphNodeId> = delta
+        .entity_deltas
+        .iter()
+        .filter_map(|entity_delta| match entity_delta {
+            EntityDelta::Removed { old } if !prospective_entity_ids.contains(&old.id) => {
+                Some(GraphNodeId::Entity(old.id))
+            }
+            _ => None,
+        })
+        .collect();
+    if departing.is_empty() {
+        return Vec::new();
+    }
+    let named: HashSet<RelationId> = delta
+        .relation_deltas
+        .iter()
+        .map(|relation_delta| match relation_delta {
+            RelationDelta::Added { new } => new.id,
+            RelationDelta::Modified { old, .. } | RelationDelta::Removed { old } => old.id,
+        })
+        .collect();
+    let mut retired: Vec<Relation> = Vec::new();
+    let mut seen: HashSet<RelationId> = HashSet::new();
+    for node in &departing {
+        let held = ent
+            .node_incoming
+            .get(node)
+            .into_iter()
+            .chain(ent.node_outgoing.get(node))
+            .flatten();
+        for relation_id in held {
+            let Some(relation) = ent.relations.get(relation_id) else {
+                continue;
+            };
+            if is_semantic_relation(relation)
+                || named.contains(&relation.id)
+                || !seen.insert(relation.id)
+            {
+                continue;
+            }
+            retired.push(relation.clone());
+        }
+    }
+    retired.sort_unstable_by_key(|relation| relation.id.0);
+    retired
+        .into_iter()
+        .map(|old| RelationDelta::Removed { old })
+        .collect()
+}
+
+/// Whether two graphs hold the same semantic relations, by value.
+fn semantic_relations_match(left: &EntityData, right: &EntityData) -> bool {
+    let mut compared = 0usize;
+    for (id, relation) in left.relations.iter() {
+        if !is_semantic_relation(relation) {
+            continue;
+        }
+        compared += 1;
+        if right.relations.get(id) != Some(relation) {
+            return false;
+        }
+    }
+    compared
+        == right
+            .relations
+            .values()
+            .filter(|relation| is_semantic_relation(relation))
+            .count()
+}
+
 fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> Relation {
     Relation {
         id: verification_relation_id(kind, src, dst),
@@ -2304,6 +2414,23 @@ fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency
 struct PendingMerkle {
     dirty: bool,
     seeds: HashSet<EntityId>,
+    /// The cache holds nothing yet and the next flush builds it whole.
+    ///
+    /// A graph restored from a snapshot starts here rather than hashing every
+    /// entity as it is built. Most restored graphs are scratch graphs that an
+    /// admission, a publication or a review builds, applies one delta to,
+    /// compares and drops, and none of them ever reads its root.
+    rebuild: bool,
+}
+
+impl PendingMerkle {
+    fn rebuild_on_first_read() -> Self {
+        Self {
+            dirty: true,
+            seeds: HashSet::new(),
+            rebuild: true,
+        }
+    }
 }
 
 /// Write access to [`EntityData`] that records the mutation in the graph's
@@ -2950,13 +3077,7 @@ impl InMemoryGraph {
         snapshot: &GraphSnapshot,
         admitted: Option<&crate::storage::change_validation::AdmittedChangeMap<'_>>,
     ) -> Result<(), KinDbError> {
-        match admitted {
-            Some(admitted) => snapshot.validate_authority_free_storage_admission_carrying(
-                crate::storage::repository::GitProjectionTreeReplay::Required,
-                admitted,
-            )?,
-            None => snapshot.validate_authority_free_storage_admission()?,
-        }
+        Self::prove_authority_free_snapshot_admission(snapshot, admitted)?;
         if snapshot.entity_revisions.is_empty() && !snapshot.changes.is_empty() {
             let _span = tracing::info_span!(
                 "kindb.graph.validate_history",
@@ -2972,6 +3093,27 @@ impl InMemoryGraph {
             )?;
         }
         Ok(())
+    }
+
+    /// The first of the two steps [`prove_authority_free_snapshot_decode`]
+    /// runs: storage admission over the authority-free payload, without the
+    /// revision derivation across the whole history.
+    ///
+    /// For a caller that replays the part of the history it has not already
+    /// proven on its own, and only that part.
+    ///
+    /// [`prove_authority_free_snapshot_decode`]: Self::prove_authority_free_snapshot_decode
+    pub(crate) fn prove_authority_free_snapshot_admission(
+        snapshot: &GraphSnapshot,
+        admitted: Option<&crate::storage::change_validation::AdmittedChangeMap<'_>>,
+    ) -> Result<(), KinDbError> {
+        match admitted {
+            Some(admitted) => snapshot.validate_authority_free_storage_admission_carrying(
+                crate::storage::repository::GitProjectionTreeReplay::Required,
+                admitted,
+            ),
+            None => snapshot.validate_authority_free_storage_admission(),
+        }
     }
 
     /// Restore a graph from a snapshot without constructing any text index.
@@ -3059,6 +3201,44 @@ impl InMemoryGraph {
         Self::from_locate_snapshot_inner(snapshot, text_index_path, expected_root_hash, true)
     }
 
+    /// Restore the links of durable verification targets in a workspace
+    /// projection. A target absent from this workspace keeps its historical
+    /// record without introducing a relation to a missing node.
+    pub(crate) fn restore_verification_proof_relations(snapshot: &mut GraphSnapshot) {
+        for run in snapshot.verification_runs.values() {
+            let Some(proof) = &run.proof else {
+                continue;
+            };
+            for target in &proof.entities {
+                if !snapshot.entities.contains_key(target) {
+                    continue;
+                }
+                let relation = verification_relation(
+                    RelationKind::DerivedFrom,
+                    GraphNodeId::VerificationRun(run.run_id),
+                    GraphNodeId::Entity(*target),
+                );
+                let incoming = snapshot.incoming.entry(*target).or_default();
+                if !incoming.contains(&relation.id) {
+                    incoming.push(relation.id);
+                    incoming.sort_unstable_by_key(|id| id.0);
+                }
+                snapshot.relations.insert(relation.id, relation);
+            }
+            for target in &proof.work_items {
+                if !snapshot.work_items.contains_key(target) {
+                    continue;
+                }
+                let relation = verification_relation(
+                    RelationKind::DerivedFrom,
+                    GraphNodeId::VerificationRun(run.run_id),
+                    GraphNodeId::Work(*target),
+                );
+                snapshot.relations.insert(relation.id, relation);
+            }
+        }
+    }
+
     /// Restore a graph from a snapshot.
     ///
     /// This takes no expected graph root hash. It used to, and the value was
@@ -3088,7 +3268,7 @@ impl InMemoryGraph {
     /// caller has already completed. Private: the two callers above are the
     /// only entry points, and each validates before reaching here.
     fn from_snapshot_inner_admitted(
-        snapshot: GraphSnapshot,
+        mut snapshot: GraphSnapshot,
         text_index_path: Option<PathBuf>,
         read_only: bool,
         skip_text_index: bool,
@@ -3096,7 +3276,16 @@ impl InMemoryGraph {
         if let Some(proof) = &snapshot.verified_binding_history {
             proof.validate_selected(&snapshot)?;
         }
-        let retrieval_authority_hash = compute_retrieval_authority_hash(&snapshot);
+        Self::restore_verification_proof_relations(&mut snapshot);
+        // The retrieval authority hash decides one thing here, whether a text
+        // index is current, and it costs a whole-graph Merkle root pass plus a
+        // digest of every retrieval domain. A graph built without a text index
+        // has nothing for it to decide. Those are the scratch graphs an edit's
+        // admission and publication build and drop, several per edit, and
+        // computing it for each was the largest single cost of admitting a
+        // one-function edit.
+        let retrieval_authority_hash =
+            (!skip_text_index).then(|| compute_retrieval_authority_hash(&snapshot));
         let GraphSnapshot {
             verified_binding_history,
             version: _,
@@ -3219,8 +3408,8 @@ impl InMemoryGraph {
         let text_index_current = text_index
             .as_ref()
             .and_then(TextIndex::graph_root_hash)
-            .map(|hash| hash == retrieval_authority_hash)
-            .unwrap_or(false);
+            .zip(retrieval_authority_hash)
+            .is_some_and(|(indexed, current)| indexed == current);
         let text_index_entity_coverage_current = if text_index_current {
             text_index
                 .as_ref()
@@ -3315,7 +3504,9 @@ impl InMemoryGraph {
             structured_artifacts,
             opaque_artifacts,
         };
-        let merkle = MerkleCache::from_source(&entity_data);
+        // Built by the first read of the root, not here; see
+        // `PendingMerkle::rebuild`.
+        let merkle = MerkleCache::new();
 
         let graph = Self {
             entities: RwLock::new(entity_data),
@@ -3358,7 +3549,7 @@ impl InMemoryGraph {
             }),
             text_index,
             merkle: parking_lot::RwLock::new(merkle),
-            merkle_pending: parking_lot::Mutex::new(PendingMerkle::default()),
+            merkle_pending: parking_lot::Mutex::new(PendingMerkle::rebuild_on_first_read()),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -3393,8 +3584,10 @@ impl InMemoryGraph {
             fail_next_text_rebuild: AtomicBool::new(false),
         };
 
-        if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
-            graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
+        if let Some(retrieval_authority_hash) = retrieval_authority_hash {
+            if !text_index_current || !text_index_entity_coverage_current {
+                graph.try_rebuild_text_index_from_graph(&graph, retrieval_authority_hash)?;
+            }
         }
 
         Ok(graph)
@@ -3750,15 +3943,22 @@ impl InMemoryGraph {
     /// `self.entities` (read or write) so the graph cannot mutate mid-refresh.
     /// `ent` is that already-held guard, passed in to avoid re-locking.
     fn flush_merkle(&self, ent: &EntityData) {
-        let seeds = {
-            let mut pending = self.merkle_pending.lock();
-            if !pending.dirty {
-                return;
-            }
-            pending.dirty = false;
-            std::mem::take(&mut pending.seeds)
-        };
-        self.merkle.write().refresh_affected(ent, seeds);
+        // The pending record is held until the cache is reconciled, so a
+        // concurrent reader that finds nothing pending reads a root this flush
+        // has already brought current. A graph whose cache was never built
+        // would otherwise hand that reader the empty graph's root.
+        let mut pending = self.merkle_pending.lock();
+        if !pending.dirty {
+            return;
+        }
+        let seeds = std::mem::take(&mut pending.seeds);
+        if std::mem::take(&mut pending.rebuild) {
+            self.merkle.write().rebuild_from_source(ent);
+        } else {
+            self.merkle.write().refresh_affected(ent, seeds);
+        }
+        pending.dirty = false;
+        drop(pending);
         #[cfg(test)]
         self.merkle_flush_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4760,6 +4960,11 @@ impl InMemoryGraph {
     /// Comparing a graph with itself short-circuits rather than taking the same
     /// lock twice, since a second read acquisition behind a waiting writer is a
     /// deadlock rather than a re-entrant read.
+    ///
+    /// The relations compared are the semantic ones, the ones
+    /// [`Self::semantic_observation`] carries. A relation from a test case, a
+    /// verification run, a work item or a contract is that record's, and two
+    /// graphs that differ only in those agree on the workspace.
     pub fn semantic_workspace_matches(&self, other: &InMemoryGraph) -> bool {
         if std::ptr::eq(self, other) {
             return true;
@@ -4767,12 +4972,21 @@ impl InMemoryGraph {
         let left = self.entities.read();
         let right = other.entities.read();
         left.entities == right.entities
-            && left.relations == right.relations
+            && semantic_relations_match(&left, &right)
             && left.resolved_tree == right.resolved_tree
     }
 
     /// Coherent current semantic observation only. No history, facets, work,
     /// sessions, or vector/text indexes are copied at an admission boundary.
+    ///
+    /// Its relations are the ones between the nodes it carries: entities,
+    /// artifacts and symbols outside the repository. The relation store also
+    /// holds the links of verification and work records, from a test case to
+    /// what it covers and from a verification run to what it proves. Those
+    /// records are not copied here, so their relations are not either. Copied
+    /// without them, each one named an end the observation did not hold, and
+    /// a graph staged from the observation refused it, which stopped every
+    /// working-copy admission after the first recorded run.
     pub fn semantic_observation(&self) -> GraphSnapshot {
         let ent = self.entities.read();
         Self::semantic_observation_from_entities(&ent)
@@ -4788,6 +5002,7 @@ impl InMemoryGraph {
         snapshot.relations = ent
             .relations
             .iter()
+            .filter(|(_, relation)| is_semantic_relation(relation))
             .map(|(id, value)| (*id, value.clone()))
             .collect();
         snapshot.external_references = ent
@@ -4963,6 +5178,7 @@ impl InMemoryGraph {
             relations: ent
                 .relations
                 .iter()
+                .filter(|(_, relation)| is_semantic_relation(relation))
                 .map(|(id, relation)| (*id, relation.clone()))
                 .collect(),
             external_references: ent
@@ -4978,8 +5194,9 @@ impl InMemoryGraph {
     /// Export exactly the domains a workspace comparison reads, by consuming
     /// this graph.
     ///
-    /// Identical in value to calling [`to_snapshot`] and keeping four of its
-    /// fields, and very different in cost. `to_snapshot` clones every store
+    /// Identical in value to [`crate::WorkspaceGraphFacts::from_snapshot`] on
+    /// [`to_snapshot`], including its semantic relation filter, and very
+    /// different in cost. `to_snapshot` clones every store
     /// under its own lock, so a caller that wanted entity truth also paid for
     /// a copy of the whole change map, the work, review, verification,
     /// provenance and session domains, and every adjacency and secondary index
@@ -4993,7 +5210,11 @@ impl InMemoryGraph {
         let ent = self.entities.into_inner();
         crate::storage::format::WorkspaceGraphFacts {
             entities: ent.entities.into_iter().collect(),
-            relations: ent.relations.into_iter().collect(),
+            relations: ent
+                .relations
+                .into_iter()
+                .filter(|(_, relation)| is_semantic_relation(relation))
+                .collect(),
             external_references: ent.external_references.into_iter().collect(),
             resolved_tree: ent.resolved_tree,
             resolution_records: ent.resolution_records.into_records(),
@@ -5041,6 +5262,15 @@ impl InMemoryGraph {
         self.truth_epoch.load(Ordering::Acquire)
     }
 
+    /// Keep this graph's history records that are too large to keep between
+    /// reads decoded for as long as the returned hold lives. A read that
+    /// replays across the same change several times, as a guide of one commit
+    /// does, holds them for its own life. See
+    /// [`crate::storage::ChangeMap::hold_large_records`].
+    pub fn hold_large_change_records(&self) -> Option<crate::storage::LargeRecordHold> {
+        self.changes.read().changes.hold_large_records()
+    }
+
     /// A process-unique identity for this graph instance, never reused.
     ///
     /// A cache of something derived from a graph keys on this together with
@@ -5071,15 +5301,44 @@ impl InMemoryGraph {
         if std::ptr::eq(self, authority) {
             return self.entities.read().verified_binding_history.is_some();
         }
+        let semantics_match = |target: &EntityData, source: &EntityData| {
+            target.entities == source.entities
+                && semantic_relations_match(target, source)
+                && target.external_references == source.external_references
+                && target.resolution_records == source.resolution_records
+                && target.resolved_tree == source.resolved_tree
+        };
+        // What a restore leaves is the authority's proof when the semantics
+        // match and no proof when they do not. A graph already holding exactly
+        // that is not written: the write would change nothing, and it would
+        // still move the truth epoch, which tells every cache keyed on it that
+        // truth moved. The daemon restores after every publication it
+        // finalizes, so on a repository that never holds a proof each edit
+        // threw away every answer computed since the edit landed, including a
+        // review guide read already in flight.
+        let already = |target: &EntityData, source: &EntityData| {
+            let restored = semantics_match(target, source)
+                .then_some(source.verified_binding_history.as_ref())
+                .flatten();
+            (target.verified_binding_history.as_ref() == restored)
+                .then(|| target.verified_binding_history.is_some())
+        };
         // A stable address order avoids inverse-call deadlocks. Authority is
         // ordinarily immutable, but the public method need not assume that.
+        let held = if std::ptr::from_ref(self) < std::ptr::from_ref(authority) {
+            let target = self.entities.read();
+            let source = authority.entities.read();
+            already(&target, &source)
+        } else {
+            let source = authority.entities.read();
+            let target = self.entities.read();
+            already(&target, &source)
+        };
+        if let Some(holds_proof) = held {
+            return holds_proof;
+        }
         let install = |mut target: TruthWriteGuard<'_>, source: &EntityData| {
-            if target.entities != source.entities
-                || target.relations != source.relations
-                || target.external_references != source.external_references
-                || target.resolution_records != source.resolution_records
-                || target.resolved_tree != source.resolved_tree
-            {
+            if !semantics_match(&target, source) {
                 return false;
             }
             target.verified_binding_history = source.verified_binding_history.clone();
@@ -10300,8 +10559,19 @@ impl EntityStore for InMemoryGraph {
                         KinDbError::StorageError(format!("transaction resolution records: {error}"))
                     })?;
             }
+            // Record links naming an entity this transaction removes go with
+            // it, through the same checks, persistence and indexes as the
+            // delta's own relation removals.
+            let retired_record_links =
+                record_links_retired_with(&ent, delta, &prospective_entity_ids);
+            let relation_deltas = || {
+                delta
+                    .relation_deltas
+                    .iter()
+                    .chain(retired_record_links.iter())
+            };
             let mut prospective_relations = ent.relations.clone();
-            for relation_delta in &delta.relation_deltas {
+            for relation_delta in relation_deltas() {
                 match relation_delta {
                     RelationDelta::Added { new } => {
                         if prospective_relations.contains_key(&new.id) {
@@ -10551,12 +10821,12 @@ impl EntityStore for InMemoryGraph {
             // 5. Process relation deltas, recorded through indexed recorders so
             // a transaction carrying a whole workspace overlay records it in
             // linear work.
-            if !delta.relation_deltas.is_empty() {
+            if !delta.relation_deltas.is_empty() || !retired_record_links.is_empty() {
                 let pending_delta = &mut pending.delta;
                 let mut relation_record = IndexedDeltaRecorder::new(&mut pending_delta.relations);
                 let mut outgoing_record = IndexedDeltaRecorder::new(&mut pending_delta.outgoing);
                 let mut incoming_record = IndexedDeltaRecorder::new(&mut pending_delta.incoming);
-                for rel_delta in &delta.relation_deltas {
+                for rel_delta in relation_deltas() {
                     match rel_delta {
                         RelationDelta::Added { new: relation } => {
                             insert_relation_indexes(&mut ent, relation);
@@ -10615,7 +10885,7 @@ impl EntityStore for InMemoryGraph {
             // touched embeds differently even when its own payload formats the
             // same. Take those ids back out of the skip set rather than
             // reasoning about them inside each relation arm.
-            for rel_delta in &delta.relation_deltas {
+            for rel_delta in relation_deltas() {
                 let endpoints = match rel_delta {
                     RelationDelta::Added { new } => entity_ids_for_relation(new),
                     RelationDelta::Removed { old } => entity_ids_for_relation(old),
@@ -11199,6 +11469,11 @@ impl ChangeStore for InMemoryGraph {
         self.changes.read().changes.read_change_for_serving(id)
     }
 
+    /// Answered from the history's index, without reading the change.
+    fn holds_change(&self, id: &SemanticChangeId) -> Result<bool, KinDbError> {
+        Ok(self.changes.read().changes.contains_change(id))
+    }
+
     fn get_changes_since(
         &self,
         base: &SemanticChangeId,
@@ -11474,6 +11749,21 @@ impl InMemoryGraph {
             }),
             _ => None,
         })
+    }
+
+    /// The annotations that carry a review flag still open, in no order.
+    ///
+    /// Read on every agent call, to tell whether an answer returned a flagged
+    /// entity, so it clones only the flags and nothing else the work graph
+    /// holds.
+    pub fn open_review_flags(&self) -> Vec<Annotation> {
+        self.work
+            .read()
+            .annotations
+            .values()
+            .filter(|annotation| annotation.open_review_flag().is_some())
+            .cloned()
+            .collect()
     }
 
     /// Recall annotations ("memory deposits") for an entity, re-anchoring across
@@ -13017,6 +13307,123 @@ mod tests {
             compute_retrieval_authority_hash(&bare.to_snapshot()),
             "skipping a derived retrieval surface must not change graph truth"
         );
+    }
+
+    /// A graph restored without a text index takes no whole-graph root pass.
+    ///
+    /// The retrieval authority hash decides only whether a text index is
+    /// current, so a graph with none has nothing for it to decide. An edit's
+    /// admission and publication build several of these graphs and drop them,
+    /// and the pass each one paid was the largest single cost of admitting a
+    /// one-function edit. The graph itself is unchanged: its live root and its
+    /// retrieval authority, asked for afterwards, are the ones an indexed
+    /// restore of the same snapshot reports.
+    #[test]
+    fn a_restore_without_a_text_index_takes_no_graph_root_pass() {
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry", "flushRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+
+        root_hash_passes::reset();
+        let bare = InMemoryGraph::from_snapshot_without_text_index(snapshot.clone()).unwrap();
+        assert_eq!(
+            root_hash_passes::count(),
+            0,
+            "a graph with no text index has no use for the retrieval authority hash"
+        );
+
+        let indexed = InMemoryGraph::from_snapshot(snapshot).unwrap();
+        assert_eq!(bare.compute_root_hash(), indexed.compute_root_hash());
+        assert_eq!(
+            bare.retrieval_authority_hash(),
+            indexed.retrieval_authority_hash()
+        );
+    }
+
+    /// A restored graph hashes its entities when its root is first read, not
+    /// while it is being built, and the root it then reports is the one an
+    /// eager build gives, mutations made before that read included.
+    ///
+    /// Most restored graphs are scratch graphs an admission, a publication or
+    /// a review builds and drops without reading a root, and the eager build
+    /// was what each of them paid beyond its indexes.
+    #[test]
+    fn a_restored_graph_hashes_its_entities_when_its_root_is_first_read() {
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+
+        let graph = InMemoryGraph::from_snapshot_without_text_index(snapshot.clone()).unwrap();
+        assert!(
+            graph.merkle.read().is_empty(),
+            "nothing is hashed at restore"
+        );
+        assert_eq!(
+            graph.compute_root_hash(),
+            compute_graph_root_hash(&snapshot)
+        );
+        assert_eq!(
+            graph
+                .merkle_flush_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the first read builds the cache in one flush"
+        );
+        assert_eq!(
+            graph.compute_root_hash(),
+            compute_graph_root_hash(&snapshot)
+        );
+        assert_eq!(
+            graph
+                .merkle_flush_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a second read finds it current"
+        );
+
+        let edited = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+        edited
+            .upsert_entity(&test_entity("flushRegistry", "src/registry.rs"))
+            .unwrap();
+        assert_eq!(
+            edited.compute_root_hash(),
+            compute_graph_root_hash(&edited.to_snapshot())
+        );
+    }
+
+    /// A restore that would leave the graph's proof exactly as it is does not
+    /// write, so it does not move the truth epoch.
+    ///
+    /// The daemon restores after every publication it finalizes. On a store
+    /// that holds no proof, each of those restores used to move the epoch
+    /// without changing anything, which discarded every cache keyed on it and
+    /// sent a review read already in flight back to build again.
+    #[test]
+    fn a_restore_that_changes_no_proof_leaves_truth_where_it_was() {
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+        let live = InMemoryGraph::from_snapshot_without_text_index(snapshot.clone()).unwrap();
+        let authority = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+
+        // The same semantics and no proof on either side.
+        let epoch = live.truth_epoch();
+        assert!(!live.restore_binding_history_from(&authority));
+        assert_eq!(live.truth_epoch(), epoch);
+
+        // Semantics that differ from authority, and no proof to revoke.
+        let edit = test_entity("flushRegistry", "src/registry.rs");
+        live.upsert_entity(&edit).unwrap();
+        let epoch = live.truth_epoch();
+        assert!(!live.restore_binding_history_from(&authority));
+        assert_eq!(live.truth_epoch(), epoch);
+        assert!(live.get_entity(&edit.id).unwrap().is_some());
     }
 
     /// The in-run vector-sidecar flush policy: the first checkpoint of a run is
@@ -15479,6 +15886,297 @@ mod tests {
             message.contains("unadmitted source endpoint"),
             "a re-offer over an unadmitted endpoint must be refused, got: {message}"
         );
+    }
+
+    /// A semantic observation carries no test case and no verification run,
+    /// so it carries no relation from one either. Copied with those relations,
+    /// the observation named ends it did not hold, a graph staged from it was
+    /// refused with `unadmitted source endpoint`, and every working-copy
+    /// admission after the first recorded run failed. The live graph keeps
+    /// the relations, and two graphs that differ only in them still agree on
+    /// the workspace. Falsify by dropping the filter in
+    /// `semantic_observation_from_entities`.
+    #[test]
+    fn a_semantic_observation_leaves_out_the_relations_of_verification_records() {
+        let graph = InMemoryGraph::new();
+        let covered = test_entity("covered", "src/a.rs");
+        let caller = test_entity("caller", "src/b.rs");
+        graph.upsert_entity(&covered).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        let call = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(covered.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        graph.upsert_relation(&call).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "covers_a".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(covered.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/a.rs")),
+        };
+        graph.create_test_case(&test_case).unwrap();
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![test_case.test_id],
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: None,
+        };
+        graph.create_verification_run(&run).unwrap();
+        graph
+            .link_run_proves_entity(&run.run_id, &covered.id)
+            .unwrap();
+        assert_eq!(
+            graph.relation_count(),
+            3,
+            "the call, the cover and the proof"
+        );
+
+        let observation = graph.semantic_observation();
+        assert_eq!(
+            observation.relations.keys().copied().collect::<Vec<_>>(),
+            [call.id],
+            "only the relation between two entities is semantic"
+        );
+        let expected = observation.relations.clone();
+        assert_eq!(graph.workspace_graph_facts().relations, expected);
+        assert_eq!(
+            crate::WorkspaceGraphFacts::from_snapshot(graph.to_snapshot()).relations,
+            expected
+        );
+        let consumed = InMemoryGraph::from_snapshot_without_text_index(graph.to_snapshot())
+            .unwrap()
+            .into_workspace_graph_facts();
+        assert_eq!(consumed.relations, expected);
+        let staged = InMemoryGraph::from_snapshot_without_text_index(observation)
+            .expect("a graph staged from the observation holds every end it names");
+        assert!(graph.semantic_workspace_matches(&staged));
+        assert!(staged.semantic_workspace_matches(&graph));
+        assert_eq!(
+            graph.list_runs_proving_entity(&covered.id).unwrap().len(),
+            1,
+            "the live graph keeps the proof"
+        );
+
+        // A semantic relation only one side holds is still a difference.
+        staged.remove_relation(&call.id).unwrap();
+        assert!(!graph.semantic_workspace_matches(&staged));
+        assert!(!staged.semantic_workspace_matches(&graph));
+    }
+
+    #[test]
+    fn durable_proof_targets_restore_links_without_inventing_missing_endpoints() {
+        let graph = InMemoryGraph::new();
+        let covered = test_entity("covered", "src/a.rs");
+        let dependency = test_entity("dependency", "src/b.rs");
+        graph.upsert_entity(&covered).unwrap();
+        graph.upsert_entity(&dependency).unwrap();
+        let call = test_relation(dependency.id, covered.id, RelationKind::Calls);
+        graph.upsert_relation(&call).unwrap();
+        let work = WorkItem {
+            work_id: WorkId::new(),
+            kind: WorkKind::Feature,
+            title: "Covered work".into(),
+            description: String::new(),
+            status: WorkStatus::Proposed,
+            priority: Priority::High,
+            scopes: vec![WorkScope::Entity(covered.id)],
+            acceptance_criteria: Vec::new(),
+            external_refs: Vec::new(),
+            created_by: IdentityRef::human("alice"),
+            created_at: Timestamp::now(),
+        };
+        graph.create_work_item(&work).unwrap();
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: Vec::new(),
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: Some(0),
+            ran_against: vec![kin_model::RunFingerprint {
+                entity: dependency.id,
+                behavior_hash: dependency.fingerprint.behavior_hash,
+            }],
+            proof: Some(kin_model::VerificationProof {
+                entities: vec![covered.id, EntityId::new()],
+                work_items: vec![work.work_id, WorkId::new()],
+            }),
+        };
+        graph.create_verification_run(&run).unwrap();
+        assert_eq!(graph.relation_count(), 1, "no proof links were recorded");
+        let recorded = graph.into_snapshot();
+        let semantic_digest = crate::storage::binding_history::graph_digest(&recorded).unwrap();
+        let restored = InMemoryGraph::from_snapshot_without_text_index(recorded)
+            .expect("missing targets cannot create invalid relation endpoints");
+        assert_eq!(
+            restored.list_runs_proving_entity(&covered.id).unwrap(),
+            std::slice::from_ref(&run)
+        );
+        assert_eq!(
+            restored.list_runs_proving_work(&work.work_id).unwrap(),
+            std::slice::from_ref(&run)
+        );
+        assert!(restored
+            .list_runs_proving_entity(&dependency.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(restored.relation_count(), 3);
+        let projected = restored.into_snapshot();
+        assert_eq!(
+            crate::storage::binding_history::graph_digest(&projected).unwrap(),
+            semantic_digest,
+            "proof links do not change semantic binding history"
+        );
+        let restored = InMemoryGraph::from_snapshot_without_text_index(projected).unwrap();
+        assert_eq!(restored.relation_count(), 3, "restoration is idempotent");
+        assert!(matches!(
+            restored.lookup_relation_by_id(&call.id).unwrap(),
+            kin_model::RelationLookup::Present(_)
+        ));
+        assert_eq!(
+            restored.list_runs_proving_entity(&covered.id).unwrap(),
+            [run]
+        );
+    }
+
+    /// A transaction that removes an entity a test case covers and a recorded
+    /// run proved is taken when it carries only the entity's semantic
+    /// relations. A semantic delta may not carry record links, so the store
+    /// retires the ones naming the removed entity and the records keep their
+    /// history. A semantic relation the delta leaves behind is still refused.
+    #[test]
+    fn removing_an_entity_retires_the_record_links_that_name_it() {
+        let graph = InMemoryGraph::new();
+        let removed = test_entity("negate", "src/math.rs");
+        let kept = test_entity("add", "src/math.rs");
+        let check = test_entity("check_math", "tests/math.rs");
+        for entity in [&removed, &kept, &check] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let calls_removed = test_relation(check.id, removed.id, RelationKind::Calls);
+        let calls_kept = test_relation(check.id, kept.id, RelationKind::Calls);
+        graph.upsert_relation(&calls_removed).unwrap();
+        graph.upsert_relation(&calls_kept).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "check_math".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(removed.id), WorkScope::Entity(kept.id)],
+            runner: TestRunner::Cargo,
+            file_origin: Some(FilePathId::new("tests/math.rs")),
+        };
+        graph.create_test_case(&test_case).unwrap();
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![test_case.test_id],
+            status: VerificationStatus::Passing,
+            runner: TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: Some(kin_model::VerificationProof {
+                entities: vec![removed.id, kept.id],
+                work_items: Vec::new(),
+            }),
+        };
+        graph.create_verification_run(&run).unwrap();
+        graph
+            .link_run_proves_entity(&run.run_id, &removed.id)
+            .unwrap();
+        graph.link_run_proves_entity(&run.run_id, &kept.id).unwrap();
+        assert_eq!(
+            graph.relation_count(),
+            6,
+            "two calls, two covers and two proofs"
+        );
+
+        let leaves_the_call = TransactionDelta {
+            entity_deltas: vec![EntityDelta::Removed {
+                old: removed.clone(),
+            }],
+            ..TransactionDelta::default()
+        };
+        let refused = graph
+            .apply_transaction_delta(&leaves_the_call)
+            .expect_err("a semantic relation naming the removed entity is the planner's to carry");
+        assert!(
+            refused.to_string().contains(&format!(
+                "transaction relation {} has unadmitted destination endpoint",
+                calls_removed.id
+            )),
+            "{refused}"
+        );
+        assert_eq!(graph.relation_count(), 6, "a refusal changes nothing");
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: removed.clone(),
+                }],
+                relation_deltas: vec![RelationDelta::Removed {
+                    old: calls_removed.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .expect("record links leave with the entity they name");
+        assert!(graph.get_entity(&removed.id).unwrap().is_none());
+        assert!(graph
+            .list_runs_proving_entity(&removed.id)
+            .unwrap()
+            .is_empty());
+        assert!(graph.get_tests_for_entity(&removed.id).unwrap().is_empty());
+        assert_eq!(
+            graph.list_runs_proving_entity(&kept.id).unwrap(),
+            std::slice::from_ref(&run)
+        );
+        assert_eq!(
+            graph.get_tests_for_entity(&kept.id).unwrap(),
+            std::slice::from_ref(&test_case)
+        );
+        assert_eq!(graph.relation_count(), 3, "the kept call, cover and proof");
+        assert_eq!(
+            graph.get_verification_run(&run.run_id).unwrap().as_ref(),
+            Some(&run),
+            "the run keeps the proof it recorded"
+        );
+        assert_eq!(
+            graph.get_test_case(&test_case.test_id).unwrap().as_ref(),
+            Some(&test_case),
+            "the test case keeps the scopes it recorded"
+        );
+
+        let reopened = InMemoryGraph::from_snapshot_without_text_index(graph.into_snapshot())
+            .expect("the retired links leave no stranded endpoint behind");
+        assert!(reopened
+            .list_runs_proving_entity(&removed.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(reopened.list_runs_proving_entity(&kept.id).unwrap(), [run]);
+        assert_eq!(reopened.relation_count(), 3);
     }
 
     /// The control the fix is most likely to break. `create_test_case` inserts
@@ -19711,6 +20409,7 @@ mod tests {
             authored_by: IdentityRef::human("bob"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
         let id = ann.annotation_id;
 
@@ -19879,6 +20578,7 @@ mod tests {
             kind: ActorKind::Human,
             display_name: "Alice".into(),
             external_refs: vec![],
+            agent_session: None,
         };
         let aid = actor.actor_id;
 
@@ -25154,6 +25854,7 @@ mod tests {
             authored_by: IdentityRef::human("alice"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
         graph.create_annotation(&ann).unwrap();
         let anchor = graph
@@ -25214,6 +25915,7 @@ mod tests {
             authored_by: IdentityRef::human("t"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
         graph.create_annotation(&ann).unwrap();
         id

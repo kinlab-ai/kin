@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "kin://contracts/repo-entities",
-  "description": "The entities of one repository's graph, as served by GET /repos/{repo_id}/entities on the daemon. Identity is always present on a row; the ranking numbers and the text ride along only when the request asked for them with include, and total appears only when the request asked for a window with limit or offset. A reader of the identity fields alone keeps reading every response this route has ever served.",
+  "description": "The entities of one repository's graph, as served by GET /repos/{repo_id}/entities on the daemon. Identity is always present on a row; the ranking numbers and the text ride along only when the request asked for them with include, total appears only when the request asked for a window with limit or offset, and untested appears only when the request asked for it. A reader of the identity fields alone keeps reading every response this route has ever served.",
   "type": "object",
   "required": ["repo_id", "entities"],
   "additionalProperties": false,
@@ -18,9 +18,31 @@
       "type": "integer",
       "minimum": 0,
       "description": "Entities the filter matched before the window was applied. Present only when the request asked for a window, where it is what separates a last page from a full one."
+    },
+    "untested": {
+      "$ref": "#/$defs/untested",
+      "description": "The entities others rely on that no test reaches. Present only when the request asked for it with untested, which names how many rows to list."
     }
   },
   "$defs": {
+    "untested": {
+      "type": "object",
+      "description": "The entities others rely on that no test reaches, most relied-on first. An entity is listed when at least one other depends on it, it is defined in this repository, it is neither a test nor a module, and neither a test entity nor a recorded test case's covered scope reaches it through the recorded dependency graph, including transitive dependencies. This is structural reach, not measured runtime coverage. It is the coverage kin verify --missing reads, collected in the same pass that ranks.",
+      "required": ["entities", "total"],
+      "additionalProperties": false,
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/entity" },
+          "description": "The most relied-on of them, as many as the request asked for, each with its ranking numbers."
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many there are among the entities the request matched."
+        }
+      }
+    },
     "entity": {
       "type": "object",
       "required": ["id", "name", "kind", "file_path"],

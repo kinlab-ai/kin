@@ -22,7 +22,8 @@
 //! which the daemon takes as proof the session is alive for as long as the
 //! process runs, and every call made in it refreshes its idle window as any
 //! session's call does. It is ended when the client closes the connection, and
-//! a server that dies first leaves it to the daemon's idle rule. A session the
+//! a server that dies first leaves it to the daemon's next sweep, which finds
+//! the process gone. A session the
 //! daemon reaped anyway is opened again once, for a write that started
 //! nothing, by [`ConnectionSession::forget`].
 //!
@@ -34,10 +35,13 @@
 //! client initializes and a daemon is already serving, in the background, so
 //! the handshake waits on nothing and no daemon is started for it. Every call
 //! the connection forwards then names it, which is how the daemon can show an
-//! agent that only reads. Opened that way it names no process, so a connection
-//! that never does anything is reaped by the daemon's ordinary idle rule; its
-//! first write attaches this process, and from then on it lives as long as the
-//! process does, as a session opened by a write always has.
+//! agent that only reads. Opened that way it names no process to live by, so a
+//! connection that never does anything is reaped by the daemon's ordinary idle
+//! rule; its first write attaches this process, and from then on it lives as
+//! long as the process does, as a session opened by a write always has. It
+//! does name this process to watch: that keeps nothing alive, and it lets the
+//! daemon end the session at its next sweep when this server is killed
+//! outright and never gets to close it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -187,11 +191,17 @@ impl ConnectionSession {
     }
 
     /// The arguments that open this connection's session for reads: the same
-    /// as [`ConnectionSession::start_arguments`] without this process, so the
-    /// daemon's idle rule reaps it if the connection never does anything.
+    /// as [`ConnectionSession::start_arguments`] with this process named only
+    /// as one to watch. A `pid` would keep the session for as long as the
+    /// process runs; a `watch_pid` keeps nothing, so the daemon's idle rule
+    /// still reaps a connection that never does anything, and it ends the
+    /// session at its next sweep once this process is gone, so a server killed
+    /// outright does not leave its agent showing as connected.
     pub fn read_start_arguments(&self, cwd: &str) -> HashMap<String, Value> {
         let mut start = self.start_arguments(cwd);
-        start.remove("pid");
+        if let Some(pid) = start.remove("pid") {
+            start.insert("watch_pid".to_string(), pid);
+        }
         start
     }
 
@@ -404,6 +414,11 @@ mod tests {
         assert!(
             !start.contains_key("pid"),
             "a session opened for reads is reaped by the idle rule"
+        );
+        assert_eq!(
+            start["watch_pid"],
+            std::process::id(),
+            "and is reaped once this process is gone"
         );
         assert_eq!(start["vendor"], "claude-code");
         let opened = session

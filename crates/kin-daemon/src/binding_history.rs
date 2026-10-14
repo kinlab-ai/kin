@@ -26,6 +26,16 @@ pub(crate) fn restore_exact_authority(state: &DaemonState) {
             crate::error::DaemonError::Graph(kin_db::KinDbError::StorageError(message))
         })?;
         let lease = authority.read_authority();
+        // The proof a materialized workspace graph would carry is the witness
+        // the authority records for this workspace, and nothing else. With
+        // none recorded and none held, there is nothing to restore, and that is
+        // known without materializing the workspace graph: after an edit's
+        // publication the graph is not yet kept for the new generation, so
+        // asking for it rebuilt the whole workspace from authority on every
+        // admission only to discard it.
+        if !lease.records_binding_history_witness(&context.workspace_id()) && unproven(state) {
+            return Ok(());
+        }
         if let Some(snapshot) = lease.workspace_graph_snapshot(&context.workspace_id())? {
             // An authority that holds no proof has none to restore, and a
             // graph that holds none has none to lose. Comparing the two would
@@ -179,9 +189,18 @@ fn capture_same_tree_predecessor(
         .iter()
         .find(|workspace| workspace.workspace_id == authority.workspace_id)
         .expect("selected workspace is admitted");
+    // The observation carries semantic relations only. Proof links restored
+    // from collaboration records remain in the selected graph, but their
+    // absence from an observation cannot be a workspace removal.
+    let selected_relations = selected
+        .relations
+        .iter()
+        .filter(|(_, relation)| kin_db::is_semantic_relation(relation))
+        .map(|(id, relation)| (*id, relation.clone()))
+        .collect();
     let semantic = kin_core::diff_workspace_semantics(
         &selected.entities,
-        &selected.relations,
+        &selected_relations,
         &observed.entities,
         &observed.relations,
     )

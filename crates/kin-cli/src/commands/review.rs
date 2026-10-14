@@ -343,6 +343,152 @@ pub async fn execute_review_request_with_authority(
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
     open_authority: Option<&super::repository_authority::ActiveRepositoryAuthority>,
 ) -> Result<ReviewExecution> {
+    execute_review_request_with_agent_writes(
+        refs,
+        graph,
+        request,
+        repository_authority,
+        source_scope,
+        open_authority,
+        &[],
+        &[],
+    )
+    .await
+}
+
+/// [`execute_review_request_with_authority`] for the daemon that ran the
+/// agents' writes through Kin and confirmed the edits their clients reported.
+/// A guide marks each step with the agent sessions among `agent_writes` and
+/// `client_edits` that wrote its entity in the work it walks; see
+/// [`super::review_guide::attribute_agent_writes`].
+pub async fn execute_review_request_with_agent_writes(
+    refs: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    open_authority: Option<&super::repository_authority::ActiveRepositoryAuthority>,
+    agent_writes: &[super::review_guide::AgentWrite],
+    client_edits: &[super::review_guide::ClientEdit],
+) -> Result<ReviewExecution> {
+    execute_review_read(
+        refs,
+        graph,
+        request,
+        repository_authority,
+        source_scope,
+        open_authority,
+        agent_writes,
+        client_edits,
+    )
+}
+
+/// The guide of one recorded change, or of the changes between `base` and
+/// `change`, as built and before any step is marked with who wrote it.
+///
+/// This is all the work a guide of committed history costs, and it depends on
+/// nothing but what is asked and the repository it is read from: the change
+/// and the history it replays never move, and what it reads of the live
+/// graph moves only with a write. So a server can keep it once built and
+/// answer the next read of the same change, from any page, by marking it
+/// with [`guide_response`]. The daemon does; see its committed guides.
+pub fn build_committed_guide(
+    refs: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<&str>,
+    base: Option<&str>,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+) -> Result<super::review_guide::ReviewGuide> {
+    let _large_records = graph.hold_large_change_records();
+    let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
+        graph,
+        repository_authority,
+        source_scope,
+    );
+    let escape_evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
+    committed_guide_with(
+        refs,
+        graph,
+        change,
+        base,
+        repository_authority,
+        &escape_evidence,
+    )
+}
+
+fn committed_guide_with(
+    refs: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    change: Option<&str>,
+    base: Option<&str>,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    escape_evidence: &kin_review::enrichment::EscapeEvidence<'_>,
+) -> Result<super::review_guide::ReviewGuide> {
+    match base {
+        Some(base) => super::review_guide::build_range_guide(
+            refs,
+            graph,
+            base,
+            change,
+            repository_authority,
+            Some(escape_evidence),
+        ),
+        None => super::review_guide::build_guide(
+            refs,
+            graph,
+            change,
+            repository_authority,
+            Some(escape_evidence),
+        ),
+    }
+}
+
+/// What a guide read answers from a built guide: each step marked with the
+/// agent sessions among `agent_writes` and `client_edits` that wrote its
+/// entity, as JSON or as text.
+pub fn guide_response(
+    mut guide: super::review_guide::ReviewGuide,
+    json: bool,
+    agent_writes: &[super::review_guide::AgentWrite],
+    client_edits: &[super::review_guide::ClientEdit],
+) -> Result<ReviewResponse> {
+    super::review_guide::attribute_agent_writes(&mut guide, agent_writes, client_edits);
+    Ok(if json {
+        ReviewResponse {
+            text: String::new(),
+            json: Some(serde_json::to_string(&guide)?),
+        }
+    } else {
+        ReviewResponse {
+            text: super::review_guide::guide_text(&guide),
+            json: None,
+        }
+    })
+}
+
+/// [`execute_review_request_with_agent_writes`] as the synchronous work it is.
+///
+/// Every review read is computation over the graph and the store, with
+/// nothing to wait for, and a guide of a large change runs for seconds. A
+/// server that answers it from an async handler runs this off its runtime
+/// worker, so the other requests it is serving keep being answered meanwhile.
+pub fn execute_review_read(
+    refs: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    open_authority: Option<&super::repository_authority::ActiveRepositoryAuthority>,
+    agent_writes: &[super::review_guide::AgentWrite],
+    client_edits: &[super::review_guide::ClientEdit],
+) -> Result<ReviewExecution> {
+    // A guide replays the history to its change several times: to place the
+    // change, to diff it, to read its connections and to run the census. Each
+    // crosses the same records, and a record too large to keep between reads
+    // (a store's bootstrap change, or a commit on it) is decoded once for the
+    // whole read instead of once per replay.
+    let _large_records = graph.hold_large_change_records();
     let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
         graph,
         repository_authority,
@@ -412,37 +558,18 @@ pub async fn execute_review_request_with_authority(
                     Some(&escape_evidence),
                     open_authority,
                 )?
-            } else if let Some(base) = base.as_deref() {
-                super::review_guide::build_range_guide(
-                    refs,
-                    graph,
-                    base,
-                    change.as_deref(),
-                    repository_authority,
-                    Some(&escape_evidence),
-                )?
             } else {
-                super::review_guide::build_guide(
+                committed_guide_with(
                     refs,
                     graph,
                     change.as_deref(),
+                    base.as_deref(),
                     repository_authority,
-                    Some(&escape_evidence),
+                    &escape_evidence,
                 )?
-            };
-            let response = if json {
-                ReviewResponse {
-                    text: String::new(),
-                    json: Some(serde_json::to_string(&guide)?),
-                }
-            } else {
-                ReviewResponse {
-                    text: super::review_guide::guide_text(&guide),
-                    json: None,
-                }
             };
             Ok(ReviewExecution {
-                response,
+                response: guide_response(guide, json, agent_writes, client_edits)?,
                 mutated: false,
             })
         }
@@ -671,15 +798,44 @@ fn compact_review_text(review: &kin_review::Review) -> String {
     .unwrap();
     match review.impact.enrichment.as_ref() {
         Some(observation) if observation.bounds_answer() => {
+            // Only owed work is pending enrichment. Other unproven sites
+            // bound the answer without claiming more enrichment is queued.
+            let owed = observation.owed_entities;
+            let answered = observation.total_pending_entities.saturating_sub(owed);
+            let entities = |count: usize| {
+                if count == 1 {
+                    "1 entity".to_string()
+                } else {
+                    format!("{count} entities")
+                }
+            };
+            if owed > 0 {
+                writeln!(
+                    text,
+                    "not settled: {} pending enrichment; risk may change.",
+                    entities(owed)
+                )
+                .unwrap();
+            }
+            if answered > 0 {
+                writeln!(
+                    text,
+                    "{}{} {} call sites that remain unproven; no enrichment is currently owed \
+                     for them.",
+                    if owed > 0 { "" } else { "not settled: " },
+                    entities(answered),
+                    if answered == 1 { "holds" } else { "hold" },
+                )
+                .unwrap();
+            }
             writeln!(
                 text,
-                "not settled: {} entities pending enrichment; risk may change.",
-                observation.total_pending_entities
-            )
-            .unwrap();
-            writeln!(
-                text,
-                "Impact counts are lower bounds; pending work may not reach this change."
+                "Impact counts are lower bounds; {} may not reach this change.",
+                if owed > 0 {
+                    "pending work"
+                } else {
+                    "those calls"
+                }
             )
             .unwrap();
             if matches!(

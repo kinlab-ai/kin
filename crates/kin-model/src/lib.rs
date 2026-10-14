@@ -35,6 +35,7 @@
 //! wrongly.
 
 pub mod admission;
+pub mod agent_session;
 #[cfg(test)]
 pub(crate) mod alloc_probe;
 pub mod binding_debt;
@@ -108,7 +109,9 @@ pub use change::{
     ChangeOrigin, EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree,
     SemanticChange, TransactionDelta, TreeDelta, TreeEntry, TreeStateError,
 };
-pub use collaboration::{CollaborationDelta, Keyed, COLLABORATION_COLLECTIONS};
+pub use collaboration::{
+    in_canonical_key_order, CollaborationDelta, Keyed, COLLABORATION_COLLECTIONS,
+};
 pub use conflict::{ConflictKind, ConflictObject};
 pub use context::{
     AnnotationEntry, ArtifactContextEntry, ArtifactContextKind, ContextEntry, ContextPack,
@@ -213,6 +216,11 @@ pub use value_escape::{
     VALUE_ESCAPE_RECORD_KEY, VALUE_ESCAPE_RECORD_VERSION, VALUE_ESCAPE_RECORD_VERSION_MIN,
 };
 
+pub use agent_session::{
+    AgentCall, AgentCallOutcome, AgentEditRecord, AgentSessionRecord, AgentSessionSource,
+    AgentWriteRecord, AGENT_EDITS_MAX, AGENT_ENTITIES_PER_WRITE_MAX, AGENT_SESSIONS_KEPT,
+    AGENT_SESSION_CALLS_MAX, AGENT_SESSION_CHANGES_MAX, AGENT_SESSION_KEPT_DAYS, AGENT_WRITES_MAX,
+};
 pub use provenance::{
     Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
     Delegation, DelegationId,
@@ -245,13 +253,14 @@ pub use session::{
 };
 pub use verification::{
     Assertion, AssertionId, CompletionState, ContractCoverageSummary, CoverageSummary, MockHint,
-    MockHintId, MockStrategy, TestCase, TestId, TestKind, TestRunner, VerificationRun,
-    VerificationRunId, VerificationStatus,
+    MockHintId, MockStrategy, RunFingerprint, TestCase, TestId, TestKind, TestRunner,
+    VerificationProof, VerificationRun, VerificationRunId, VerificationStatus,
 };
 pub use work::{
     Annotation, AnnotationFilter, AnnotationId, AnnotationKind, AnnotationTarget, ExternalRef,
-    IdentityKind, IdentityRef, Priority, SemanticAnchor, StalenessState, WorkFilter, WorkId,
-    WorkItem, WorkKind, WorkLink, WorkScope, WorkStatus,
+    IdentityKind, IdentityRef, Priority, ReviewFlag, ReviewFlagResolution, ReviewFlagSighting,
+    SemanticAnchor, StalenessState, WorkFilter, WorkId, WorkItem, WorkKind, WorkLink, WorkScope,
+    WorkStatus, REVIEW_FLAG_SIGHTINGS_MAX,
 };
 pub use workspace_tree::{
     WorkspaceTreeArtifact, WorkspaceTreeSnapshot, WORKSPACE_TREE_SNAPSHOT_SCHEMA_VERSION,

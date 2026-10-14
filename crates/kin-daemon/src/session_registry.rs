@@ -82,6 +82,15 @@ pub struct TrafficCheck {
 /// restart. Deployments that run many PID-less sessions against one daemon and
 /// would rather take the mid-task reaping risk can lower the window with
 /// [`SESSION_IDLE_TTL_ENV`].
+///
+/// A session opened only to read, as an MCP connection's is when its client
+/// initializes, names no PID on purpose: a live PID would keep a connection
+/// that never does anything for as long as its process runs. It may instead
+/// name a process to watch ([`SessionCoordinator::watch_process_exit`]). That
+/// process proves nothing while it runs, so the session still ages out on this
+/// window, but once it is gone the session is reaped at the next sweep, the
+/// way a session whose PID died is. A server killed outright therefore stops
+/// holding its session within one sweep rather than for this whole window.
 pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(1800);
 
 /// Environment override for [`DEFAULT_SESSION_IDLE_TTL`], in whole seconds.
@@ -147,6 +156,17 @@ impl Drop for ActiveCall {
     }
 }
 
+/// Where one finished call was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishedCall {
+    /// On the live session's log, as this entry.
+    Live(crate::agent_activity::ToolCallEntry),
+    /// On what was kept of the session, which ended while the call ran.
+    AfterEnd,
+    /// Nowhere: the daemon holds no such session and kept nothing of one.
+    Unknown,
+}
+
 pub struct SessionCoordinator {
     graph: Arc<kin_db::InMemoryGraph>,
     /// Linearization point for session/intent lifecycle mutations. `kin-db`'s
@@ -165,6 +185,10 @@ pub struct SessionCoordinator {
     /// log, the changes it committed, and the throttle on the events that
     /// announce them. Dropped with the session.
     activity: crate::agent_activity::AgentActivity,
+    /// Where what a session did is kept once it ends: the record of what
+    /// agents did, which repository authority holds once
+    /// [`SessionCoordinator::keep_ended_sessions_in`] names the daemon's own.
+    ended: Arc<crate::agent_authorship::AgentAuthorship>,
     /// When each live session was last heard from, kept here rather than in
     /// its record.
     ///
@@ -179,6 +203,13 @@ pub struct SessionCoordinator {
     /// what the record holds, and a client whose session it lost opens another
     /// on its next call.
     liveness: Mutex<HashMap<SessionId, Timestamp>>,
+    /// The process each PID-less session watches: once it is gone the session
+    /// is reaped, and while it runs it keeps nothing alive. See
+    /// [`SessionCoordinator::watch_process_exit`].
+    ///
+    /// In memory, like liveness. A daemon that restarts forgets the watch and
+    /// leaves the session on its idle window, which is what it had before.
+    exit_watch: Mutex<HashMap<SessionId, u32>>,
 }
 
 impl SessionCoordinator {
@@ -197,6 +228,9 @@ impl SessionCoordinator {
 
     /// Create a coordinator with an explicit session idle TTL.
     pub fn with_session_idle_ttl(graph: Arc<kin_db::InMemoryGraph>, ttl: Duration) -> Self {
+        let ended = Arc::new(crate::agent_authorship::AgentAuthorship::new(Arc::clone(
+            &graph,
+        )));
         Self {
             graph,
             arbitration: Mutex::new(()),
@@ -204,7 +238,9 @@ impl SessionCoordinator {
             active_calls: Arc::new(Mutex::new(HashMap::new())),
             next_call_id: AtomicU64::new(0),
             activity: crate::agent_activity::AgentActivity::default(),
+            ended,
             liveness: Mutex::new(HashMap::new()),
+            exit_watch: Mutex::new(HashMap::new()),
         }
     }
 
@@ -223,12 +259,46 @@ impl SessionCoordinator {
         session
     }
 
-    /// Drop the liveness kept for a session that ended.
+    /// Drop the liveness and the process watch kept for a session that ended.
     fn forget_liveness(&self, session_id: &SessionId) {
         self.liveness
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+        self.exit_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    /// The process a PID-less session watches, if it watches one.
+    fn watched_process(&self, session_id: &SessionId) -> Option<u32> {
+        self.exit_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+    }
+
+    /// Whether the process a session lives by, or the one it watches, is gone,
+    /// so the next sweep reaps it. A session with a call running here is not
+    /// judged, as the sweep does not judge it.
+    pub fn process_gone(&self, session: &AgentSession) -> bool {
+        if self.active_call_count(&session.session_id) > 0 {
+            return false;
+        }
+        session
+            .pid
+            .or_else(|| self.watched_process(&session.session_id))
+            .is_some_and(|pid| !is_process_alive(pid))
+    }
+
+    /// How many sessions watch a process.
+    pub fn watched_processes(&self) -> usize {
+        self.exit_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Make a session look last heard from at `at`, in its record and in the
@@ -255,6 +325,124 @@ impl SessionCoordinator {
     /// What each live session has done through this daemon.
     pub fn activity(&self) -> &crate::agent_activity::AgentActivity {
         &self.activity
+    }
+
+    /// Keep what the sessions that end did in `record`, the daemon's record
+    /// of what agents did.
+    pub fn keep_ended_sessions_in(
+        &mut self,
+        record: Arc<crate::agent_authorship::AgentAuthorship>,
+    ) {
+        self.ended = record;
+    }
+
+    /// The record that keeps what ended sessions did.
+    pub fn ended_sessions(&self) -> &crate::agent_authorship::AgentAuthorship {
+        &self.ended
+    }
+
+    /// Whether the daemon holds `session_id` as a live session.
+    fn holds(&self, session_id: &SessionId) -> bool {
+        self.get_session(session_id).ok().flatten().is_some()
+    }
+
+    /// Record one finished call for `session_id`: on its live log while the
+    /// session lives, and otherwise, when the session was live as the call
+    /// began, on what was kept of the session when it ended.
+    ///
+    /// An agent that gives up on a slow commit closes its connection, and its
+    /// session ends while the commit runs on to land. Recorded only on the
+    /// live log, that commit was nowhere in the session's calls although its
+    /// change was. Ending a session deletes it and hands its log over in one
+    /// step under `arbitration`, so a call that finds the session gone waits
+    /// for that step and is then kept after the calls the log handed over.
+    pub fn record_finished_call(
+        &self,
+        session_id: &SessionId,
+        draft: crate::agent_activity::ToolCallDraft,
+        at: Timestamp,
+        began_live: bool,
+    ) -> FinishedCall {
+        let live = || self.holds(session_id);
+        if let Some(entry) =
+            self.activity
+                .record_call_if(session_id, draft.clone(), at.clone(), live)
+        {
+            return FinishedCall::Live(entry);
+        }
+        if !began_live {
+            return FinishedCall::Unknown;
+        }
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) =
+            self.activity
+                .record_call_if(session_id, draft.clone(), at.clone(), live)
+        {
+            return FinishedCall::Live(entry);
+        }
+        if self
+            .ended
+            .record_after_end(&session_id.to_string(), &draft, &at)
+        {
+            FinishedCall::AfterEnd
+        } else {
+            FinishedCall::Unknown
+        }
+    }
+
+    /// Remember a change `session_id` committed: on its live log, or on what
+    /// was kept of the session when the commit landed after it ended. A
+    /// session the daemon never held is given no log for it.
+    pub fn record_committed_change(&self, session_id: &SessionId, change_id: String) {
+        if self.holds(session_id) {
+            self.activity.record_change(session_id, change_id);
+            return;
+        }
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.holds(session_id) {
+            self.activity.record_change(session_id, change_id);
+        } else {
+            self.ended
+                .record_change_after_end(&session_id.to_string(), &change_id);
+        }
+    }
+
+    /// Drop the log of a session that ends, and keep what it held when the
+    /// session did any work: an agent that connected and asked nothing has
+    /// nothing to show. The daemon's own session is not an agent.
+    fn end_activity(&self, session: Option<&AgentSession>, session_id: &SessionId) {
+        let log = self.activity.forget(session_id);
+        let Some(session) = session else {
+            return;
+        };
+        if session.vendor == crate::agent_activity::DAEMON_OWN_VENDOR
+            || (log.calls_total == 0 && log.changes.is_empty())
+        {
+            return;
+        }
+        let mut heard = session.started_at.clone();
+        if session.last_heartbeat > heard {
+            heard = session.last_heartbeat.clone();
+        }
+        let now = Timestamp::now();
+        self.ended.hold_ended(crate::ended_sessions::EndedSession {
+            session_id: session.session_id.to_string(),
+            vendor: crate::agent_activity::display_name(&session.vendor, "unknown"),
+            client: crate::agent_activity::display_name(&session.client_name, "unnamed client"),
+            transport: crate::agent_activity::transport_name(session.transport).to_string(),
+            started_at: session.started_at.clone(),
+            last_activity_at: log.last_call_at.unwrap_or(heard),
+            ended_at: now,
+            calls_total: log.calls_total,
+            calls: log.calls,
+            change_ids: log.changes,
+        });
     }
 
     /// How many calls the daemon is running for this session right now.
@@ -480,6 +668,41 @@ impl SessionCoordinator {
         }
     }
 
+    /// Watch a process whose exit ends a session that names no PID. `None`
+    /// when the session does not exist; otherwise whether the watch is held.
+    ///
+    /// A watched process is evidence in one direction only. Once it is gone
+    /// the sweep reaps the session, as it reaps one whose PID died; while it
+    /// runs it keeps nothing alive, so the session still ages out on the idle
+    /// window. That is the difference from [`SessionCoordinator::attach_process`],
+    /// and the reason a session opened only to read uses this one: it ends
+    /// promptly when its server is killed outright, and a connection that
+    /// never does anything is still reaped by the idle rule while its server
+    /// runs. A session that already names a PID keeps judging by it and holds
+    /// no watch.
+    pub fn watch_process_exit(&self, session_id: &SessionId, pid: u32) -> Result<Option<bool>> {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(session) = self
+            .graph
+            .get_session(session_id)
+            .map_err(DaemonError::from)?
+        else {
+            return Ok(None);
+        };
+        if session.pid.is_some() {
+            return Ok(Some(false));
+        }
+        self.exit_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(*session_id, pid);
+        debug!(session_id = %session_id, pid, "session watches its process for exit");
+        Ok(Some(true))
+    }
+
     /// Record a heartbeat for a session. Returns an error if the session
     /// doesn't exist.
     pub fn heartbeat(&self, session_id: &SessionId) -> Result<()> {
@@ -499,6 +722,7 @@ impl SessionCoordinator {
             .arbitration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ending = self.get_session(session_id)?;
         for intent in self.list_intents(session_id)? {
             self.graph
                 .delete_intent(&intent.intent_id)
@@ -507,7 +731,7 @@ impl SessionCoordinator {
         self.graph
             .delete_session(session_id)
             .map_err(DaemonError::from)?;
-        self.activity.forget(session_id);
+        self.end_activity(ending.as_ref(), session_id);
         self.forget_liveness(session_id);
         info!(session_id = %session_id, "deregistered agent session");
         Ok(())
@@ -1240,6 +1464,21 @@ impl SessionCoordinator {
                 is_stale = true;
             }
 
+            // A PID-less session's watched process can only end it. While it
+            // runs, the idle rule below still decides.
+            if session.pid.is_none() {
+                if let Some(pid) = self.watched_process(&session.session_id) {
+                    if !is_process_alive(pid) {
+                        debug!(
+                            session_id = %session.session_id,
+                            pid = pid,
+                            "the process this session watches is gone"
+                        );
+                        is_stale = true;
+                    }
+                }
+            }
+
             // Check heartbeat staleness.
             if let Some(age) = timestamp_age(&session.last_heartbeat, &now) {
                 if age > stale_threshold {
@@ -1282,7 +1521,7 @@ impl SessionCoordinator {
                 self.graph
                     .delete_session(&session.session_id)
                     .map_err(DaemonError::from)?;
-                self.activity.forget(&session.session_id);
+                self.end_activity(Some(session), &session.session_id);
                 self.forget_liveness(&session.session_id);
                 warn!(
                     session_id = %session.session_id,
@@ -1740,6 +1979,8 @@ mod tests {
             duration_ms: 1,
             is_error: false,
             repo_id: None,
+            change_id: None,
+            caller_left: false,
         }
     }
 
@@ -1800,6 +2041,102 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(coord.sweep_stale_sessions().unwrap(), 0);
         assert!(coord.get_session(&sid).unwrap().is_some());
+    }
+
+    fn read_session(coord: &SessionCoordinator) -> SessionId {
+        coord
+            .register_session(
+                "claude-code",
+                "claude-code",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap()
+    }
+
+    /// A session opened for reads watches its server's process. When that
+    /// process is killed outright the session is reaped at the next sweep,
+    /// long before its idle window would end it.
+    #[test]
+    fn a_read_session_whose_process_is_gone_is_reaped_at_the_next_sweep() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord = SessionCoordinator::with_session_idle_ttl(graph, DEFAULT_SESSION_IDLE_TTL);
+        let sid = read_session(&coord);
+        // A process id no process holds, as a killed server's is.
+        assert_eq!(
+            coord.watch_process_exit(&sid, 999_999_999).unwrap(),
+            Some(true)
+        );
+        assert_eq!(coord.watched_processes(), 1);
+        let reaped = coord.sweep_stale_sessions_detailed().unwrap();
+        assert_eq!(reaped.len(), 1, "a fresh session whose process is gone");
+        assert_eq!(reaped[0].0.session_id, sid);
+        assert!(coord.get_session(&sid).unwrap().is_none());
+        assert_eq!(coord.watched_processes(), 0, "the watch goes with it");
+    }
+
+    /// A watched process that runs keeps nothing alive: a read session that
+    /// never does anything still ages out on the idle rule, which is why such
+    /// a session names no PID.
+    #[test]
+    fn a_live_idle_read_session_still_ages_out_on_the_idle_rule() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord = SessionCoordinator::with_session_idle_ttl(graph, Duration::from_millis(40));
+        let sid = read_session(&coord);
+        assert_eq!(
+            coord.watch_process_exit(&sid, std::process::id()).unwrap(),
+            Some(true)
+        );
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 0, "fresh and alive");
+        assert!(coord.get_session(&sid).unwrap().is_some());
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            1,
+            "idle past the window although its process runs"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_none());
+        assert_eq!(coord.watched_processes(), 0);
+    }
+
+    /// Only a PID-less session holds a watch. One that names its process is
+    /// judged by that process, and a session the daemon does not hold is
+    /// answered as missing.
+    #[test]
+    fn only_a_session_without_a_process_watches_one() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord = SessionCoordinator::with_session_idle_ttl(graph, Duration::from_millis(30));
+        let sid = read_session(&coord);
+        coord.attach_process(&sid, std::process::id()).unwrap();
+        assert_eq!(
+            coord.watch_process_exit(&sid, 999_999_999).unwrap(),
+            Some(false)
+        );
+        assert_eq!(coord.watched_processes(), 0);
+        assert_eq!(
+            coord
+                .watch_process_exit(&SessionId::new(), 999_999_999)
+                .unwrap(),
+            None
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            0,
+            "its live PID keeps it, as before"
+        );
+        let ended = read_session(&coord);
+        coord
+            .watch_process_exit(&ended, std::process::id())
+            .unwrap();
+        coord.deregister_session(&ended).unwrap();
+        assert_eq!(
+            coord.watched_processes(),
+            0,
+            "an ended session's watch goes"
+        );
     }
 
     /// Liveness is kept in memory, so refreshing it writes nothing into the

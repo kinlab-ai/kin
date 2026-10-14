@@ -236,6 +236,22 @@ impl Confined {
         }
     }
 
+    /// When the entry at `relative` last changed, without following a link.
+    /// An empty path asks about the directory itself. `Ok(None)` when nothing
+    /// exists there.
+    pub(crate) fn modified(&self, relative: &Path) -> io::Result<Option<std::time::SystemTime>> {
+        let metadata = if relative.as_os_str().is_empty() {
+            self.dir.dir_metadata()
+        } else {
+            self.dir.symlink_metadata(relative)
+        };
+        match metadata {
+            Ok(metadata) => Ok(Some(metadata.modified()?.into_std())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The names directly inside `relative`, sorted.
     pub(crate) fn names(&self, relative: &Path) -> io::Result<Vec<std::ffi::OsString>> {
         let entries = if relative.as_os_str().is_empty() {

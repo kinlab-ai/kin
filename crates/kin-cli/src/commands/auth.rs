@@ -301,7 +301,15 @@ fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()>
     Ok(())
 }
 
-fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredCredential>> {
+/// The stored credential for `base_url`. `may_prompt` says whether an
+/// encrypted credential may ask for its passphrase: a server that answers a
+/// page has nobody to answer that prompt, so it reads only what opens without
+/// one.
+fn load_credential(
+    base_url: &str,
+    allow_keyring: bool,
+    may_prompt: bool,
+) -> Result<Option<StoredCredential>> {
     let key = account_key(base_url);
     if allow_keyring && keyring_enabled() {
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
@@ -322,6 +330,9 @@ fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredC
         return Ok(Some(serde_json::from_slice(&bytes)?));
     }
 
+    if !may_prompt {
+        return Ok(None);
+    }
     if let Some(bytes) = read_encrypted_file(&encrypted_path)? {
         return Ok(Some(serde_json::from_slice(&bytes)?));
     }
@@ -608,9 +619,20 @@ fn prompt_for_code() -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// The saved bearer token for `base_url` when it opens without asking anyone:
+/// a plaintext credential file. The platform keyring and an encrypted file
+/// both can stop and wait for a person, so neither is read.
+pub(crate) fn saved_bearer_token_without_prompt(base_url: &str) -> Option<String> {
+    kin_remote::http_transport::validate_credential_url(base_url).ok()?;
+    load_credential(base_url, false, false)
+        .ok()
+        .flatten()
+        .map(|credential| credential.token)
+}
+
 pub(crate) fn load_saved_bearer_token(base_url: &str) -> Option<String> {
     kin_remote::http_transport::validate_credential_url(base_url).ok()?;
-    load_credential(base_url, true)
+    load_credential(base_url, true, true)
         .ok()
         .flatten()
         .map(|credential| credential.token)
@@ -639,7 +661,7 @@ pub(crate) fn has_stored_credential(base_url: &str) -> bool {
 }
 
 pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
-    let identity = load_credential(base_url, false)
+    let identity = load_credential(base_url, false, true)
         .ok()
         .flatten()
         .map(|credential| credential.user_email)
@@ -817,7 +839,7 @@ pub(crate) fn stored_credential_provider(base_url: &str) -> Option<String> {
 
 pub async fn status(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    match load_credential(&base_url, true)? {
+    match load_credential(&base_url, true, true)? {
         Some(credential) => {
             println!("KinLab auth is configured for {}.", base_url);
             println!("  User:    {}", credential.user_email);
@@ -846,7 +868,7 @@ pub async fn status(base_url: Option<String>) -> Result<()> {
 pub async fn whoami(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
     kin_remote::http_transport::validate_credential_url(&base_url).map_err(anyhow::Error::msg)?;
-    let credential = load_credential(&base_url, true)?
+    let credential = load_credential(&base_url, true, true)?
         .ok_or_else(|| anyhow::anyhow!("no KinLab auth credential stored for {}", base_url))?;
     let response = credential_http_client()?
         .get(format!("{}/api/session", base_url))
@@ -943,7 +965,7 @@ async fn revoke_saved_session(base_url: &str) -> Result<RevocationOutcome> {
             "network revocation skipped: {reason}"
         )));
     }
-    let revocation = match load_credential(base_url, true)? {
+    let revocation = match load_credential(base_url, true, true)? {
         None => None,
         Some(credential) => Some(
             match credential_http_client()?
@@ -1029,7 +1051,7 @@ mod tests {
             .expect("local logout must not wait on an unsafe endpoint")
             .unwrap();
         assert!(!legacy.exists());
-        assert!(load_credential(other, false).unwrap().is_some());
+        assert!(load_credential(other, false, true).unwrap().is_some());
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -1181,7 +1203,7 @@ mod tests {
         });
         logout(Some(base.clone())).await.unwrap();
         server.join().unwrap();
-        assert!(load_credential(&base, false).unwrap().is_none());
+        assert!(load_credential(&base, false, true).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1244,7 +1266,7 @@ mod tests {
             "the fixture has to write the plaintext tier, or the assertion below proves nothing"
         );
         assert!(
-            load_credential(base_url, false)
+            load_credential(base_url, false, true)
                 .expect("read back what was stored")
                 .is_some(),
             "and the product has to be able to read it, or this is not the tier under test"
@@ -1253,7 +1275,7 @@ mod tests {
         delete_credential(base_url).expect("logout removes the local credential");
 
         assert!(
-            load_credential(base_url, false)
+            load_credential(base_url, false, true)
                 .expect("read after the logout")
                 .is_none(),
             "a logout that leaves a credential a later load reads has not logged anybody out"
@@ -1282,7 +1304,7 @@ mod tests {
         delete_credential(mine).expect("log out of mine only");
 
         assert!(
-            load_credential(theirs, false)
+            load_credential(theirs, false, true)
                 .expect("read the other account")
                 .is_some(),
             "logging out of one account must not remove another account's credential"

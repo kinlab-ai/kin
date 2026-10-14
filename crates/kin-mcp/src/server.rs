@@ -809,16 +809,27 @@ where
             config.connection_session.current().await
         }
         .map(daemon_delegate::ConnectionSessionTag::new);
-        let response = daemon_delegate::with_connection_session(session_tag.clone(), async {
-            match call_progress.as_mut() {
-                Some(notifier) => {
-                    forward_reporting_progress(&message, &config, notifier, &mut *writer, framed)
+        // What the daemon says this call's answers reach of a reviewer's open
+        // flags is collected beside the response and written into it last.
+        let (response, review_flags) = crate::review_flags::collecting(
+            daemon_delegate::with_connection_session(session_tag.clone(), async {
+                match call_progress.as_mut() {
+                    Some(notifier) => {
+                        forward_reporting_progress(
+                            &message,
+                            &config,
+                            notifier,
+                            &mut *writer,
+                            framed,
+                        )
                         .await
+                    }
+                    None => Ok(process_daemon_message(&message, &config).await),
                 }
-                None => Ok(process_daemon_message(&message, &config).await),
-            }
-        })
-        .await?;
+            }),
+        )
+        .await;
+        let response = response?;
         // The daemon no longer holds the session: reaped after its idle
         // window, or lost to a restart. Open a new one now, so the agent is
         // shown again from its next call.
@@ -832,7 +843,7 @@ where
             if is_tools_call(&message) {
                 stamp_client_folder(&mut response, binding.repo_root.as_deref(), &config);
             }
-            let response = present_for_client(response, &message, &config);
+            let response = present_flagged_for_client(response, &message, &config, &review_flags);
             let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
             write_stdio_message(&mut *writer, &response_json, framed).await?;
         }
@@ -1992,11 +2003,14 @@ pub fn serves_structured_output(config: &McpServerConfig) -> bool {
 /// context rather than on its own, so it is a budget rather than a page.
 /// Grok delivers it as a 1,194-byte synthetic user message on turn one.
 ///
+/// 1,200 until the line about a reviewer's flags, which took 101 bytes and
+/// has not been measured with a model the way the routing lines were.
+///
 /// Held by the compile-time assertion below the string rather than by a test.
 /// There is no state in which this crate should build with an instructions
 /// string a client cannot afford to inject, and a test that fails after the
 /// bytes are written is a slower way to learn the same thing.
-pub(crate) const SERVER_INSTRUCTIONS_BUDGET: usize = 1_200;
+pub(crate) const SERVER_INSTRUCTIONS_BUDGET: usize = 1_300;
 
 /// Usage instructions returned at initialize time so a connecting agent knows
 /// what this server is before its first tool call.
@@ -2039,6 +2053,12 @@ pub(crate) const SERVER_INSTRUCTIONS_BUDGET: usize = 1_200;
 /// this profile does not serve, and of four characters on two other lines.
 /// The routed profiles' strings have no room for it and are unchanged.
 ///
+/// One line says where a reviewer's open flags arrive and that `status` lists
+/// them all, on every profile but the citable ones. An answer that reaches a
+/// flag says so in its own advice, so the line's work is to tell an agent
+/// asked to address what was flagged where to start. See
+/// [`crate::review_flags`].
+///
 /// The routed profiles' wording is [`ROUTED_SERVER_INSTRUCTIONS`] and
 /// [`ROUTED_QUERY_SERVER_INSTRUCTIONS`], the tool-search profile's is
 /// [`SEARCH_SERVER_INSTRUCTIONS`], and the citable profiles keep
@@ -2058,6 +2078,7 @@ Read _kin.verdict:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Explore entities and relationships. Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags arrive in _kin.flags; address each before committing. status lists them all.
 If hidden, search for \"kin\" first, to find Kin's tools.";
 
 /// [`SERVER_INSTRUCTIONS`] for `agent-search`, which serves a measured
@@ -2075,6 +2096,7 @@ Read _kin.verdict:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Explore entities and relationships. Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags arrive in _kin.flags; address each before committing. status lists them all.
 If hidden, search for \"kin\" first, to find Kin's tools.";
 
 /// [`SERVER_INSTRUCTIONS`] for a named profile that also lists [`crate::ask`]
@@ -2091,6 +2113,7 @@ Read _kin.verdict:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Explore entities and relationships. Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags arrive in _kin.flags; address each before committing. status lists them all.
 If hidden, search for \"kin\" first, to find Kin's tools.";
 
 /// The instructions for `agent-ask`, which serves [`crate::ask`] alone: every
@@ -2102,6 +2125,7 @@ Read each answer's Answer (verdict) line:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags lead the answers they concern; address each before committing.
 If hidden, search for \"kin\" first, to find Kin's tools.";
 
 /// [`SERVER_INSTRUCTIONS`] for `agent-routed`, where every command is reached
@@ -2123,6 +2147,7 @@ Read _kin.verdict:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Explore entities and relationships. Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags arrive in _kin.flags; address each before committing. kin status lists them all.
 If hidden, search for \"kin\" first, to find Kin's tools. kin describe lists every other Kin tool, and kin call runs one.";
 
 /// [`ROUTED_SERVER_INSTRUCTIONS`] for `agent-routed-query`, which serves the
@@ -2140,6 +2165,7 @@ Read _kin.verdict:
 - complete except the sites listed below, or indirect uses: rows are checked; check only listed places that could apply, then answer.
 - partial: answer from the proven rows and name the gap, unless the reply lists a concrete next step.
 Explore entities and relationships. Kin's current graph outranks memory of other versions of this code. Answer once in the requested format.
+A reviewer's open flags arrive in _kin.flags; address each before committing. kin status lists them all.
 If hidden, search for \"kin\" first, to find Kin's tools. kin describe lists every other read-only Kin tool, and kin call runs one.";
 
 /// Historical instructions for the benchmark profiles, with retired file catalogs
@@ -2594,6 +2620,20 @@ pub fn present_for_client(
             .remember_delivered(result, "semantic_locate", details);
     }
     write_for_agent(&mut response, request, config);
+    response
+}
+
+/// [`present_for_client`], and then the reviewer's open flags the call's
+/// daemon answers reached, written into the reply last and under the handles
+/// this connection serves. See [`crate::review_flags`].
+pub fn present_flagged_for_client(
+    response: JsonRpcResponse,
+    request: &str,
+    config: &McpServerConfig,
+    reached: &crate::review_flags::Delivered,
+) -> JsonRpcResponse {
+    let mut response = present_for_client(response, request, config);
+    crate::review_flags::stamp(&mut response, reached, config.active_handles());
     response
 }
 

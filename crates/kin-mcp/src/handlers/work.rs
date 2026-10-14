@@ -483,6 +483,7 @@ pub fn handle_annotation_add<G: GraphStore>(
         authored_by: kin_model::IdentityRef::assistant("mcp-client"),
         created_at: Timestamp::now(),
         staleness: kin_model::StalenessState::Fresh,
+        review: None,
     };
 
     store

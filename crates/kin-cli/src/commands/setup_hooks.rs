@@ -16,6 +16,14 @@
 //! first, recommending it, and a non-interactive run writes it only when
 //! `--prompt-hook` says so. This module only shapes the settings; the
 //! installer in `setup.rs` reads and writes them.
+//!
+//! The same settings hold the edit hook, which `kin setup` writes whenever it
+//! connects Claude Code. Synchronous `PreToolUse` and `PostToolUse` hooks run
+//! `kin agents record-edit` around `Edit`, `Write` and `MultiEdit`: they tell
+//! the repository's daemon which session made the edit and capture its before
+//! and after state, so the entities the edit changed can name the agent in a
+//! review. Kin owns one group in each event list, the one holding that command,
+//! and touches no other.
 
 use std::path::{Path, PathBuf};
 
@@ -174,6 +182,179 @@ pub(crate) fn current_prompt_hook(root: &Value) -> Option<Value> {
         .cloned()
 }
 
+// ---------------------------------------------------------------------------
+// The edit hook
+// ---------------------------------------------------------------------------
+
+/// The Claude Code event the edit hook runs after.
+pub(crate) const EDIT_HOOK_EVENT: &str = "PostToolUse";
+
+/// The Claude Code event the edit hook runs before.
+pub(crate) const PRE_EDIT_HOOK_EVENT: &str = "PreToolUse";
+
+const EDIT_HOOK_EVENTS: [&str; 2] = [PRE_EDIT_HOOK_EVENT, EDIT_HOOK_EVENT];
+
+/// The Claude Code tools the edit hooks run around: the ones that edit code.
+pub(crate) const EDIT_HOOK_MATCHER: &str = "Edit|Write|MultiEdit";
+
+/// The seconds Claude Code gives the edit hook. The hook sends one local
+/// request and gives up on it well inside this.
+pub(crate) const EDIT_HOOK_TIMEOUT_SECONDS: u64 = 10;
+
+/// The command the edit hook runs: the launcher every Kin client entry
+/// names, quoted when it carries a space, then `agents record-edit`.
+pub(crate) fn edit_hook_command(launcher: &str) -> String {
+    let arguments = super::agent_edits::EDIT_HOOK_ARGUMENTS;
+    if launcher.contains(char::is_whitespace) && !launcher.starts_with('"') {
+        format!("\"{launcher}\" {arguments}")
+    } else {
+        format!("{launcher} {arguments}")
+    }
+}
+
+/// The synchronous group Kin owns in each edit-event list, as Claude Code
+/// reads it. Claude Code's default is synchronous when `async` is absent.
+pub(crate) fn edit_hook_group(command: &str) -> Value {
+    json!({
+        "matcher": EDIT_HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": EDIT_HOOK_TIMEOUT_SECONDS,
+        }],
+    })
+}
+
+/// Whether a hook entry is Kin's edit hook: a command that ends by running
+/// `agents record-edit` for Claude Code.
+fn is_kin_edit_hook(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| {
+            command
+                .trim_end()
+                .ends_with(super::agent_edits::EDIT_HOOK_ARGUMENTS)
+        })
+}
+
+fn holds_kin_edit_hook(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| hooks.iter().any(is_kin_edit_hook))
+}
+
+/// `root` with Kin's paired edit hooks running `command`, and what that changed.
+/// Each group is written whole: its matcher and its one hook. A Kin entry found
+/// among a person's own hooks in another group is taken out of that group and
+/// their hooks are left as they were. Settings not shaped as Claude Code
+/// writes them are refused rather than rewritten.
+pub(crate) fn with_edit_hook(
+    root: Option<Value>,
+    command: &str,
+) -> Result<(Value, PromptHookWrite)> {
+    let mut root = root.unwrap_or_else(|| Value::Object(Map::new()));
+    let group = edit_hook_group(command);
+    let Some(object) = root.as_object_mut() else {
+        bail!("it is not a JSON object");
+    };
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(hooks) = hooks.as_object_mut() else {
+        bail!("its `hooks` value is not an object");
+    };
+    let mut existing = false;
+    let mut changed = false;
+    for event in EDIT_HOOK_EVENTS {
+        let groups = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(groups) = groups.as_array_mut() else {
+            bail!("its `hooks.{event}` value is not a list");
+        };
+        let held = groups
+            .iter()
+            .filter(|held| holds_kin_edit_hook(held))
+            .count();
+        existing |= held != 0;
+        if held == 1 && groups.iter().any(|held| *held == group) {
+            continue;
+        }
+        changed = true;
+        for held in groups.iter_mut() {
+            if let Some(entries) = held.get_mut("hooks").and_then(Value::as_array_mut) {
+                entries.retain(|hook| !is_kin_edit_hook(hook));
+            }
+        }
+        groups.retain(|held| {
+            held.get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|entries| !entries.is_empty())
+        });
+        groups.push(group.clone());
+    }
+    let write = if !changed {
+        PromptHookWrite::Unchanged
+    } else if !existing {
+        PromptHookWrite::Added
+    } else {
+        PromptHookWrite::Replaced
+    };
+    Ok((root, write))
+}
+
+/// `root` without Kin's edit hooks: every Kin entry removed, and a group left
+/// with no hooks removed with it. Whether anything was removed.
+pub(crate) fn without_edit_hook(root: &mut Value) -> bool {
+    let mut removed = false;
+    for event in EDIT_HOOK_EVENTS {
+        let Some(groups) = root
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(event))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = hooks.len();
+                hooks.retain(|hook| !is_kin_edit_hook(hook));
+                removed |= hooks.len() != before;
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|hooks| !hooks.is_empty())
+        });
+    }
+    removed
+}
+
+/// Every group holding Kin's edit hook, keyed by event, when any remain. Both
+/// event lists are fingerprinted together, including unexpected duplicates,
+/// so a partial pair or changed matcher cannot verify as an intact install.
+pub(crate) fn current_edit_hook(root: &Value) -> Option<Value> {
+    let hooks = root.get("hooks")?;
+    let mut owned = Map::new();
+    for event in EDIT_HOOK_EVENTS {
+        let Some(groups) = hooks.get(event).and_then(Value::as_array) else {
+            continue;
+        };
+        let groups: Vec<_> = groups
+            .iter()
+            .filter(|group| holds_kin_edit_hook(group))
+            .cloned()
+            .collect();
+        if !groups.is_empty() {
+            owned.insert(event.to_owned(), Value::Array(groups));
+        }
+    }
+    (!owned.is_empty()).then_some(Value::Object(owned))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +439,155 @@ mod tests {
             prompt_hook_command("/Users/A B/.kin/bin/kin"),
             "\"/Users/A B/.kin/bin/kin\" ask --hook claude"
         );
+    }
+
+    #[test]
+    fn the_edit_hook_is_its_own_group_beside_every_other_hook() {
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo ready"}]}],
+                "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo ran"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo hi"}]}]
+            }
+        });
+        let command = edit_hook_command(LAUNCHER);
+        assert_eq!(
+            command,
+            format!("{LAUNCHER} agents record-edit --client claude")
+        );
+        let (root, write) = with_edit_hook(Some(settings), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Added);
+        for event in EDIT_HOOK_EVENTS {
+            let groups = root["hooks"][event].as_array().unwrap();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0]["matcher"], "Bash");
+            assert_eq!(groups[1]["matcher"], "Edit|Write|MultiEdit");
+            assert_eq!(groups[1]["hooks"][0]["command"], command);
+            assert_eq!(groups[1]["hooks"][0]["timeout"], 10);
+            assert!(groups[1]["hooks"][0].get("async").is_none());
+        }
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo ready"
+        );
+        assert_eq!(
+            root["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "echo ran"
+        );
+        assert_eq!(
+            root["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "echo hi"
+        );
+        assert_eq!(
+            current_edit_hook(&root),
+            Some(json!({
+                "PreToolUse": [edit_hook_group(&command)],
+                "PostToolUse": [edit_hook_group(&command)],
+            }))
+        );
+
+        let (again, write) = with_edit_hook(Some(root.clone()), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Unchanged);
+        assert_eq!(again, root);
+
+        let moved = edit_hook_command("/opt/kin/bin/kin");
+        let (mut moved_root, write) = with_edit_hook(Some(root), &moved).unwrap();
+        assert_eq!(write, PromptHookWrite::Replaced);
+        for event in EDIT_HOOK_EVENTS {
+            let groups = moved_root["hooks"][event].as_array().unwrap();
+            assert_eq!(groups.len(), 2, "one Kin group per event, never two");
+            assert_eq!(groups[1]["hooks"][0]["command"], moved);
+        }
+
+        assert!(without_edit_hook(&mut moved_root));
+        assert_eq!(
+            moved_root["hooks"]["PreToolUse"],
+            json!([{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo ready"}]}])
+        );
+        assert_eq!(
+            moved_root["hooks"]["PostToolUse"],
+            json!([{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo ran"}]}])
+        );
+        assert!(!without_edit_hook(&mut moved_root));
+        assert!(current_edit_hook(&moved_root).is_none());
+    }
+
+    #[test]
+    fn a_kin_edit_hook_a_person_moved_among_their_own_is_taken_back_out() {
+        let command = edit_hook_command(LAUNCHER);
+        let theirs = json!({"type": "command", "command": "echo edited"});
+        let mixed = json!({
+            "matcher": "Edit",
+            "hooks": [theirs.clone(), {"type": "command", "command": command}],
+        });
+        let settings = json!({"hooks": {
+            "PreToolUse": [mixed.clone()],
+            "PostToolUse": [mixed],
+        }});
+        let (mut root, write) = with_edit_hook(Some(settings), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Replaced);
+        for event in EDIT_HOOK_EVENTS {
+            assert_eq!(
+                root["hooks"][event],
+                json!([{"matcher": "Edit", "hooks": [theirs]}, edit_hook_group(&command)])
+            );
+        }
+        assert!(without_edit_hook(&mut root));
+        for event in EDIT_HOOK_EVENTS {
+            assert_eq!(
+                root["hooks"][event],
+                json!([{"matcher": "Edit", "hooks": [theirs]}])
+            );
+        }
+        for settings in [
+            json!([]),
+            json!({"hooks": []}),
+            json!({"hooks": {"PreToolUse": {}}}),
+            json!({"hooks": {"PostToolUse": {}}}),
+        ] {
+            assert!(
+                with_edit_hook(Some(settings.clone()), &command).is_err(),
+                "{settings}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_only_install_is_upgraded_without_duplicating_its_group() {
+        let command = edit_hook_command(LAUNCHER);
+        let post = edit_hook_group(&command);
+        let settings = json!({"hooks": {"PostToolUse": [post.clone()]}});
+        let (root, write) = with_edit_hook(Some(settings), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Replaced);
+        assert_eq!(root["hooks"]["PostToolUse"], json!([post]));
+        assert_eq!(
+            root["hooks"]["PreToolUse"],
+            json!([edit_hook_group(&command)])
+        );
+        let (again, write) = with_edit_hook(Some(root.clone()), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Unchanged);
+        assert_eq!(again, root);
+    }
+
+    #[test]
+    fn duplicate_edit_groups_are_collapsed_and_all_owned_groups_are_observed() {
+        let command = edit_hook_command(LAUNCHER);
+        let group = edit_hook_group(&command);
+        let settings = json!({"hooks": {
+            "PreToolUse": [group.clone(), group.clone()],
+            "PostToolUse": [group.clone()],
+        }});
+        assert_eq!(
+            current_edit_hook(&settings).unwrap()["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let (root, write) = with_edit_hook(Some(settings), &command).unwrap();
+        assert_eq!(write, PromptHookWrite::Replaced);
+        for event in EDIT_HOOK_EVENTS {
+            assert_eq!(root["hooks"][event], json!([group]));
+        }
     }
 }

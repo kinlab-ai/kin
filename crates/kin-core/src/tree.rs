@@ -721,32 +721,7 @@ pub fn verify_repository_workspace_projection(
                 )
             })?;
 
-        let entry_refs = entries.iter().collect::<Vec<_>>();
-        let materialized_identities = projection
-            .projection
-            .validate_frozen_entries_unchanged(&entry_refs)?;
-        let mut graph_only_proofs = Vec::new();
-        for artifact in tree.artifacts_by_path() {
-            let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
-            if disposition != SourceProjectionDisposition::Materialized {
-                graph_only_proofs.push((
-                    artifact.path.clone(),
-                    disposition,
-                    projection
-                        .projection
-                        .verify_frozen_graph_only(&artifact.path, disposition)?,
-                ));
-            }
-        }
-        projection
-            .projection
-            .revalidate_frozen_entries_unchanged(&entry_refs, &materialized_identities)?;
-        for (path, disposition, proof) in &graph_only_proofs {
-            projection
-                .projection
-                .revalidate_frozen_graph_only(path, *disposition, proof)?;
-        }
-        projection.revalidate_namespace()?;
+        verify_frozen_workspace_projection(&projection, tree, &entries)?;
         Ok((entries.len(), authority_freeze))
     }
     #[cfg(not(any(unix, windows)))]
@@ -754,6 +729,95 @@ pub fn verify_repository_workspace_projection(
         let _ = (root, tree, authority);
         Err(unsupported_safe_projection_error())
     }
+}
+
+/// Verify that the complete current repository workspace still matches its
+/// exact derived projection, then publish one repository transaction that
+/// leaves every workspace where it is, while the projection stays frozen.
+///
+/// History admitted onto the branch a workspace tracks is such a transaction:
+/// it moves the ref and leaves the workspace on its previous base until a
+/// separate transition follows the ref. The model refuses a workspace mutation
+/// that changes nothing, so such a transaction carries none, and this is the
+/// seam that still proves the tracked bytes before it publishes. The
+/// transaction's own root compare-and-swap is what stops a concurrent change
+/// to the workspace; the projection lock is held from the proof through the
+/// commit, in the global projection-then-authority order.
+pub fn verify_repository_workspace_projection_and_commit_repository_transaction(
+    root: &Path,
+    tree: &ResolvedTree,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> Result<(
+    usize,
+    RepositoryCommitReceipt,
+    LocalRepositoryAuthorityFreeze,
+)> {
+    if transaction.workspace_mutation.is_some() {
+        return Err(KinError::Other(
+            "a transaction that moves a workspace publishes through a workspace transition"
+                .to_string(),
+        ));
+    }
+    #[cfg(any(unix, windows))]
+    {
+        let projection =
+            ExactProjectionFreeze::acquire_existing_for_repository_transition(root, authority)?;
+        let owned = load_repository_projection_entries(authority, tree, "current workspace")?;
+        let entries = validated_source_entries(
+            owned
+                .iter()
+                .map(|entry| (&entry.path, entry.kind, entry.content.as_slice())),
+        )?;
+        validate_repository_projection_entries_match_tree("current workspace", tree, &entries)?;
+        validate_projection_proof_paths(tree.artifacts_by_path().map(|artifact| &artifact.path))?;
+        verify_frozen_workspace_projection(&projection, tree, &entries)?;
+        let (receipt, freeze) =
+            commit_repository_transaction_exact_and_freeze(authority, transaction).into_result()?;
+        Ok((entries.len(), receipt, freeze))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, tree, authority, transaction);
+        Err(unsupported_safe_projection_error())
+    }
+}
+
+/// Prove every member of `tree` unchanged in the frozen projection, the
+/// materialized ones by their exact bytes and the graph-only ones by their
+/// retained representation, twice, and the projection root still in place.
+#[cfg(any(unix, windows))]
+fn verify_frozen_workspace_projection(
+    projection: &ExactProjectionFreeze,
+    tree: &ResolvedTree,
+    entries: &[ValidatedSourceEntry<'_>],
+) -> Result<()> {
+    let entry_refs = entries.iter().collect::<Vec<_>>();
+    let materialized_identities = projection
+        .projection
+        .validate_frozen_entries_unchanged(&entry_refs)?;
+    let mut graph_only_proofs = Vec::new();
+    for artifact in tree.artifacts_by_path() {
+        let disposition = source_projection_disposition(&artifact.path, artifact.entry)?;
+        if disposition != SourceProjectionDisposition::Materialized {
+            graph_only_proofs.push((
+                artifact.path.clone(),
+                disposition,
+                projection
+                    .projection
+                    .verify_frozen_graph_only(&artifact.path, disposition)?,
+            ));
+        }
+    }
+    projection
+        .projection
+        .revalidate_frozen_entries_unchanged(&entry_refs, &materialized_identities)?;
+    for (path, disposition, proof) in &graph_only_proofs {
+        projection
+            .projection
+            .revalidate_frozen_graph_only(path, *disposition, proof)?;
+    }
+    projection.revalidate_namespace()
 }
 
 /// One bounded read-only observation of the derived projection against the

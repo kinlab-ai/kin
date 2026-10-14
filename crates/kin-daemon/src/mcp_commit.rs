@@ -46,6 +46,11 @@ struct ExactMcpPlan {
     /// build of Kin derived. See
     /// [`crate::repository_commit::NativeCommitPlan::carried_semantic_files`].
     rederived_files: Vec<RepoPath>,
+    /// Entities this change records in units the operations wrote exactly as
+    /// the working copy already held them: uncommitted work published with
+    /// the unit it sits in, which no operation here wrote. See
+    /// [`held_before_in_written_units`].
+    held_before: BTreeSet<EntityId>,
     /// The paths this transaction's own operations write. Publication accepts
     /// one of them when the working copy already holds its exact target bytes,
     /// because a writer that edited the file and then staged its new text is
@@ -209,6 +214,7 @@ struct PlannedCommitFacts {
     layouts: Vec<FileLayout>,
     carried_pending_files: Vec<RepoPath>,
     rederived_files: Vec<RepoPath>,
+    held_before: BTreeSet<EntityId>,
 }
 
 /// How far back a commit looks in the audit log for attribution it may already
@@ -862,6 +868,7 @@ fn commit_exact_transaction_inner(
             layouts: plan.layouts,
             carried_pending_files: plan.carried_pending_files,
             rederived_files: plan.rederived_files,
+            held_before: plan.held_before,
         }),
         coordination,
         CommitApplication::Applied,
@@ -970,6 +977,10 @@ struct CommitActor {
     author: kin_model::AuthorId,
     actor: Actor,
     session_id: String,
+    /// The vendor and client names the session gave, made safe to record.
+    /// Empty when the session had already ended.
+    vendor: String,
+    client: String,
 }
 
 fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -> CommitActor {
@@ -1002,8 +1013,15 @@ fn commit_actor_for(
             kind: ActorKind::Assistant,
             display_name,
             external_refs: Vec::new(),
+            agent_session: None,
         },
         session_id: session_id.to_string(),
+        vendor: agent
+            .map(|agent| provenance_label(&agent.vendor))
+            .unwrap_or_default(),
+        client: agent
+            .map(|agent| provenance_label(&agent.client_name))
+            .unwrap_or_default(),
     }
 }
 
@@ -1091,6 +1109,7 @@ fn record_commit_provenance(
     committed: &NativeCommitResult,
     carried_pending_files: &[RepoPath],
     rederived_files: &[RepoPath],
+    held_before: &BTreeSet<EntityId>,
 ) -> Result<(), String> {
     graph
         .create_actor(&actor.actor)
@@ -1135,7 +1154,13 @@ fn record_commit_provenance(
             origin_of.insert(entity.id, origin);
         }
     }
+    // Uncommitted work published inside a unit an operation wrote is carried
+    // the same way, entity by entity: the change records it as the working
+    // copy already held it, and no operation here wrote it.
     let is_carried = |entity_id: &kin_model::EntityId| -> bool {
+        if held_before.contains(entity_id) {
+            return true;
+        }
         if let Some(origin) = origin_of.get(entity_id) {
             return carried_origins.contains(origin);
         }
@@ -1653,9 +1678,9 @@ fn plan_exact_transaction(
 
     // Unit-addressed work lands on top of entity edits, so an edit and an
     // import change to one unit publish together. It may not share a unit with
-    // a whole-file operation or with anchored lifecycle work, whose bytes are
-    // planned from a different base.
-    let mut whole_file_paths = creations
+    // a whole-file operation. Anchored lifecycle work is planned after the
+    // edits, on the source they produced, so it may share their unit.
+    let whole_file_paths = creations
         .values()
         .map(|(file_id, _)| file_id)
         .chain(replacements.values().map(|(file_id, _)| file_id))
@@ -1663,23 +1688,8 @@ fn plan_exact_transaction(
         .chain(relocations.values().flat_map(|(from, to)| [from, to]))
         .filter_map(|file_id| RepoPath::from_utf8(file_id.0.clone()).ok())
         .collect::<BTreeSet<_>>();
-    let lifecycle = crate::entity_lifecycle::prepare(
-        state,
-        authority_context,
-        base,
-        &transaction.staged_operations,
-    )?;
-    let (snapshot, mut layouts) = if let Some(lifecycle) = lifecycle {
-        if !authored_files.is_disjoint(&lifecycle.authored_files) {
-            return Err("lifecycle and other source operations cannot write the same source unit in one transaction".into());
-        }
-        whole_file_paths.extend(lifecycle.authored_files.iter().cloned());
-        authored_files.extend(lifecycle.authored_files);
-        (lifecycle.snapshot, lifecycle.layouts)
-    } else {
-        (base.graph.to_snapshot(), Vec::new())
-    };
-    let prospective = kin_db::InMemoryGraph::from_snapshot(snapshot)
+    let mut layouts = Vec::new();
+    let mut prospective = kin_db::InMemoryGraph::from_snapshot(base.graph.to_snapshot())
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
     // Before any staged operation is planned, because an edit is re-derived
     // against its dependents and the strict reader refuses one still holding
@@ -2005,6 +2015,33 @@ fn plan_exact_transaction(
         layouts.push(layout);
     }
 
+    if let Some(lifecycle) = crate::entity_lifecycle::prepare(
+        state,
+        authority_context,
+        &prospective,
+        &edited_entities,
+        &transaction.staged_operations,
+    )? {
+        if !whole_file_paths.is_disjoint(&lifecycle.authored_files) {
+            return Err(
+                "lifecycle and other source operations cannot write the same source unit in one transaction"
+                    .into(),
+            );
+        }
+        prospective = kin_db::InMemoryGraph::from_snapshot(lifecycle.snapshot)
+            .map_err(|error| format!("create prospective exact graph: {error}"))?;
+        for layout in lifecycle.layouts {
+            layouts.retain(|held: &FileLayout| held.file_id != layout.file_id);
+            layouts.push(layout);
+        }
+        for layout in &layouts {
+            prospective.upsert_file_layout(layout).map_err(|error| {
+                format!("install prospective layout for {}: {error}", layout.file_id)
+            })?;
+        }
+        authored_files.extend(lifecycle.authored_files);
+    }
+
     authored_files.extend(crate::module_code_commit::plan_module_patches(
         state,
         held_authority,
@@ -2058,7 +2095,7 @@ fn plan_exact_transaction(
         &mut layouts,
     )?;
 
-    apply_relation_operations(&prospective, relation_operations)?;
+    let added_relations = apply_relation_operations(&prospective, relation_operations)?;
     if semantic_workspace_matches(
         &prospective,
         carried_baseline.as_ref().unwrap_or(&base.graph),
@@ -2078,6 +2115,133 @@ fn plan_exact_transaction(
         return Err(
             "exact MCP transaction produced no semantic, relation, or tree change".to_string(),
         );
+    }
+
+    // Uncommitted work in source units no operation here wrote is somebody
+    // else's: a person's edits, or another session's. It is not this
+    // transaction's to publish, so the change records the base change and what
+    // this transaction's operations wrote, and that work stays in the working
+    // copy, uncommitted against the new change, with the entities and the
+    // authorship it already had. A unit an operation writes is one set of
+    // bytes, and the operation was planned against them as the working copy
+    // holds them, so uncommitted work inside that unit is published with the
+    // operation's own, as it always was.
+    let pending = timed_commit_phase("plan_pending_units", || {
+        pending_units(held_authority, base, &authored_files)
+    })?;
+    // Read before anything is published, while the daemon's graph is still the
+    // working copy this transaction was planned beside.
+    let held_before = |change: &kin_model::SemanticChange| {
+        held_before_in_written_units(state.graph.as_ref(), change, &pending.written)
+    };
+    if let Some(left) = pending.left.as_ref() {
+        // A relationship this transaction's own operations or derivation
+        // changed keeps the value they gave it; every other one in a unit left
+        // uncommitted is that unit's, on either side.
+        let baseline = carried_baseline.as_ref().unwrap_or(&base.graph);
+        let changed = |id: &kin_model::RelationId, here: Option<&Relation>| {
+            baseline.get_relation_by_id(id).as_ref() != here
+        };
+        let change = timed_commit_phase("plan_change_without_pending_units", || {
+            crate::entity_keep::with_units_from(
+                prospective.to_snapshot(),
+                crate::entity_keep::Semantics::of_state(&left.head),
+                &left.units,
+                &changed,
+                &added_relations,
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "{error}, so this change cannot record what this transaction wrote without that \
+                 work. Commit or restore that uncommitted work first, then send this commit again"
+            )
+        })?;
+        // The working copy keeps the units it leaves uncommitted as the daemon
+        // serves them, which is what keeps their entities' identities, and so
+        // whatever authorship is recorded against them, exactly as they were.
+        let live = state.graph.to_snapshot();
+        if left.units.iter().any(|path| {
+            live.resolved_tree.artifact_at_path(path) != base.tree.artifact_at_path(path)
+        }) {
+            return Err(
+                "Kin is still reading the latest edits to uncommitted work this change leaves in \
+                 place, so nothing was published; send this commit again in a moment"
+                    .to_string(),
+            );
+        }
+        let working_copy = timed_commit_phase("plan_working_copy_after_commit", || {
+            crate::entity_keep::with_units_from(
+                prospective.to_snapshot(),
+                crate::entity_keep::Semantics::of_snapshot(&live),
+                &left.units,
+                &changed,
+                &BTreeSet::new(),
+            )
+        })
+        .map_err(|error| {
+            format!(
+                "{error}, so Kin cannot keep that work uncommitted beside this change. Commit or \
+                 restore that uncommitted work first, then send this commit again"
+            )
+        })?;
+        drop(live);
+        drop(prospective);
+
+        let plan_kept = |rederived: &[RepoPath]| {
+            crate::repository_commit::plan_native_commit_from_base_keeping_pending(
+                &change,
+                &working_copy,
+                state.blobs.as_ref(),
+                authority_context,
+                operation_id,
+                kin_model::Timestamp::now(),
+                actor.author.clone(),
+                &authored_files,
+                &|carried| {
+                    commit_message(
+                        &transaction.transaction_id,
+                        requested_message,
+                        carried,
+                        rederived,
+                    )
+                },
+                base,
+                Some(Arc::clone(held_authority)),
+            )
+            .map_err(|error| format!("plan exact MCP repository commit: {error}"))
+        };
+        let native = plan_kept(&[])?;
+        // Named in the message as on every other commit; see below.
+        let native = if native.carried_semantic_files.is_empty() {
+            native
+        } else {
+            let rederived = native.carried_semantic_files.clone();
+            drop(native);
+            plan_kept(&rederived)?
+        };
+        refuse_left_units_in_change(&native.change, &left.units)?;
+        if native.change.entity_deltas.is_empty()
+            && native.change.relation_deltas.is_empty()
+            && native.change.tree_deltas.is_empty()
+        {
+            return Err(
+                "exact MCP transaction produced no semantic, relation, or tree change outside \
+                 the uncommitted work it leaves in place"
+                    .to_string(),
+            );
+        }
+        let carried_pending_files = native.carried_pending_files.clone();
+        let rederived_files = native.carried_semantic_files.clone();
+        let held_before = held_before(&native.change);
+        return Ok(ExactMcpPlan {
+            native,
+            layouts,
+            carried_pending_files,
+            rederived_files,
+            held_before,
+            authored_files,
+        });
     }
 
     let plan_against = |graph: &kin_db::InMemoryGraph, rederived: &[RepoPath]| {
@@ -2143,13 +2307,177 @@ fn plan_exact_transaction(
     };
     let carried_pending_files = native.carried_pending_files.clone();
     let rederived_files = native.carried_semantic_files.clone();
+    let held_before = held_before(&native.change);
     Ok(ExactMcpPlan {
         native,
         layouts,
         carried_pending_files,
         rederived_files,
+        held_before,
         authored_files,
     })
+}
+
+/// How the workspace's uncommitted work stands against one transaction's
+/// operations.
+struct PendingUnits {
+    /// The units the operations wrote that already held uncommitted work. Each
+    /// is one set of bytes, so that work is published with the operation's.
+    written: BTreeSet<RepoPath>,
+    /// The units no operation wrote, which stay uncommitted, when there are
+    /// any, with the base change they are left against.
+    left: Option<LeftUncommitted>,
+}
+
+/// The source units one transaction leaves uncommitted, and the base change
+/// it leaves them against.
+struct LeftUncommitted {
+    /// Every path those units hold in the base change or the working copy.
+    units: BTreeSet<RepoPath>,
+    /// The base change the workspace stands on, as the change it records
+    /// holds the units it does not write.
+    head: kin_model::graph::ResolvedGraphState,
+}
+
+/// Which source units the workspace holds ahead of its base change, read
+/// against what this transaction's operations wrote.
+///
+/// Read one unit transition at a time, and a transition that touches a path
+/// the operations wrote belongs to them whole. A unit the working copy moved
+/// and an operation then wrote is one unit: its move is published with the
+/// write, declared as carried, rather than split from it.
+fn pending_units(
+    held_authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+    base: &NativeCommitBase,
+    authored: &BTreeSet<RepoPath>,
+) -> Result<PendingUnits, String> {
+    let lease = held_authority.read_authority();
+    let head = match base.head {
+        Some(head) => crate::commit_deltas::resolve_authority_baseline(lease.snapshot(), &head)
+            .map_err(|error| format!("read the change the workspace stands on: {error}"))?,
+        None => std::borrow::Cow::Owned(kin_model::graph::ResolvedGraphState::default()),
+    };
+    let pending = kin_core::exact_tree_correction(&head.tree, &base.tree)
+        .map_err(|error| format!("read the workspace's uncommitted work: {error}"))?;
+    let mut written = BTreeSet::new();
+    let mut units = BTreeSet::new();
+    for delta in &pending {
+        let paths = [delta.old_state(), delta.new_state()]
+            .into_iter()
+            .flatten()
+            .map(|located| located.path.clone())
+            .collect::<Vec<_>>();
+        if paths.iter().any(|path| authored.contains(path)) {
+            written.extend(paths);
+        } else {
+            units.extend(paths);
+        }
+    }
+    let left = (!units.is_empty()).then(|| LeftUncommitted {
+        units,
+        head: head.into_owned(),
+    });
+    Ok(PendingUnits { written, left })
+}
+
+/// The entities a change records, in units the transaction wrote that already
+/// held uncommitted work, exactly as the working copy held them before the
+/// transaction ran.
+///
+/// That is uncommitted work published with the unit it sits in, which no
+/// operation in this transaction wrote, so it is not attributed to the
+/// committing session. `held` is the working copy before this commit, which
+/// the daemon serves, and an entity is matched by identity or, where the
+/// change derived its own, by its kind and name in the same unit. A position
+/// is not content ([`kin_core::entity_content_agrees`]), so an entity that
+/// only moved because the operation's edit sat above it is matched too.
+fn held_before_in_written_units(
+    held: &kin_db::InMemoryGraph,
+    change: &kin_model::SemanticChange,
+    written: &BTreeSet<RepoPath>,
+) -> BTreeSet<EntityId> {
+    let written = written
+        .iter()
+        .filter_map(|path| path.as_utf8())
+        .collect::<HashSet<_>>();
+    let mut carried = BTreeSet::new();
+    for delta in &change.entity_deltas {
+        let recorded = delta.new_state().or(delta.old_state());
+        let Some(path) = recorded
+            .and_then(|entity| entity.file_origin.as_ref())
+            .filter(|origin| written.contains(origin.0.as_str()))
+        else {
+            continue;
+        };
+        let target = delta.target_id();
+        let held_entity = held.get_entity(&target).ok().flatten().or_else(|| {
+            let recorded = recorded?;
+            let mut named = held
+                .query_entities(&kin_model::EntityFilter {
+                    file_path: Some(path.clone()),
+                    ..Default::default()
+                })
+                .ok()?
+                .into_iter()
+                .filter(|entity| entity.kind == recorded.kind && entity.name == recorded.name);
+            let only = named.next()?;
+            named.next().is_none().then_some(only)
+        });
+        let as_held = match (delta.new_state(), held_entity.as_ref()) {
+            (Some(new), Some(held)) => {
+                kin_core::workspace_semantics::entity_content_agrees(new, held)
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if as_held {
+            carried.insert(target);
+        }
+    }
+    carried
+}
+
+/// Refuse a planned change that records anything inside a source unit it
+/// leaves uncommitted.
+///
+/// [`crate::entity_keep::with_units_from`] builds the change so that it does
+/// not; this checks the change itself before anything is published, because
+/// publishing somebody's uncommitted work under this transaction's name is the
+/// outcome this path exists to prevent.
+fn refuse_left_units_in_change(
+    change: &kin_model::SemanticChange,
+    units: &BTreeSet<RepoPath>,
+) -> Result<(), String> {
+    let unit_paths = units
+        .iter()
+        .filter_map(|path| path.as_utf8())
+        .collect::<HashSet<_>>();
+    let tree = change.tree_deltas.iter().any(|delta| {
+        [delta.old_state(), delta.new_state()]
+            .into_iter()
+            .flatten()
+            .any(|located| units.contains(&located.path))
+    });
+    let entity = change
+        .entity_deltas
+        .iter()
+        .flat_map(|delta| [delta.old_state(), delta.new_state()])
+        .flatten()
+        .filter_map(|entity| entity.file_origin.as_ref())
+        .any(|origin| unit_paths.contains(origin.0.as_str()));
+    if tree || entity {
+        tracing::warn!(
+            change = %change.id,
+            units = units.len(),
+            "a planned MCP change recorded uncommitted work its operations did not write"
+        );
+        return Err(
+            "this change would also record uncommitted work no operation in it wrote, so \
+             nothing was published"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// How many carried paths one commit message names before it stops listing.
@@ -2172,11 +2500,14 @@ const CARRIED_SAMPLE: usize = 10;
 /// Trimmed, and an all-whitespace message is read as none, so a caller cannot
 /// publish a blank subject line by accident.
 fn requested_commit_message(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
-    let message = arguments
-        .get("message")
-        .and_then(serde_json::Value::as_str)?
-        .trim();
-    (!message.is_empty()).then(|| message.to_string())
+    // `transaction commit` names it `message` and `mutate` names it
+    // `summary`; the first one with words in it is the subject.
+    ["message", "summary"]
+        .iter()
+        .filter_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|message| !message.is_empty())
+        .map(str::to_string)
 }
 
 /// The message one MCP commit publishes, stating what it folded in.
@@ -2186,21 +2517,23 @@ fn requested_commit_message(arguments: &HashMap<String, serde_json::Value>) -> O
 /// declaration on a commit that folded nothing would teach every reader to skim
 /// past the ones that did.
 ///
-/// When something was carried, the first line says so on its own, because a
-/// subject-only view of history is where a reader is most likely to meet this
-/// change and least able to ask a follow-up question. The body then says what
-/// the fold does and does not do: the bytes move and the semantics move with
-/// them, because a change that published one without the other would describe
-/// two different sources, and the entities inside those files keep the
-/// authorship they already had rather than silently becoming this agent's work,
-/// because no operation here wrote them.
+/// When something was carried, the transaction line declares the fold and the
+/// body says what the fold does and does not do: the bytes move and the
+/// semantics move with them, because a change that published one without the
+/// other would describe two different sources, and the entities inside those
+/// files keep the authorship they already had rather than silently becoming
+/// this agent's work, because no operation here wrote them. Uncommitted work
+/// in a unit no operation writes is never carried; it stays in the working
+/// copy (see [`pending_units`]). What can be carried is
+/// uncommitted content of a unit an operation does write, such as the place a
+/// moved unit left.
 ///
 /// A caller that named its own message gets that message as the subject, with
 /// the transaction line kept underneath rather than dropped: the id is how an
 /// operator ties a change back to the call that made it, and an agent's subject
-/// is what a human reads first. A caller that named none sees exactly what it
-/// saw before this argument existed, which is why the whole shape hangs off
-/// `Option` instead of a default string.
+/// is what a human reads first. A caller that named none sees the transaction
+/// line as the subject, which is why the whole shape hangs off `Option` instead
+/// of a default string.
 fn commit_message(
     transaction_id: &str,
     requested: Option<&str>,
@@ -2226,11 +2559,6 @@ fn commit_message(
         }
         sample
     };
-    // The subject still declares the fold even when the caller named a message,
-    // because the fold is the thing a reader of a subject-only history most
-    // needs to be warned about and least able to ask a follow-up question
-    // about. The caller's own words open the body instead, where they are the
-    // first thing read once the subject has been.
     let mut folds = Vec::new();
     let mut paragraphs = Vec::new();
     if !carried.is_empty() {
@@ -2241,11 +2569,11 @@ fn commit_message(
         ));
         paragraphs.push(format!(
             "The workspace already held admitted working-tree content its base change did not \
-             carry, so this change publishes that content beside the staged operations rather \
-             than reverting it, and re-derives its semantics from the exact bytes published \
-             here, because a change that moved one without the other would describe two \
-             different sources. No operation in this transaction authored that content, so the \
-             entities inside it keep the authorship they already had.\n\
+             carry, as part of a source unit the staged operations write, so this change \
+             publishes that content with them, and re-derives its semantics from the exact \
+             bytes published here, because a change that moved one without the other would \
+             describe two different sources. No operation in this transaction authored that \
+             content, so the entities inside it keep the authorship they already had.\n\
              Carried: {}",
             sample_of(carried)
         ));
@@ -2268,12 +2596,11 @@ fn commit_message(
             sample_of(rederived)
         ));
     }
-    let subject = format!("MCP transaction {transaction_id} ({})", folds.join("; "));
-    let preamble = match requested {
-        Some(message) => format!("{message}\n\n"),
-        None => String::new(),
-    };
-    format!("{subject}\n\n{preamble}{}", paragraphs.join("\n\n"))
+    let fold_line = format!("MCP transaction {transaction_id} ({})", folds.join("; "));
+    match requested {
+        Some(message) => format!("{message}\n\n{fold_line}\n\n{}", paragraphs.join("\n\n")),
+        None => format!("{fold_line}\n\n{}", paragraphs.join("\n\n")),
+    }
 }
 
 /// Land what this daemon's startup repair re-derived on the values the live
@@ -3318,7 +3645,9 @@ enum CarriedDerivation {
 /// `WorkspaceSemanticDelta`. [`plan_exact_transaction`] reparses only the files
 /// its staged operations name, so a file the workspace admitted and no
 /// operation authored arrives at publication as new bytes standing over old
-/// entity spans, and the change seals both.
+/// entity spans, and the change seals both. Such a file reaches a plan only as
+/// part of a unit an operation writes, such as the place a moved unit left: a
+/// unit no operation writes is left uncommitted and never carried.
 ///
 /// Declaring the carry does not settle that. The declaration says who authored
 /// the file, and this is about whether one change's tree and entities agree
@@ -3559,10 +3888,13 @@ fn refuse_carry_standing_over_unparsed_content(
     ))
 }
 
+/// Apply the transaction's relationship operations to `prospective`, and name
+/// the relationships they added.
 fn apply_relation_operations(
     prospective: &kin_db::InMemoryGraph,
     operations: Vec<(String, kin_mcp::McpMutationPayload)>,
-) -> Result<(), String> {
+) -> Result<BTreeSet<kin_model::RelationId>, String> {
+    let mut added = BTreeSet::new();
     for (verb, payload) in operations {
         let kin_mcp::McpMutationPayload::Relation { from, to, kind } = payload else {
             return Err("internal exact relation planner received a non-relation payload".into());
@@ -3673,11 +4005,20 @@ fn apply_relation_operations(
                 ))
             }
         };
+        added.extend(
+            delta
+                .relation_deltas
+                .iter()
+                .filter_map(|delta| match delta {
+                    RelationDelta::Added { new } => Some(new.id),
+                    _ => None,
+                }),
+        );
         prospective
             .apply_transaction_delta(&delta)
             .map_err(|error| format!("apply prospective relation operation: {error}"))?;
     }
-    Ok(())
+    Ok(added)
 }
 
 /// Answer a commit whose transaction record is gone by asking repository
@@ -3832,13 +4173,18 @@ fn finalize_committed_transaction(
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
     application: CommitApplication,
 ) -> Result<kin_mcp::ToolCallResult, String> {
-    let (planned_layouts, planned_carry, rederived_files) = match planned {
+    // A commit recovered by operation id has no plan, so it cannot tell
+    // uncommitted work published with a written unit from the operations' own
+    // and attributes the whole unit, as every commit did before that line was
+    // drawn.
+    let (planned_layouts, planned_carry, rederived_files, held_before) = match planned {
         Some(planned) => (
             planned.layouts,
             Some(planned.carried_pending_files),
             planned.rederived_files,
+            planned.held_before,
         ),
-        None => (Vec::new(), None, Vec::new()),
+        None => (Vec::new(), None, Vec::new(), BTreeSet::new()),
     };
     let authority_context = authority_context(state)?;
     // Through the held resolver: the commit moved the record, so this is the
@@ -3919,8 +4265,55 @@ fn finalize_committed_transaction(
             &committed,
             &carried_pending_files,
             &rederived_files,
+            &held_before,
         )
     })?;
+    // Which of the change's entities this transaction's own operations wrote,
+    // for a review that names the agent on each entity it wrote and on none
+    // it did not. The provenance above attributes every entity outside a
+    // carried file, which includes an edit beside the written one and spans
+    // that only moved.
+    timed_finalize_step("record_agent_authorship", || {
+        crate::agent_authorship::record_commit(
+            &state.agent_authorship,
+            &actor.session_id,
+            &actor.vendor,
+            &actor.client,
+            &transaction.staged_operations,
+            &committed.change,
+            &authority.graph,
+        )
+    });
+    // A change that left uncommitted work in the working copy seals only what
+    // it recorded, and the attribution of everything it left moves onto the new
+    // base, still uncommitted and still its author's. Read from the receipt, so
+    // a commit recovered after an interruption seals the same way.
+    let kept_working_copy = committed
+        .receipt
+        .operation
+        .workspace_mutation
+        .as_ref()
+        .is_some_and(|mutation| mutation.new_base_tree_hash != Some(mutation.new_tree_hash));
+    if kept_working_copy {
+        let recorded = committed
+            .change
+            .entity_deltas
+            .iter()
+            .map(EntityDelta::target_id)
+            .collect::<HashSet<_>>();
+        crate::client_edits::seal_kept_commit(
+            state,
+            &committed.change,
+            committed.resolved_publication_base,
+            &recorded,
+        );
+    } else {
+        crate::client_edits::seal_commit(
+            state,
+            &committed.change,
+            committed.resolved_publication_base,
+        );
+    }
     // The second commit path, recorded for the same reason the first one is.
     // An agent that only ever writes through MCP would otherwise leave the
     // store's census frozen at whatever the last CLI commit or sweep left, and
@@ -5158,35 +5551,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Leave one brand new working file admitted the way the watcher leaves it.
-    ///
-    /// The workspace tree gains a path its base change never carried and no
-    /// semantic change is published for it, so the change that follows carries
-    /// this path as a `TreeDelta::Added` with no entities behind it.
-    fn admit_pending_working_tree_file(state: &Arc<DaemonState>, file: &str, content: &[u8]) {
-        let path = RepoPath::from_utf8(file).unwrap();
-        let target = state.layout.working_dir().join(file);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&target, content).unwrap();
-        let digest = state.blobs.write(content).unwrap();
-        state
-            .graph
-            .apply_transaction_delta(&TransactionDelta {
-                tree_deltas: vec![TreeDelta::Added {
-                    artifact_id: kin_model::ArtifactId::new(),
-                    new: LocatedEntry::new(
-                        path,
-                        TreeEntry::blob(Hash256::from_bytes(digest.0), false),
-                    ),
-                }],
-                ..TransactionDelta::default()
-            })
-            .unwrap();
-        publish_pending_workspace_tree(state);
-    }
-
     /// Leave one working file's removal admitted the way the watcher leaves it.
     ///
     /// The entities go with the artifact in the LIVE graph, because kin-db
@@ -5226,6 +5590,108 @@ pub(crate) mod tests {
             })
             .unwrap();
         try_publish_pending_workspace_tree(state)
+    }
+
+    /// Leave one working-file edit admitted the way the watcher leaves it: the
+    /// working copy, the daemon's graph and workspace authority all hold the
+    /// new bytes and the entities they derive to, and no change records them.
+    fn admit_watched_edit(state: &Arc<DaemonState>, file: &str, content: &[u8]) {
+        let written = state.layout.working_dir().join(file);
+        if let Some(parent) = written.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&written, content).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::loop_runner::sync_filesystem_with_graph_under_coordination(state))
+            .unwrap();
+    }
+
+    /// What the change the workspace stands on holds at `file`.
+    fn head_source(state: &Arc<DaemonState>, file: &str) -> Option<Vec<u8>> {
+        let context = authority_context(state).unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .unwrap()
+            .clone();
+        let head = lease
+            .resolve_target_change_id(workspace.base_target.as_ref().unwrap())
+            .unwrap();
+        let hash = crate::commit_deltas::resolve_authority_baseline(lease.snapshot(), &head)
+            .unwrap()
+            .tree
+            .artifact_at_path(&test_path(file))
+            .and_then(|artifact| artifact.entry.blob_identity());
+        drop(lease);
+        hash.map(|hash| authority.load_source_blob(hash).unwrap().unwrap())
+    }
+
+    /// The entities the working copy holds uncommitted, by name, as `kin diff`
+    /// derives them.
+    fn uncommitted_entities(state: &Arc<DaemonState>) -> BTreeSet<String> {
+        let binding =
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout).unwrap();
+        kin_cli::commands::diff::inspect(&binding, None, None, Some(state.graph.as_ref()))
+            .unwrap()
+            .entity_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EntityDelta::Added { new } => Some(new),
+                EntityDelta::Removed { old } => Some(old),
+                EntityDelta::Modified { old, new } => {
+                    kin_review::is_semantic_modification(old, new).then_some(new)
+                }
+            })
+            .filter(|entity| !kin_model::is_file_module_surface(entity))
+            .map(|entity| entity.name.clone())
+            .collect()
+    }
+
+    fn names<const N: usize>(names: [&str; N]) -> BTreeSet<String> {
+        names.into_iter().map(String::from).collect()
+    }
+
+    /// The change a commit reply names, read through an entity it changed.
+    fn replied_change(
+        state: &Arc<DaemonState>,
+        reply: &serde_json::Value,
+        entity: &Entity,
+    ) -> kin_model::SemanticChange {
+        let change_id = reply["change_id"].as_str().unwrap();
+        state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity the operation wrote")
+    }
+
+    /// Every path one change's tree and entities name.
+    fn change_paths(change: &kin_model::SemanticChange) -> BTreeSet<String> {
+        change
+            .tree_deltas
+            .iter()
+            .flat_map(|delta| [delta.old_state(), delta.new_state()])
+            .flatten()
+            .map(|located| located.path.to_string())
+            .chain(
+                change
+                    .entity_deltas
+                    .iter()
+                    .flat_map(|delta| [delta.old_state(), delta.new_state()])
+                    .flatten()
+                    .filter_map(|entity| entity.file_origin.as_ref())
+                    .map(|origin| origin.0.clone()),
+            )
+            .collect()
     }
 
     /// Whether workspace authority still holds a tree its base change does not.
@@ -11467,18 +11933,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// A store somebody has been working in commits in one pass, and says what
-    /// it took with it.
+    /// A store somebody has been working in commits the agent's work and only
+    /// the agent's work.
     ///
-    /// The workspace here holds an admitted edit to a file no staged operation
-    /// names, which is the state the commit path used to refuse with "requires a
-    /// clean exact workspace". The pending content is inside the prospective
-    /// graph either way, so the only honest options were publishing it or
-    /// reverting the working file. It is published, and both the reply and the
-    /// change record name it as carried rather than presenting it as the agent's
-    /// work.
+    /// The workspace here holds an admitted edit to a unit no staged operation
+    /// names, which is the state every store somebody works in sits in. That
+    /// edit is somebody else's, and publishing it under the agent's change put
+    /// a person's uncommitted work in the agent's commit and emptied their
+    /// view of what they had left to review. The change records the base
+    /// change and the unit the operation wrote. The other unit's edit stays in
+    /// the working copy, uncommitted against the new change, with the entities
+    /// it had, and the reply and the record declare no fold because there is
+    /// none.
     #[test]
-    fn a_commit_carrying_pending_working_tree_content_declares_it_in_the_reply_and_the_record() {
+    fn a_commit_leaves_pending_work_in_a_unit_it_did_not_write_uncommitted() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -11486,78 +11954,75 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        install_exact_source(
+        let (other, installed) = install_exact_source(
             &state,
             "src/other.rs",
             b"pub fn other() -> u8 { 1 }\n",
             "other",
         );
-        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        admit_watched_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        assert_eq!(
+            uncommitted_entities(&state),
+            names(["other"]),
+            "the fixture's uncommitted work"
+        );
 
         let sessions = test_sessions();
-        let (_, arguments) =
+        let (transaction_id, arguments) =
             stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
             Some(true),
-            "a workspace holding pending content must still commit: {}",
+            "a workspace holding uncommitted work must still commit: {}",
             result_text(&result)
         );
 
         let reply = commit_reply(&result);
+        assert!(
+            reply.get("staged_operation_files").is_none()
+                && reply.get("carried_pending_files").is_none(),
+            "a change that carried nothing in declares no fold: {reply:#}"
+        );
+        assert_eq!(reply["modified_files"], serde_json::json!(["src/lib.rs"]));
         let accounting = &reply["publication_accounting"];
-        assert_eq!(accounting["status"], "exact");
-        assert_eq!(accounting["source_units"]["published_total"], 2);
+        assert_eq!(accounting["status"], "exact", "{reply:#}");
+        assert_eq!(accounting["source_units"]["published_total"], 1);
         assert_eq!(accounting["source_units"]["publication_only"]["count"], 1);
-        assert_eq!(accounting["source_units"]["carried_unchanged"]["count"], 1);
-        // Pending bytes may be reparsed only during publication, independently
-        // of whether their semantic overlay was already admitted.
+        assert_eq!(accounting["source_units"]["carried_unchanged"]["count"], 0);
+
+        let change = replied_change(&state, &reply, &entity);
         assert_eq!(
-            accounting["entities"]["published_total"],
-            reply["entity_deltas"]
+            change.message,
+            format!("MCP transaction {transaction_id}"),
+            "the record declares no fold, because it carried none"
         );
         assert_eq!(
-            accounting["relationships"]["published_total"],
-            reply["relation_deltas"]
+            change_paths(&change),
+            names(["src/lib.rs"]),
+            "the agent's change holds only what its operation wrote"
         );
-        assert_eq!(
-            reply["staged_operation_files"],
-            serde_json::json!(["src/lib.rs"]),
-            "the reply must separate the files the operations wrote: {reply:#}"
-        );
-        assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"]),
-            "the reply must name the files it carried in: {reply:#}"
-        );
-        assert_eq!(
-            reply["modified_files"],
-            serde_json::json!(["src/lib.rs", "src/other.rs"]),
-            "the split covers modified_files rather than replacing it: {reply:#}"
+        assert!(change
+            .entity_deltas
+            .iter()
+            .any(|delta| delta.target_id() == entity.id));
+        assert!(
+            !change
+                .entity_deltas
+                .iter()
+                .any(|delta| delta.target_id() == other.id),
+            "the other unit's entity is not in the agent's change"
         );
 
-        let change_id = reply["change_id"].as_str().unwrap().to_string();
-        let change = state
-            .graph
-            .get_entity_history(&entity.id)
-            .unwrap()
-            .into_iter()
-            .find(|change| change.id.to_string() == change_id)
-            .expect("the published change is reachable from the entity the operation wrote");
-        assert!(
-            change
-                .message
-                .contains("also admitted 1 pending working-tree file"),
-            "the change record must state the fold and its count: {}",
-            change.message
+        assert_eq!(
+            head_source(&state, "src/lib.rs").unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
         );
-        assert!(
-            change.message.contains("src/other.rs"),
-            "the change record must sample what it carried: {}",
-            change.message
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n",
+            "the change keeps the other unit as its base change holds it"
         );
-
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
             b"pub fn value() -> u8 { 2 }\n",
@@ -11566,27 +12031,44 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/other.rs")).unwrap(),
             b"pub fn other() -> u8 { 7 }\n",
-            "the carried file keeps the bytes the human left in it"
+            "the other unit keeps the bytes its author left in it"
         );
         assert!(
-            !workspace_is_dirty(&state),
-            "the commit must leave the workspace level with its base"
+            workspace_is_dirty(&state),
+            "the other unit's edit is still uncommitted against the new change"
+        );
+        assert_eq!(
+            uncommitted_entities(&state),
+            names(["other"]),
+            "the uncommitted work is exactly what it was, and the agent's is not in it"
+        );
+        let history = state.graph.get_entity_history(&other.id).unwrap();
+        assert!(
+            !history.iter().any(|recorded| recorded.id == change.id),
+            "the agent's change is not in the history of an entity it did not write"
+        );
+        assert_eq!(history.first().map(|recorded| recorded.id), Some(installed));
+        assert_eq!(semantic_disagreement(&state, "src/lib.rs"), None);
+        assert_eq!(
+            semantic_disagreement(&state, "src/other.rs"),
+            None,
+            "the working copy's entities still describe the bytes it holds"
         );
     }
 
-    /// The closing arm: a file nothing did but write is carried by the next
-    /// commit and named as carried.
+    /// The closing arm: a unit nothing did but write stays uncommitted beside
+    /// the next agent commit.
     ///
     /// The pending content here comes from the real watcher path rather than
     /// from a delta assembled to look like one, because the composition is the
-    /// claim. Writing the file is the whole of the user's action: ambient
+    /// claim. Writing the unit is the whole of the user's action: ambient
     /// admission puts it in the workspace tree without moving the base, and the
-    /// commit that follows publishes it while stating plainly that its author
-    /// did not write it. Either half alone is defensible and useless; a file
-    /// that becomes queryable and then gets published as somebody's work is
-    /// worse than one that never appeared.
+    /// agent commit that follows records only what its operation wrote. A unit
+    /// that becomes queryable and then gets published as somebody else's work
+    /// is worse than one that never appeared, so it stays queryable and stays
+    /// its author's.
     #[test]
-    fn a_commit_declares_a_watcher_admitted_file_as_carried() {
+    fn a_watcher_admitted_unit_stays_uncommitted_beside_an_agent_commit() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -11615,38 +12097,40 @@ pub(crate) mod tests {
         assert_ne!(
             result.is_error,
             Some(true),
-            "a workspace carrying a watcher-admitted file must still commit: {}",
+            "a workspace holding a watcher-admitted unit must still commit: {}",
             result_text(&result)
         );
 
         let reply = commit_reply(&result);
-        assert_eq!(
-            reply["staged_operation_files"],
-            serde_json::json!(["src/lib.rs"]),
-            "the reply must keep the operations' own file separate: {reply:#}"
-        );
-        assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/brand_new.rs"]),
-            "a file the watcher admitted is carried, not authored: {reply:#}"
-        );
-
-        let change_id = reply["change_id"].as_str().unwrap().to_string();
-        let change = state
-            .graph
-            .get_entity_history(&entity.id)
-            .unwrap()
-            .into_iter()
-            .find(|change| change.id.to_string() == change_id)
-            .expect("the published change is reachable from the entity the operation wrote");
         assert!(
-            change.message.contains("src/brand_new.rs"),
-            "the permanent record must name what it carried: {}",
+            reply.get("carried_pending_files").is_none(),
+            "a unit the watcher admitted is neither carried nor authored: {reply:#}"
+        );
+        assert_eq!(reply["modified_files"], serde_json::json!(["src/lib.rs"]));
+        let change = replied_change(&state, &reply, &entity);
+        assert_eq!(change_paths(&change), names(["src/lib.rs"]));
+        assert!(
+            !change.message.contains("brand_new"),
+            "the permanent record names nothing it did not record: {}",
             change.message
         );
+        assert_eq!(
+            head_source(&state, "src/brand_new.rs"),
+            None,
+            "the change the agent made does not hold the unit somebody else wrote"
+        );
+        assert!(workspace_is_dirty(&state));
         assert!(
-            !workspace_is_dirty(&state),
-            "the commit must leave the workspace level with its base"
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&test_path("src/brand_new.rs"))
+                .is_some(),
+            "the unit stays in the working copy, uncommitted"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/brand_new.rs")).unwrap(),
+            b"pub fn brand_new() -> u8 { 1 }\n"
         );
     }
 
@@ -11740,6 +12224,18 @@ pub(crate) mod tests {
         );
     }
 
+    /// Uncommitted work inside the very unit an operation writes is published
+    /// with the operation, and declared.
+    ///
+    /// A unit's bytes are one, and the operation was planned against them as
+    /// the working copy holds them: its source base names that version, so the
+    /// agent read and patched the unit with the sibling's edit in it. Leaving
+    /// the sibling out would publish a version of the unit nobody read, and
+    /// refusing would leave an agent unable to write any unit somebody else had
+    /// touched. So the unit is published whole, the accounting names the unit
+    /// as one that held uncommitted work before this publication, and a unit
+    /// the operation did not write is still left alone (see
+    /// `a_commit_leaves_pending_work_in_a_unit_it_did_not_write_uncommitted`).
     #[test]
     fn publication_accounting_reports_pending_overlap_within_one_source_unit() {
         let (_dir, state) = test_state();
@@ -11749,11 +12245,12 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 1 }\n",
             "value",
         );
-        admit_pending_working_tree_edit(
+        admit_watched_edit(
             &state,
             "src/lib.rs",
             b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 7 }\n",
         );
+        let sibling = live_entity(&state, "src/lib.rs", "sibling");
         let context = authority_context(&state).unwrap();
         let authority = context.open().unwrap();
         let lease = authority.read_authority();
@@ -11823,6 +12320,121 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
             b"pub fn value() -> u8 { 2 }\npub fn sibling() -> u8 { 7 }\n"
+        );
+        assert_eq!(
+            head_source(&state, "src/lib.rs").unwrap(),
+            b"pub fn value() -> u8 { 2 }\npub fn sibling() -> u8 { 7 }\n",
+            "the unit the operation wrote is published as one set of bytes"
+        );
+        assert!(
+            !workspace_is_dirty(&state),
+            "nothing is left uncommitted when the only uncommitted work was in the unit written"
+        );
+        let attributed = commit_attributed(&state, &reply);
+        assert!(
+            attributed.contains(&entity.id),
+            "the entity the operation wrote is attributed to the committing session"
+        );
+        assert!(
+            !attributed.contains(&sibling.id),
+            "the uncommitted sibling published as the working copy held it is not: {attributed:?}"
+        );
+    }
+
+    /// The live entity named `name` declared at `file`.
+    fn live_entity(state: &Arc<DaemonState>, file: &str, name: &str) -> Entity {
+        state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(file)),
+                ..EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == name && !kin_model::is_file_module_surface(entity))
+            .unwrap_or_else(|| panic!("{file} declares no {name}"))
+    }
+
+    /// The entities one commit's attribution events name.
+    fn commit_attributed(
+        state: &Arc<DaemonState>,
+        reply: &serde_json::Value,
+    ) -> BTreeSet<EntityId> {
+        let change_id = reply["change_id"].as_str().unwrap();
+        state
+            .graph
+            .query_audit_events(None, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.action == "kin_transaction_commit"
+                    && event
+                        .details
+                        .as_deref()
+                        .is_some_and(|details| details.contains(change_id))
+            })
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(id)) => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Both rules in one commit: the unit an operation writes is published
+    /// whole, its uncommitted sibling with it, and a unit it does not write
+    /// stays uncommitted.
+    #[test]
+    fn a_commit_publishes_its_own_unit_whole_and_leaves_other_units_uncommitted() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_watched_edit(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\npub fn sibling() -> u8 { 7 }\n",
+        );
+        admit_watched_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        assert_eq!(uncommitted_entities(&state), names(["other", "sibling"]));
+        let sibling = live_entity(&state, "src/lib.rs", "sibling");
+
+        let sessions = test_sessions();
+        let (_, arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+        let reply = commit_reply(&result);
+        assert_eq!(reply["modified_files"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(
+            reply["publication_accounting"]["source_units"]["pending_and_publication"]["count"], 1,
+            "the written unit is declared as one that held uncommitted work: {reply:#}"
+        );
+        assert_eq!(
+            head_source(&state, "src/lib.rs").unwrap(),
+            b"pub fn value() -> u8 { 2 }\npub fn sibling() -> u8 { 7 }\n"
+        );
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n"
+        );
+        assert!(workspace_is_dirty(&state));
+        assert_eq!(uncommitted_entities(&state), names(["other"]));
+        assert_eq!(semantic_disagreement(&state, "src/lib.rs"), None);
+        assert_eq!(semantic_disagreement(&state, "src/other.rs"), None);
+        let attributed = commit_attributed(&state, &reply);
+        assert!(attributed.contains(&entity.id));
+        assert!(
+            !attributed.contains(&sibling.id),
+            "the uncommitted sibling published with the unit is not attributed: {attributed:?}"
         );
     }
 
@@ -11916,6 +12528,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// The caller's subject stands as it would on a clean workspace, with
+    /// uncommitted work elsewhere left out of the change and out of its record.
+    #[test]
+    fn a_commit_beside_uncommitted_work_keeps_the_caller_message_as_subject() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+
+        let sessions = test_sessions();
+        let (transaction_id, mut arguments) =
+            stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
+        arguments.insert(
+            "summary".to_string(),
+            serde_json::json!("Return two from value"),
+        );
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        let change_id = commit_reply(&result)["change_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let change = state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity it wrote");
+        assert_eq!(
+            change.message,
+            format!("Return two from value\n\nMCP transaction {transaction_id}"),
+            "the record is the caller's subject and the transaction line, and names no work it \
+             did not record"
+        );
+    }
+
     /// A blank message is no message, not a blank subject line.
     ///
     /// A client that always sends the field and sometimes has nothing to put in
@@ -11957,17 +12617,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// The retry that a slow commit guarantees is told about the fold too.
+    /// The retry that a slow commit guarantees is answered as the first
+    /// attempt was, uncommitted work beside it included.
     ///
     /// This is the reply a real caller reads. The MCP client budgets 60 seconds
     /// per attempt, a commit on a store of any size takes longer, and the
     /// duplicate request that follows is answered from the repository receipt
-    /// after the first attempt has evicted its own transaction record. A split
-    /// that only the planning process could produce would therefore never reach
-    /// anyone, so the fold is recorded in the commit's own attribution and read
-    /// back here.
+    /// after the first attempt has evicted its own transaction record. That
+    /// answer has only the receipt and the commit's own attribution to go on,
+    /// so it has to say what the first one said from those alone: the same
+    /// change, the same units, no fold, and the same accounting, including when
+    /// the attribution window has moved past the commit.
     #[test]
-    fn a_retry_of_an_evicted_commit_still_declares_what_that_commit_carried() {
+    fn a_retry_of_an_evicted_commit_answers_as_the_commit_did() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12005,21 +12667,23 @@ pub(crate) mod tests {
         let retry_reply = commit_reply(&retry);
         assert_eq!(retry_reply["already_applied"], true);
         assert_eq!(retry_reply["change_id"], first_reply["change_id"]);
+        assert_eq!(retry_reply["modified_files"], first_reply["modified_files"]);
         assert_eq!(
-            retry_reply["carried_pending_files"], first_reply["carried_pending_files"],
-            "the retry must declare the same fold the first answer did: {retry_reply:#}"
+            retry_reply["modified_files"],
+            serde_json::json!(["src/lib.rs"])
         );
-        assert_eq!(
-            retry_reply["staged_operation_files"],
-            first_reply["staged_operation_files"]
-        );
-        assert_eq!(
-            retry_reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"])
+        assert!(
+            retry_reply.get("carried_pending_files").is_none()
+                && first_reply.get("carried_pending_files").is_none(),
+            "neither answer declares a fold, because the commit made none: {retry_reply:#}"
         );
         assert_eq!(
             retry_reply["publication_accounting"],
             first_reply["publication_accounting"]
+        );
+        assert!(
+            workspace_is_dirty(&state),
+            "the retry moved nothing, and the uncommitted work beside the commit is still there"
         );
         let mut unrelated = state
             .graph
@@ -12045,34 +12709,26 @@ pub(crate) mod tests {
             first_reply["publication_accounting"]
         );
         assert_eq!(
-            old_reply["publication_accounting"]["source_units"]["carried_unchanged"]["count"],
+            old_reply["publication_accounting"]["source_units"]["publication_only"]["count"],
             1
+        );
+        assert_eq!(
+            old_reply["publication_accounting"]["source_units"]["carried_unchanged"]["count"],
+            0
         );
     }
 
-    /// Carrying a file in never rewrites who authored what is inside it.
+    /// A unit left uncommitted keeps the authorship its entities already had.
     ///
-    /// A carried file reaches the change as a tree delta AND the semantics those
-    /// bytes derive to, because a change that published one without the other
-    /// would seal a tree and an entity set describing different source. So its
-    /// entities do gain a revision, and that revision is a statement about
-    /// content, not about authorship: the entity keeps its id and the change it
-    /// was created in, and no attribution event names it, which is what keeps a
-    /// provenance reader from being told the agent wrote a human's uncommitted
-    /// work. The fold is also reachable from provenance one level up, because
-    /// the change every attributed entity names carries the declaration in its
-    /// message.
-    ///
-    /// The assertion that the carried entity's history did NOT contain this
-    /// change was here until the incoherence it described was fixed. It could
-    /// not survive the fix and be true at the same time: `get_entity_history`
-    /// selects changes by scanning entity deltas, so the only change that
-    /// satisfies it is one that publishes bytes for a file and no semantics for
-    /// them. What that assertion was protecting is below, in the origin change
-    /// and the attribution, and it is asserted there rather than through the
-    /// absence of a revision.
+    /// The other unit's edit here is attributed, the way a client that reports
+    /// its own edits attributes one, to a client session that is not the agent
+    /// committing. The agent's commit does not record that edit, so nothing may
+    /// seal its attribution into the agent's change or drop it: it stays
+    /// uncommitted, now on the new base, under the session that made it. No
+    /// attribution event of the commit names the entity, the agent's change is
+    /// not in its history, and it keeps the change it was created in.
     #[test]
-    fn a_carried_file_keeps_the_authorship_its_entities_already_had() {
+    fn a_unit_left_uncommitted_keeps_the_authorship_its_entities_already_had() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12080,13 +12736,23 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        let (carried_entity, installed_change) = install_exact_source(
+        let (pending, installed_change) = install_exact_source(
             &state,
             "src/other.rs",
             b"pub fn other() -> u8 { 1 }\n",
             "other",
         );
-        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        admit_watched_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        let authored = kin_cli::commands::review_guide::ClientEdit {
+            base: Some(installed_change.to_string()),
+            change_id: None,
+            client: "claude-code".to_string(),
+            session: "client-session-1".to_string(),
+            kin_session: None,
+            at: Timestamp::now().to_string(),
+            entities: vec![pending.id],
+        };
+        state.agent_authorship.record_edit(authored.clone());
 
         let sessions = test_sessions();
         let (_, arguments) =
@@ -12096,27 +12762,36 @@ pub(crate) mod tests {
         let reply = commit_reply(&result);
         let change_id = reply["change_id"].as_str().unwrap().to_string();
 
-        let carried_history = state.graph.get_entity_history(&carried_entity.id).unwrap();
+        let edits = state.agent_authorship.edits();
+        assert_eq!(
+            edits,
+            vec![kin_cli::commands::review_guide::ClientEdit {
+                base: Some(change_id.clone()),
+                ..authored
+            }],
+            "the edit is still uncommitted, under the session that made it, on the new base"
+        );
+
+        let history = state.graph.get_entity_history(&pending.id).unwrap();
         assert!(
-            carried_history
+            !history
                 .iter()
                 .any(|change| change.id.to_string() == change_id),
-            "the change that republished the carried file's bytes must carry its semantics too, \
-             or it seals a tree and an entity set describing different source"
+            "the agent's change is not a revision of an entity it did not record"
         );
         assert_eq!(
-            carried_history.first().map(|change| change.id),
+            history.first().map(|change| change.id),
             Some(installed_change),
-            "the carried file's entity keeps the change it was created in"
+            "the entity keeps the change it was created in"
         );
         assert_eq!(
             state
                 .graph
-                .get_entity(&carried_entity.id)
+                .get_entity(&pending.id)
                 .unwrap()
                 .map(|entity| (entity.name, entity.kind)),
-            Some((carried_entity.name.clone(), carried_entity.kind)),
-            "the carried file's entity keeps the identity it already had"
+            Some((pending.name.clone(), pending.kind)),
+            "the entity keeps the identity it already had"
         );
 
         let attributed = state
@@ -12141,24 +12816,16 @@ pub(crate) mod tests {
             "the entity the operation wrote is attributed to the committing session"
         );
         assert!(
-            !attributed.contains(&carried_entity.id),
-            "no attribution event may name an entity inside a carried file"
+            !attributed.contains(&pending.id),
+            "no attribution event may name an entity the change left uncommitted"
         );
-
-        // Reachability, from provenance rather than from the plan: the events
-        // above name a change id, and that change states what it folded in.
-        let declared = state
-            .graph
-            .get_entity_history(&entity.id)
-            .unwrap()
-            .into_iter()
-            .find(|change| change.id.to_string() == change_id)
-            .expect("the attributed change is loadable by the id its audit event names");
+        let declared = replied_change(&state, &reply, &entity);
         assert!(
-            declared.message.contains("src/other.rs"),
-            "the change an audit event names must declare the fold: {}",
+            !declared.message.contains("src/other.rs"),
+            "the change names nothing it did not record: {}",
             declared.message
         );
+        assert_eq!(uncommitted_entities(&state), names(["other"]));
     }
 
     /// How the store's own entities disagree with the exact bytes it publishes
@@ -12173,10 +12840,10 @@ pub(crate) mod tests {
     /// bytes over older semantic spans leaves behind.
     ///
     /// Read against the live graph on purpose. `install_authority_graph` levels
-    /// it onto repository authority inside every commit reply and
+    /// it onto repository authority's workspace inside every commit reply and
     /// `verify_workspace_matches_authority` refuses if it did not, so after a
-    /// commit the live graph, authority and the change just sealed are the same
-    /// answer, and asking the cheapest of the three asks all of them.
+    /// commit the live graph and the working copy authority keeps are the same
+    /// answer, and for a unit the change recorded, so is the change.
     fn semantic_disagreement(state: &Arc<DaemonState>, file: &str) -> Option<String> {
         let file_id = FilePathId::new(file);
         let path = RepoPath::from_utf8(file).unwrap();
@@ -12240,26 +12907,20 @@ pub(crate) mod tests {
         None
     }
 
-    /// A commit over MCP must publish entities that describe the bytes it
-    /// published, for a carried file as much as for an authored one.
+    /// A commit beside an uncommitted edit leaves the change and the working
+    /// copy each describing its own bytes.
     ///
-    /// The two commit surfaces plan from different graphs. The CLI route is
-    /// handed the daemon's live derived graph, which the reconcile loop keeps
-    /// current, so a pending file's entities there came from the pending bytes.
-    /// The MCP route is handed repository authority's own workspace graph
-    /// snapshot, whose tree is the workspace tree and whose entities are
-    /// whatever the last published semantic delta left, because
-    /// `publish_workspace_tree` advances the tree with an empty
-    /// `WorkspaceSemanticDelta`. `plan_exact_transaction` reparses only the
-    /// files its staged operations name, so a carried file reaches the sealed
-    /// change as new tree bytes over old entity spans and nothing on that path
-    /// re-derives them.
-    ///
-    /// Declaring the carry does not make that acceptable. The declaration is
-    /// about authorship, and this is about whether canonical truth agrees with
-    /// itself.
+    /// The two commit surfaces plan from different graphs. The MCP route is
+    /// handed repository authority's own workspace graph snapshot, whose
+    /// entities for a unit with uncommitted bytes are whatever the last
+    /// published semantic delta left. A change that published that unit's new
+    /// bytes over those entities sealed a tree and an entity set describing
+    /// different source. The change no longer records that unit at all: it
+    /// keeps the bytes and entities its base change holds for it, which agree,
+    /// and the working copy keeps the entities the daemon derived from the
+    /// uncommitted bytes, which agree too.
     #[test]
-    fn a_carried_immediate_edit_commits_entities_that_describe_the_bytes_it_published() {
+    fn an_uncommitted_edit_beside_a_commit_stays_coherent_in_the_change_and_the_working_copy() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12273,7 +12934,7 @@ pub(crate) mod tests {
             b"pub fn other() -> u8 { 1 }\n",
             "other",
         );
-        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 100 }\n");
+        admit_watched_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 100 }\n");
 
         let sessions = test_sessions();
         let (_, arguments) =
@@ -12282,35 +12943,39 @@ pub(crate) mod tests {
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"]),
-            "the fixture must actually exercise the carry: {reply:#}"
+            reply["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "the fixture must leave the other unit out of the change: {reply:#}"
+        );
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n"
         );
 
-        // The control for the check itself. The authored file is re-derived by
-        // the edit path, so a checker that could not tell a coherent file from
+        // The control for the check itself. The authored unit is re-derived by
+        // the edit path, so a checker that could not tell a coherent unit from
         // an incoherent one would report this one too.
         assert_eq!(
             semantic_disagreement(&state, "src/lib.rs"),
             None,
-            "the file the operation authored must be coherent, or the check below proves nothing"
+            "the unit the operation authored must be coherent, or the check below proves nothing"
         );
         assert_eq!(
             semantic_disagreement(&state, "src/other.rs"),
             None,
-            "the carried file's entities must describe the bytes this commit published for it"
+            "the working copy's entities must describe the uncommitted bytes it holds"
         );
     }
 
-    /// The same defect where no span moves, so only a fingerprint can catch it.
+    /// The same, where no span moves, so only a fingerprint can tell.
     ///
-    /// `return 1` to `return 7` leaves every byte offset in the file identical,
+    /// `return 1` to `return 7` leaves every byte offset in the unit identical,
     /// so a coherence check written as a span or a length comparison passes over
     /// it while the entity's body is still wrong. `behavior_hash` is the hash of
     /// an entity's full source text, so it is the field that moves, and this arm
     /// exists to keep the check honest about which one it reads.
     #[test]
-    fn a_carried_same_length_body_edit_commits_entities_that_describe_the_bytes_it_published() {
+    fn an_uncommitted_same_length_edit_beside_a_commit_stays_coherent_in_the_working_copy() {
         const BEFORE: &[u8] = b"pub fn other() -> u8 { 1 }\n";
         const AFTER: &[u8] = b"pub fn other() -> u8 { 7 }\n";
         assert_eq!(
@@ -12326,13 +12991,13 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        let (carried_entity, _) = install_exact_source(&state, "src/other.rs", BEFORE, "other");
-        let span_before = carried_entity
+        let (pending, _) = install_exact_source(&state, "src/other.rs", BEFORE, "other");
+        let span_before = pending
             .span
             .as_ref()
             .map(|span| (span.start_byte, span.end_byte))
             .expect("an installed source entity has a span");
-        admit_pending_working_tree_edit(&state, "src/other.rs", AFTER);
+        admit_watched_edit(&state, "src/other.rs", AFTER);
 
         let sessions = test_sessions();
         let (_, arguments) =
@@ -12341,30 +13006,31 @@ pub(crate) mod tests {
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"]),
-            "the fixture must actually exercise the carry: {reply:#}"
+            reply["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "the fixture must leave the other unit out of the change: {reply:#}"
         );
+        assert_eq!(head_source(&state, "src/other.rs").unwrap(), BEFORE);
 
         assert_eq!(
             semantic_disagreement(&state, "src/lib.rs"),
             None,
-            "the file the operation authored must be coherent, or the check below proves nothing"
+            "the unit the operation authored must be coherent, or the check below proves nothing"
         );
         assert_eq!(
             semantic_disagreement(&state, "src/other.rs"),
             None,
-            "the carried file's entities must describe the bytes this commit published for it, \
-             including when the edit moved no byte offset"
+            "the working copy's entities must describe the uncommitted bytes it holds, including \
+             when the edit moved no byte offset"
         );
 
-        let carried_after = state
+        let after = state
             .graph
-            .get_entity(&carried_entity.id)
+            .get_entity(&pending.id)
             .unwrap()
-            .expect("the carried entity keeps its identity across the commit");
+            .expect("the uncommitted entity keeps its identity across the commit");
         assert_eq!(
-            carried_after
+            after
                 .span
                 .as_ref()
                 .map(|span| (span.start_byte, span.end_byte)),
@@ -12374,16 +13040,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// The same defect on a store nothing in this process derived.
+    /// The same on a store nothing in this process derived.
     ///
     /// Reopening drops every graph this process built and rebuilds the daemon's
     /// view from what the store persisted, so the commit that follows plans
-    /// against cold repository authority and cold source. If the incoherence
-    /// were an artifact of live in-memory state carried across the admission it
-    /// would not survive here; it does, because the snapshot the MCP route plans
-    /// from is the persisted one.
+    /// against cold repository authority and cold source. The change still
+    /// records only the unit its operation wrote, and the working copy still
+    /// answers for the uncommitted unit with entities that describe its bytes.
     #[test]
-    fn a_carried_edit_committed_after_a_reopen_publishes_entities_that_describe_its_tree() {
+    fn an_uncommitted_edit_beside_a_commit_after_a_reopen_stays_out_of_the_change() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12397,7 +13062,7 @@ pub(crate) mod tests {
             b"pub fn other() -> u8 { 1 }\n",
             "other",
         );
-        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+        admit_watched_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
 
         let layout = state.layout.clone();
         drop(state);
@@ -12410,35 +13075,39 @@ pub(crate) mod tests {
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"]),
-            "the fixture must actually exercise the carry: {reply:#}"
+            reply["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "the fixture must leave the other unit out of the change: {reply:#}"
         );
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n"
+        );
+        assert!(workspace_is_dirty(&state));
 
         assert_eq!(
             semantic_disagreement(&state, "src/lib.rs"),
             None,
-            "the file the operation authored must be coherent, or the check below proves nothing"
+            "the unit the operation authored must be coherent, or the check below proves nothing"
         );
         assert_eq!(
             semantic_disagreement(&state, "src/other.rs"),
             None,
-            "a cold graph and cold source must still publish entities that describe the bytes the \
-             commit published"
+            "a cold graph and cold source must still leave the working copy describing its bytes"
         );
     }
 
-    /// The success contract a carried commit already has, held to while the
-    /// semantics are repaired.
+    /// The success contract held where repository authority's semantics for
+    /// the uncommitted unit lag its bytes.
     ///
-    /// Deriving a carried file's semantics into the commit is the fix, and the
-    /// thing it could plausibly break is everything this asserts: the commit
-    /// still lands, the reply and the change record still declare the fold, the
-    /// carried entity keeps its identity and the change it was created in, and
-    /// no attribution event names it. Republishing an entity's bytes is not the
-    /// same as claiming its authorship, and this is where the two stay separate.
+    /// The pending edit here is admitted the way a tree-only admission leaves
+    /// it: the workspace tree holds the new bytes and nothing derived them. The
+    /// commit still lands, records only the unit its operation wrote, declares
+    /// no fold, leaves the edit uncommitted on disk and in the workspace, and
+    /// the uncommitted entity keeps its identity, the change it was created in,
+    /// and its freedom from the agent's attribution.
     #[test]
-    fn a_coherent_carried_pending_commit_still_succeeds_and_declares_the_carry() {
+    fn a_commit_beside_an_underived_uncommitted_edit_lands_and_leaves_that_edit_alone() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12446,7 +13115,7 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        let (carried_entity, installed_change) = install_exact_source(
+        let (pending, installed_change) = install_exact_source(
             &state,
             "src/other.rs",
             b"pub fn other() -> u8 { 1 }\n",
@@ -12455,62 +13124,43 @@ pub(crate) mod tests {
         admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
 
         let sessions = test_sessions();
-        let (_, arguments) =
+        let (transaction_id, arguments) =
             stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(
             result.is_error,
             Some(true),
-            "a workspace holding pending content must still commit: {}",
+            "a workspace holding uncommitted work must still commit: {}",
             result_text(&result)
         );
         let reply = commit_reply(&result);
         let change_id = reply["change_id"].as_str().unwrap().to_string();
-        assert_eq!(
-            reply["staged_operation_files"],
-            serde_json::json!(["src/lib.rs"])
-        );
-        assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/other.rs"])
-        );
-        assert_eq!(
-            reply["modified_files"],
-            serde_json::json!(["src/lib.rs", "src/other.rs"])
-        );
+        assert!(reply.get("carried_pending_files").is_none(), "{reply:#}");
+        assert_eq!(reply["modified_files"], serde_json::json!(["src/lib.rs"]));
 
-        let declared = state
-            .graph
-            .get_entity_history(&entity.id)
-            .unwrap()
-            .into_iter()
-            .find(|change| change.id.to_string() == change_id)
-            .expect("the published change is reachable from the entity the operation wrote");
-        assert!(
-            declared
-                .message
-                .contains("also admitted 1 pending working-tree file")
-                && declared.message.contains("src/other.rs"),
-            "the change record must still state the fold and sample it: {}",
-            declared.message
+        let declared = replied_change(&state, &reply, &entity);
+        assert_eq!(
+            declared.message,
+            format!("MCP transaction {transaction_id}")
         );
+        assert_eq!(change_paths(&declared), names(["src/lib.rs"]));
 
-        let carried_after = state
+        let after = state
             .graph
-            .get_entity(&carried_entity.id)
+            .get_entity(&pending.id)
             .unwrap()
-            .expect("the carried entity keeps the identity it already had");
-        assert_eq!(carried_after.name, carried_entity.name);
-        assert_eq!(carried_after.kind, carried_entity.kind);
+            .expect("the uncommitted entity keeps the identity it already had");
+        assert_eq!(after.name, pending.name);
+        assert_eq!(after.kind, pending.kind);
         assert_eq!(
             state
                 .graph
-                .get_entity_history(&carried_entity.id)
+                .get_entity_history(&pending.id)
                 .unwrap()
                 .first()
                 .map(|change| change.id),
             Some(installed_change),
-            "the carried entity keeps the change it was created in"
+            "the uncommitted entity keeps the change it was created in"
         );
 
         let attributed = state
@@ -12530,33 +13180,37 @@ pub(crate) mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        assert!(attributed.contains(&entity.id));
         assert!(
-            attributed.contains(&entity.id),
-            "the entity the operation wrote is attributed to the committing session"
-        );
-        assert!(
-            !attributed.contains(&carried_entity.id),
-            "republishing a carried entity's bytes must not attribute it to the committing session"
+            !attributed.contains(&pending.id),
+            "an entity the change left uncommitted is not attributed to the committing session"
         );
 
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/other.rs")).unwrap(),
+            b"pub fn other() -> u8 { 7 }\n"
+        );
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n"
+        );
         assert!(
-            !workspace_is_dirty(&state),
-            "the commit must leave the workspace level with its base"
+            workspace_is_dirty(&state),
+            "the commit must leave the uncommitted edit uncommitted"
         );
     }
 
-    /// A carried path the workspace ADDED reaches the change with the entities
-    /// its bytes derive to.
+    /// A unit the workspace ADDED stays uncommitted, and the working copy keeps
+    /// answering about it.
     ///
-    /// The other carried arms exercise a `TreeDelta::Updated`, where the entity
-    /// deltas are modifications. This one is the admission of untracked content:
-    /// the workspace tree gains a path its base change never carried, and
-    /// because ambient admission publishes no semantic delta, the change would
-    /// otherwise publish a source file with no entities inside it at all. That
-    /// is not a subtler version of the same defect; it is a file the graph
-    /// cannot answer a single question about.
+    /// The other arms exercise an edit of a unit the base change holds. This
+    /// one is the admission of untracked content: the workspace tree gains a
+    /// path its base change never carried. The agent's change does not take it,
+    /// so the base change it records is still the one without that unit, and
+    /// the working copy keeps the entities the daemon derived from it, so the
+    /// graph can still answer every question about it.
     #[test]
-    fn a_carried_added_path_commits_the_entities_its_bytes_derive_to() {
+    fn an_added_unit_stays_uncommitted_and_answerable_beside_a_commit() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12564,7 +13218,7 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        admit_pending_working_tree_file(&state, "src/added.rs", b"pub fn added() -> u8 { 5 }\n");
+        admit_watched_edit(&state, "src/added.rs", b"pub fn added() -> u8 { 5 }\n");
 
         let sessions = test_sessions();
         let (_, arguments) =
@@ -12573,20 +13227,21 @@ pub(crate) mod tests {
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/added.rs"]),
-            "the fixture must actually exercise the carry: {reply:#}"
+            reply["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "the fixture must leave the added unit out of the change: {reply:#}"
         );
+        assert_eq!(head_source(&state, "src/added.rs"), None);
 
         assert_eq!(
             semantic_disagreement(&state, "src/lib.rs"),
             None,
-            "the file the operation authored must be coherent, or the check below proves nothing"
+            "the unit the operation authored must be coherent, or the check below proves nothing"
         );
         assert_eq!(
             semantic_disagreement(&state, "src/added.rs"),
             None,
-            "a carried file the workspace admitted must reach the change with its entities"
+            "the added unit's entities still describe its bytes"
         );
         assert!(
             state
@@ -12598,8 +13253,9 @@ pub(crate) mod tests {
                 .unwrap()
                 .iter()
                 .any(|held| held.name == "added"),
-            "the graph must be able to answer about the file the commit published"
+            "the graph must still be able to answer about the uncommitted unit"
         );
+        assert_eq!(uncommitted_entities(&state), names(["added"]));
     }
 
     /// A vacated path takes its semantics with it, and this is the mechanism
@@ -12682,18 +13338,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// A carried path whose new bytes stop being source is refused by name, not
-    /// published with the old entities still standing over them.
+    /// A unit whose uncommitted bytes stop being source neither blocks the
+    /// commit nor reaches it.
     ///
-    /// Deriving cannot answer this one: there is nothing to parse, so there are
-    /// no entities to replace the ones the graph holds. Publishing anyway is the
-    /// defect in its worst form, entities describing source the repository is
-    /// about to stop holding. Retiring them silently is not this commit's call
-    /// either, because no operation in it named that file and a retirement is a
-    /// decision about somebody else's work. So it refuses, names the path, says
-    /// what the graph still holds, and gives the three ways out.
+    /// Deriving cannot answer for those bytes: there is nothing to parse, so
+    /// there are no entities to replace the ones the graph holds. Publishing
+    /// them would be the worst form of the incoherence, entities describing
+    /// source the repository no longer holds, and retiring them is a decision
+    /// about somebody else's work. Neither is this commit's to make, because no
+    /// operation in it named that unit: the change keeps the unit as its base
+    /// change holds it, bytes and entities both, and the working copy keeps
+    /// the uncommitted bytes for whoever resolves them.
     #[test]
-    fn a_carried_path_that_stops_being_source_is_refused_by_name() {
+    fn a_unit_whose_uncommitted_bytes_stop_being_source_is_left_out_of_the_change() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12701,7 +13358,7 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\n",
             "value",
         );
-        install_exact_source(
+        let (pending, _) = install_exact_source(
             &state,
             "src/other.rs",
             b"pub fn other() -> u8 { 1 }\n",
@@ -12710,43 +13367,40 @@ pub(crate) mod tests {
         // Not valid UTF-8, so the classifier cannot call it entity source no
         // matter what the extension says.
         admit_pending_working_tree_edit(&state, "src/other.rs", &[0xff, 0xfe, 0x00, 0x01]);
-        let before = load_native_commit_base(&state.layout).unwrap();
 
         let sessions = test_sessions();
-        let (transaction_id, arguments) =
+        let (_, arguments) =
             stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
-
-        assert_eq!(
+        assert_ne!(
             result.is_error,
             Some(true),
-            "publishing stale entities under bytes they never came from is not an option: {}",
+            "uncommitted work the operations did not write is not this commit's to resolve: {}",
             result_text(&result)
         );
-        let message = result_text(&result);
-        assert!(
-            message.contains("src/other.rs"),
-            "the refusal must name the path that cannot be derived: {message}"
+        let reply = commit_reply(&result);
+        let change = replied_change(&state, &reply, &entity);
+        assert_eq!(change_paths(&change), names(["src/lib.rs"]));
+        assert_eq!(
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n",
+            "the change keeps the unit's source and the entities that describe it"
         );
         assert!(
-            message.contains("no longer classifies as supported entity source"),
-            "the refusal must say what is wrong with it: {message}"
-        );
-        assert!(
-            message.contains("conversion/reconciliation boundary")
-                && message.contains("restore the prior working content"),
-            "the refusal must say what to do about it: {message}"
+            !state
+                .graph
+                .get_entity_history(&pending.id)
+                .unwrap()
+                .iter()
+                .any(|recorded| recorded.id == change.id),
+            "no entity of the unit is revised by a change that did not write it"
         );
         assert_eq!(
-            sessions.get_transaction(&transaction_id).unwrap().state,
-            "active",
-            "a refused commit leaves the transaction where the caller can retry it"
+            std::fs::read(state.layout.working_dir().join("src/other.rs")).unwrap(),
+            [0xff, 0xfe, 0x00, 0x01],
+            "the working copy keeps the uncommitted bytes"
         );
-        assert_eq!(
-            load_native_commit_base(&state.layout).unwrap().roots,
-            before.roots,
-            "no repository authority may move behind a refusal"
-        );
+        assert!(workspace_is_dirty(&state));
     }
 
     /// Leave one source path converted to a symlink the way a working session
@@ -12784,21 +13438,18 @@ pub(crate) mod tests {
         try_publish_pending_workspace_tree(state)
     }
 
-    /// A carried path that became a symlink is refused by name, not skipped.
+    /// A unit the working copy turned into a symlink is left out of the change
+    /// the same way.
     ///
-    /// The first cut of the derivation skipped every non-blob tree entry on the
-    /// reasoning that a symlink carries no source body and therefore no entities
-    /// to disagree with it. The first half is true and the second does not
-    /// follow: the tree and the semantics are independent, and kin-db
-    /// revalidates an invalidated path by requiring an artifact to remain at it
-    /// without requiring that artifact to be a blob (0.7.104
-    /// `src/engine/graph.rs:8705`). So a same-path source-to-symlink conversion
-    /// satisfies every check while the entities the old source derived keep
-    /// standing, and the skip published them over a link. It is the same defect
-    /// as an unsupported blob, so it gets the same refusal.
+    /// The tree and the semantics are independent, and kin-db revalidates an
+    /// invalidated path by requiring an artifact to remain at it without
+    /// requiring that artifact to be a blob, so publishing the conversion would
+    /// leave the entities the old source derived standing over a link. The
+    /// change does not publish it: it keeps the unit as its base change holds
+    /// it, and the symlink stays uncommitted in the working copy.
     #[cfg(unix)]
     #[test]
-    fn a_carried_source_to_symlink_conversion_is_refused_by_name() {
+    fn a_unit_the_working_copy_turned_into_a_symlink_is_left_out_of_the_change() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12816,55 +13467,44 @@ pub(crate) mod tests {
             "if some earlier layer refuses this conversion, that mechanism is the finding and \
              this test must be rewritten around it rather than deleted",
         );
-        let before = load_native_commit_base(&state.layout).unwrap();
 
         let sessions = test_sessions();
-        let (transaction_id, arguments) =
+        let (_, arguments) =
             stage_entity_edit(&state, &sessions, &entity, "pub fn value() -> u8 { 2 }");
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
-
-        assert_eq!(
+        assert_ne!(
             result.is_error,
             Some(true),
-            "publishing source entities over a symlink is not an option: {}",
+            "uncommitted work the operations did not write is not this commit's to resolve: {}",
             result_text(&result)
         );
-        let message = result_text(&result);
-        assert!(
-            message.contains("src/other.rs"),
-            "the refusal must name the path it cannot derive: {message}"
-        );
-        assert!(
-            message.contains("a symlink"),
-            "the refusal must say what the path became: {message}"
-        );
-        assert!(
-            message.contains("conversion/reconciliation boundary")
-                && message.contains("restore the prior working content"),
-            "the refusal must say what to do about it: {message}"
-        );
+        let reply = commit_reply(&result);
+        let change = replied_change(&state, &reply, &entity);
+        assert_eq!(change_paths(&change), names(["src/lib.rs"]));
         assert_eq!(
-            sessions.get_transaction(&transaction_id).unwrap().state,
-            "active",
-            "a refused commit leaves the transaction where the caller can retry it"
+            head_source(&state, "src/other.rs").unwrap(),
+            b"pub fn other() -> u8 { 1 }\n",
+            "the change keeps the unit as source, with the entities that describe it"
         );
-        assert_eq!(
-            load_native_commit_base(&state.layout).unwrap().roots,
-            before.roots,
-            "no repository authority may move behind a refusal"
+        assert!(
+            std::fs::symlink_metadata(state.layout.working_dir().join("src/other.rs"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the working copy keeps the uncommitted symlink"
         );
+        assert!(workspace_is_dirty(&state));
     }
 
-    /// A newly admitted symlink with nothing standing under it stays a legal
-    /// tree-only carry, and its target is never resolved through the parser.
+    /// A newly admitted symlink stays uncommitted beside a commit, and its
+    /// target is never resolved through the parser.
     ///
-    /// The control for the refusal above. A symlink is a perfectly ordinary
-    /// thing for a workspace to carry, and refusing every one of them would
-    /// trade one broken commit for another. The refusal is about the entities
-    /// standing at the path, not about the entry kind, and this is what says so.
+    /// A symlink is a perfectly ordinary thing for a working copy to hold, and
+    /// it is somebody's work: the change does not take it, and nothing parses
+    /// its target on its behalf.
     #[cfg(unix)]
     #[test]
-    fn a_carried_symlink_with_no_standing_entities_is_a_legal_tree_only_carry() {
+    fn a_new_symlink_stays_uncommitted_beside_a_commit() {
         let (_dir, state) = test_state();
         let (entity, _) = install_exact_source(
             &state,
@@ -12896,14 +13536,23 @@ pub(crate) mod tests {
         assert_ne!(
             result.is_error,
             Some(true),
-            "a symlink nothing derives entities from must still commit: {}",
+            "a symlink nothing derives entities from must not block a commit: {}",
             result_text(&result)
         );
         let reply = commit_reply(&result);
+        assert!(reply.get("carried_pending_files").is_none(), "{reply:#}");
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/link.rs"]),
-            "the symlink is carried and declared like any other pending path: {reply:#}"
+            change_paths(&replied_change(&state, &reply, &entity)),
+            names(["src/lib.rs"])
+        );
+        assert_eq!(head_source(&state, "src/link.rs"), None);
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&test_path("src/link.rs"))
+                .is_some(),
+            "the working copy keeps the symlink"
         );
         assert!(
             state
@@ -12919,23 +13568,23 @@ pub(crate) mod tests {
         assert_eq!(
             semantic_disagreement(&state, "src/lib.rs"),
             None,
-            "the file the operation authored stays coherent beside a carried symlink"
+            "the unit the operation authored stays coherent beside an uncommitted symlink"
         );
+        assert!(workspace_is_dirty(&state));
     }
 
-    /// A relation-only commit beside a carried edit attributes the endpoint the
-    /// agent joined and not the one it carried.
+    /// A relation-only commit beside an uncommitted edit of its endpoint
+    /// records the relationship and none of the edit.
     ///
-    /// The carried-path filter that keeps a folded-in file out of attribution
-    /// applies while entity-delta scopes are collected. A relation-only commit
-    /// has no entity deltas of its own, so it falls back to the relation's
-    /// endpoints, and once a carried file contributes entity deltas the two
-    /// interact: the carried entity is filtered out of the first list, the list
-    /// is empty, the fallback opens, and an unfiltered fallback hands the carried
-    /// endpoint straight back to the committing session. Both sources are
-    /// filtered for that reason.
+    /// The relationship joins two entities the base change holds, so the
+    /// change records it exactly as it would on a clean workspace, and its
+    /// attribution falls back to the endpoints it joined as a relation-only
+    /// commit's always does. The uncommitted edit of the callee's unit is not
+    /// in the change and stays uncommitted, and the same relationship, under
+    /// the same identity, stands in the working copy, so it is not reported as
+    /// uncommitted work too.
     #[test]
-    fn a_relation_only_commit_beside_a_carry_attributes_only_the_endpoint_it_joined() {
+    fn a_relation_only_commit_beside_an_uncommitted_endpoint_records_only_the_relationship() {
         let (_dir, state) = test_state();
         let (caller, _) = install_exact_source(
             &state,
@@ -12949,9 +13598,7 @@ pub(crate) mod tests {
             b"pub fn callee() -> u8 { 2 }\n",
             "callee",
         );
-        // The carried half, on the callee's own path, so the commit re-derives
-        // the entity the staged relation points at.
-        admit_pending_working_tree_edit(&state, "src/callee.rs", b"pub fn callee() -> u8 { 7 }\n");
+        admit_watched_edit(&state, "src/callee.rs", b"pub fn callee() -> u8 { 7 }\n");
 
         let sessions = kin_mcp::SessionRegistry::new();
         let session = start_agent_session(&sessions, "gemini-cli", "relation-writer");
@@ -12989,14 +13636,35 @@ pub(crate) mod tests {
         assert_ne!(
             result.is_error,
             Some(true),
-            "a relation-only commit beside a carry must still land: {}",
+            "a relation-only commit beside uncommitted work must still land: {}",
             result_text(&result)
         );
         let reply = commit_reply(&result);
+        assert!(reply.get("carried_pending_files").is_none(), "{reply:#}");
+        let change_id = reply["change_id"].as_str().unwrap().to_string();
+        let change = state
+            .graph
+            .get_change(&SemanticChangeId::from_hash(
+                Hash256::from_hex(&change_id).unwrap(),
+            ))
+            .unwrap()
+            .expect("the live graph holds the change it just published");
+        assert!(change.tree_deltas.is_empty(), "{change:?}");
+        assert!(change.entity_deltas.is_empty(), "{change:?}");
+        let [RelationDelta::Added { new }] = change.relation_deltas.as_slice() else {
+            panic!("the change records exactly the relationship: {change:?}");
+        };
         assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/callee.rs"]),
-            "the fixture must actually exercise the carry: {reply:#}"
+            (new.src, new.dst),
+            (
+                GraphNodeId::Entity(caller.id),
+                GraphNodeId::Entity(callee.id)
+            )
+        );
+        assert_eq!(
+            state.graph.get_relation_by_id(&new.id).as_ref(),
+            Some(new),
+            "the working copy holds the same relationship the change recorded"
         );
 
         let scoped = state
@@ -13010,18 +13678,18 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            scoped.contains(&caller.id),
-            "the endpoint the agent joined and did not carry is still attributed to it"
+            scoped.contains(&caller.id) && scoped.contains(&callee.id),
+            "a relation-only commit is attributed to the endpoints it joined"
         );
-        assert!(
-            !scoped.contains(&callee.id),
-            "an endpoint inside a carried file must not reach the committing session's \
-             attribution through the relation fallback"
+        assert_eq!(
+            head_source(&state, "src/callee.rs").unwrap(),
+            b"pub fn callee() -> u8 { 2 }\n"
         );
+        assert_eq!(uncommitted_entities(&state), names(["callee"]));
         assert_eq!(
             semantic_disagreement(&state, "src/callee.rs"),
             None,
-            "the carried endpoint's own entities still describe the bytes this commit published"
+            "the uncommitted endpoint's own entities still describe its bytes"
         );
     }
 
@@ -13066,7 +13734,7 @@ pub(crate) mod tests {
             .graph
             .get_entity(&original.id)
             .unwrap()
-            .expect("a carried move must preserve entity identity");
+            .expect("an uncommitted move must preserve entity identity");
         assert_eq!(moved.file_origin, Some(FilePathId::new("src/new.rs")));
         assert_eq!(
             moved.span.as_ref().unwrap().file,
@@ -13202,10 +13870,17 @@ pub(crate) mod tests {
         let result = commit_exact_transaction(&state, &sessions, &arguments, None);
         assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
         let reply = commit_reply(&result);
-        assert_eq!(
-            reply["carried_pending_files"],
-            serde_json::json!(["src/new.rs"])
+        assert!(
+            reply.get("carried_pending_files").is_none(),
+            "the uncommitted move is not the agent's to publish: {reply:#}"
         );
+        assert_eq!(reply["modified_files"], serde_json::json!(["src/lib.rs"]));
+        assert!(
+            head_source(&state, "src/old.rs").is_some()
+                && head_source(&state, "src/new.rs").is_none(),
+            "the change keeps the moved unit where its base change holds it"
+        );
+        assert!(workspace_is_dirty(&state));
         assert_carried_move_identity(&state, &moved, artifact, &incoming);
         assert_eq!(semantic_disagreement(&state, "src/new.rs"), None);
         assert_eq!(semantic_disagreement(&state, "src/lib.rs"), None);

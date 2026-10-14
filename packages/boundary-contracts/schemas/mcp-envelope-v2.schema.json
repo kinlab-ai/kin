@@ -614,6 +614,48 @@
     "advice": {
       "type": "string"
     },
+    "flags": {
+      "description": "A reviewer's open flags on entities this answer returned, each with the reviewer's note. Status pages list up to 25 open flags; pass flags_next_cursor as flags_cursor to continue. Advisory: a flag stops nothing.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "entity": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string"
+          },
+          "changed_since": {
+            "type": "boolean"
+          },
+          "source_unavailable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entity",
+          "name",
+          "by",
+          "at"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "flags_next_cursor": {
+      "description": "Continue status review flags by passing this as flags_cursor; independent of the enrichment cursor.",
+      "type": "string",
+      "maxLength": 64
+    },
     "repository": {
       "type": "object",
       "properties": {

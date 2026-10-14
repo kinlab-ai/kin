@@ -555,6 +555,10 @@ fn main() {
         }
     }
 
+    // Still single-threaded, and before anything below writes what it
+    // resolves into this process's environment: a daemon that later hands its
+    // store over starts its successor with what it was itself started with.
+    kin_daemon::history_schedule::remember_start_environment();
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let program = env::args()
         .next()
@@ -650,6 +654,21 @@ fn main() {
     // waits a bounded grace period for the blocking pool to drain, then abandons
     // anything still running so we don't hang here…
     runtime.shutdown_timeout(kin_daemon::daemon::runtime_shutdown_grace());
+    // A daemon that stopped serving to hand its store over starts the daemon
+    // that attaches the staged history, as late as it can: this process still
+    // holds the repository's runtime authority, and the successor takes it
+    // when the exit below ends the process.
+    if kin_daemon::history_schedule::handed_off() {
+        match kin_daemon::history_schedule::start_successor() {
+            Ok(pid) => eprintln!(
+                "kin-daemon: started daemon {pid} to attach this store's complete history"
+            ),
+            Err(error) => eprintln!(
+                "kin-daemon: could not start the daemon that attaches this store's complete \
+                 history ({error}); the next start attaches it"
+            ),
+        }
+    }
     // …and we exit explicitly to terminate the whole process — including any
     // blocking thread that was abandoned above. SIGTERM always ends in real
     // termination; no zombie survives.
@@ -812,6 +831,17 @@ async fn async_main(args: Args) -> i32 {
             process::exit(1);
         }
     };
+
+    // Ahead of the first read of the store's own records: a history attach
+    // a crash interrupted can have left it without them, its manifest
+    // included, and a start is what finishes it.
+    if matches!(args.storage, StorageMode::Local) {
+        let interrupted = layout.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            kin_daemon::history_schedule::recover_before_start(&interrupted)
+        })
+        .await;
+    }
 
     let explicit_repo_id = args.repo_id.or_else(|| env::var("KIN_REPO_ID").ok());
     let repo_id = match kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref()) {
@@ -1046,6 +1076,12 @@ async fn async_main(args: Args) -> i32 {
         },
         embed_batch_size,
         embed_pipeline_overlap,
+        // A local store's history is attached by the daemon that starts next,
+        // and this entrypoint is what starts it. Not when this process is a
+        // container's init: everything in the container ends with it, the
+        // successor included, so it leaves a staged history for its next
+        // start, which attaches it.
+        history_handoff: matches!(args.storage, StorageMode::Local) && process::id() != 1,
         ..DaemonConfig::default()
     };
 

@@ -951,6 +951,7 @@ impl PersistedRepositoryAuthority {
             RootRecomputation::Required,
             &admitted,
             HistoryProof::Required,
+            PayloadProof::Required,
         )
     }
 
@@ -961,6 +962,7 @@ impl PersistedRepositoryAuthority {
         roots: RootRecomputation,
         admitted: &AdmittedChangeMap<'_>,
         history: HistoryProof,
+        payload: PayloadProof,
     ) -> Result<(), KinDbError> {
         let mut timer = PublicationPhaseTimer::start();
         if !(MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION..=REPOSITORY_AUTHORITY_SCHEMA_VERSION)
@@ -977,7 +979,14 @@ impl PersistedRepositoryAuthority {
         }
         self.roots.validate()?;
         super::binding_history::validate_metadata(self)?;
-        git_snapshot_proof::validate_metadata(snapshot, self)?;
+        // Carried on the same obligation as the Git authority checks below. It
+        // reads the snapshot proofs, the external objects they name and the
+        // root changes they prove. A transaction that leaves the Git authority
+        // carried admits no proof and no external object, and history only
+        // grows, so all three are the values the predecessor passed this with.
+        if history.git_authority_required() {
+            git_snapshot_proof::validate_metadata(snapshot, self)?;
+        }
         self.ref_state.validate()?;
 
         require_sorted_unique(
@@ -1146,7 +1155,7 @@ impl PersistedRepositoryAuthority {
         let history_caches_ms = timer.lap_ms();
         validate_ref_targets(snapshot, self)?;
         let ref_targets_ms = timer.lap_ms();
-        validate_workspace_authority(snapshot, self, Some(admitted), history)?;
+        validate_workspace_authority(snapshot, self, Some(admitted), history, payload)?;
         let workspace_authority_ms = timer.lap_ms();
 
         // Skipped only on an exact obligation the caller discharged over this
@@ -1257,9 +1266,14 @@ pub struct RepositoryAuthorityState {
     published: std::sync::atomic::AtomicBool,
     /// The workspace graph this state last materialized, kept so the next
     /// reader of the same workspace is handed a copy. See
-    /// [`KeptWorkspaceGraph`]. Never serialized, and no clone or successor
-    /// carries it: it is derived from this exact state and from nothing else.
+    /// [`KeptWorkspaceGraph`]. Never serialized, and no clone carries it. A
+    /// successor inherits it only for a workspace its transaction provably
+    /// could not move: see [`Self::inherit_workspace_graph`].
     workspace_graph: std::sync::Mutex<Option<KeptWorkspaceGraph>>,
+    /// Identity hash of every record in this state's operation log, by
+    /// position. See [`Self::operation_identities`]. Never serialized, and no
+    /// clone carries it.
+    operation_identities: std::sync::OnceLock<Arc<Vec<Hash256>>>,
 }
 
 /// One workspace's graph as an immutable [`RepositoryAuthorityState`]
@@ -1286,6 +1300,16 @@ pub struct RepositoryAuthorityState {
 struct KeptWorkspaceGraph {
     workspace_id: WorkspaceId,
     graph: Arc<GraphSnapshot>,
+    /// [`graph_digest`](super::binding_history::graph_digest) of `graph`, when
+    /// it has been computed over this exact graph or checked against the
+    /// witness that binds it.
+    digest: Option<Hash256>,
+    /// Whether `graph` is the predecessor's materialization rather than this
+    /// state's own. An inherited graph holds the right entities, relations,
+    /// external references and tree, and the predecessor's binding-history
+    /// capability, so it is bound again under this state's envelope each time
+    /// it is served until this state keeps its own bound copy.
+    inherited: bool,
 }
 
 /// Most entities and relations a workspace graph may hold and still be kept
@@ -1303,6 +1327,7 @@ impl Clone for RepositoryAuthorityState {
             installed_record: std::sync::OnceLock::new(),
             published: std::sync::atomic::AtomicBool::new(false),
             workspace_graph: std::sync::Mutex::new(None),
+            operation_identities: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1338,6 +1363,7 @@ impl RepositoryAuthorityState {
             installed_record: std::sync::OnceLock::new(),
             published: std::sync::atomic::AtomicBool::new(false),
             workspace_graph: std::sync::Mutex::new(None),
+            operation_identities: std::sync::OnceLock::new(),
         }
     }
 
@@ -1376,6 +1402,7 @@ impl RepositoryAuthorityState {
             installed_record: std::sync::OnceLock::new(),
             published: std::sync::atomic::AtomicBool::new(false),
             workspace_graph: std::sync::Mutex::new(None),
+            operation_identities: std::sync::OnceLock::new(),
         }
     }
 
@@ -1400,6 +1427,9 @@ impl RepositoryAuthorityState {
             installed_record: std::sync::OnceLock::new(),
             published: std::sync::atomic::AtomicBool::new(false),
             workspace_graph: std::sync::Mutex::new(None),
+            // An equivalent rewrite changes the representation and nothing the
+            // envelope says, so its operation log is `current`'s own.
+            operation_identities: current.operation_identities.clone(),
         }
     }
 
@@ -1416,6 +1446,25 @@ impl RepositoryAuthorityState {
 
     pub fn roots(&self) -> &RootBundle {
         &self.metadata().roots
+    }
+
+    /// Whether this authority records a binding-history witness for
+    /// `workspace_id`.
+    ///
+    /// The witness is the only source of the proof a materialized workspace
+    /// graph carries, so this answers whether [`Self::workspace_graph_snapshot`]
+    /// would return a graph holding one, from the authority's own record and
+    /// without materializing that graph.
+    pub fn records_binding_history_witness(&self, workspace_id: &WorkspaceId) -> bool {
+        self.snapshot
+            .repository_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                authority
+                    .binding_history
+                    .iter()
+                    .any(|witness| witness.workspace_id() == *workspace_id)
+            })
     }
 
     /// The language-server enrichment marks one workspace carries, or none
@@ -1537,17 +1586,26 @@ impl RepositoryAuthorityState {
         if let Some(kept) = self.kept_workspace_graph(workspace_id) {
             return Ok(Some(kept));
         }
+        // Or its predecessor did, and the transaction between them could not
+        // have moved it.
+        if let Some(inherited) = self.inherited_workspace_graph(workspace_id)? {
+            return Ok(Some(inherited));
+        }
 
         let prepared = self
             .prepared
             .as_ref()
             .filter(|_| prepared_workspace_state_pays_for_itself(workspace));
+        let identities = self.lineage_identities()?;
+        let identities = identities.as_ref().map(|held| held.as_slice());
         if let Some(prepared) = prepared {
             if let Some(mut snapshot) = prepared.serve(self.generation(), workspace) {
                 super::binding_history::bind_selected_graph(
                     self.metadata(),
                     *workspace_id,
                     &mut snapshot,
+                    None,
+                    identities,
                 )?;
                 self.keep_workspace_graph(workspace_id, &snapshot);
                 return Ok(Some(snapshot));
@@ -1558,12 +1616,50 @@ impl RepositoryAuthorityState {
             self.metadata(),
             workspace,
             None,
+            identities,
         )?;
         if let Some(prepared) = prepared {
             prepared.record(self.generation(), workspace, &materialized);
         }
         self.keep_workspace_graph(workspace_id, &materialized);
         Ok(Some(materialized))
+    }
+
+    /// Digest of the graph [`Self::workspace_graph_snapshot`] hands out for
+    /// `workspace_id`, or `None` when this state holds no such workspace.
+    ///
+    /// The digest this state already holds beside that graph whenever it holds
+    /// one, without copying the graph out to hash it. Otherwise the graph is
+    /// materialized and hashed here, and the digest is remembered beside the
+    /// graph when the state keeps it.
+    pub(crate) fn workspace_graph_digest(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<Hash256>, KinDbError> {
+        let held = self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|kept| &kept.workspace_id == workspace_id)
+            .and_then(|kept| kept.digest);
+        if held.is_some() {
+            return Ok(held);
+        }
+        let Some(graph) = self.workspace_graph_snapshot(workspace_id)? else {
+            return Ok(None);
+        };
+        let digest = super::binding_history::graph_digest(&graph)?;
+        if let Some(kept) = self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+            .filter(|kept| &kept.workspace_id == workspace_id)
+        {
+            kept.digest = Some(digest);
+        }
+        Ok(Some(digest))
     }
 
     /// A copy of the graph this state last materialized for `workspace_id`.
@@ -1577,7 +1673,7 @@ impl RepositoryAuthorityState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let graph = kept
             .as_ref()
-            .filter(|kept| &kept.workspace_id == workspace_id)
+            .filter(|kept| !kept.inherited && &kept.workspace_id == workspace_id)
             .map(|kept| Arc::clone(&kept.graph))?;
         drop(kept);
         #[cfg(test)]
@@ -1600,8 +1696,166 @@ impl RepositoryAuthorityState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptWorkspaceGraph {
             workspace_id: *workspace_id,
             graph: Arc::new(graph.clone()),
+            // A bound graph was compared with its witness's digest when it was
+            // bound, so the capability names the digest of these exact domains.
+            digest: graph
+                .verified_binding_history
+                .as_ref()
+                .map(super::binding_history::VerifiedBindingHistory::selected_graph_digest),
+            inherited: false,
         });
     }
+
+    /// Inherit `current`'s materialized workspace graph for a workspace the
+    /// transaction that produced this state could not have moved.
+    ///
+    /// Called only for a successor prepared under
+    /// [`HistoryProof::CarriedFromPredecessor`] that admits no collaboration
+    /// record, which states the obligation this rests on: the transaction
+    /// admits no change, alias, external object, Git authority delta,
+    /// collaboration record or local overlay, so the
+    /// authority-free payload, the materialized graph section and everything a
+    /// base target resolves through are the predecessor's own values. A
+    /// workspace's selected graph is a function of exactly those and of the
+    /// workspace's own state. So for every workspace the transaction does not
+    /// mutate, and whose state in this successor equals its state in the
+    /// predecessor, materializing it here would resolve the same base, apply
+    /// the same overlay and reach the graph the predecessor already holds.
+    ///
+    /// What does differ is the binding-history capability bound on that graph,
+    /// which names the envelope it was bound under. An inherited graph is
+    /// therefore never handed out as it was kept: every serve binds it again
+    /// under this state's envelope as it then stands, with the digest the
+    /// graph was kept under compared against this state's witness.
+    fn inherit_workspace_graph(&self, current: &Self, mutated_workspace: Option<WorkspaceId>) {
+        let held = current
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|kept| (kept.workspace_id, Arc::clone(&kept.graph), kept.digest));
+        let Some((workspace_id, graph, digest)) = held else {
+            return;
+        };
+        if mutated_workspace == Some(workspace_id) {
+            return;
+        }
+        let state_in = |state: &Self| {
+            state
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .cloned()
+        };
+        // Compared rather than assumed from the transaction's shape, so a
+        // transaction that reaches a workspace's state by any other route
+        // inherits nothing for it.
+        match (state_in(current), state_in(self)) {
+            (Some(before), Some(after)) if before == after => {}
+            _ => return,
+        }
+        *self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptWorkspaceGraph {
+            workspace_id,
+            graph,
+            digest,
+            inherited: true,
+        });
+    }
+
+    /// A copy of the graph this state inherited for `workspace_id`, bound
+    /// under this state's envelope.
+    ///
+    /// Served before publication too, which a graph this state materialized
+    /// itself never is. The commit still preparing this state writes only its
+    /// binding history, and the inherited domains do not read it; the binding
+    /// is applied here, from the envelope as it stands at this call. Once the
+    /// state is published the envelope is final, and the bound copy replaces
+    /// the inherited one as this state's own.
+    fn inherited_workspace_graph(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<GraphSnapshot>, KinDbError> {
+        let inherited = self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|kept| kept.inherited && &kept.workspace_id == workspace_id)
+            .map(|kept| (Arc::clone(&kept.graph), kept.digest));
+        let Some((graph, digest)) = inherited else {
+            return Ok(None);
+        };
+        let mut snapshot = GraphSnapshot::clone(&graph);
+        let identities = self.lineage_identities()?;
+        let digest = super::binding_history::bind_selected_graph(
+            self.metadata(),
+            *workspace_id,
+            &mut snapshot,
+            digest,
+            identities.as_ref().map(|held| held.as_slice()),
+        )?;
+        #[cfg(test)]
+        WORKSPACE_GRAPHS_INHERITED.with(|count| count.set(count.get() + 1));
+        let mut kept = self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(kept) = kept
+            .as_mut()
+            .filter(|kept| kept.inherited && &kept.workspace_id == workspace_id)
+        {
+            kept.digest = digest;
+            if self.is_published() {
+                kept.graph = Arc::new(snapshot.clone());
+                kept.inherited = false;
+            }
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Identity hash of every record in this state's operation log, by
+    /// position.
+    ///
+    /// An identity is a canonical encoding of the whole record, including the
+    /// workspace mutation it carried, and the local root and every
+    /// binding-history lineage read all of them. A state's log never changes
+    /// once the state exists, so the list is computed at most once per state,
+    /// and a successor is handed its predecessor's list plus the one record it
+    /// appended rather than hashing the log again.
+    pub(crate) fn operation_identities(&self) -> Result<Arc<Vec<Hash256>>, KinDbError> {
+        if let Some(held) = self.operation_identities.get() {
+            return Ok(Arc::clone(held));
+        }
+        let computed = Arc::new(operation_identities_of(self.metadata())?);
+        Ok(Arc::clone(
+            self.operation_identities.get_or_init(|| computed),
+        ))
+    }
+
+    /// [`Self::operation_identities`] for a caller about to validate this
+    /// state's binding-history lineages, or `None` when it holds no lineage and
+    /// nothing would read them.
+    fn lineage_identities(&self) -> Result<Option<Arc<Vec<Hash256>>>, KinDbError> {
+        if self.metadata().binding_history.is_empty() {
+            return Ok(None);
+        }
+        self.operation_identities().map(Some)
+    }
+}
+
+/// Identity hash of every record in `metadata`'s operation log, in log order.
+fn operation_identities_of(
+    metadata: &PersistedRepositoryAuthority,
+) -> Result<Vec<Hash256>, KinDbError> {
+    Ok(metadata
+        .operation_log
+        .iter()
+        .map(RepositoryOperationRecord::identity_hash)
+        .collect::<kin_model::Result<Vec<_>>>()?)
 }
 
 /// Whether a durable prepared artifact can pay for itself for this workspace.
@@ -2057,6 +2311,42 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         }
     }
 
+    /// The proven frame this publication may take, or `None` when it must be
+    /// a full snapshot whatever its size.
+    ///
+    /// A successor that raises the envelope schema, which only a re-derivation
+    /// commit does, changes the representation a frame is encoded against, so
+    /// it is persisted whole rather than offered to the frame encoder, which
+    /// refuses it. The byte bound is judged by the caller, on the frame this
+    /// returns.
+    fn candidate_frame(
+        &self,
+        current: &RepositoryAuthorityState,
+        next: &RepositoryAuthorityState,
+        state: &PersistenceState,
+    ) -> Option<crate::storage::authority_frame::ProvenFrame> {
+        let same_schema = current.metadata().schema_version == next.metadata().schema_version;
+        if !same_schema || !self.frame_is_candidate(state) {
+            return None;
+        }
+        match self.encode_frame(current, next) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                // The writer refusing its own frame is a kin-db defect, never a
+                // durability question: the successor is still fully validated,
+                // so it is persisted whole and the defect is reported where an
+                // operator will see it.
+                tracing::error!(
+                    repository = %self.repository_id,
+                    generation = next.generation(),
+                    error = %error,
+                    "authority frame encoding refused; persisting this publication as a full snapshot"
+                );
+                None
+            }
+        }
+    }
+
     /// Encode the frame that carries `current` to `next`, proven from its own
     /// wire bytes, or say why the publication must be a full snapshot instead.
     fn encode_frame(
@@ -2116,31 +2406,7 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         // an earlier one was either reconciled as committed or dropped, and a
         // frame retained for it must not outlive that decision.
         state.pending_frame = None;
-        // A successor that raises the envelope schema, which only a
-        // re-derivation commit does, changes the representation a frame is
-        // encoded against, so it is persisted whole rather than offered to the
-        // frame encoder, which refuses it.
-        let same_schema = current.metadata().schema_version == next.metadata().schema_version;
-        let frame = if same_schema && self.frame_is_candidate(&state) {
-            match self.encode_frame(current, next) {
-                Ok(frame) => Some(frame),
-                Err(error) => {
-                    // The writer refusing its own frame is a kin-db defect,
-                    // never a durability question: the successor is still
-                    // fully validated, so it is persisted whole and the defect
-                    // is reported where an operator will see it.
-                    tracing::error!(
-                        repository = %self.repository_id,
-                        generation = next.generation(),
-                        error = %error,
-                        "authority frame encoding refused; persisting this publication as a full snapshot"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let frame = self.candidate_frame(current, next, &state);
         let shape = match &frame {
             Some(frame) => self.publication_shape(&state, frame.bytes().len() as u64),
             None => PublicationShape::FullSnapshot,
@@ -2437,16 +2703,119 @@ fn record_frame_persistence_phases(
 }
 
 impl RepositorySnapshotPersistence<LocalFileBackend> {
-    /// Persist a full snapshot and keep the backend lock that committed it.
+    /// Persist a freezing publication and keep the backend lock that committed
+    /// it.
     ///
     /// The freezing publication is the branch, tag, stash, merge-state, and
-    /// replay-recovery path; it stays a full snapshot in this revision, which
-    /// also compacts whatever journal the commit path built up.
+    /// replay-recovery path. It takes the shape any other publication takes
+    /// under the same bounds: one authority frame while the journal has room,
+    /// otherwise a full snapshot, which also compacts the journal. A branch
+    /// create or delete moves the ref state and appends one operation, so its
+    /// frame is a few kilobytes where the full snapshot is the whole store.
+    ///
+    /// Either shape commits at the record rename under the repository's
+    /// exclusive lock and returns that same lock, so the caller's freeze has
+    /// no release and reacquire window whichever was written.
     fn persist_and_freeze(
         &self,
+        current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
+        let _persist_span = tracing::info_span!("kindb.commit.persist_and_freeze").entered();
+        let timer = PublicationPhaseTimer::start();
+        let mut state = self.state.lock();
+        // As in `persist_successor`: a persist call means no candidate is
+        // retained, so a frame kept for an earlier one must not outlive it.
+        state.pending_frame = None;
+        if let Some(frame) = self.candidate_frame(current, next, &state) {
+            if self.publication_shape(&state, frame.bytes().len() as u64) == PublicationShape::Frame
+            {
+                return self.persist_frame_and_freeze(&mut state, next, &frame, timer);
+            }
+        }
+        // The publication's writer permit is held across this hand-off, so
+        // nothing else persists between releasing the journal state here and
+        // the full-snapshot path taking it again.
+        drop(state);
         self.persist_and_freeze_inner(next, None)
+    }
+
+    /// Append `frame` as the successor and keep the backend lock that
+    /// committed it.
+    ///
+    /// The writer-side bookkeeping is exactly an ordinary frame append's: the
+    /// cursor and the journal counts move only on a committed append, and an
+    /// indeterminate one retains the exact frame bytes for the successor they
+    /// were encoded for, so the next commit reconciles them against the record
+    /// rather than guessing.
+    fn persist_frame_and_freeze(
+        &self,
+        state: &mut PersistenceState,
+        next: &RepositoryAuthorityState,
+        frame: &crate::storage::authority_frame::ProvenFrame,
+        mut timer: PublicationPhaseTimer,
+    ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
+        timer.lap_ms();
+        let bytes = frame.bytes();
+        let cursor = state.cursor;
+        let (persisted, record) = self.installing_record(|| {
+            self.backend.save_authority_frame_and_freeze(
+                self.repository_id.as_str(),
+                bytes,
+                cursor,
+                Some(HISTORY_VALIDATION_VERSION),
+            )
+        });
+        let outcome = match persisted {
+            Ok((committed_cursor, retained)) if committed_cursor != state.cursor => {
+                let generation = committed_cursor.backend_generation();
+                state.cursor = committed_cursor;
+                // Named the way an ordinary append names its head: the head
+                // this writer could already name, extended by the frame it just
+                // wrote. The record the retained lock committed names the same
+                // head, and when it does not this writer's view was stale, so
+                // it stops naming one and a later freeze reloads in full.
+                state.head = state
+                    .head
+                    .take()
+                    .and_then(|head| head.with_frame(generation, hex::encode(Sha256::digest(bytes))))
+                    .filter(|head| head == retained.identity());
+                state.record = record.filter(|_| state.head.is_some());
+                state.journal_frames = state.journal_frames.saturating_add(1);
+                state.journal_bytes = state.journal_bytes.saturating_add(bytes.len() as u64);
+                next.mark_published();
+                if let Some(head) = state.head.clone() {
+                    next.bind_durable_identity(head);
+                }
+                if let Some(record) = state.record {
+                    next.bind_installed_record(record);
+                }
+                RetainedPersistOutcome::Committed { retained }
+            }
+            Ok((committed_cursor, _)) => RetainedPersistOutcome::Indeterminate(storage(format!(
+                "authority frame backend acknowledged a freezing publication without advancing its CAS cursor from {}",
+                committed_cursor.backend_generation()
+            ))),
+            Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {
+                RetainedPersistOutcome::Indeterminate(error)
+            }
+            Err(error) => RetainedPersistOutcome::NotCommitted(error),
+        };
+        if let RetainedPersistOutcome::Indeterminate(_) = &outcome {
+            state.pending_frame = Some(PendingFrame {
+                roots: next.roots().clone(),
+                bytes: bytes.to_vec(),
+            });
+        }
+        let write_ms = timer.lap_ms();
+        record_frame_persistence_phases(
+            frame.drain_ms(),
+            frame.self_check_ms(),
+            frame.serialize_ms(),
+            write_ms,
+            bytes.len(),
+        );
+        outcome
     }
 
     fn persist_and_freeze_inner(
@@ -2751,8 +3120,8 @@ impl LocalRepositoryAuthorityFreeze {
         // cached history proofs, while the retained lock excludes writers.
         let snapshot = crate::storage::backend::recover_snapshot_from_state(
             repository_id.as_str(),
-            locked.authority(),
-            locked.frames(),
+            locked.authority()?,
+            locked.frames()?,
             None,
             crate::storage::backend::HistoryDecode::Streamed(&mut |change| {
                 crate::storage::change_validation::validate_semantic_change(change)
@@ -3256,7 +3625,7 @@ impl RepositoryAuthorityMetadata<LocalFileBackend> {
         else {
             return Ok(None);
         };
-        let (authority, journal) = locked.into_captured();
+        let (authority, journal) = locked.into_captured()?;
         let read_at = started.elapsed();
         let envelope = crate::storage::format::AuthorityEnvelopeSnapshot::from_bytes(
             &authority.snapshot_bytes,
@@ -4479,7 +4848,11 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             .as_mut()
             .expect("validated authority")
             .binding_history = witnesses;
-        super::binding_history::validate_metadata(next.metadata())?;
+        let identities = next.lineage_identities()?;
+        super::binding_history::validate_metadata_with(
+            next.metadata(),
+            identities.as_ref().map(|held| held.as_slice()),
+        )?;
         Ok(AuthorityCommitDecision::Publish { next, output })
     }
 
@@ -4613,7 +4986,7 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
                 }
             },
             |_, current| self.freeze_exact_state(current),
-            |persistence, _, next| match persistence.persist_and_freeze(next) {
+            |persistence, current, next| match persistence.persist_and_freeze(current, next) {
                 RetainedPersistOutcome::Committed { retained } => {
                     RetainedPersistOutcome::Committed {
                         retained: LocalRepositoryAuthorityFreeze {
@@ -5091,7 +5464,12 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         external_history,
         history,
     )?;
-    git_snapshot_proof::admit(current, &snapshot, &mut metadata, transaction, source)?;
+    // A transaction that leaves the Git authority carried brings no snapshot
+    // proof, so there is none to admit, and the proofs it holds were validated
+    // with the predecessor: see the same carry in `validate_against_snapshot_with`.
+    if history.git_authority_required() || !transaction.git_snapshot_proofs.is_empty() {
+        git_snapshot_proof::admit(current, &snapshot, &mut metadata, transaction, source)?;
+    }
     // A carried successor keeps the predecessor's policies, which were derived
     // from this same history.
     if history.history_required() {
@@ -5125,7 +5503,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // Every remaining validation reads the same authority-free payload:
     // `changes` is final once admission above returns, and the steps below
     // mutate only the detached metadata. One shared decode serves them all.
-    let replay = history.replay_graph(&snapshot, None);
+    let replay = history.preparation_replay_graph(&snapshot, &transaction.changes);
     apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
     let workspace_ms = timer.lap_ms();
     drop(lap);
@@ -5200,6 +5578,14 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // Release any retained workspace base tree once its admission readers
     // finish, before constructing the successor's roots and envelope.
     let replay_decode_ms = replay.build_ms();
+    // Read off the view itself rather than inferred from the arm: every arm
+    // has proven or carried the payload by here, and storage admission below
+    // reads this same payload with only the envelope and version put back.
+    let payload = if replay.proven.get().is_some() {
+        PayloadProof::Proven
+    } else {
+        PayloadProof::Required
+    };
     drop(replay);
 
     let lap = tracing::info_span!("kindb.prepare.roots").entered();
@@ -5230,12 +5616,20 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     };
     operation.validate()?;
     metadata.operation_log.push(operation.clone());
+    // The successor's log is the predecessor's, cloned above with the rest of
+    // its snapshot, and this one record: nothing between that clone and here
+    // touches a record already in it. So its identities are the predecessor's,
+    // which that state hashes at most once, and this record's. The identity
+    // excludes both root bundles, so it is final before `roots_after` is.
+    let mut operation_identities = current.operation_identities()?.as_ref().clone();
+    operation_identities.push(operation.identity_hash()?);
     metadata.roots = compute_successor_roots(
         &snapshot,
         &metadata,
         next_generation,
         history,
         current.roots(),
+        &operation_identities,
     )?;
     let roots_ms = timer.lap_ms();
     drop(lap);
@@ -5246,6 +5640,14 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         .operation_log
         .last_mut()
         .expect("operation was just appended") = operation.clone();
+    // Checked against the final log, `roots_after` included, so a test build
+    // refuses the carry if an identity ever starts reading the roots.
+    #[cfg(test)]
+    assert_eq!(
+        operation_identities,
+        operation_identities_of(&metadata)?,
+        "a successor's carried operation identities are its log's own"
+    );
 
     let receipt = RepositoryCommitReceipt {
         operation_id: transaction.operation_id,
@@ -5306,8 +5708,16 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     // points restores this caller's obligation to
     // `RootRecomputation::Required`. This is the ONE caller entitled to state
     // it, because it is the only one holding a bundle it folded itself.
-    snapshot
-        .validate_storage_admission_with_proven_roots(GitProjectionTreeReplay::Proven, history)?;
+    //
+    // The payload proof is stated on the same terms through `payload`: the
+    // replay view above proved or carried exactly this authority-free payload,
+    // and the only writes since are `repository_authority` and `version`, which
+    // the proof does not read.
+    snapshot.validate_storage_admission_with_proven_roots(
+        GitProjectionTreeReplay::Proven,
+        history,
+        payload,
+    )?;
     let storage_admission_ms = timer.lap_ms();
     drop(lap);
 
@@ -5317,6 +5727,15 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     } else {
         RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes)
     };
+    // Both are derived from this exact successor and nothing else. The
+    // identities were folded into its local root above, and the comparison
+    // there was against this same log.
+    let _ = state
+        .operation_identities
+        .set(Arc::new(operation_identities));
+    if let Some(mutated_workspace) = history.inherits_workspace_graphs_except() {
+        state.inherit_workspace_graph(current, mutated_workspace);
+    }
     let successor_index_ms = timer.lap_ms();
     drop(lap);
     let elapsed = prepare_started.elapsed();
@@ -5735,6 +6154,29 @@ pub(crate) enum RootRecomputation {
     Proven,
 }
 
+/// Whether storage admission proves the authority-free payload decodes, or the
+/// caller has already proven it over this exact payload.
+///
+/// The proof is [`SharedReplayGraph::prove`]: storage admission over the
+/// payload with its envelope ignored, and the history replay behind it.
+/// Storage admission needs it before a workspace's base resolves, and it used
+/// to build a replay view of its own and run the proof again, after successor
+/// preparation had run it a few statements earlier over the same payload. On
+/// every commit that replayed history, that was one more replay of the whole
+/// history: 27 seconds of a 244-second collaboration commit on a converted
+/// axum store in a debug build.
+///
+/// [`PayloadProof::Proven`] states an exact obligation, as
+/// [`RootRecomputation::Proven`] does, and only `prepare_successor` states
+/// it: its own replay view proved this payload, and the only writes since are
+/// the authority envelope and the snapshot version, which the proof does not
+/// read. Every other caller passes [`PayloadProof::Required`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadProof {
+    Required,
+    Proven,
+}
+
 /// Whether a successor still owes the proofs that read immutable history alone.
 ///
 /// Five checks in successor preparation and storage admission read nothing a
@@ -5749,11 +6191,13 @@ pub(crate) enum RootRecomputation {
 /// most of the minutes `kin branch create` spent preparing a one-ref successor.
 ///
 /// [`HistoryProof::CarriedFromPredecessor`] states an exact obligation. The
-/// transaction admits no change, alias, external object, Git authority delta,
-/// collaboration record or local overlay, so the successor's history, Git
-/// authority, admission policies, child index and authority-free payload are
-/// the predecessor's own values, and the one operation it appends records no
-/// Git delta. The predecessor passed every one of these checks, because every
+/// transaction admits no change, alias, external object, Git authority delta
+/// or local overlay, so the successor's history, Git authority, admission
+/// policies and child index are the predecessor's own values, and the one
+/// operation it appends records no Git delta. Its authority-free payload is
+/// the predecessor's too, except for any collaboration records it admits,
+/// which no history proof reads; the paragraph on collaboration records below
+/// says why. The predecessor passed every one of these checks, because every
 /// [`RepositoryAuthorityState`] did: an open runs them or trusts a
 /// history-validation record bound to the exact bytes that passed them, a
 /// frozen lock and an equivalent rewrite run them, and a successor runs them
@@ -5766,10 +6210,42 @@ pub(crate) enum RootRecomputation {
 /// Everything a ref or workspace mutation can change still runs on a carried
 /// successor: the ref leases, targets and fast-forward checks, the
 /// operation-log and receipt chain, the mutated workspace, and the ref-state,
-/// ref-log and local roots. The other three roots carry, for the same reason,
-/// through [`compute_successor_roots`].
+/// ref-log and local roots. The history and replication roots carry, for the
+/// same reason, through [`compute_successor_roots`], and so does the
+/// collaboration root unless the transaction admits collaboration records.
+///
+/// Two more derivations rest on this same obligation. A workspace's selected
+/// graph is a function of the authority-free payload, of what its base target
+/// resolves through, and of its own state. A base target is always resolved,
+/// never symbolic, so no ref mutation moves it. Every workspace such a
+/// transaction leaves as it was therefore selects the graph its predecessor
+/// materialized, and the successor inherits that graph instead of resolving
+/// the base and applying the overlay again:
+/// [`RepositoryAuthorityState::inherit_workspace_graph`]. The local root still
+/// folds on every successor, but over operation identities the predecessor
+/// already hashed plus the one record appended:
+/// [`RepositoryAuthorityState::operation_identities`].
 /// A persisted full snapshot still re-verifies every history record as it
 /// serializes, so history bytes edited after the open are refused at the write.
+///
+/// Collaboration records (reviews and their flags and sightings, test cases
+/// and verification runs, agent authorship actors and audit events) are
+/// snapshot collections beside the history, never part of it, and a
+/// collaboration delta only adds or replaces records in them. No history
+/// proof reads them: the replay, the admission policies and the child index
+/// read `changes` alone, and the one part of the payload proof that does read
+/// a collaboration collection, the graph-node sets relation endpoints are
+/// checked against, runs again on every successor in its own storage
+/// admission over the final snapshot. So a transaction that admits
+/// collaboration records and no history carries the history proofs as well,
+/// under two obligations a carried successor otherwise drops. Its collaboration
+/// root folds again. And it inherits no workspace graph, because a
+/// materialized workspace graph holds a copy of every collaboration
+/// collection and the relations derived from verification runs, so the
+/// predecessor's graph is not the one this successor selects. A daemon makes
+/// such a commit for every review flag, stored test run and ended agent
+/// session, and on a converted axum store with 1,901 changes each one used to
+/// replay the whole history three times over: 244 seconds in a debug build.
 ///
 /// [`HistoryProof::GitAuthorityCarried`] is the narrower obligation of an
 /// ordinary native commit. It adds history, so every other history proof runs
@@ -5778,7 +6254,21 @@ pub(crate) enum RootRecomputation {
 /// the external objects, the aliases, the Git deltas the operation log
 /// records, and, among the changes, only those an alias names or whose origin
 /// is a Git commit; the projection replay walks aliased changes alone. None of
-/// that differs from the predecessor, so their verdict carries too.
+/// that differs from the predecessor, so their verdict carries too. The Git
+/// snapshot proofs carry with them in both arms: validating them reads the
+/// proofs, the external objects they name and the root changes they prove,
+/// and such a transaction brings no proof and no object while history only
+/// grows.
+///
+/// History only growing is also what lets this arm replay just what it adds.
+/// `admit_changes` appends, and refuses a held identity whose bytes differ, so
+/// every change the predecessor held is byte-identical here and its
+/// first-parent lineage is held changes alone. A replay verdict depends on a
+/// change and its lineage and on nothing else, so the predecessor's verdict on
+/// every held change stands, and the payload proof replays the lineage of the
+/// changes this transaction adds rather than the whole forest:
+/// [`SharedReplayGraph::new_over_additions`]. The Kahn pass over every change
+/// still runs, so a merge parent nobody holds is refused as before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryProof {
     Required,
@@ -5788,6 +6278,9 @@ pub(crate) enum HistoryProof {
         // Authenticated by the predecessor's workspace admission, never by
         // the proposed mutation. Valid only while its history is unchanged.
         workspace_base: Option<(SemanticChangeId, Hash256)>,
+        // The transaction admits collaboration records, so the collaboration
+        // root folds and no workspace graph is inherited.
+        admits_collaboration: bool,
     },
 }
 
@@ -5806,10 +6299,10 @@ impl HistoryProof {
         if !git_authority_untouched {
             return Self::Required;
         }
-        if !transaction.changes.is_empty()
-            || transaction.collaboration_delta.is_some()
-            || transaction.local_overlay_delta.is_some()
-        {
+        // A local overlay is carried by no arm below: every unmutated
+        // workspace's validation reads the overlay its local stamp names, and a
+        // carried successor validates only the workspace it mutates.
+        if !transaction.changes.is_empty() || transaction.local_overlay_delta.is_some() {
             return Self::GitAuthorityCarried;
         }
         Self::CarriedFromPredecessor {
@@ -5818,6 +6311,7 @@ impl HistoryProof {
                 .as_ref()
                 .map(|mutation| mutation.workspace_id),
             workspace_base: None,
+            admits_collaboration: transaction.collaboration_delta.is_some(),
         }
     }
 
@@ -5831,7 +6325,9 @@ impl HistoryProof {
         current: &RepositoryAuthorityState,
     ) -> Result<Self, KinDbError> {
         let Self::CarriedFromPredecessor {
-            mutated_workspace, ..
+            mutated_workspace,
+            admits_collaboration,
+            ..
         } = self
         else {
             return Ok(self);
@@ -5848,12 +6344,41 @@ impl HistoryProof {
         Ok(Self::CarriedFromPredecessor {
             mutated_workspace,
             workspace_base,
+            admits_collaboration,
         })
     }
 
     /// Whether the proofs over the whole history still run.
     fn history_required(self) -> bool {
         !matches!(self, Self::CarriedFromPredecessor { .. })
+    }
+
+    /// Whether the collaboration root folds again rather than carrying.
+    fn collaboration_root_required(self) -> bool {
+        match self {
+            Self::Required | Self::GitAuthorityCarried => true,
+            Self::CarriedFromPredecessor {
+                admits_collaboration,
+                ..
+            } => admits_collaboration,
+        }
+    }
+
+    /// The workspace a successor under this obligation may NOT inherit a
+    /// materialized graph for, or `None` when it inherits none at all.
+    ///
+    /// Only a carried successor inherits, and only one that admits no
+    /// collaboration record: a workspace graph copies every collaboration
+    /// collection, so a new record changes the graph every workspace selects.
+    fn inherits_workspace_graphs_except(self) -> Option<Option<WorkspaceId>> {
+        match self {
+            Self::CarriedFromPredecessor {
+                mutated_workspace,
+                admits_collaboration: false,
+                ..
+            } => Some(mutated_workspace),
+            _ => None,
+        }
     }
 
     /// Whether the Git authority shape, projection and alias checks still run.
@@ -5884,6 +6409,27 @@ impl HistoryProof {
             replay.workspace_base = workspace_base;
         }
         replay
+    }
+
+    /// The replay view successor preparation reads, for a transaction adding
+    /// `additions` to its predecessor's history.
+    ///
+    /// Under [`Self::GitAuthorityCarried`] history only grows, so the payload
+    /// proof replays the lineage of `additions` alone; the paragraph on that
+    /// arm says why the predecessor's verdict stands for every held change.
+    /// Every other arm reads [`Self::replay_graph`].
+    fn preparation_replay_graph<'a>(
+        self,
+        snapshot: &'a GraphSnapshot,
+        additions: &[kin_model::SemanticChange],
+    ) -> SharedReplayGraph<'a> {
+        match self {
+            Self::GitAuthorityCarried => SharedReplayGraph::new_over_additions(
+                snapshot,
+                additions.iter().map(|change| change.id),
+            ),
+            _ => self.replay_graph(snapshot, None),
+        }
     }
 }
 
@@ -7974,6 +8520,10 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 struct SharedReplayGraph<'a> {
     snapshot: &'a GraphSnapshot,
     admitted: Option<AdmittedChangeMap<'a>>,
+    // The changes a transaction adds to a history its predecessor already
+    // validated, sorted and deduplicated, when the proof replays their lineage
+    // alone. `None` replays the whole history.
+    additions: Option<Vec<SemanticChangeId>>,
     workspace_base: Option<(SemanticChangeId, Hash256)>,
     workspace_base_tree: std::cell::OnceCell<ResolvedTree>,
     proven: std::cell::OnceCell<()>,
@@ -7998,12 +8548,39 @@ impl<'a> SharedReplayGraph<'a> {
         Self {
             snapshot,
             admitted: admitted.copied(),
+            additions: None,
             workspace_base: None,
             workspace_base_tree: std::cell::OnceCell::new(),
             proven: std::cell::OnceCell::new(),
             proof_runs: std::cell::Cell::new(0),
             build_ms: std::cell::Cell::new(0),
         }
+    }
+
+    /// Build a replay view over a successor whose predecessor validated every
+    /// change it held, and which adds `additions` and nothing else.
+    ///
+    /// Its proof runs the same storage admission over the authority-free
+    /// payload, then replays the first-parent lineage of `additions` instead
+    /// of the whole forest. Only [`HistoryProof::GitAuthorityCarried`] is
+    /// entitled to ask for it; its documentation states the obligation.
+    fn new_over_additions(
+        snapshot: &'a GraphSnapshot,
+        additions: impl IntoIterator<Item = SemanticChangeId>,
+    ) -> Self {
+        let mut additions: Vec<_> = additions.into_iter().collect();
+        additions.sort_unstable();
+        additions.dedup();
+        Self {
+            additions: Some(additions),
+            ..Self::new(snapshot)
+        }
+    }
+
+    /// Whether this view's own proof replayed exactly the lineage of
+    /// `targets`, so a caller asking for that same replay already has it.
+    fn proof_replayed_lineage_of(&self, targets: &[SemanticChangeId]) -> bool {
+        self.proven.get().is_some() && self.additions.as_deref() == Some(targets)
     }
 
     /// Prove the payload decodes, once, and remember that it did.
@@ -8015,13 +8592,30 @@ impl<'a> SharedReplayGraph<'a> {
         if self.proven.get().is_none() {
             let started = std::time::Instant::now();
             self.proof_runs.set(self.proof_runs.get() + 1);
+            #[cfg(test)]
+            PAYLOAD_PROOFS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
             // The witness, when there is one, was minted for this very map:
             // nothing is cloned here, so the pointer identity `describes`
             // checks holds outright instead of being carried onto a copy.
-            InMemoryGraph::prove_authority_free_snapshot_decode(
-                self.snapshot,
-                self.admitted.as_ref(),
-            )?;
+            match &self.additions {
+                None => InMemoryGraph::prove_authority_free_snapshot_decode(
+                    self.snapshot,
+                    self.admitted.as_ref(),
+                )?,
+                Some(additions) => {
+                    InMemoryGraph::prove_authority_free_snapshot_admission(
+                        self.snapshot,
+                        self.admitted.as_ref(),
+                    )?;
+                    let _span = tracing::info_span!(
+                        "kindb.graph.validate_history",
+                        changes = self.snapshot.changes.len(),
+                        additions = additions.len()
+                    )
+                    .entered();
+                    validate_first_parent_history(&self.snapshot.changes, additions)?;
+                }
+            }
             self.build_ms.set(started.elapsed().as_millis());
             let _ = self.proven.set(());
         }
@@ -8170,6 +8764,20 @@ fn history_replays_on_this_thread() -> usize {
     HISTORY_REPLAYS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAYLOAD_PROOFS_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many authority-free payload proofs this thread ran, across every replay
+/// view. Counted in [`SharedReplayGraph::prove`] itself, so a proof storage
+/// admission runs on a view of its own is counted too.
+#[cfg(test)]
+fn payload_proofs_on_this_thread() -> usize {
+    PAYLOAD_PROOFS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 fn validate_history_replay_with<'a>(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
@@ -8190,7 +8798,9 @@ fn validate_history_replay_with<'a>(
     // and it proves graph truth rather than serving queries, so it needs
     // neither a text index nor a decoded copy of the payload to keep. The
     // shared proof is that exact pass: an earlier preparation step may already
-    // have paid for it, and asking for it here proves it.
+    // have paid for it, and asking for it here proves it. A view built over a
+    // validated predecessor derives only the timelines its additions reach;
+    // see `SharedReplayGraph::new_over_additions`.
     replay.prove()?;
 
     // New transactions validate every admitted tip directly. Reopen has no
@@ -8201,6 +8811,16 @@ fn validate_history_replay_with<'a>(
     // Reopen and freeze borrow the complete map; transaction preparation
     // borrows only incoming changes. Replay needs identities, not owned payloads.
     let mut validation_targets: Vec<_> = new_changes.into_iter().map(|change| change.id).collect();
+    validation_targets.sort_unstable();
+    validation_targets.dedup();
+    // A proof over a predecessor's validated history replays exactly what the
+    // transaction adds, which is this same set, so it has already been
+    // replayed once. An empty set is a transaction that adds no history to a
+    // validated predecessor, and it has nothing to replay, rather than every
+    // leaf the way a reopen with no predecessor does.
+    if replay.proof_replayed_lineage_of(&validation_targets) {
+        return Ok(());
+    }
     if validation_targets.is_empty() {
         validation_targets = snapshot
             .changes
@@ -8394,11 +9014,16 @@ fn is_ancestor(
 /// all three as one `TransactionDelta` preserves the graph engine's atomic
 /// validation: an entity can never be restored onto an absent artifact and a
 /// relation can never point at a missing entity.
+/// `operation_identities` is as
+/// [`validate_metadata_with`](super::binding_history::validate_metadata_with)
+/// takes it: the identity of every record in `metadata.operation_log`, from
+/// the state that owns that log, or `None` to hash them here.
 fn materialize_workspace_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
     admitted: Option<&AdmittedChangeMap<'_>>,
+    operation_identities: Option<&[Hash256]>,
 ) -> Result<GraphSnapshot, KinDbError> {
     let base = resolve_workspace_base_graph_snapshot(
         authority_snapshot,
@@ -8407,7 +9032,13 @@ fn materialize_workspace_graph_snapshot(
         WorkspaceBaseHistory::Carried(admitted),
     )?;
     let mut selected = materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)?;
-    super::binding_history::bind_selected_graph(metadata, workspace.workspace_id, &mut selected)?;
+    super::binding_history::bind_selected_graph(
+        metadata,
+        workspace.workspace_id,
+        &mut selected,
+        None,
+        operation_identities,
+    )?;
     Ok(selected)
 }
 
@@ -8419,7 +9050,7 @@ fn materialize_workspace_graph_snapshot(
 /// check below is the one the resolving entry point runs; nothing is skipped
 /// because the base arrived by argument.
 fn materialize_workspace_graph_snapshot_from_base(
-    base: GraphSnapshot,
+    mut base: GraphSnapshot,
     workspace: &WorkspaceState,
     admitted: Option<&AdmittedChangeMap<'_>>,
 ) -> Result<GraphSnapshot, KinDbError> {
@@ -8447,6 +9078,7 @@ fn materialize_workspace_graph_snapshot_from_base(
                 workspace.workspace_id
             )));
         }
+        InMemoryGraph::restore_verification_proof_relations(&mut base);
         return Ok(base);
     }
     // Materialization consumes this graph as a snapshot and drops it. Building a
@@ -8475,7 +9107,8 @@ fn materialize_workspace_graph_snapshot_from_base(
     // it out instead held a whole second copy of everything `materialized`
     // carries across the admission pass below, which at repository scale is
     // one more whole history.
-    let materialized = graph.into_snapshot();
+    let mut materialized = graph.into_snapshot();
+    InMemoryGraph::restore_verification_proof_relations(&mut materialized);
     let to_snapshot_ms = timer.lap_ms();
     if materialized.resolved_tree != workspace.tree {
         return Err(storage(format!(
@@ -8601,6 +9234,9 @@ thread_local! {
 
     /// Workspace graphs a state handed out from the one it had kept.
     static WORKSPACE_GRAPHS_SERVED_FROM_STATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Workspace graphs a state handed out from the one its predecessor kept.
+    static WORKSPACE_GRAPHS_INHERITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// Base-graph resolutions performed on this thread, ever.
     ///
@@ -9104,9 +9740,10 @@ fn derive_workspace_semantic_overlay(
         .collect();
     let relation_deltas = base
         .relations
-        .keys()
-        .chain(desired.relations.keys())
-        .copied()
+        .iter()
+        .filter(|(_, relation)| crate::engine::is_semantic_relation(relation))
+        .map(|(id, _)| *id)
+        .chain(desired.relations.keys().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|relation_id| {
@@ -9284,12 +9921,18 @@ fn validate_workspace_authority(
     metadata: &PersistedRepositoryAuthority,
     admitted: Option<&AdmittedChangeMap<'_>>,
     history: HistoryProof,
+    payload: PayloadProof,
 ) -> Result<(), KinDbError> {
     // One decode serves every workspace's base-tree check instead of one
     // rebuild per workspace. A workspace validation reads no ref, and the only
     // operations it reads are those that mutated it, so a carried successor
     // re-validates the one workspace its transaction moved and carries the rest.
     let replay = history.replay_graph(snapshot, admitted);
+    // The caller proved this exact payload in the same preparation; see
+    // `PayloadProof::Proven`. Each base still resolves its own lineage below.
+    if payload == PayloadProof::Proven {
+        let _ = replay.proven.set(());
+    }
     for workspace in metadata
         .workspaces
         .iter()
@@ -9586,12 +10229,10 @@ fn peel_authority_external_target(
         ))
         .into());
     };
-    let entries = authority
-        .closure
-        .objects
-        .iter()
-        .map(|entry| (entry.record.object, entry))
-        .collect::<BTreeMap<_, _>>();
+    // Indexed only for an annotated tag: a commit, which is what nearly every
+    // branch targets, peels to itself, and indexing the whole closure for it
+    // would make every branch read cost the size of the history.
+    let mut entries = None;
     let mut current = object;
     let mut seen = BTreeSet::new();
     while current.kind == ExternalObjectKind::Tag {
@@ -9603,6 +10244,14 @@ fn peel_authority_external_target(
             ))
             .into());
         }
+        let entries = entries.get_or_insert_with(|| {
+            authority
+                .closure
+                .objects
+                .iter()
+                .map(|entry| (entry.record.object, entry))
+                .collect::<BTreeMap<_, _>>()
+        });
         let entry = entries.get(&current).ok_or_else(|| {
             ModelError::InvalidOperation(format!(
                 "external tag {} is absent from the persisted Git authority closure",
@@ -10604,7 +11253,7 @@ fn compute_roots(
     };
     let local_state = {
         let _s = tracing::info_span!("kindb.roots.local_state").entered();
-        local_state_root(snapshot, authority)?
+        local_state_root(snapshot, authority, None)?
     };
     Ok(RootBundle {
         version: REPOSITORY_ROOT_SCHEMA_VERSION,
@@ -10628,9 +11277,9 @@ fn compute_roots(
 /// ref-only preparation on a converted Flask store once the history proofs
 /// carried, and a large part of every native commit's. Under
 /// [`HistoryProof::CarriedFromPredecessor`] the history root, which reads the
-/// changes and admission policies, and the collaboration root, which reads the
-/// collaboration records, carry for the same reason. Every other root is
-/// folded here as always.
+/// changes and admission policies, carries for the same reason, and so does
+/// the collaboration root, which reads the collaboration records, unless the
+/// transaction admits some. Every other root is folded here as always.
 ///
 /// A bundle of another root schema is never carried from; the whole bundle is
 /// folded instead, so a carried root is always one this binary would compute.
@@ -10640,6 +11289,7 @@ fn compute_successor_roots(
     generation: u64,
     history: HistoryProof,
     predecessor: &RootBundle,
+    operation_identities: &[Hash256],
 ) -> Result<RootBundle, KinDbError> {
     let carried_schema = [
         predecessor.version,
@@ -10654,24 +11304,23 @@ fn compute_successor_roots(
     }
     #[cfg(test)]
     ROOT_BUNDLES_FOLDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
-    let (history_hash, collaboration_hash) = if history.history_required() {
-        let history_hash = {
-            let _s = tracing::info_span!("kindb.roots.history").entered();
-            history_root(snapshot, authority)?
-        };
-        let collaboration_hash = {
-            let _s = tracing::info_span!("kindb.roots.collaboration").entered();
-            collaboration_root(snapshot)?
-        };
-        (
-            AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, history_hash),
-            AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, collaboration_hash),
+    let history_hash = if history.history_required() {
+        let _s = tracing::info_span!("kindb.roots.history").entered();
+        AuthorityRoot::new(
+            REPOSITORY_ROOT_SCHEMA_VERSION,
+            history_root(snapshot, authority)?,
         )
     } else {
-        (
-            predecessor.history.clone(),
-            predecessor.collaboration.clone(),
+        predecessor.history.clone()
+    };
+    let collaboration_hash = if history.collaboration_root_required() {
+        let _s = tracing::info_span!("kindb.roots.collaboration").entered();
+        AuthorityRoot::new(
+            REPOSITORY_ROOT_SCHEMA_VERSION,
+            collaboration_root(snapshot)?,
         )
+    } else {
+        predecessor.collaboration.clone()
     };
     let ref_state = {
         let _s = tracing::info_span!("kindb.roots.ref_state").entered();
@@ -10683,7 +11332,7 @@ fn compute_successor_roots(
     };
     let local_state = {
         let _s = tracing::info_span!("kindb.roots.local_state").entered();
-        local_state_root(snapshot, authority)?
+        local_state_root(snapshot, authority, Some(operation_identities))?
     };
     Ok(RootBundle {
         version: REPOSITORY_ROOT_SCHEMA_VERSION,
@@ -10838,15 +11487,25 @@ fn replication_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256,
     Ok(root.finish())
 }
 
+/// `operation_identities`, when given, is the identity hash of every record
+/// in `authority.operation_log`, by position, from the state that owns this
+/// exact log. The root folds those hashes as leaves, so a held list folds to
+/// the same bytes as one hashed here. A list of any other length describes
+/// some other log and is not consulted.
 fn local_state_root(
     snapshot: &GraphSnapshot,
     authority: &PersistedRepositoryAuthority,
+    operation_identities: Option<&[Hash256]>,
 ) -> Result<Hash256, KinDbError> {
-    let operation_identities = authority
-        .operation_log
-        .iter()
-        .map(RepositoryOperationRecord::identity_hash)
-        .collect::<kin_model::Result<Vec<_>>>()?;
+    let hashed;
+    let operation_identities =
+        match operation_identities.filter(|held| held.len() == authority.operation_log.len()) {
+            Some(held) => held,
+            None => {
+                hashed = operation_identities_of(authority)?;
+                &hashed
+            }
+        };
     let mut root = DomainRoot::new(b"kin-repository-local-root-v2\0");
     root.unordered("sessions", &snapshot.sessions.iter().collect::<Vec<_>>())?;
     root.unordered("intents", &snapshot.intents.iter().collect::<Vec<_>>())?;
@@ -10861,7 +11520,7 @@ fn local_state_root(
     if !authority.merge_transactions.is_empty() {
         root.ordered("merge_transactions", &authority.merge_transactions)?;
     }
-    root.ordered("operation_identities", &operation_identities)?;
+    root.ordered("operation_identities", operation_identities)?;
     Ok(root.finish())
 }
 
@@ -10961,8 +11620,8 @@ mod tests {
         MergeTransactionDelta, MergeTransactionState, MergeWorkspaceRestorePoint, RefMutation,
         Relation, RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, ResolvedTree,
         SemanticChange, SemanticFingerprint, SensitiveArtifactAllowance, SensitiveArtifactKind,
-        TreeDelta, Visibility, WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
-        REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        TreeDelta, VerificationStore, Visibility, WorkspaceExpectation, WorkspaceMutation,
+        WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
     };
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15325,6 +15984,97 @@ mod tests {
     }
 
     #[test]
+    fn verification_proof_targets_survive_authority_publication_and_workspace_reopen() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let entity = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 0x30);
+        let mut initial = arbitrary_repository_transaction(&manager);
+        let change = initial.changes.first_mut().unwrap();
+        change.entity_deltas.push(EntityDelta::Added {
+            new: entity.clone(),
+        });
+        change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+        change.id = compute_semantic_change_id(change).unwrap();
+        let base_target = RefTarget::change(change.id);
+        initial.ref_mutations[0].new_target = Some(base_target.clone());
+        let workspace = initial.workspace_mutation.as_mut().unwrap();
+        workspace.new_base_target = Some(base_target);
+        workspace.semantic_delta = WorkspaceSemanticDelta::new(
+            vec![EntityDelta::Added {
+                new: entity.clone(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let work = kin_model::WorkItem {
+            work_id: kin_model::WorkId::new(),
+            kind: kin_model::WorkKind::Feature,
+            title: "Verified work".into(),
+            description: String::new(),
+            status: kin_model::WorkStatus::Proposed,
+            priority: kin_model::Priority::High,
+            scopes: vec![kin_model::WorkScope::Entity(entity.id)],
+            acceptance_criteria: Vec::new(),
+            external_refs: Vec::new(),
+            created_by: kin_model::IdentityRef::human("alice"),
+            created_at: Timestamp::now(),
+        };
+        let run = kin_model::VerificationRun {
+            run_id: kin_model::VerificationRunId::new(),
+            test_ids: Vec::new(),
+            status: kin_model::VerificationStatus::Passing,
+            runner: kin_model::TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: Some(0),
+            ran_against: vec![kin_model::RunFingerprint {
+                entity: entity.id,
+                behavior_hash: entity.fingerprint.behavior_hash,
+            }],
+            proof: Some(kin_model::VerificationProof {
+                entities: vec![entity.id],
+                work_items: vec![work.work_id],
+            }),
+        };
+        initial.collaboration_delta = Some(kin_model::CollaborationDelta {
+            work_items: vec![kin_model::Keyed::new(work.work_id, work.clone())],
+            verification_runs: vec![kin_model::Keyed::new(run.run_id, run.clone())],
+            ..kin_model::CollaborationDelta::default()
+        });
+        manager.commit_repository_transaction(initial).unwrap();
+        let workspace_id = manager.read_authority().metadata().workspaces[0].workspace_id;
+        let check = |manager: &RepositoryAuthorityManager<MemoryBackend>| {
+            let authority = manager.read_authority();
+            assert!(authority.snapshot().entities.is_empty());
+            assert!(authority.snapshot().relations.is_empty());
+            let projection = authority
+                .workspace_graph_snapshot(&workspace_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                projection.relations.len(),
+                2,
+                "the authority projection restores both proof links"
+            );
+            let graph = InMemoryGraph::from_snapshot_without_text_index(projection).unwrap();
+            assert_eq!(
+                graph.list_runs_proving_entity(&entity.id).unwrap(),
+                std::slice::from_ref(&run)
+            );
+            assert_eq!(
+                graph.list_runs_proving_work(&work.work_id).unwrap(),
+                std::slice::from_ref(&run)
+            );
+        };
+        check(&manager);
+        drop(manager);
+        let reopened = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+        check(&reopened);
+    }
+
+    #[test]
     fn same_tree_polyglot_semantics_and_cross_language_relation_survive_reopen() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
@@ -19263,6 +20013,18 @@ mod tests {
 
     #[test]
     fn local_commit_returns_successor_freeze_without_releasing_writer_lock() {
+        freezing_commit_retains_its_commit_point_lock(PublicationShape::FullSnapshot);
+    }
+
+    #[test]
+    fn local_frame_commit_returns_successor_freeze_without_releasing_writer_lock() {
+        freezing_commit_retains_its_commit_point_lock(PublicationShape::Frame);
+    }
+
+    /// A freezing commit of either shape returns the lock its commit point
+    /// held, so a competing writer that queued on it during the commit waits
+    /// until the freeze is dropped and then loses its compare-and-swap.
+    fn freezing_commit_retains_its_commit_point_lock(shape: PublicationShape) {
         let directory = TempDir::new().unwrap();
         let backend = Arc::new(LocalFileBackend::new(directory.path()));
         let manager =
@@ -19270,6 +20032,14 @@ mod tests {
         manager
             .commit_repository_transaction(arbitrary_repository_transaction(&manager))
             .unwrap();
+        match shape {
+            PublicationShape::FullSnapshot => {
+                manager.persistence().set_max_journal_frames_for_test(0)
+            }
+            PublicationShape::Frame => manager
+                .persistence()
+                .set_journal_byte_bound_for_test(Some(u64::MAX)),
+        }
 
         let competing = RepositoryAuthorityManager::open(
             repository_id(),
@@ -19292,7 +20062,7 @@ mod tests {
                 .unwrap();
         });
         let hook_finished_rx = Arc::clone(&finished_rx);
-        backend.set_snapshot_before_authority_commit_hook(move || {
+        let hook = move || {
             release_tx.send(()).unwrap();
             started_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
@@ -19305,12 +20075,23 @@ mod tests {
                     .is_err(),
                 "the competing writer must wait behind the commit-point lock"
             );
-        });
+        };
+        match shape {
+            PublicationShape::FullSnapshot => {
+                backend.set_snapshot_before_authority_commit_hook(hook)
+            }
+            PublicationShape::Frame => backend.set_delta_before_authority_commit_hook(hook),
+        }
 
         let (receipt, freeze) = manager
             .commit_repository_transaction_and_freeze(successor)
             .expect("local commit must return its still-held successor lock");
         assert_eq!(receipt.generation, 2);
+        assert_eq!(
+            acknowledged_frame_count(&directory),
+            usize::from(shape == PublicationShape::Frame),
+            "the freezing commit took the {shape:?} shape"
+        );
         assert_eq!(freeze.roots(), &receipt.roots_after);
         assert_eq!(freeze.authority().roots(), &receipt.roots_after);
         assert!(
@@ -22476,6 +23257,420 @@ mod tests {
         assert_eq!(store.manager.read_authority().roots(), &before);
     }
 
+    /// The change a synthetic store's workspace is based at.
+    fn synthetic_base_change(store: &SyntheticHistoryStore) -> SemanticChangeId {
+        let lease = store.manager.read_authority();
+        let base = lease.metadata().workspaces[0]
+            .base_target
+            .as_ref()
+            .expect("the synthetic workspace bases at head");
+        target_change_id(lease.metadata(), base).unwrap()
+    }
+
+    /// A native change on `parent` carrying `entity_deltas` and nothing else.
+    fn native_change_on(
+        parent: SemanticChangeId,
+        message: &str,
+        entity_deltas: Vec<EntityDelta>,
+    ) -> SemanticChange {
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![parent],
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-10-14T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("authority-test"),
+            message: message.to_string(),
+            entity_deltas,
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            resolution_record_deltas: Vec::new(),
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        change
+    }
+
+    /// One transaction publishing `change` on a new branch named `branch`.
+    fn change_on_new_branch<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        change: SemanticChange,
+        branch: &[u8],
+    ) -> RepositoryTransaction {
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(branch).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(change.id)),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.changes.push(change);
+        transaction
+    }
+
+    /// What preparing `transaction`'s successor replayed: the changes every
+    /// history validation entered, the payload proofs run, and the calls into
+    /// the history replay. Read at the production seam rather than around a
+    /// whole commit, because this test backend decodes and validates every
+    /// snapshot it saves in full again, which a local store does not.
+    fn replay_work_preparing(
+        store: &SyntheticHistoryStore,
+        transaction: &RepositoryTransaction,
+    ) -> (RepositoryAuthorityState, usize, usize, usize) {
+        use crate::storage::history_replay::take_validated_history_changes;
+        let held = store.manager.read_authority();
+        let _ = take_validated_history_changes();
+        let proofs = payload_proofs_on_this_thread();
+        let replays = history_replays_on_this_thread();
+        let (after, receipt) = prepare_successor(
+            &held,
+            transaction,
+            transaction.transaction_hash().unwrap(),
+            store.backend.as_ref(),
+            NativeAdmissionSource::LocalWorkspace,
+            None,
+        )
+        .unwrap();
+        receipt.validate().unwrap();
+        (
+            after,
+            take_validated_history_changes(),
+            payload_proofs_on_this_thread() - proofs,
+            history_replays_on_this_thread() - replays,
+        )
+    }
+
+    /// A transaction that admits collaboration records and no history, the
+    /// shape a daemon commits for every review flag, stored test run and ended
+    /// agent session, carries the history proofs. Its preparation enters no
+    /// change in any history validation and runs no payload proof, in its own
+    /// laps or in storage admission, where a native commit on the same store
+    /// does both.
+    ///
+    /// What it carries is sound and what it owes still runs. The successor
+    /// passes a from-scratch validation under `HistoryProof::Required`, which
+    /// replays the whole history and folds every root to compare. Its history
+    /// and replication roots are the predecessor's and its collaboration root
+    /// is not. The workspace graph it serves holds the new records, although
+    /// the predecessor held a materialized graph that a carried successor
+    /// otherwise inherits. And a reopen, which on this backend trusts no record
+    /// and replays the whole history, loads exactly what it published.
+    #[test]
+    fn a_collaboration_only_commit_replays_no_history() {
+        use crate::storage::history_replay::take_validated_history_changes;
+        let store = build_synthetic_history_store(6, 8, 6, 3);
+
+        let control = advance_synthetic_base(&store);
+        let (_, entered, proofs, replays) = replay_work_preparing(&store, &control);
+        assert!(
+            entered > 0 && proofs > 0 && replays > 0,
+            "control: a native commit must replay history, or the zeros below prove nothing"
+        );
+        store
+            .manager
+            .commit_repository_transaction(control)
+            .unwrap();
+
+        let before_graph = materialize_synthetic(&store);
+        let roots_before = store.manager.read_authority().roots().clone();
+        let delta = every_collaboration_collection(0x31);
+        let review_id = delta.reviews[0].key;
+        assert!(!before_graph.reviews.contains_key(&review_id));
+        let mut transaction = transaction_shell(&store.manager, 0xc011_0001);
+        transaction.collaboration_delta = Some(delta);
+        assert!(
+            matches!(
+                HistoryProof::owed_by(&transaction, None),
+                HistoryProof::CarriedFromPredecessor {
+                    admits_collaboration: true,
+                    ..
+                }
+            ),
+            "a collaboration-only transaction must carry the history proofs"
+        );
+
+        let (after, entered, proofs, replays) = replay_work_preparing(&store, &transaction);
+        assert_eq!(
+            entered, 0,
+            "a collaboration-only commit entered history in a validation"
+        );
+        assert_eq!(
+            proofs, 0,
+            "a collaboration-only commit proved a payload whose history it carries"
+        );
+        assert_eq!(
+            replays, 0,
+            "a collaboration-only commit replayed history it cannot change"
+        );
+        after
+            .metadata()
+            .validate_against_snapshot(after.snapshot())
+            .expect("the carried successor must pass a from-scratch validation");
+        assert_eq!(after.roots().history, roots_before.history);
+        assert_eq!(after.roots().replication, roots_before.replication);
+        assert_ne!(
+            after.roots().collaboration,
+            roots_before.collaboration,
+            "the collaboration root must fold the records the transaction admitted"
+        );
+        drop(after);
+
+        let inherited = inherited_graphs();
+        store
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap()
+            .validate()
+            .unwrap();
+        {
+            let lease = store.manager.read_authority();
+            assert!(lease.snapshot().reviews.contains_key(&review_id));
+            assert_ne!(lease.roots().collaboration, roots_before.collaboration);
+        }
+
+        let after_graph = materialize_synthetic(&store);
+        assert_eq!(
+            inherited_graphs(),
+            inherited,
+            "a successor that admits collaboration records must not inherit a workspace graph"
+        );
+        assert!(
+            after_graph.reviews.contains_key(&review_id),
+            "the workspace graph must hold the records the commit admitted"
+        );
+        assert_eq!(after_graph.entities, before_graph.entities);
+        assert_eq!(after_graph.resolved_tree, before_graph.resolved_tree);
+
+        let _ = take_validated_history_changes();
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap();
+        assert!(!reopened.opened_by_history_validation());
+        assert!(
+            take_validated_history_changes() > 0,
+            "a reopen that trusts no record must replay the history"
+        );
+        assert_eq!(
+            reopened.read_authority().roots(),
+            store.manager.read_authority().roots()
+        );
+        assert!(reopened
+            .read_authority()
+            .snapshot()
+            .reviews
+            .contains_key(&review_id));
+    }
+
+    /// An ordinary native commit replays the lineage of the change it adds,
+    /// once. Its predecessor validated every change it held, and a held
+    /// change's replay verdict reads only that change and its first-parent
+    /// lineage, which history only growing leaves exactly as they were. Storage
+    /// admission, which reads the same payload, runs no proof of its own.
+    ///
+    /// A side branch makes the difference countable: its change is held and is
+    /// outside the new change's lineage, so a whole-forest replay enters it and
+    /// this one must not. The successor still passes a from-scratch validation.
+    #[test]
+    fn a_native_commit_replays_only_the_lineage_it_adds() {
+        let store = build_synthetic_history_store(4, 8, 4, 3);
+        let side = native_change_on(synthetic_base_change(&store), "a side branch", Vec::new());
+        store
+            .manager
+            .commit_repository_transaction(change_on_new_branch(
+                &store.manager,
+                0xc011_1001,
+                side.clone(),
+                b"side",
+            ))
+            .unwrap();
+
+        let transaction = advance_synthetic_base(&store);
+        assert_eq!(
+            HistoryProof::owed_by(&transaction, None),
+            HistoryProof::GitAuthorityCarried
+        );
+        let added = transaction.changes[0].id;
+        let (after, entered, proofs, _) = replay_work_preparing(&store, &transaction);
+        assert_eq!(
+            proofs, 1,
+            "storage admission must reuse the payload proof preparation ran"
+        );
+
+        let snapshot = after.snapshot();
+        let mut lineage = BTreeSet::new();
+        let mut next = Some(added);
+        while let Some(id) = next {
+            lineage.insert(id);
+            next = snapshot
+                .changes
+                .read_change(&id)
+                .unwrap()
+                .unwrap()
+                .parents
+                .first()
+                .copied();
+        }
+        assert!(!lineage.contains(&side.id));
+        assert_eq!(
+            entered,
+            lineage.len(),
+            "a native commit must replay its addition's lineage once and nothing else"
+        );
+        assert!(entered < snapshot.changes.len());
+        after
+            .metadata()
+            .validate_against_snapshot(snapshot)
+            .expect("a successor proven over its additions must pass a from-scratch validation");
+        drop(after);
+        store
+            .manager
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&store.backend)).unwrap();
+        assert_eq!(
+            reopened.read_authority().roots(),
+            store.manager.read_authority().roots()
+        );
+    }
+
+    /// Replaying only what a commit adds still refuses a forged addition. A
+    /// change whose transition contradicts the state its lineage published is
+    /// refused by successor preparation itself, with the error a whole-history
+    /// replay gives, whether or not the transaction also admits collaboration
+    /// records, and the commit publishes nothing.
+    ///
+    /// Asserted at the preparation seam first, because this test backend
+    /// decodes and validates every snapshot it saves in full again, which
+    /// would refuse the forgery on its own and hide a preparation that let it
+    /// through. A local store validates nothing at the save.
+    #[test]
+    fn a_forged_addition_is_still_refused_when_only_its_lineage_replays() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let published = materialize_synthetic(&store)
+            .entities
+            .get(&store.modified_entity)
+            .expect("the modified entity resolves in the workspace graph")
+            .clone();
+        let mut stale = published.clone();
+        stale.signature = format!("{} /* never published */", published.signature);
+        let mut new = published.clone();
+        new.signature = format!("{} /* forged */", published.signature);
+        let forged = native_change_on(
+            synthetic_base_change(&store),
+            "a transition from a state its lineage never published",
+            vec![EntityDelta::Modified { old: stale, new }],
+        );
+        let roots = store.manager.read_authority().roots().clone();
+        for (operation, label, collaboration) in [
+            (0xc011_2001, "native", None),
+            (
+                0xc011_2002,
+                "native with collaboration records",
+                Some(every_collaboration_collection(0x32)),
+            ),
+        ] {
+            let mut transaction =
+                change_on_new_branch(&store.manager, operation, forged.clone(), b"forged");
+            transaction.collaboration_delta = collaboration;
+            assert_eq!(
+                HistoryProof::owed_by(&transaction, None),
+                HistoryProof::GitAuthorityCarried,
+                "{label}: the fixture must take the lineage-only proof"
+            );
+            let held = store.manager.read_authority();
+            let prepared = prepare_successor(
+                &held,
+                &transaction,
+                transaction.transaction_hash().unwrap(),
+                store.backend.as_ref(),
+                NativeAdmissionSource::LocalWorkspace,
+                None,
+            );
+            drop(held);
+            let error = match prepared {
+                Ok(_) => panic!("{label}: preparation admitted a forged addition"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("stale old payload for entity"),
+                "{label}: unexpected refusal: {error}"
+            );
+            store
+                .manager
+                .commit_repository_transaction(transaction)
+                .expect_err("a forged addition must be refused");
+            assert_eq!(
+                store.manager.read_authority().roots(),
+                &roots,
+                "{label}: a refused commit must publish nothing"
+            );
+        }
+    }
+
+    /// A carried collaboration commit leaves a reopen nothing to trust that it
+    /// did not check before. With the durable validation record removed, the
+    /// reopen replays the whole history and loads exactly what was published;
+    /// and the frame the commit wrote is refused once its bytes are tampered.
+    #[test]
+    fn a_reopen_after_a_carried_collaboration_commit_still_verifies() {
+        use crate::storage::history_replay::take_validated_history_changes;
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = framed_local_repository(&directory);
+        let mut transaction = transaction_shell(&manager, 0xc011_3001);
+        transaction.collaboration_delta = Some(every_collaboration_collection(0x33));
+        assert!(matches!(
+            HistoryProof::owed_by(&transaction, None),
+            HistoryProof::CarriedFromPredecessor {
+                admits_collaboration: true,
+                ..
+            }
+        ));
+        let receipt = manager.commit_repository_transaction(transaction).unwrap();
+        let roots = manager.read_authority().roots().clone();
+        drop(manager);
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+
+        let mut record = read_authority_json(directory.path());
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("history_validation")
+            .expect("the commit bound a validation record to remove");
+        write_authority_json(directory.path(), &record);
+        let _ = take_validated_history_changes();
+        let reopened = reopen(&directory);
+        assert!(!reopened.opened_by_history_validation());
+        assert!(
+            take_validated_history_changes() > 0,
+            "a reopen without a record must replay the history"
+        );
+        assert_eq!(reopened.read_authority().roots(), &roots);
+        drop(reopened);
+
+        let path = frame_path(&directory, receipt.generation);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            RepositoryAuthorityManager::open(
+                repository_id(),
+                Arc::new(LocalFileBackend::new(directory.path())),
+            )
+            .is_err(),
+            "a tampered collaboration frame must refuse the reopen"
+        );
+    }
+
     /// A workspace mutation is three materialization steps over a base graph
     /// that costs a whole history replay to resolve, and the mutation's own
     /// contract fixes which base each step wants. Resolving a base per step
@@ -24453,6 +25648,7 @@ mod tests {
                     authored_by: who.clone(),
                     created_at: at.clone(),
                     staleness: kin_model::StalenessState::Fresh,
+                    review: None,
                 },
             )],
             work_links: vec![kin_model::WorkLink::Affects {
@@ -24530,6 +25726,8 @@ mod tests {
                     duration_ms: None,
                     evidence_blob: None,
                     exit_code: None,
+                    ran_against: Vec::new(),
+                    proof: None,
                 },
             )],
             mock_hints: vec![kin_model::MockHint {
@@ -24557,6 +25755,7 @@ mod tests {
                     kind: kin_model::ActorKind::Human,
                     display_name: format!("actor {seed}"),
                     external_refs: Vec::new(),
+                    agent_session: None,
                 },
             )],
             delegations: vec![kin_model::Delegation {
@@ -25566,9 +26765,9 @@ mod tests {
     }
 
     #[test]
-    fn freezes_reconstruct_a_journal_head_and_a_freezing_commit_compacts_it() {
+    fn freezes_reconstruct_a_journal_head_and_a_freezing_commit_extends_it() {
         let directory = TempDir::new().unwrap();
-        let (_backend, manager) = framed_local_repository(&directory);
+        let (backend, manager) = framed_local_repository(&directory);
         manager
             .commit_repository_transaction(overlay_publication(&manager, 0xf2_2347_3001, 0x60))
             .unwrap();
@@ -25582,6 +26781,7 @@ mod tests {
         assert_same_authority(&manager.read_authority(), frozen.authority(), "frozen");
         drop(frozen);
 
+        let snapshots = snapshot_files(&directory);
         let (receipt, freeze) = manager
             .commit_repository_transaction_and_freeze(overlay_publication(
                 &manager,
@@ -25592,16 +26792,755 @@ mod tests {
         assert_eq!(receipt.generation, 3);
         assert_eq!(
             record_version(&directory),
-            3,
-            "a freezing commit writes a full snapshot"
+            4,
+            "a freezing commit appends a frame while the journal has room"
         );
-        assert_eq!(acknowledged_frame_count(&directory), 0);
+        assert_eq!(acknowledged_frame_count(&directory), 2);
+        assert_eq!(
+            snapshot_files(&directory),
+            snapshots,
+            "a freezing frame commit rewrites no snapshot"
+        );
+        assert!(
+            backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap(),
+            "the freeze keeps the lock its frame committed under"
+        );
         drop(freeze);
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
         assert_same_authority(
             &manager.read_authority(),
             &reopen(&directory).read_authority(),
             "after freezing commit",
         );
+    }
+
+    /// Name and length of every file under the repository's snapshot surface.
+    fn snapshot_files(directory: &TempDir) -> Vec<(std::ffi::OsString, u64)> {
+        let surface = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("snapshots");
+        let mut files: Vec<_> = std::fs::read_dir(surface)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), entry.metadata().unwrap().len())
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A branch create at `main`'s target: the ref-only transition a
+    /// `kin branch create` commits.
+    fn branch_create_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        name: &[u8],
+    ) -> RepositoryTransaction {
+        let target =
+            branch_target(&manager.read_authority(), b"main").expect("the fixture publishes main");
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.reason = "create branch".to_string();
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction
+    }
+
+    /// The matching branch delete, leased on the branch's current target.
+    fn branch_delete_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        name: &[u8],
+    ) -> RepositoryTransaction {
+        let target =
+            branch_target(&manager.read_authority(), name).expect("the branch to delete exists");
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.reason = "delete branch".to_string();
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(name).unwrap(),
+            expected: RefExpectation::MustEqual { target },
+            new_target: None,
+            policy: RefUpdatePolicy::ForceWithLease,
+        });
+        transaction
+    }
+
+    fn branch_target(state: &RepositoryAuthorityState, name: &[u8]) -> Option<RefTarget> {
+        state
+            .resolve_ref_target(&RefName::branch(name).unwrap())
+            .unwrap()
+    }
+
+    /// A branch create and a branch delete move only refs. Each freezing
+    /// commit appends one frame, rewrites no snapshot, keeps the lock it
+    /// committed under, and leaves a history proof the next open trusts; and a
+    /// freeze of the head it wrote re-derives nothing.
+    #[test]
+    fn a_ref_only_freezing_commit_appends_one_frame_and_rewrites_no_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let snapshots = snapshot_files(&directory);
+        let [(_, base_bytes)] = snapshots.as_slice() else {
+            panic!("the fixture holds exactly one full snapshot: {snapshots:?}");
+        };
+        let main = branch_target(&manager.read_authority(), b"main").unwrap();
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(branch_create_transaction(
+                &manager,
+                0x0e3f_0001,
+                b"feature",
+            ))
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            RepositoryCommitOutcome::Committed
+        ));
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(freeze.roots(), &receipt.roots_after);
+        let written = last_persistence_phases()
+            .expect("the freezing commit recorded its phases")
+            .payload_bytes as u64;
+        let frame_bytes = std::fs::metadata(frame_path(&directory, 2)).unwrap().len();
+        assert_eq!(written, frame_bytes, "the frame is all the commit wrote");
+        assert!(
+            frame_bytes < *base_bytes,
+            "a ref frame ({frame_bytes} bytes) is smaller than the store ({base_bytes} bytes)"
+        );
+        assert_eq!(record_version(&directory), 4);
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+        assert_eq!(snapshot_files(&directory), snapshots);
+        assert!(backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        drop(freeze);
+
+        let reopened = reopen(&directory);
+        assert!(
+            reopened.opened_by_history_validation(),
+            "the frame's record carries a history proof for its head"
+        );
+        assert_eq!(
+            branch_target(&reopened.read_authority(), b"feature"),
+            Some(main)
+        );
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "after the branch create",
+        );
+        drop(reopened);
+
+        let before = FreezeRevalidation::now();
+        let frozen = manager
+            .freeze_current_authority(manager.read_authority().roots())
+            .unwrap();
+        assert_eq!(
+            FreezeRevalidation::since(before),
+            FreezeRevalidation::NONE,
+            "the manager names the head its frame wrote"
+        );
+        drop(frozen);
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(branch_delete_transaction(
+                &manager,
+                0x0e3f_0002,
+                b"feature",
+            ))
+            .unwrap();
+        assert_eq!(receipt.generation, 3);
+        drop(freeze);
+        assert_eq!(acknowledged_frame_count(&directory), 2);
+        assert_eq!(snapshot_files(&directory), snapshots);
+        let reopened = reopen(&directory);
+        assert_eq!(branch_target(&reopened.read_authority(), b"feature"), None);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "after the branch delete",
+        );
+    }
+
+    fn base_resolutions() -> usize {
+        WORKSPACE_BASE_RESOLUTIONS.with(std::cell::Cell::get)
+    }
+
+    fn inherited_graphs() -> usize {
+        WORKSPACE_GRAPHS_INHERITED.with(std::cell::Cell::get)
+    }
+
+    fn fixture_workspace() -> WorkspaceId {
+        WorkspaceId::from_uuid(Uuid::from_u128(20))
+    }
+
+    /// Every domain a workspace graph selects, and the capability bound on it.
+    fn assert_same_workspace_graph(left: &GraphSnapshot, right: &GraphSnapshot, context: &str) {
+        assert_eq!(left.entities, right.entities, "{context}: entities");
+        assert_eq!(left.relations, right.relations, "{context}: relations");
+        assert_eq!(
+            left.external_references, right.external_references,
+            "{context}: external references"
+        );
+        assert_eq!(left.resolved_tree, right.resolved_tree, "{context}: tree");
+        assert_eq!(
+            left.resolution_records, right.resolution_records,
+            "{context}: resolution records"
+        );
+        assert_eq!(left.changes, right.changes, "{context}: changes");
+        assert_eq!(
+            left.verified_binding_history, right.verified_binding_history,
+            "{context}: binding-history capability"
+        );
+    }
+
+    /// The graph a state materializes for the fixture workspace when it holds
+    /// nothing to serve it from: base resolved, overlay applied, bound.
+    fn freshly_materialized(state: &RepositoryAuthorityState) -> GraphSnapshot {
+        let workspace = state
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == fixture_workspace())
+            .expect("the fixture workspace exists");
+        materialize_workspace_graph_snapshot(
+            state.snapshot(),
+            state.metadata(),
+            workspace,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A ref-only transaction cannot move a workspace's selected graph, so
+    /// its successor serves the graph its predecessor materialized rather than
+    /// resolving the base and applying the overlay again, bound under the
+    /// successor's own envelope. What it serves is what a from-scratch
+    /// materialization of the successor reaches, and what a fresh open of the
+    /// persisted bytes reaches.
+    #[test]
+    fn a_ref_only_successor_inherits_the_workspace_graph_it_cannot_move() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = binding_history_framed_repository(&directory);
+        // An overlay first, so the workspace graph is more than its base.
+        manager
+            .commit_repository_transaction_with_binding_history(
+                overlay_publication(&manager, 0x0e40_0001, 0x90),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        let before = manager
+            .read_authority()
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert!(
+            before.verified_binding_history.is_some(),
+            "the fixture's lineage is checked"
+        );
+
+        let resolutions = base_resolutions();
+        let inherited = inherited_graphs();
+        manager
+            .commit_repository_transaction_with_binding_history(
+                branch_create_transaction(&manager, 0x0e40_0002, b"feature"),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        let lease = manager.read_authority();
+        let served = lease
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        let digest = lease
+            .workspace_graph_digest(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            base_resolutions(),
+            resolutions,
+            "a ref-only commit and the read after it resolve no workspace base"
+        );
+        assert!(
+            inherited_graphs() > inherited,
+            "the successor served its predecessor's graph"
+        );
+
+        let fresh = freshly_materialized(&lease);
+        assert_same_workspace_graph(&served, &fresh, "inherited against fresh");
+        assert_ne!(
+            served.verified_binding_history, before.verified_binding_history,
+            "the capability is bound under the successor's envelope, not carried"
+        );
+        assert_eq!(
+            digest,
+            crate::storage::binding_history::graph_digest(&fresh).unwrap(),
+            "the digest held with the inherited graph is the graph's own"
+        );
+        assert_eq!(
+            *lease.operation_identities().unwrap(),
+            operation_identities_of(lease.metadata()).unwrap(),
+            "the identities carried through three commits are the log's own"
+        );
+
+        let reopened = reopen(&directory);
+        let reopened_graph = reopened
+            .read_authority()
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert_same_workspace_graph(&served, &reopened_graph, "inherited against reopened");
+    }
+
+    #[test]
+    fn an_unqualified_successor_clears_an_inherited_binding_capability() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = binding_history_framed_repository(&directory);
+        let before = manager
+            .read_authority()
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert!(before.verified_binding_history.is_some());
+
+        let inherited = inherited_graphs();
+        manager
+            .commit_repository_transaction(branch_create_transaction(
+                &manager,
+                0x0e42_0001,
+                b"unqualified",
+            ))
+            .unwrap();
+        let lease = manager.read_authority();
+        let served = lease
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert!(inherited_graphs() > inherited);
+        assert!(served.verified_binding_history.is_none());
+        assert_same_workspace_graph(&served, &freshly_materialized(&lease), "unqualified");
+        assert_eq!(served.entities, before.entities);
+        assert_eq!(served.relations, before.relations);
+        assert_eq!(served.resolved_tree, before.resolved_tree);
+    }
+
+    /// The carry is per workspace and per transaction: a transaction that
+    /// mutates the workspace inherits nothing for it and materializes its new
+    /// graph in full.
+    #[test]
+    fn a_workspace_mutation_inherits_no_workspace_graph() {
+        let directory = TempDir::new().unwrap();
+        let (_backend, manager) = binding_history_framed_repository(&directory);
+        manager
+            .read_authority()
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+
+        let resolutions = base_resolutions();
+        let inherited = inherited_graphs();
+        manager
+            .commit_repository_transaction_with_binding_history(
+                overlay_publication(&manager, 0x0e41_0001, 0x91),
+                &StorageTestVerifier,
+            )
+            .unwrap();
+        let lease = manager.read_authority();
+        let served = lease
+            .workspace_graph_snapshot(&fixture_workspace())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inherited_graphs(),
+            inherited,
+            "a mutated workspace is never served from its predecessor"
+        );
+        assert!(
+            base_resolutions() > resolutions,
+            "a mutated workspace is materialized from its base"
+        );
+        assert!(
+            served
+                .entities
+                .values()
+                .any(|entity| entity.name == "kin_145"),
+            "the served graph holds the entity the mutation added"
+        );
+        assert_same_workspace_graph(&served, &freshly_materialized(&lease), "mutated");
+    }
+
+    /// The journal bound holds for freezing commits: at the bound the freezing
+    /// commit promotes a full snapshot, retires the journal, and still returns
+    /// the lock it committed under.
+    #[test]
+    fn a_freezing_commit_at_the_journal_bound_compacts_it() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        manager.persistence().set_max_journal_frames_for_test(1);
+        let (_, freeze) = manager
+            .commit_repository_transaction_and_freeze(branch_create_transaction(
+                &manager,
+                0x0e3e_0001,
+                b"feature",
+            ))
+            .unwrap();
+        drop(freeze);
+        assert_eq!(acknowledged_frame_count(&directory), 1);
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(branch_delete_transaction(
+                &manager,
+                0x0e3e_0002,
+                b"feature",
+            ))
+            .unwrap();
+        assert_eq!(receipt.generation, 3);
+        assert_eq!(
+            record_version(&directory),
+            3,
+            "the bound forced a promotion"
+        );
+        assert_eq!(acknowledged_frame_count(&directory), 0);
+        assert!(backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        drop(freeze);
+        let reopened = reopen(&directory);
+        assert_eq!(branch_target(&reopened.read_authority(), b"feature"), None);
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "after the promotion",
+        );
+    }
+
+    /// A freezing frame whose record was installed but whose durability was
+    /// not confirmed fails the commit, holds no lock, and keeps its exact bytes;
+    /// the retry reconciles them as committed rather than appending again.
+    #[test]
+    fn an_indeterminate_freezing_frame_is_reconciled_by_its_retry() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let transaction = branch_create_transaction(&manager, 0x0e3d_0001, b"feature");
+
+        backend.set_delta_before_authority_commit_hook(|| {
+            // As in the ordinary frame test: the record write claims and
+            // promotes its candidate through two parent syncs, and failing the
+            // third leaves it installed with its durability unconfirmed.
+            crate::storage::mmap::fail_parent_sync_after(2);
+        });
+        let error = manager
+            .commit_repository_transaction_and_freeze(transaction.clone())
+            .expect_err("an installed frame with a lost durability acknowledgement fails");
+        assert!(
+            matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "{error}"
+        );
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert_eq!(acknowledged_frame_count(&directory), 1, "the frame landed");
+        assert!(manager
+            .persistence()
+            .state
+            .lock()
+            .pending_frame
+            .as_ref()
+            .is_some_and(|pending| pending.roots.generation == 2));
+        assert!(
+            !backend
+                .repository_writer_would_block(repository_id().as_str())
+                .unwrap(),
+            "a failed freezing commit holds no lock"
+        );
+
+        let (receipt, freeze) = manager
+            .commit_repository_transaction_and_freeze(transaction)
+            .expect("the retained frame reconciles as committed");
+        assert_eq!(receipt.generation, 2);
+        assert!(matches!(
+            receipt.outcome,
+            RepositoryCommitOutcome::IdempotentReplay
+        ));
+        assert!(backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        drop(freeze);
+        assert_eq!(acknowledged_frame_count(&directory), 1, "no second frame");
+        assert!(manager.persistence().state.lock().pending_frame.is_none());
+        let reopened = reopen(&directory);
+        assert!(branch_target(&reopened.read_authority(), b"feature").is_some());
+        assert_same_authority(
+            &manager.read_authority(),
+            &reopened.read_authority(),
+            "reconciled",
+        );
+    }
+
+    /// A freezing frame over a head another writer moved is refused at the
+    /// backend's compare-and-swap, before anything is written: the other
+    /// writer's head stands, and the refused ref is nowhere.
+    #[test]
+    fn a_freezing_frame_over_a_moved_head_commits_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let other =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        other
+            .persistence()
+            .set_journal_byte_bound_for_test(Some(u64::MAX));
+        other
+            .commit_repository_transaction(overlay_publication(&other, 0x0e3c_1001, 0x62))
+            .unwrap();
+        let moved = authority_record_bytes(&directory);
+
+        let error = manager
+            .commit_repository_transaction_and_freeze(branch_create_transaction(
+                &manager,
+                0x0e3c_1002,
+                b"feature",
+            ))
+            .expect_err("the head moved under this writer");
+        assert!(
+            !matches!(error, KinDbError::SnapshotPersistenceIndeterminate(_)),
+            "a compare-and-swap refusal is a clean failure: {error}"
+        );
+        assert_eq!(authority_record_bytes(&directory), moved);
+        assert_eq!(manager.read_authority().generation(), 1);
+        assert!(manager.persistence().state.lock().pending_frame.is_none());
+        assert!(!backend
+            .repository_writer_would_block(repository_id().as_str())
+            .unwrap());
+        let reopened = reopen(&directory);
+        assert_eq!(
+            reopened.read_authority().roots(),
+            other.read_authority().roots()
+        );
+        assert_eq!(branch_target(&reopened.read_authority(), b"feature"), None);
+    }
+
+    /// A freezing append must verify the retained base and every earlier
+    /// acknowledged frame before acknowledging a new ref over them.
+    #[test]
+    fn a_freezing_ref_commit_refuses_corrupted_retained_authority() {
+        for corrupt_frame in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (_backend, manager) = framed_local_repository(&directory);
+            let (_, freeze) = manager
+                .commit_repository_transaction_and_freeze(branch_create_transaction(
+                    &manager,
+                    0x0e3a_0001,
+                    b"retained",
+                ))
+                .unwrap();
+            drop(freeze);
+            let before = manager.read_authority().roots().clone();
+            let record = authority_record_bytes(&directory);
+            let path = if corrupt_frame {
+                frame_path(&directory, 2)
+            } else {
+                let snapshot_file = read_authority_json(directory.path())["snapshot_file"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                directory
+                    .path()
+                    .join(repository_id().as_str())
+                    .join("snapshots")
+                    .join(snapshot_file)
+            };
+            let mut bytes = std::fs::read(&path).unwrap();
+            let corrupted = if corrupt_frame { bytes.len() / 2 } else { 0 };
+            bytes[corrupted] ^= 0x01;
+            std::fs::write(&path, bytes).unwrap();
+
+            let error = manager
+                .commit_repository_transaction_and_freeze(branch_create_transaction(
+                    &manager,
+                    0x0e3a_0002,
+                    b"refused",
+                ))
+                .expect_err("corrupted retained authority cannot support a freezing commit");
+            assert!(error.to_string().contains("digest mismatch"), "{error}");
+            assert!(!matches!(
+                error,
+                KinDbError::SnapshotPersistenceIndeterminate(_)
+            ));
+            assert_eq!(manager.read_authority().roots(), &before);
+            assert_eq!(authority_record_bytes(&directory), record);
+            assert_eq!(acknowledged_frame_count(&directory), 1);
+            assert_eq!(branch_target(&manager.read_authority(), b"refused"), None);
+        }
+    }
+
+    /// A process killed during a freezing ref commit leaves the old ref or the
+    /// new one, never neither, and a commit that returned survives the kill.
+    ///
+    /// A child process runs the commit and is SIGKILLed at one of two points:
+    /// after the frame is durable but before the record rename that commits
+    /// it, and after the commit returned while the child still holds the
+    /// freeze. No destructor or unwinding runs in either case, so what the
+    /// parent reopens is exactly what the kernel holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_freezing_ref_commit_leaves_the_old_ref_or_the_new_one() {
+        const CHILD_ROOT: &str = "KIN_DB_FREEZING_FRAME_KILL_ROOT";
+        const CHILD_POINT: &str = "KIN_DB_FREEZING_FRAME_KILL_POINT";
+        const OPERATION: u128 = 0x0e3b_1001;
+        fn kill_this_process() -> ! {
+            // SAFETY: signalling this process is always sound; SIGKILL cannot
+            // be caught, so nothing after it runs.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            loop {
+                std::thread::park();
+            }
+        }
+
+        if let (Some(root), Some(point)) =
+            (std::env::var_os(CHILD_ROOT), std::env::var_os(CHILD_POINT))
+        {
+            let root = std::path::PathBuf::from(root);
+            let marker = root.join("reached");
+            let backend = Arc::new(LocalFileBackend::new(root.join("store")));
+            let manager =
+                RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+            manager
+                .persistence()
+                .set_journal_byte_bound_for_test(Some(u64::MAX));
+            let transaction = branch_create_transaction(&manager, OPERATION, b"feature");
+            match point.to_str() {
+                Some("before-record") => {
+                    backend.set_delta_before_authority_commit_hook(move || {
+                        std::fs::write(&marker, b"frame installed").unwrap();
+                        kill_this_process();
+                    });
+                    let _ = manager.commit_repository_transaction_and_freeze(transaction);
+                    unreachable!("the child is killed before its record rename");
+                }
+                Some("after-commit") => {
+                    let (receipt, _freeze) = manager
+                        .commit_repository_transaction_and_freeze(transaction)
+                        .unwrap();
+                    std::fs::write(&marker, receipt.generation.to_string()).unwrap();
+                    kill_this_process();
+                }
+                other => panic!("unknown kill point {other:?}"),
+            }
+        }
+
+        let name = format!(
+            "{}::a_killed_freezing_ref_commit_leaves_the_old_ref_or_the_new_one",
+            module_path!().split_once("::").unwrap().1
+        );
+        for point in ["before-record", "after-commit"] {
+            let root = TempDir::new().unwrap();
+            let store = root.path().join("store");
+            std::fs::create_dir(&store).unwrap();
+            let (main, before) = {
+                let backend = Arc::new(LocalFileBackend::new(&store));
+                let manager =
+                    RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend))
+                        .unwrap();
+                manager
+                    .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+                    .unwrap();
+                let lease = manager.read_authority();
+                (
+                    branch_target(&lease, b"main").unwrap(),
+                    lease.roots().clone(),
+                )
+            };
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD_ROOT, root.path())
+                .env(CHILD_POINT, point)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{point}: the child neither finished nor was killed in time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "{point}: the child must die at the kill point, not finish: {status}"
+            );
+            assert!(
+                root.path().join("reached").exists(),
+                "{point}: the child reached its kill point"
+            );
+
+            let backend = Arc::new(LocalFileBackend::new(&store));
+            let reopened = RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend))
+                .expect("a store killed mid-commit reopens");
+            let lease = reopened.read_authority();
+            match point {
+                "before-record" => {
+                    assert_eq!(lease.roots(), &before, "the old head stands");
+                    assert_eq!(branch_target(&lease, b"feature"), None);
+                    drop(lease);
+                    // The frame the kill left staged past head is not authority,
+                    // and the same write lands over it.
+                    reopened
+                        .persistence()
+                        .set_journal_byte_bound_for_test(Some(u64::MAX));
+                    let (receipt, freeze) = reopened
+                        .commit_repository_transaction_and_freeze(branch_create_transaction(
+                            &reopened, OPERATION, b"feature",
+                        ))
+                        .expect("the store takes the write after the kill");
+                    assert!(matches!(
+                        receipt.outcome,
+                        RepositoryCommitOutcome::Committed
+                    ));
+                    drop(freeze);
+                    let again =
+                        RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend))
+                            .unwrap();
+                    assert_eq!(
+                        branch_target(&again.read_authority(), b"feature"),
+                        Some(main.clone())
+                    );
+                }
+                "after-commit" => {
+                    let reached: u64 = std::fs::read_to_string(root.path().join("reached"))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert_eq!(lease.generation(), reached, "the returned commit survived");
+                    assert_eq!(lease.generation(), before.generation + 1);
+                    assert_eq!(branch_target(&lease, b"feature"), Some(main.clone()));
+                    assert_eq!(
+                        read_authority_json(&store)["acknowledged_deltas"]
+                            .as_array()
+                            .map(Vec::len),
+                        Some(1),
+                        "the killed child's commit was a frame append"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// What one freeze re-derived on this thread, read as a delta across it.
@@ -30138,6 +32077,203 @@ mod committed_artifact_under_an_ignored_directory {
             .expect_err("a matching symlink approval still cannot override an ignore rule");
         judge(&blob(COMMITTED, BODY), BODY, vec![approved])
             .expect_err("a symlink approval must not approve a blob with the same digest");
+    }
+}
+
+/// What one collaboration-only commit and one change-admitting commit cost on
+/// a real store with a long history, phase by phase.
+///
+/// Run it against a scratch copy, never a live store: it commits twice and
+/// reopens. Each arm prints the preparation laps the slow-preparation log line
+/// carries, the storage-admission laps, and the counters the unit tests assert
+/// on, so a reading names the work done rather than only its milliseconds.
+///
+/// ```text
+/// KIN_DB_MEASURE_STORE=<copy>/kindb KIN_DB_MEASURE_REPO=<repository id> \
+///     cargo test -p kin-db --lib collaboration_commit_measurement -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod collaboration_commit_measurement {
+    use super::*;
+    use crate::storage::history_replay::take_validated_history_changes;
+    use kin_model::{
+        compute_semantic_change_id, ChangeOrigin, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    };
+
+    fn print_phase_log(label: &str) {
+        PREPARATION_PHASE_LOG.with(|log| {
+            for (name, laps) in log.borrow().iter() {
+                let total: u128 = laps.iter().map(|(_, ms)| *ms).sum();
+                let detail = laps
+                    .iter()
+                    .map(|(field, ms)| format!("{field}={ms}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("[{label}] {name} total_ms={total} {detail}");
+            }
+            log.borrow_mut().clear();
+        });
+    }
+
+    fn shell<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        repository_id: &RepositoryId,
+        reason: &str,
+    ) -> RepositoryTransaction {
+        let lease = manager.read_authority();
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.generation(),
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("replay-fix-measurement"),
+            reason: reason.to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
+        }
+    }
+
+    fn commit_and_report<B: StorageBackend + ?Sized + 'static>(
+        label: &str,
+        manager: &RepositoryAuthorityManager<B>,
+        transaction: RepositoryTransaction,
+    ) {
+        println!(
+            "[{label}] proof={:?}",
+            HistoryProof::owed_by(&transaction, None)
+        );
+        PREPARATION_PHASE_LOG.with(|log| log.borrow_mut().clear());
+        let _ = take_validated_history_changes();
+        let replays = history_replays_on_this_thread();
+        let proofs = payload_proofs_on_this_thread();
+        let started = std::time::Instant::now();
+        let receipt = manager
+            .commit_repository_transaction(transaction)
+            .unwrap_or_else(|error| panic!("{label} commit: {error}"));
+        println!(
+            "[TERM] {label}_commit_ms={} generation={}",
+            started.elapsed().as_millis(),
+            receipt.generation
+        );
+        println!(
+            "[{label}] history_replays={} payload_proofs={} validated_history_changes={}",
+            history_replays_on_this_thread() - replays,
+            payload_proofs_on_this_thread() - proofs,
+            take_validated_history_changes()
+        );
+        print_phase_log(label);
+    }
+
+    #[test]
+    #[ignore = "needs KIN_DB_MEASURE_STORE naming a scratch copy of a real kindb directory"]
+    fn measure_one_collaboration_and_one_change_commit() {
+        let store = std::env::var("KIN_DB_MEASURE_STORE")
+            .expect("set KIN_DB_MEASURE_STORE to a scratch copy of a <store>/kindb directory");
+        let repo = std::env::var("KIN_DB_MEASURE_REPO")
+            .expect("set KIN_DB_MEASURE_REPO to the repository id under that directory");
+        let repository_id = RepositoryId::new(&repo).expect("repository id");
+        let backend = Arc::new(crate::storage::backend::LocalFileBackend::new(&store));
+
+        let started = std::time::Instant::now();
+        let manager = RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend))
+            .expect("open repository authority");
+        println!(
+            "[TERM] authority_open_ms={} by_history_validation={}",
+            started.elapsed().as_millis(),
+            manager.opened_by_history_validation()
+        );
+        let base_change = {
+            let lease = manager.read_authority();
+            let metadata = lease.metadata();
+            println!(
+                "[store] generation={} changes={} workspaces={} operations={}",
+                lease.generation(),
+                lease.snapshot().changes.len(),
+                metadata.workspaces.len(),
+                metadata.operation_log.len(),
+            );
+            let base = metadata
+                .workspaces
+                .first()
+                .and_then(|workspace| workspace.base_target.as_ref())
+                .expect("the store's first workspace bases at a change");
+            target_change_id(metadata, base).expect("the base target names a change")
+        };
+
+        let annotation_id = kin_model::AnnotationId(uuid::Uuid::new_v4());
+        let mut collaboration = shell(&manager, &repository_id, "measure a collaboration commit");
+        collaboration.collaboration_delta = Some(kin_model::CollaborationDelta {
+            annotations: vec![kin_model::Keyed::new(
+                annotation_id,
+                kin_model::Annotation {
+                    annotation_id,
+                    kind: kin_model::AnnotationKind::Comment,
+                    body: "replay-fix measurement".to_string(),
+                    scopes: Vec::new(),
+                    anchored_fingerprint: None,
+                    authored_by: kin_model::IdentityRef::human("replay-fix-measurement"),
+                    created_at: Timestamp::now(),
+                    staleness: kin_model::StalenessState::Fresh,
+                    review: None,
+                },
+            )],
+            ..Default::default()
+        });
+        commit_and_report("collaboration", &manager, collaboration);
+
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![base_change],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("replay-fix-measurement"),
+            message: "measure a change-admitting commit".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            resolution_record_deltas: Vec::new(),
+        };
+        change.id = compute_semantic_change_id(&change).expect("change id computes");
+        let mut admitting = shell(&manager, &repository_id, "measure a change commit");
+        admitting.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"replay-fix-measurement").expect("branch name"),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::change(change.id)),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        admitting.changes.push(change);
+        commit_and_report("change", &manager, admitting);
+
+        let roots = manager.read_authority().roots().clone();
+        drop(manager);
+        let _ = take_validated_history_changes();
+        let started = std::time::Instant::now();
+        let reopened = RepositoryAuthorityManager::open(repository_id, backend)
+            .expect("reopen what the two commits published");
+        println!(
+            "[TERM] reopen_ms={} by_history_validation={} validated_history_changes={}",
+            started.elapsed().as_millis(),
+            reopened.opened_by_history_validation(),
+            take_validated_history_changes()
+        );
+        assert_eq!(reopened.read_authority().roots(), &roots);
     }
 }
 

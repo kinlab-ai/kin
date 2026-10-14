@@ -241,8 +241,27 @@ impl SemanticReview {
         store: &G,
         escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
     ) -> Result<Review, ReviewError> {
-        let impact_report =
-            impact::analyze_impact_with_source(store, &semantic_diff, escape_evidence)?;
+        Self::review_from_diff_with_sources(
+            semantic_diff,
+            store,
+            crate::enrichment::ObservationSources {
+                escape_evidence,
+                no_resolver: None,
+            },
+        )
+    }
+
+    /// [`Self::review_from_diff_with_source`] with every host observation the
+    /// review's source holds. A review of live work passes the host's resolver
+    /// readings, so a caller no resolver can prove on this host reads as
+    /// unproven for that reason rather than as enrichment still owed, the way
+    /// impact and the store-wide status read it.
+    pub fn review_from_diff_with_sources<G: GraphStore>(
+        semantic_diff: SemanticDiff,
+        store: &G,
+        sources: crate::enrichment::ObservationSources<'_>,
+    ) -> Result<Review, ReviewError> {
+        let impact_report = impact::analyze_impact_with_sources(store, &semantic_diff, sources)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
         let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 
@@ -517,5 +536,80 @@ mod tests {
         assert_eq!(review.diff.entity_changes.len(), 1);
         assert!(review.impact.is_empty());
         assert_eq!(review.risk.overall_risk, kin_model::review::RiskLevel::Low);
+    }
+
+    /// A review of live work reads a caller with no ledger the way impact and
+    /// the store-wide status read it. When no resolver can prove the caller's
+    /// language on this host, its call sites are unproven for that reason and
+    /// nothing is owed, so a reader is not told enrichment is still coming.
+    #[test]
+    fn a_review_with_the_hosts_resolvers_does_not_owe_what_no_resolver_can_prove() {
+        use kin_model::EntityStore as _;
+
+        let store = InMemoryGraph::new();
+        // A span places the caller in source that can hold calls. Without one
+        // it has no sites at all and nothing about it is unsettled.
+        let file = FilePathId::new("src/callers.rs");
+        let ledgerless = Entity {
+            file_origin: Some(file.clone()),
+            span: Some(kin_model::SourceSpan {
+                file,
+                start_byte: 0,
+                end_byte: 3,
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 3,
+            }),
+            ..test_entity("caller_without_a_ledger")
+        };
+        store.upsert_entity(&ledgerless).unwrap();
+        let change = SemanticChange {
+            id: test_change_id(1),
+            parents: vec![test_change_id(0)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "add my_func".into(),
+            entity_deltas: vec![EntityDelta::Added {
+                new: test_entity("my_func"),
+            }],
+            relation_deltas: vec![],
+            tree_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
+        };
+
+        let unsourced =
+            SemanticReview::review_from_diff_with_source(diff_from_change(&change), &store, None)
+                .unwrap();
+        let owed = unsourced.impact.enrichment.expect("an observation");
+        assert_eq!(owed.owed_entities, 1, "{owed:?}");
+
+        let no_resolver = |_: LanguageId| Some(kin_model::NoResolver::NoLanguageServer);
+        let sourced = SemanticReview::review_from_diff_with_sources(
+            diff_from_change(&change),
+            &store,
+            crate::enrichment::ObservationSources {
+                escape_evidence: None,
+                no_resolver: Some(&no_resolver),
+            },
+        )
+        .unwrap();
+        let unproven = sourced.impact.enrichment.expect("an observation");
+        assert!(unproven.bounds_answer(), "{unproven:?}");
+        assert_eq!(unproven.owed_entities, 0, "{unproven:?}");
+        assert_eq!(
+            unproven
+                .pending_by_code
+                .get("call_sites_unproven_no_resolver"),
+            Some(&1),
+            "{unproven:?}"
+        );
     }
 }

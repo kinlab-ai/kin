@@ -100,6 +100,10 @@ pub(super) struct UiState {
     pub(super) catalog: Option<Arc<super::workspace_ui::Catalog>>,
     /// The agent sessions this server has seen, for the pages that show them.
     pub(super) agents: super::workspace_agents::AgentMemory,
+    /// The pushes and pulls this repository's page has sent.
+    pub(super) transfers: super::workspace_remotes::Transfers,
+    /// The test runs this page started, while this server runs.
+    pub(super) verify_runs: super::workspace_verify::VerifyRuns,
 }
 
 impl UiState {
@@ -127,6 +131,8 @@ impl UiState {
             base_path,
             catalog: Some(catalog),
             agents: Default::default(),
+            transfers: Default::default(),
+            verify_runs: Default::default(),
         }
     }
 }
@@ -594,7 +600,9 @@ async fn serve_guide(
 /// Admit the working copy before the page reads it. The admission names the
 /// daemon as its actor, so a host with no Git identity still gets a measured
 /// working copy; see [`super::admit::AdmitRequest::new`].
-async fn admit_working_for_ui(client: &crate::daemon_client::DaemonClient) -> Option<String> {
+pub(super) async fn admit_working_for_ui(
+    client: &crate::daemon_client::DaemonClient,
+) -> Option<String> {
     working_admission_reason(client.admit(&super::admit::AdmitRequest::new()).await)
 }
 
@@ -768,6 +776,32 @@ fn polish_guide(guide: &mut serde_json::Value) {
             *message = plain.into();
         }
     };
+    // Each agent named as an author carries the key its agent lane is found
+    // by, as a change an agent made does. A lane belongs to a Kin session, so
+    // an edit made with the agent's own tools has one only when Kin could tell
+    // which connected session the client was.
+    let keyed = |authors: Option<&mut Vec<serde_json::Value>>| {
+        for author in authors.into_iter().flatten() {
+            let through_client = author.get("through").and_then(serde_json::Value::as_str)
+                == Some(super::review_guide::THROUGH_CLIENT);
+            let lane = author
+                .get(if through_client {
+                    "kin_session"
+                } else {
+                    "session"
+                })
+                .and_then(serde_json::Value::as_str)
+                .map(super::workspace_agents::agent_key);
+            if let Some(key) = lane {
+                author["key"] = key.into();
+            }
+        }
+    };
+    keyed(
+        guide
+            .pointer_mut("/summary/authors")
+            .and_then(serde_json::Value::as_array_mut),
+    );
     if let Some(chapters) = guide["chapters"].as_array_mut() {
         for step in chapters
             .iter_mut()
@@ -779,6 +813,10 @@ fn polish_guide(guide: &mut serde_json::Value) {
                     rewrite(&mut finding["message"]);
                 }
             }
+            keyed(
+                step.get_mut("authored_by")
+                    .and_then(serde_json::Value::as_array_mut),
+            );
         }
     }
     if let Some(lists) = guide["findings"].as_object_mut() {
@@ -1388,6 +1426,8 @@ pub async fn run(target: GuideTarget, port: Option<u16>, open_browser: bool) -> 
         base_path: String::new(),
         catalog: None,
         agents: Default::default(),
+        transfers: Default::default(),
+        verify_runs: Default::default(),
     });
 
     let url = format!("http://127.0.0.1:{port}/");
@@ -1431,6 +1471,8 @@ mod tests {
             base_path: String::new(),
             catalog: None,
             agents: Default::default(),
+            transfers: Default::default(),
+            verify_runs: Default::default(),
         });
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();

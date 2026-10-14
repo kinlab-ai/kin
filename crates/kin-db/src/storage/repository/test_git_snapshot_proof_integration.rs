@@ -783,3 +783,56 @@ fn repeating_a_held_proof_does_not_readmit_an_ignored_path_under_a_new_artifact_
             .is_none());
     }
 }
+
+/// A proof, the objects it names and the root it proves cannot move in a
+/// transaction that brings no proof, object, alias or Git delta. A ref-only
+/// commit therefore re-validates none of them, a transaction that names a
+/// proof validates every proof it leaves behind, and the store reopens with the
+/// proof it held.
+#[test]
+fn a_transaction_that_cannot_touch_a_proof_does_not_revalidate_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = open_manager(&directory);
+    let fixture = Fixture::ignored();
+    fixture.save(&manager);
+    manager
+        .commit_repository_transaction(fixture.transaction(&manager, 140))
+        .unwrap();
+
+    let mut branch = transaction_shell(&manager, 141);
+    branch.ref_mutations.push(RefMutation {
+        name: RefName::branch(b"feature").unwrap(),
+        expected: RefExpectation::MustNotExist,
+        new_target: Some(RefTarget::change(fixture.change.id)),
+        policy: RefUpdatePolicy::FastForwardOnly,
+    });
+    let validations = super::metadata_validations();
+    let receipt = manager.commit_repository_transaction(branch).unwrap();
+    assert_eq!(receipt.outcome, RepositoryCommitOutcome::Committed);
+    assert_eq!(
+        super::metadata_validations(),
+        validations,
+        "a ref-only commit re-proves no snapshot proof"
+    );
+    assert_eq!(
+        manager.read_authority().metadata().git_snapshot_proofs,
+        vec![fixture.proof.clone()]
+    );
+
+    let mut identical = transaction_shell(&manager, 142);
+    identical.git_snapshot_proofs.push(fixture.proof.clone());
+    manager.commit_repository_transaction(identical).unwrap();
+    assert!(
+        super::metadata_validations() > validations,
+        "a transaction that names a proof validates the proofs it leaves"
+    );
+
+    let roots = manager.read_authority().roots().clone();
+    drop(manager);
+    let reopened = open_manager(&directory);
+    assert_eq!(reopened.read_authority().roots(), &roots);
+    assert_eq!(
+        reopened.read_authority().metadata().git_snapshot_proofs,
+        vec![fixture.proof]
+    );
+}

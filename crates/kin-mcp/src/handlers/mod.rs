@@ -12669,6 +12669,7 @@ mod tests {
             kind: kin_model::provenance::ActorKind::Human,
             display_name: "reviewer".into(),
             external_refs: vec![],
+            agent_session: None,
         };
         store.actors_by_id.insert(actor.actor_id, actor);
     }

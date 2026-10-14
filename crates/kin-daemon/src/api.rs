@@ -162,7 +162,7 @@ const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
 /// This is storage-commit metadata, never a semantic answer: it decides only
 /// whether an already-loaded authority may be reused, and every answer served
 /// still comes from repository-v6 graph truth.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum LocalPublicationIdentity {
     /// The repository has persisted no authority yet, so its authority is the
     /// unpublished generation-zero state.
@@ -1450,6 +1450,12 @@ struct StartSessionRequest {
     transport: String,
     #[serde(default)]
     pid: Option<u32>,
+    /// A process whose exit ends a session that names no `pid`, without
+    /// keeping it alive while it runs. A connection that opens its session
+    /// only to read names its process here; see
+    /// [`crate::session_registry::SessionCoordinator::watch_process_exit`].
+    #[serde(default)]
+    watch_pid: Option<u32>,
     cwd: String,
     /// What the client restricts itself to, when it says. Absent means the
     /// client declared nothing, which is different from declaring read-only
@@ -1808,6 +1814,28 @@ pub struct RepoEntitiesResponse {
     /// page from a full one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<usize>,
+    /// What others rely on that no test reaches, present only when the caller
+    /// asked for it with `untested`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untested: Option<RepoUntested>,
+}
+
+/// The entities others rely on that no test reaches, most relied-on first.
+///
+/// An entity is listed when at least one other depends on it, it is defined
+/// in this repository, it is neither a test nor a module, and no test reaches
+/// it through the recorded dependency graph, including transitive reach
+/// from a test entity or a recorded test case's covered scope. This is
+/// structural reach, not measured runtime coverage. It is the coverage
+/// `kin verify --missing` reads, and
+/// `dependents` is the number importance orders by.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoUntested {
+    /// The most relied-on of them, as many as were asked for, each with its
+    /// ranking numbers.
+    pub entities: Vec<RepoEntityEntry>,
+    /// How many there are among the entities the request matched.
+    pub total: usize,
 }
 
 /// Repo file listing response.
@@ -1968,6 +1996,10 @@ struct RepoEntitiesQuery {
     /// Comma-separated optional row fields: `ranking`, `signature`, `summary`.
     #[serde(default)]
     include: Option<String>,
+    /// How many of the entities others rely on that no test reaches to list,
+    /// most relied-on first. Absent leaves the list out and reads no coverage.
+    #[serde(default)]
+    untested: Option<usize>,
 }
 
 /// The current API version number, returned in the `X-Kin-API-Version` header.
@@ -3349,6 +3381,14 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/agents", get(crate::agent_activity::agents_route))
         .route(
+            "/agents/ended",
+            get(crate::agent_activity::ended_agents_route),
+        )
+        .route(
+            "/agents/edits",
+            post(crate::client_edits::record_edit_route),
+        )
+        .route(
             "/session/{session_id}/scope",
             post(set_scope).delete(clear_scope).get(get_scope),
         )
@@ -3368,10 +3408,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/review", post(review))
         .route("/work", post(work))
         .route("/note", post(note))
+        .route("/review/flags", post(crate::review_flags::route))
         .route("/embed", post(embed))
         .route("/blame", post(blame))
         .route("/history", post(history))
         .route("/verify/run", post(verify_run))
+        .route("/verify/work", post(verify_work))
         .route("/commands/verify", post(command_verify))
         .route("/support", get(support))
         .route("/graph/bootstrap", get(graph_bootstrap))
@@ -3397,6 +3439,11 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/approvals", post(command_approvals))
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
+        .route("/commands/git-update", post(crate::git_update::update))
+        .route(
+            "/commands/git-update/status",
+            get(crate::git_update::status),
+        )
         .route("/commands/branch/preview", post(command_branch_preview))
         .route("/commands/branch/confirm", post(command_branch_confirm))
         .route("/commands/merge", post(command_merge))
@@ -3423,6 +3470,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         )
         .route("/reconcile", post(reconcile_session_workspace))
         .route("/commands/commit", post(command_commit))
+        .route("/commands/commit/entities", post(command_commit_entities))
+        .route("/commands/entity/restore", post(command_entity_restore))
         .route("/commands/push", post(command_push))
         .route("/commands/pull", post(command_pull))
         .route("/commands/transfer-plan", post(command_transfer_plan))
@@ -5743,6 +5792,56 @@ impl NameReadWait {
         }
     }
 
+    /// For a read of committed history whose attempt a writer moved the
+    /// authority epoch across: whether the graph's truth held still all the
+    /// same, so the answer read is the one the last settled graph gives.
+    ///
+    /// A writer that held graph authority while the attempt ran and changed
+    /// nothing, such as a pass over the working copy that found it as it was,
+    /// leaves the graph's truth epoch where it was. Each write to truth
+    /// advances that epoch before its writer lets authority go, so once no
+    /// writer holds authority and the reconcile loop holds no changes it
+    /// picked up, an epoch that never moved since the attempt began means
+    /// every row the attempt read was the graph's row throughout.
+    ///
+    /// Waits, within the read's limit and holding nothing, for writers still
+    /// running. A truth that moved, or a writer that outlasts the limit, is
+    /// left to the ordinary wait, which reads again or refuses.
+    ///
+    /// Before this a guide of one commit that took longer to build than the
+    /// gap between two such passes was served only when one attempt happened
+    /// to fall between them: on zod, while its watcher dropped events and a
+    /// pass ran every six to eight seconds, a 20 s guide build was spanned on
+    /// most attempts, and the page's guide did not load in four minutes.
+    async fn truth_held_still(
+        &mut self,
+        state: &DaemonState,
+        graph: &kin_db::InMemoryGraph,
+        epoch: &AnalysisReadEpoch,
+    ) -> bool {
+        if graph.truth_epoch() != epoch.truth {
+            return false;
+        }
+        self.pass = None;
+        let started = tokio::time::Instant::now();
+        let drain = state
+            .wait_for_graph_authority_drain(
+                self.deadline,
+                crate::state::SettleScope::WritersAndPendingAdmissions,
+            )
+            .await;
+        if drain != crate::state::GraphAuthorityDrain::NoWriter {
+            self.wait.waited += started.elapsed();
+        }
+        if matches!(drain, crate::state::GraphAuthorityDrain::DeadlinePassed(_)) {
+            return false;
+        }
+        // Every writer the read could have met has finished, so its writes to
+        // truth are counted; one that begins from here on began after the
+        // read ended.
+        graph.truth_epoch() == epoch.truth
+    }
+
     /// Whether an answer read since `epoch` was sampled may claim an absence:
     /// the read is of a historical scope no admission writes, or nothing
     /// blocked it as it began, no writer moved authority since, and the
@@ -6385,7 +6484,7 @@ fn stamp_settled_replay(
 }
 
 async fn command_xref_with_stable_authority<F>(
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
@@ -6403,7 +6502,7 @@ where
         // Initialize once per round, outside the stamped interval: lazy spine
         // hydration and registration can be expensive, but it is not part of
         // the graph read.
-        let spine_authority = state.acquire_spine_read_authority().await;
+        let spine_authority = state.acquire_spine_read_authority_for_read().await;
         if state.hosted_spine_readiness_required() && spine_authority.is_none() {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -6577,7 +6676,7 @@ where
     let deadline = tokio::time::Instant::now() + wait.ceiling;
     let mut attempts_made = 0;
     loop {
-        let spine_authority = state.acquire_spine_read_authority().await;
+        let spine_authority = state.acquire_spine_read_authority_for_read().await;
         if state.hosted_spine_readiness_required() && spine_authority.is_none() {
             return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
         }
@@ -6947,7 +7046,7 @@ fn require_mcp_local_repository_binding(
 }
 
 async fn mcp_bulk_check_references_with_stable_authority<F>(
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
@@ -6962,7 +7061,7 @@ where
     let deadline = tokio::time::Instant::now() + wait.ceiling;
     let mut attempts_made = 0;
     loop {
-        let spine_authority = state.acquire_spine_read_authority().await;
+        let spine_authority = state.acquire_spine_read_authority_for_read().await;
         if state.hosted_spine_readiness_required() && spine_authority.is_none() {
             return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
         }
@@ -7752,6 +7851,12 @@ async fn start_session(
             capabilities,
         )
         .map_err(internal_error)?;
+    if let (None, Some(watch_pid)) = (request.pid, request.watch_pid) {
+        state
+            .coordinator
+            .watch_process_exit(&session_id, watch_pid)
+            .map_err(internal_error)?;
+    }
     let session = state
         .coordinator
         .get_session(&session_id)
@@ -9251,7 +9356,7 @@ async fn command_refs(
         // The spine read the reference tools take, so an empty answer is graded
         // on the cross-repo authority `find_references` weighs. Held for this
         // attempt only, and let go before any wait below.
-        let spine_authority = state.acquire_spine_read_authority().await;
+        let spine_authority = state.acquire_spine_read_authority_for_read().await;
         let spine_deferral = state.spine_initialization_deferral();
         // The text at each site is cut from its caller's own body through the
         // held authority and at the source scope `find_references` reads at,
@@ -10793,59 +10898,10 @@ fn command_commit_after_admission(
         .collect::<Vec<_>>();
 
     // --- Lease enforcement gate for native repository publication ---
+    if let Some(refusal) =
+        foreign_hard_lease_refusal(state, &plan.entity_scope_ids, request.session_id.as_deref())?
     {
-        use kin_model::session::IntentScope;
-
-        let scopes: Vec<IntentScope> = plan
-            .entity_scope_ids
-            .iter()
-            .copied()
-            .map(IntentScope::Entity)
-            .collect();
-
-        if !scopes.is_empty() {
-            let caller_session = request
-                .session_id
-                .as_ref()
-                .and_then(|s| uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId));
-            let traffic = state
-                .coordinator
-                .check_traffic(&scopes)
-                .map_err(internal_error)?;
-            if traffic.has_hard_blocks {
-                let foreign_blocks: Vec<_> = traffic
-                    .reports
-                    .iter()
-                    .flat_map(|r| r.active_intents.iter())
-                    .filter(|s| {
-                        s.lock_type == kin_model::session::LockType::Hard
-                            && caller_session.as_ref().is_none_or(|cs| &s.session_id != cs)
-                    })
-                    .collect();
-                if !foreign_blocks.is_empty() {
-                    let body = serde_json::json!({
-                        "error": "lease_conflict",
-                        "conflict_type": "HardCollision",
-                        "blocking_intents": foreign_blocks.iter().map(|b| {
-                            serde_json::json!({
-                                "intent_id": b.intent_id.to_string(),
-                                "session_id": b.session_id.to_string(),
-                                "lock_type": format!("{:?}", b.lock_type),
-                                "task_description": b.task_description,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "message": format!(
-                            "commit blocked: {} entity scope(s) held by active hard lease(s)",
-                            foreign_blocks.len()
-                        ),
-                    });
-                    return Err(CommitAttempt::Refused((
-                        StatusCode::CONFLICT,
-                        body.to_string(),
-                    )));
-                }
-            }
-        }
+        return Err(CommitAttempt::Refused(refusal));
     }
 
     let committed = if let Some(observed) = observed {
@@ -10883,6 +10939,11 @@ fn command_commit_after_admission(
     })
     .map_err(internal_error)?;
     crate::binding_history::restore_exact_authority(state);
+    crate::client_edits::seal_commit(
+        state,
+        &committed.change,
+        committed.resolved_publication_base,
+    );
     // The plan above was derived from this live graph under the coordination
     // gate, and the transaction published it, so the two are level here and
     // this is the count durable authority now carries (FIR-2421). Read from the
@@ -10917,6 +10978,210 @@ fn command_commit_after_admission(
         file_count,
         carried_pending_files,
     }))
+}
+
+/// The refusal a native publication meets when another session holds a hard
+/// lease on an entity it changes, or `None` when nothing blocks it.
+///
+/// `caller` is the session the write names, whose own leases never block it.
+pub(crate) fn foreign_hard_lease_refusal(
+    state: &DaemonState,
+    entity_scope_ids: &[kin_model::EntityId],
+    caller: Option<&str>,
+) -> Result<Option<(StatusCode, String)>, (StatusCode, String)> {
+    use kin_model::session::IntentScope;
+
+    let scopes: Vec<IntentScope> = entity_scope_ids
+        .iter()
+        .copied()
+        .map(IntentScope::Entity)
+        .collect();
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let caller_session =
+        caller.and_then(|s| uuid::Uuid::parse_str(s).ok().map(kin_model::SessionId));
+    let traffic = state
+        .coordinator
+        .check_traffic(&scopes)
+        .map_err(internal_error)?;
+    if !traffic.has_hard_blocks {
+        return Ok(None);
+    }
+    let foreign_blocks: Vec<_> = traffic
+        .reports
+        .iter()
+        .flat_map(|r| r.active_intents.iter())
+        .filter(|s| {
+            s.lock_type == kin_model::session::LockType::Hard
+                && caller_session.as_ref().is_none_or(|cs| &s.session_id != cs)
+        })
+        .collect();
+    if foreign_blocks.is_empty() {
+        return Ok(None);
+    }
+    let body = serde_json::json!({
+        "error": "lease_conflict",
+        "conflict_type": "HardCollision",
+        "blocking_intents": foreign_blocks.iter().map(|b| {
+            serde_json::json!({
+                "intent_id": b.intent_id.to_string(),
+                "session_id": b.session_id.to_string(),
+                "lock_type": format!("{:?}", b.lock_type),
+                "task_description": b.task_description,
+            })
+        }).collect::<Vec<_>>(),
+        "message": format!(
+            "commit blocked: {} entity scope(s) held by active hard lease(s)",
+            foreign_blocks.len()
+        ),
+    });
+    Ok(Some((StatusCode::CONFLICT, body.to_string())))
+}
+
+/// The answer an entity write gives when it stopped before it began, worded
+/// for the person who asked.
+fn entity_refusal(message: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        json!({
+            "error": kin_cli::commands::entity_work::ENTITY_REFUSED,
+            "message": message,
+        })
+        .to_string(),
+    )
+}
+
+/// POST /commands/commit/entities — commit only the chosen entities'
+/// uncommitted changes and leave every other change uncommitted.
+///
+/// The same admission and the same gate as `/commands/commit`, and the same
+/// operation id contract: the caller's id is the repository operation, so a
+/// request whose answer was lost is settled by authority's receipt, and a
+/// request sent again after it landed answers with the change it recorded.
+async fn command_commit_entities(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::entity_work::EntityCommitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/commands/commit/entities",
+            &state.layout.working_dir().display().to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err(entity_refusal(
+            "Entity work is not available on a hosted store, so nothing was committed.",
+        ));
+    }
+    if request.operation_id.0.is_nil() {
+        return Err(entity_refusal("A commit needs an operation id."));
+    }
+    if request.entities.is_empty() {
+        return Err(entity_refusal("Choose at least one entity to commit."));
+    }
+    if request.message.trim().is_empty() {
+        return Err(entity_refusal("A commit needs a message."));
+    }
+    if let Some(refusal) = read_only_session_write_refusal(
+        &state,
+        &headers,
+        request.session_id.as_deref(),
+        kin_mcp::session::WriteDoor::CliCommit,
+    )? {
+        return Err(refusal);
+    }
+    let _pending_commit = state.pending_commits.announce();
+    let _transaction =
+        crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
+    let _coordination = crate::mcp_commit::timed_commit_phase_async(
+        "coordination_gate_wait",
+        state.coordination_gate.lock(),
+    )
+    .await;
+    if cached_authority_has_open_merge(&state)? {
+        return Err(entity_refusal(
+            "A merge is still open, so nothing was committed; finish or abandon the merge first.",
+        ));
+    }
+    // The working copy is admitted first, so the entities chosen from what the
+    // reader saw are the entities the plan reads, and the plan's own check
+    // that the daemon holds the admitted tree has something current to hold.
+    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "the working copy could not be admitted for an entity commit");
+            entity_refusal("Kin could not read the working copy, so nothing was committed.")
+        })?;
+    state
+        .background_work
+        .reconcile()
+        .record_admission_success(std::time::Instant::now());
+    crate::background_work::record_durable_admission(
+        &state.layout,
+        state.graph.resolved_tree().len() as u64,
+    );
+    let response = crate::entity_keep::commit_entities(&state, &request)
+        .map_err(|refusal| refusal.into_http())?;
+    Ok(Json(response))
+}
+
+/// POST /commands/entity/restore — put one entity's source back as it was at
+/// the head, or at an earlier change, as an uncommitted edit.
+async fn command_entity_restore(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::entity_work::EntityRestoreRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if state.filesystem_reconcile_disabled() {
+        return Err(filesystem_ingest_disabled_response(
+            "/commands/entity/restore",
+            &state.layout.working_dir().display().to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err(entity_refusal(
+            "Entity work is not available on a hosted store, so nothing was restored.",
+        ));
+    }
+    if request.operation_id.0.is_nil() {
+        return Err(entity_refusal("A restore needs an operation id."));
+    }
+    // Like a checkout, a restore writes the primary working copy, which no
+    // session owns, so it is refused for any session rather than held to one
+    // session's capabilities.
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err(entity_refusal(
+            "A restore writes the primary working copy and does not run inside a session, so \
+             nothing was restored.",
+        ));
+    }
+    let _transaction =
+        crate::commit_liveness::TransactionGuard::open(state.layout.root(), "restore");
+    let _coordination = state.coordination_gate.lock().await;
+    if cached_authority_has_open_merge(&state)? {
+        return Err(entity_refusal(
+            "A merge is still open, so nothing was restored; finish or abandon the merge first.",
+        ));
+    }
+    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "the working copy could not be admitted for an entity restore");
+            entity_refusal("Kin could not read the working copy, so nothing was restored.")
+        })?;
+    state
+        .background_work
+        .reconcile()
+        .record_admission_success(std::time::Instant::now());
+    crate::background_work::record_durable_admission(
+        &state.layout,
+        state.graph.resolved_tree().len() as u64,
+    );
+    let response = crate::entity_keep::restore_entity(&state, &request)
+        .map_err(|refusal| refusal.into_http())?;
+    Ok(Json(response))
 }
 
 /// Refuse a CLI write made for a read-only session.
@@ -13438,36 +13703,93 @@ async fn review(
     // binding, which opened and re-verified the whole store per request, and
     // that open was nearly all of what an entity's history read cost.
     let repository_authority = entity_history_authority(&state)?;
+    let mut stages = ReviewReadStages::begin(&req);
+    // A guide names, on each entity an agent wrote through Kin, the session
+    // that wrote it; see `crate::agent_authorship`.
+    let (agent_writes, client_edits) =
+        if matches!(req, kin_cli::commands::review::ReviewRequest::Guide { .. }) {
+            (
+                state.agent_authorship.writes(),
+                state.agent_authorship.edits(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    // A guide of committed history is kept once built and joined while it
+    // builds; see `crate::committed_guides`. A session's temporal scope reads
+    // another graph, which is read the ordinary way.
+    if let kin_cli::commands::review::ReviewRequest::Guide {
+        change,
+        base,
+        json,
+        working: false,
+    } = &req
+    {
+        if matches!(graph_authority, RequestGraphAuthority::Head) {
+            let request =
+                crate::committed_guides::GuideRequest::new(change.as_deref(), base.as_deref());
+            if let Some(answer) = committed_guide(
+                &state,
+                session_id,
+                request,
+                *json,
+                &graph,
+                &agent_writes,
+                &client_edits,
+            )
+            .await
+            {
+                return answer.map(Json);
+            }
+        }
+    }
     // A review and its persisted enrichment limits must describe one graph
     // epoch. Non-analysis reads retain their existing behavior.
     let mut settle = NameReadWait::begin(&state, &graph);
     let execution = loop {
+        let attempt_started = std::time::Instant::now();
         let epoch = settle
             .sample_analysis(&state, &graph, graph_authority)
             .await;
+        stages.sampled(attempt_started, epoch.writer.is_some());
         let source_authority = mcp_repository_authority_source(&state)
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         // A guide of uncommitted work reads the diff `/commands/diff` reads,
         // and takes the authority the way that route does: one open per
         // publication rather than one per request. The page that shows it
         // asks again as the working tree changes.
-        let open_authority = if matches!(
-            req,
-            kin_cli::commands::review::ReviewRequest::Guide { working: true, .. }
-        ) {
-            Some(command_repository_authority(&state)?)
-        } else {
-            None
-        };
-        let outcome = kin_cli::commands::review::execute_review_request_with_authority(
-            &repository_authority,
-            graph.as_ref(),
-            req.clone(),
-            source_authority.as_ref(),
-            source_scope,
-            open_authority.as_deref(),
-        )
-        .await;
+        //
+        // The authority open and the build are synchronous and can run for
+        // seconds, a guide of a large committed change for most of a minute.
+        // Inline on the runtime worker they held whatever the scheduler had
+        // queued there, the listener among it: measured on zod, every request
+        // to this daemon, its health included, waited out a 50 s guide build.
+        // So they run off the worker, and reads arriving meanwhile are
+        // answered.
+        let build_started = std::time::Instant::now();
+        let outcome = crate::lifecycle::without_blocking_runtime_worker(|| {
+            #[cfg(test)]
+            pause_review_read_for_test(&state);
+            let open_authority = if matches!(
+                req,
+                kin_cli::commands::review::ReviewRequest::Guide { working: true, .. }
+            ) {
+                Some(command_repository_authority(&state)?)
+            } else {
+                None
+            };
+            Ok::<_, (StatusCode, String)>(kin_cli::commands::review::execute_review_read(
+                &repository_authority,
+                graph.as_ref(),
+                req.clone(),
+                source_authority.as_ref(),
+                source_scope,
+                open_authority.as_deref(),
+                &agent_writes,
+                &client_edits,
+            ))
+        })?;
+        stages.built(build_started);
         if state
             .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
             .await
@@ -13485,22 +13807,14 @@ async fn review(
         );
         let settled = if analysis {
             epoch.is_current(&state, &graph)
+                || (reads_committed_history(&req)
+                    && settle.truth_held_still(&state, &graph, &epoch).await)
         } else {
             settle.settled(&state, epoch.writer)
         };
         if !(analysis || review_run_claims_absence(&req, &outcome)) || settled {
-            break outcome.map_err(|error| {
-                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-                    (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
-                } else if error
-                    .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
-                    .is_some()
-                {
-                    (StatusCode::NOT_FOUND, error.to_string())
-                } else {
-                    internal_error(error)
-                }
-            })?;
+            stages.finish(settle.attempts, settle.wait.waited);
+            break outcome.map_err(review_read_refusal)?;
         }
         settle
             .wait_out(&state, "review")
@@ -13508,6 +13822,301 @@ async fn review(
             .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
     };
     Ok(Json(execution.response))
+}
+
+/// The status a failed review read is answered with: a ref that resolves to
+/// nothing is the caller's, a review that does not exist is not found, and
+/// anything else is this daemon's.
+fn review_read_refusal(error: anyhow::Error) -> (StatusCode, String) {
+    if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
+    } else if error
+        .downcast_ref::<kin_cli::commands::review::ReviewNotFound>()
+        .is_some()
+    {
+        (StatusCode::NOT_FOUND, error.to_string())
+    } else {
+        internal_error(error)
+    }
+}
+
+/// The basis a guide of committed history read from `graph` stands at now:
+/// the graph's identity and writes to truth, and the repository's
+/// publication. `None` on a daemon with no local publication to read, which
+/// builds every guide as it is asked.
+fn committed_guide_basis(
+    state: &DaemonState,
+    graph: &kin_db::InMemoryGraph,
+) -> Option<crate::committed_guides::GuideBasis> {
+    let backend = state.local_repository_backend()?;
+    let binding = state.local_repository_authority_binding().ok()?;
+    let publication = read_local_publication_identity(&backend, binding.repository_id()).ok()?;
+    Some(crate::committed_guides::GuideBasis::of(graph, publication))
+}
+
+/// Answer a guide of committed history from the guide kept for its basis,
+/// from the build of it already running, or from a build this request
+/// starts. `None` when the daemon cannot read the basis to keep a guide by.
+///
+/// Each answer marks the guide's steps with the agent sessions that wrote
+/// them as they are recorded now, so a session recorded after the guide was
+/// built is named on it.
+async fn committed_guide(
+    state: &Arc<DaemonState>,
+    session_id: Option<SessionId>,
+    request: crate::committed_guides::GuideRequest,
+    json: bool,
+    graph: &Arc<kin_db::InMemoryGraph>,
+    agent_writes: &[kin_cli::commands::review_guide::AgentWrite],
+    client_edits: &[kin_cli::commands::review_guide::ClientEdit],
+) -> Option<Result<kin_cli::commands::review::ReviewResponse, (StatusCode, String)>> {
+    use crate::committed_guides::{built, Found};
+    let arrived = committed_guide_basis(state, graph)?;
+    let started = std::time::Instant::now();
+    let (guide, how) = loop {
+        match state.committed_guides.find(&request, &arrived) {
+            Found::Kept(guide) => break (Ok(guide), "kept"),
+            Found::Lead(sender) => {
+                let receiver = sender.subscribe();
+                // On a task of its own, so a build outlives a request that
+                // stops waiting for it, and the next read of the change
+                // takes it up where it is.
+                let building = Arc::clone(state);
+                let read_from = Arc::clone(graph);
+                let building_request = request.clone();
+                tokio::spawn(async move {
+                    let built =
+                        build_committed_guide(&building, session_id, &building_request, read_from)
+                            .await;
+                    building
+                        .committed_guides
+                        .finish(&building_request, sender, built);
+                });
+                break match built(receiver).await {
+                    Some(Ok((_, guide))) => (Ok(guide), "built"),
+                    Some(Err(refusal)) => (Err(refusal), "built"),
+                    None => (
+                        Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "the guide's build ended without an answer".to_string(),
+                        )),
+                        "built",
+                    ),
+                };
+            }
+            Found::Join(receiver) => match built(receiver).await {
+                // A build that began before this request settled where the
+                // repository stood as it ended. Its guide answers this request
+                // only when it describes the repository as the request found
+                // it, or as it stands now; otherwise the request looks again.
+                Some(Ok((basis, guide)))
+                    if basis == arrived
+                        || committed_guide_basis(state, graph).as_ref() == Some(&basis) =>
+                {
+                    break (Ok(guide), "joined");
+                }
+                Some(Ok(_)) | None => continue,
+                Some(Err(refusal)) => break (Err(refusal), "joined"),
+            },
+        }
+    };
+    let answered = match guide {
+        Ok(guide) => crate::lifecycle::without_blocking_runtime_worker(|| {
+            kin_cli::commands::review::guide_response(
+                guide.as_ref().clone(),
+                json,
+                agent_writes,
+                client_edits,
+            )
+        })
+        .map_err(internal_error),
+        Err(refusal) => Err(refusal),
+    };
+    let elapsed = started.elapsed();
+    if how != "kept" || elapsed >= Duration::from_secs(1) {
+        tracing::info!(
+            how,
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            builds = state.committed_guides.builds(),
+            kept_served = state.committed_guides.kept_served(),
+            "committed guide answered"
+        );
+    }
+    Some(answered)
+}
+
+/// Build the guide of committed history `request` names, settled the way
+/// every review read is: an attempt whose graph a writer moved is read again,
+/// and one that never holds still is refused at the read's limit.
+async fn build_committed_guide(
+    state: &Arc<DaemonState>,
+    session_id: Option<SessionId>,
+    request: &crate::committed_guides::GuideRequest,
+    graph: Arc<kin_db::InMemoryGraph>,
+) -> crate::committed_guides::Built {
+    let graph_authority = RequestGraphAuthority::Head;
+    let source_scope = state
+        .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope expired or was replaced".to_string(),
+            )
+        })?;
+    let repository_authority = entity_history_authority(state)?;
+    let mut stages = ReviewReadStages::begin(&kin_cli::commands::review::ReviewRequest::Guide {
+        change: request.change.clone(),
+        json: true,
+        working: false,
+        base: request.base.clone(),
+    });
+    let mut settle = NameReadWait::begin(state, &graph);
+    loop {
+        let attempt_started = std::time::Instant::now();
+        let epoch = settle.sample_analysis(state, &graph, graph_authority).await;
+        stages.sampled(attempt_started, epoch.writer.is_some());
+        let basis = committed_guide_basis(state, &graph).ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this daemon could not read its repository's publication".to_string(),
+            )
+        })?;
+        let source_authority = mcp_repository_authority_source(state)
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let build_started = std::time::Instant::now();
+        let outcome = crate::lifecycle::without_blocking_runtime_worker(|| {
+            #[cfg(test)]
+            pause_review_read_for_test(state);
+            kin_cli::commands::review::build_committed_guide(
+                &repository_authority,
+                graph.as_ref(),
+                request.change.as_deref(),
+                request.base.as_deref(),
+                source_authority.as_ref(),
+                source_scope,
+            )
+        });
+        stages.built(build_started);
+        if state
+            .source_scope_for_selected_graph(session_id.as_ref(), &graph, graph_authority)
+            .await
+            != Some(source_scope)
+        {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected source scope changed while reading review; retry the request".into(),
+            ));
+        }
+        if epoch.is_current(state, &graph) || settle.truth_held_still(state, &graph, &epoch).await {
+            stages.finish(settle.attempts, settle.wait.waited);
+            return outcome
+                .map(|guide| (basis, Arc::new(guide)))
+                .map_err(review_read_refusal);
+        }
+        settle
+            .wait_out(state, "review")
+            .await
+            .map_err(|refusal| (StatusCode::SERVICE_UNAVAILABLE, refusal))?;
+    }
+}
+
+/// A pause a review read takes as it builds, for the one daemon state a test
+/// names, so a test can hold a read open as long as a guide of a large change
+/// runs without a repository large enough to make it slow. Keyed by the
+/// state's address, so no other test's read waits on it.
+#[cfg(test)]
+static REVIEW_READ_PAUSE_FOR_TEST: std::sync::Mutex<Option<(usize, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_review_read_for_test(state: &DaemonState) {
+    let owner = state as *const DaemonState as usize;
+    let named = *REVIEW_READ_PAUSE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((named_state, pause)) = named {
+        if named_state == owner {
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+/// Whether a review read is a guide of committed history: one change, or the
+/// changes between two refs, rather than the working copy or a run over files.
+///
+/// Its change, the history it replays and the graph at that change never
+/// move. What it reads of the live graph is truth, which moves only by a
+/// write, so it can be served once the graph's truth held still across the
+/// read; see [`NameReadWait::truth_held_still`].
+fn reads_committed_history(request: &kin_cli::commands::review::ReviewRequest) -> bool {
+    matches!(
+        request,
+        kin_cli::commands::review::ReviewRequest::Guide { working: false, .. }
+    )
+}
+
+/// Where one review read spent its time, logged when the read was slow.
+///
+/// A guide read after an edit answers only once the graph holds still, so its
+/// wall time is the build plus however long it waited for that. The two are
+/// separate costs with separate fixes, and the request's own latency cannot
+/// tell them apart.
+struct ReviewReadStages {
+    op: &'static str,
+    started: std::time::Instant,
+    sample_wait: Duration,
+    build: Duration,
+    last_build: Duration,
+    unsettled_samples: usize,
+}
+
+impl ReviewReadStages {
+    fn begin(request: &kin_cli::commands::review::ReviewRequest) -> Self {
+        use kin_cli::commands::review::ReviewRequest;
+        Self {
+            op: match request {
+                ReviewRequest::Guide { working: true, .. } => "guide_working",
+                ReviewRequest::Guide { .. } => "guide",
+                ReviewRequest::Run { .. } => "run",
+                _ => "other",
+            },
+            started: std::time::Instant::now(),
+            sample_wait: Duration::ZERO,
+            build: Duration::ZERO,
+            last_build: Duration::ZERO,
+            unsettled_samples: 0,
+        }
+    }
+
+    fn sampled(&mut self, attempt_started: std::time::Instant, settled: bool) {
+        self.sample_wait += attempt_started.elapsed();
+        self.unsettled_samples += usize::from(!settled);
+    }
+
+    fn built(&mut self, build_started: std::time::Instant) {
+        self.last_build = build_started.elapsed();
+        self.build += self.last_build;
+    }
+
+    fn finish(&self, attempts: usize, writer_wait: Duration) {
+        let elapsed = self.started.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let ms = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            op = self.op,
+            elapsed_ms = ms(elapsed),
+            attempts,
+            unsettled_samples = self.unsettled_samples,
+            build_ms = ms(self.build),
+            last_build_ms = ms(self.last_build),
+            sample_wait_ms = ms(self.sample_wait),
+            writer_wait_ms = ms(writer_wait),
+            "slow review read"
+        );
+    }
 }
 
 /// Whether a review read claims an absence: a files review whose files
@@ -14077,6 +14686,34 @@ fn with_graph_authority_mutation<T>(state: &DaemonState, operation: impl FnOnce(
     result
 }
 
+/// The authority a test run plans and records through: the one this daemon
+/// holds open for the current publication, resolved when a step first reads
+/// it, as [`command_repository_authority`] serves every request.
+///
+/// A run used to open the persisted authority itself three times, once for
+/// each of its two plans and once to keep its output as one evidence blob,
+/// and each open re-verifies every persisted body. On a converted fastify
+/// store that was about 6 seconds apiece, so a test command that exited in
+/// 0.4 seconds took 25 to report.
+fn verification_authority(
+    state: &Arc<DaemonState>,
+) -> Result<kin_cli::commands::repository_authority::RequestRepositoryAuthority, (StatusCode, String)>
+{
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let resolver_state = Arc::clone(state);
+    Ok(
+        kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
+            binding,
+            Arc::new(move || {
+                command_repository_authority(&resolver_state)
+                    .map_err(|(_, message)| anyhow::anyhow!(message))
+            }),
+        ),
+    )
+}
+
 /// POST /verify/run — execute and persist a verification run in daemon state.
 async fn verify_run(
     State(state): State<Arc<DaemonState>>,
@@ -14120,33 +14757,119 @@ async fn verify_run(
     // enrichment writes back for the whole run.
     drop(settle);
     let state_for_verify = Arc::clone(&state);
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    let repository_authority = verification_authority(&state)?;
     let response = tokio::task::spawn_blocking(move || {
         // A cancelled request detaches this worker; the worker must own its
-        // exclusion fence until proof relations and their snapshot are installed.
+        // exclusion fence until the run and its proof relations are committed.
         // Release authorization reads coverage under this same gate.
         let _coordination = state_for_verify.coordination_gate.blocking_lock();
         with_graph_authority_mutation(state_for_verify.as_ref(), || {
-            let response = kin_cli::commands::verify::execute_verify_run(
-                &state_for_verify.layout,
+            let graph = state_for_verify.graph.as_ref();
+            let prepared = kin_cli::commands::verify::prepare_verify_run(graph, &req)
+                .map_err(|error| error.to_string())?;
+            let executed = kin_cli::commands::verify::execute_verification(
+                state_for_verify.layout.working_dir(),
+                prepared.command_line(),
+            );
+            let (record, response) = kin_cli::commands::verify::record_verify_run(
                 &repository_authority,
-                state_for_verify.graph.as_ref(),
-                &req,
+                graph,
+                &prepared,
+                &executed,
             )
             .map_err(|error| error.to_string())?;
-            state_for_verify.bump_version();
-            state_for_verify
-                .save_snapshot()
-                .map_err(|error| error.to_string())?;
-            state_for_verify.mark_clean();
+            // The run is repository authority: committed there first, then
+            // shown to the live graph, so no admission meets a relation from
+            // a run authority does not hold.
+            crate::verification_write::commit_verification_record(&state_for_verify, &record)?;
             Ok::<_, String>(response)
         })
     })
     .await
     .map_err(internal_error)?
     .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /verify/work — the tests that reach a piece of work: how this
+/// repository runs them, their plan, or a run of them recorded in daemon
+/// state.
+///
+/// A run plans from the graph, runs the repository's own test command in its
+/// working tree with no gate held, and commits the run under the coordination
+/// gate. `/verify/run` holds the gate for the whole run; this route does not,
+/// because the page that asks keeps reading the working copy while a suite
+/// runs, and every such read admits it first. The run is tied to the
+/// fingerprints the plan read, so an edit made while it ran leaves its result
+/// stale rather than current.
+async fn verify_work(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<kin_cli::commands::verify::WorkVerifyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kin_cli::commands::verify::PreparedWork;
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    let repository_authority = verification_authority(&state)?;
+    let state_for_verify = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        let state = state_for_verify;
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("open startup-pinned repository authority: {error}"),
+                    )
+                })?;
+        let manifests = kin_index::GraphProjectFiles::with_reader(
+            state.graph.as_ref(),
+            crate::source_cas::source_reader_opening(state.blobs.as_ref(), &authority_context),
+        );
+        let prepared = {
+            // A plan's entities, relations and fingerprints must all describe
+            // one graph version, rather than span a concurrent admission.
+            let _coordination = state.coordination_gate.blocking_lock();
+            kin_cli::commands::verify::prepare_work_verify(
+                &repository_authority,
+                state.graph.as_ref(),
+                &manifests,
+                &req,
+            )
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?
+        };
+        let ready = match prepared {
+            PreparedWork::Answered(response) => return Ok::<_, (StatusCode, String)>(response),
+            PreparedWork::Ready(ready) => ready,
+        };
+        let executed = kin_cli::commands::verify::execute_verification(
+            state.layout.working_dir(),
+            ready.command_line(),
+        );
+        // A cancelled request detaches this worker; it keeps the fence until
+        // the run and its proof relations are committed.
+        let _coordination = state.coordination_gate.blocking_lock();
+        with_graph_authority_mutation(state.as_ref(), || {
+            let (record, response) = kin_cli::commands::verify::record_work_verify(
+                &repository_authority,
+                state.graph.as_ref(),
+                &ready,
+                &executed,
+            )
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
+            crate::verification_write::commit_verification_record(&state, &record)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            Ok(response)
+        })
+    })
+    .await
+    .map_err(internal_error)??;
     Ok(Json(response))
 }
 
@@ -20947,41 +21670,106 @@ async fn mcp_tools_call(
     // and how much it answered, never the request or the answer. The only part
     // of the request it may keep is an argument that is a whole entity id, so
     // those are read here, before the call consumes its arguments.
-    let activity = extract_session_id_from_headers(&headers)
+    // The same ids say which of a reviewer's open flags the call reaches,
+    // whether or not it names a session.
+    let session_id = extract_session_id_from_headers(&headers).ok().flatten();
+    let targets = request
+        .as_ref()
+        .map(|Json(request)| crate::agent_activity::argument_uuids(&request.arguments))
+        .unwrap_or_default();
+    let flags_cursor = request
+        .as_ref()
         .ok()
-        .flatten()
-        .map(|session_id| {
-            let targets = request
-                .as_ref()
-                .map(|Json(request)| crate::agent_activity::argument_uuids(&request.arguments))
-                .unwrap_or_default();
-            (session_id, Arc::clone(&state.0), targets)
-        });
+        .and_then(|Json(request)| request.arguments.get("flags_cursor"))
+        .cloned();
+    let held_state = Arc::clone(&state.0);
+    let began_live = session_id.is_some_and(|session_id| {
+        held_state
+            .coordinator
+            .get_session(&session_id)
+            .ok()
+            .flatten()
+            .is_some()
+    });
     let started = Instant::now();
-    let answered = mcp_tools_call_internal(headers, tokens, state, request).await;
-    let mut session_held = true;
-    if let Some((session_id, state, targets)) = activity {
-        let refused;
-        let result = match &answered {
-            Ok(Json(result)) => result,
-            Err((_, message)) => {
-                refused = kin_mcp::ToolCallResult::error(message.clone());
-                &refused
-            }
+    // A write lands whether or not its caller is still waiting when it ends:
+    // an agent's MCP client gives up on a commit after its own patience, and
+    // the commit runs on to publish its change. Answered on this request's
+    // task, its record went with the request: the client closed its
+    // connection, the request was dropped, and the session's calls never
+    // showed the commit its change came from. So a write runs and is recorded
+    // on its own task, and this request only waits for it; the guard below
+    // says, once the request is gone, that nobody heard the answer.
+    let waiting = CallerWaiting::default();
+    let caller_left = waiting.left();
+    let tool_for_call = tool.clone();
+    let call = async move {
+        let tool = tool_for_call;
+        let answered = mcp_tools_call_internal(headers, tokens, state, request).await;
+        #[cfg(test)]
+        pause_call_record_for_test(&held_state).await;
+        let (answered, reached) = match answered {
+            Ok(Json(result)) => match crate::review_flags::reached_by_call(
+                &held_state,
+                session_id,
+                &tool,
+                &targets,
+                &result,
+                flags_cursor.as_ref(),
+            ) {
+                Ok(reached) => (Ok(Json(result)), reached),
+                Err(message) => (
+                    Ok(Json(kin_mcp::ToolCallResult::error(message))),
+                    kin_mcp::review_flags::Delivered::default(),
+                ),
+            },
+            Err(refusal) => (Err(refusal), kin_mcp::review_flags::Delivered::default()),
         };
-        session_held = crate::agent_activity::record_tool_call(
-            &state,
-            session_id,
-            &tool,
-            &targets,
-            result,
-            started.elapsed(),
-        )
-        .await;
-    }
+        let mut session_held = true;
+        if let Some(session_id) = session_id {
+            let refused;
+            let result = match &answered {
+                Ok(Json(result)) => result,
+                Err((_, message)) => {
+                    refused = kin_mcp::ToolCallResult::error(message.clone());
+                    &refused
+                }
+            };
+            session_held = crate::agent_activity::record_tool_call(
+                &held_state,
+                session_id,
+                &tool,
+                &targets,
+                result,
+                started.elapsed(),
+                crate::agent_activity::CallMeeting {
+                    began_live,
+                    caller_left: caller_left(),
+                },
+            )
+            .await;
+        }
+        (answered, reached, session_held)
+    };
+    let (answered, reached, session_held) =
+        if crate::agent_activity::is_write_tool(&tool) || mcp_tool_mutates_graph(&tool) {
+            tokio::spawn(call).await.map_err(internal_error)?
+        } else {
+            call.await
+        };
+    waiting.answered();
     let Json(result) = answered
         .map_err(|(status, message)| (status, kin_mcp::semantic_surface::diagnostic(&message)))?;
-    let mut response = Json(present_mcp_http_tool_result(result, &tool)).into_response();
+    // Read from the answer as the daemon wrote it, before presentation, and
+    // carried beside it: the answer's own payload is served exactly as it was.
+    let presented = present_mcp_http_tool_result(result, &tool);
+    let mut response = if reached.is_silent() {
+        Json(presented).into_response()
+    } else {
+        let mut carried = serde_json::to_value(&presented).map_err(internal_error)?;
+        kin_mcp::review_flags::attach(&mut carried, &reached);
+        Json(carried).into_response()
+    };
     if !session_held {
         // The session this call named is not one the daemon holds, so the
         // call was not recorded against it. A connection that opened that
@@ -20992,6 +21780,65 @@ async fn mcp_tools_call(
         );
     }
     Ok(response)
+}
+
+/// A pause a tool call takes between its answer and its record, for the one
+/// daemon state a test names, so a test can end the call's session and drop
+/// its request while a write is still finishing. Keyed by the state's address,
+/// so no other test's call waits on it.
+#[cfg(test)]
+static CALL_RECORD_PAUSE_FOR_TEST: std::sync::Mutex<Option<(usize, Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn pause_call_record_for_test(state: &DaemonState) {
+    let owner = state as *const DaemonState as usize;
+    let named = *CALL_RECORD_PAUSE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((named_state, pause)) = named {
+        if named_state == owner {
+            tokio::time::sleep(pause).await;
+        }
+    }
+}
+
+/// Held by a request while the call it made runs elsewhere. Dropped with the
+/// request, it records that the caller stopped waiting; see
+/// [`mcp_tools_call`].
+struct CallerWaiting {
+    left: Arc<std::sync::atomic::AtomicBool>,
+    answered: bool,
+}
+
+impl Default for CallerWaiting {
+    fn default() -> Self {
+        Self {
+            left: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            answered: false,
+        }
+    }
+}
+
+impl CallerWaiting {
+    /// Whether the caller has stopped waiting, read when the call ends.
+    fn left(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let left = Arc::clone(&self.left);
+        move || left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The call's answer reached the request: whoever reads it was waiting.
+    fn answered(mut self) {
+        self.answered = true;
+    }
+}
+
+impl Drop for CallerWaiting {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.left.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 async fn mcp_tools_call_internal(
@@ -25342,6 +26189,7 @@ async fn repo_entities(
     let order = RepoEntityOrder::parse(params.order.as_deref())?;
     let fields = RepoEntityFields::parse(params.include.as_deref())?;
     let window = repo_entity_window(params.limit, params.offset)?;
+    let untested = repo_untested_rows(params.untested)?;
     // On a local daemon this repository's graph is the live one an edit
     // admission writes, so a name query that matched nothing is served only
     // from a read no writer spanned, for the reason `NameReadWait` gives. A
@@ -25359,6 +26207,7 @@ async fn repo_entities(
             order,
             fields,
             window,
+            untested,
             params.query.clone(),
             repo_id.clone(),
         )
@@ -25381,6 +26230,7 @@ async fn repo_entities_attempt(
     order: RepoEntityOrder,
     fields: RepoEntityFields,
     window: Option<(usize, usize)>,
+    untested: Option<usize>,
     query: Option<String>,
     repo: String,
 ) -> std::result::Result<(RepoEntitiesResponse, bool), (StatusCode, String)> {
@@ -25395,57 +26245,98 @@ async fn repo_entities_attempt(
         };
         let mut matched = graph.query_entities(&filter)?;
         let matched_nothing = matched.is_empty();
-        let ranks = if order == RepoEntityOrder::Importance || fields.ranking {
-            Some(repo_entity_ranks(graph.as_ref())?)
-        } else {
-            None
+        // Coverage is read in the pass that ranks, over the relations it has
+        // already read, so asking for it adds no second walk of the graph.
+        let reading =
+            if order == RepoEntityOrder::Importance || fields.ranking || untested.is_some() {
+                Some(repo_entity_ranks(graph.as_ref(), untested.is_some())?)
+            } else {
+                None
+            };
+        let ranks = reading.as_ref().map(|reading| &reading.ranks);
+        let by_importance = |ranks: &HashMap<EntityId, RepoEntityRank>,
+                             left: &kin_model::Entity,
+                             right: &kin_model::Entity| {
+            let (left_rank, right_rank) = (entity_rank(ranks, left), entity_rank(ranks, right));
+            right_rank
+                .dependents
+                .cmp(&left_rank.dependents)
+                .then_with(|| right_rank.degree.cmp(&left_rank.degree))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.id.cmp(&right.id))
         };
-        if let (RepoEntityOrder::Importance, Some(ranks)) = (order, ranks.as_ref()) {
-            matched.sort_by(|left, right| {
-                let (left_rank, right_rank) = (entity_rank(ranks, left), entity_rank(ranks, right));
-                right_rank
-                    .dependents
-                    .cmp(&left_rank.dependents)
-                    .then_with(|| right_rank.degree.cmp(&left_rank.degree))
-                    .then_with(|| left.name.cmp(&right.name))
-                    .then_with(|| left.id.cmp(&right.id))
-            });
+        if let (RepoEntityOrder::Importance, Some(ranks)) = (order, ranks) {
+            matched.sort_by(|left, right| by_importance(ranks, left, right));
         }
+        let entry = |entity: &kin_model::Entity, ranked: bool| {
+            let rank = ranks
+                .filter(|_| ranked)
+                .map(|ranks| entity_rank(ranks, entity));
+            RepoEntityEntry {
+                id: entity.id.to_string(),
+                name: entity.name.clone(),
+                kind: format!("{:?}", entity.kind),
+                file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
+                degree: rank.map(|rank| rank.degree),
+                dependents: rank.map(|rank| rank.dependents),
+                signature: fields
+                    .signature
+                    .then(|| one_line(&entity.signature))
+                    .flatten(),
+                summary: fields
+                    .summary
+                    .then(|| entity.doc_summary.as_deref().and_then(one_line))
+                    .flatten(),
+            }
+        };
+        let untested = match (untested, reading.as_ref()) {
+            (Some(rows), Some(reading)) => {
+                let unreached = reading.unreached.as_ref();
+                let mut relied_on: Vec<&kin_model::Entity> = matched
+                    .iter()
+                    .filter(|entity| {
+                        entity.file_origin.is_some()
+                            && !kin_cli::commands::verify::is_test_entity(entity)
+                            && !kin_model::is_module_container(entity)
+                            && entity_rank(&reading.ranks, entity).dependents > 0
+                            && unreached.is_some_and(|unreached| unreached.contains(&entity.id))
+                    })
+                    .collect();
+                relied_on.sort_by(|left, right| by_importance(&reading.ranks, left, right));
+                Some(RepoUntested {
+                    total: relied_on.len(),
+                    entities: relied_on
+                        .into_iter()
+                        .take(rows)
+                        .map(|entity| entry(entity, true))
+                        .collect(),
+                })
+            }
+            _ => None,
+        };
         // The population this window was cut from, so a reader of one page can
         // tell a last page from a full one. Absent when no window was asked for,
         // where the rows are the population.
         let total = window.map(|_| matched.len());
-        let rows: Vec<kin_model::Entity> = match window {
-            Some((offset, limit)) => matched.into_iter().skip(offset).take(limit).collect(),
-            None => matched,
+        let ranked_rows = order == RepoEntityOrder::Importance || fields.ranking;
+        let entries = match window {
+            Some((offset, limit)) => matched
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|entity| entry(entity, ranked_rows))
+                .collect(),
+            None => matched
+                .iter()
+                .map(|entity| entry(entity, ranked_rows))
+                .collect(),
         };
-        let entries = rows
-            .into_iter()
-            .map(|entity| {
-                let rank = ranks.as_ref().map(|ranks| entity_rank(ranks, &entity));
-                RepoEntityEntry {
-                    id: entity.id.to_string(),
-                    name: entity.name.clone(),
-                    kind: format!("{:?}", entity.kind),
-                    file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
-                    degree: rank.map(|rank| rank.degree),
-                    dependents: rank.map(|rank| rank.dependents),
-                    signature: fields
-                        .signature
-                        .then(|| one_line(&entity.signature))
-                        .flatten(),
-                    summary: fields
-                        .summary
-                        .then(|| entity.doc_summary.as_deref().and_then(one_line))
-                        .flatten(),
-                }
-            })
-            .collect();
         Ok::<_, anyhow::Error>((
             RepoEntitiesResponse {
                 repo_id: repo,
                 entities: entries,
                 total,
+                untested,
             },
             matched_nothing,
         ))
@@ -25534,11 +26425,36 @@ fn repo_entity_window(
     }
 }
 
+/// How many untested rows a request asked for. The list is a short one for a
+/// reader, so a request for none or for more than a page is refused rather
+/// than clamped.
+fn repo_untested_rows(
+    asked: Option<usize>,
+) -> std::result::Result<Option<usize>, (StatusCode, String)> {
+    match asked {
+        None => Ok(None),
+        Some(rows) if (1..=100).contains(&rows) => Ok(Some(rows)),
+        Some(rows) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("untested must be 1..100 when given; got {rows}"),
+        )),
+    }
+}
+
 /// One entity's place in its graph.
 #[derive(Debug, Clone, Copy, Default)]
 struct RepoEntityRank {
     degree: usize,
     dependents: usize,
+}
+
+/// One pass over a graph's entities and their relations: each entity's rank,
+/// and, when asked, the entities no test reaches.
+struct RepoEntityReading {
+    ranks: HashMap<EntityId, RepoEntityRank>,
+    /// The entities no test reaches, by the rule `kin verify` reads coverage
+    /// with. `None` when the pass was not asked to read coverage.
+    unreached: Option<HashSet<EntityId>>,
 }
 
 fn entity_rank(
@@ -25557,20 +26473,56 @@ fn entity_rank(
 /// `dependents` is the other half, and the one importance orders by, because
 /// degree alone ranks a long test function that calls fifty things above the
 /// function fifty things call. It counts distinct entities that reach this one
-/// over a call, an import or a reference, excluding the entity itself and
-/// excluding receiver-name guesses, which is exactly the set the reference
-/// surface certifies: those guesses bind `x.clone()` to every method named
-/// `clone` in the repository, and counting them would rank the guess.
+/// over a call, an import or a reference, excluding the entity itself, under
+/// the floor the reference surface counts `find_references` rows by: a
+/// receiver-name guess never, since it binds `x.clone()` to every method named
+/// `clone` in the repository; a match by name alone only where nothing proves
+/// more, that is when no edge into the entity is proven and its language has
+/// no proven reference across files anywhere in the store.
+///
+/// It used to count every match by name alone that was not a receiver guess.
+/// The entity page lists what relies on an entity from its reference read,
+/// which holds those matches as candidates, so on fastify's `serialize` the
+/// page said four relied on it, listed three that do and one candidate, and
+/// said "1 more that Kin counted and did not list".
+///
+/// With `read_coverage`, the same walk also says which entities no test
+/// reaches through the dependency graph. Each entity's projected relations
+/// are already in hand here, so collecting adjacency costs no second graph
+/// read. One multi-source traversal reads transitive reach by the same rule
+/// as `kin verify --missing`.
 fn repo_entity_ranks(
     graph: &kin_db::InMemoryGraph,
-) -> anyhow::Result<HashMap<EntityId, RepoEntityRank>> {
+    read_coverage: bool,
+) -> anyhow::Result<RepoEntityReading> {
+    use kin_cli::commands::verify::{uncovered_by_test_cases, RecordedTestReach};
     let entities = graph.list_all_entities()?;
     let known: HashSet<EntityId> = entities.iter().map(|entity| entity.id).collect();
+    let mut test_reach = if read_coverage {
+        Some(RecordedTestReach::new(
+            &entities,
+            uncovered_by_test_cases(graph)?,
+        ))
+    } else {
+        None
+    };
     let reference_kinds = kin_mcp::handlers::common::default_reference_kinds();
     let mut edges: HashSet<(EntityId, EntityId, kin_model::RelationKind)> = HashSet::new();
     let mut dependents: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+    // Matches by name alone, counted only where the floor drops to them.
+    let mut named_only: HashMap<EntityId, HashSet<EntityId>> = HashMap::new();
+    let places: HashMap<EntityId, (Option<&kin_model::FilePathId>, kin_model::LanguageId)> =
+        entities
+            .iter()
+            .map(|entity| (entity.id, (entity.file_origin.as_ref(), entity.language)))
+            .collect();
+    let mut languages_proven: HashSet<kin_model::LanguageId> = HashSet::new();
     for entity in &entities {
-        for relation in kin_index::relation_read::relations_for_read(graph, &entity.id)? {
+        let relations = kin_index::relation_read::relations_for_read(graph, &entity.id)?;
+        if let Some(test_reach) = test_reach.as_mut() {
+            test_reach.observe_inbound(&relations, &entity.id);
+        }
+        for relation in relations {
             let (Some(source), Some(destination)) =
                 (relation.src.as_entity(), relation.dst.as_entity())
             else {
@@ -25592,8 +26544,31 @@ fn repo_entity_ranks(
                 && reference_kinds.contains(&relation.kind)
                 && !kin_index::resolution::is_receiver_name_guess(&relation)
             {
-                dependents.entry(destination).or_default().insert(source);
+                if kin_index::resolution::RelationResolution::of(&relation).is_proven() {
+                    dependents.entry(destination).or_default().insert(source);
+                    let (from, to) = (places.get(&source), places.get(&destination));
+                    if let (
+                        Some((Some(from_file), from_language)),
+                        Some((Some(to_file), to_language)),
+                    ) = (from, to)
+                    {
+                        if from_file != to_file {
+                            languages_proven.insert(*from_language);
+                            languages_proven.insert(*to_language);
+                        }
+                    }
+                } else {
+                    named_only.entry(destination).or_default().insert(source);
+                }
             }
+        }
+    }
+    for (destination, sources) in named_only {
+        let language_proves_more = places
+            .get(&destination)
+            .is_some_and(|(_, language)| languages_proven.contains(language));
+        if !dependents.contains_key(&destination) && !language_proves_more {
+            dependents.insert(destination, sources);
         }
     }
     let mut ranks: HashMap<EntityId, RepoEntityRank> = HashMap::new();
@@ -25604,7 +26579,10 @@ fn repo_entity_ranks(
     for (entity_id, reaching) in dependents {
         ranks.entry(entity_id).or_default().dependents = reaching.len();
     }
-    Ok(ranks)
+    Ok(RepoEntityReading {
+        ranks,
+        unreached: test_reach.map(RecordedTestReach::uncovered),
+    })
 }
 
 /// One line of text, whitespace collapsed, or `None` when there is none.
@@ -56496,10 +57474,215 @@ pub(crate) mod tests {
                     repo_id: repo_id.to_string(),
                     entities: Vec::new(),
                     total: None,
+                    untested: None,
                 },
             );
         }
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// What others rely on that no test reaches is read in the ranking pass,
+    /// by the rule a verification plan reads tests with: `hub` has three
+    /// dependents and no test, so it leads the list with that count, ahead of
+    /// the five entities one other calls. Once a test entity calls it, or a
+    /// recorded test case covers it, an entity is not listed. A test, a
+    /// module and a name with no definition here are never listed, however
+    /// many depend on them, and an entity nothing depends on is not relied on
+    /// at all. A request that does not ask carries no such field.
+    #[tokio::test]
+    async fn a_repo_entity_list_names_what_others_rely_on_that_no_test_reaches() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let user = test_entity("user", "src/user.py");
+        state.graph.upsert_entity(&user).unwrap();
+        let mut a_test = test_entity("check_helper", "tests/test_helper.py");
+        a_test.role = EntityRole::Test;
+        let mut external = test_entity("requests", "src/none.py");
+        external.file_origin = None;
+        let mut module = test_entity("helpers", "src/helpers.py");
+        module.kind = EntityKind::Module;
+        let tested = test_entity("tested", "src/tested.py");
+        for entity in [&a_test, &external, &module, &tested] {
+            state.graph.upsert_entity(entity).unwrap();
+            link(&state, &user, entity, kin_model::RelationKind::Calls);
+        }
+        let mut reaching = test_entity("check_tested", "tests/test_tested.py");
+        reaching.role = EntityRole::Test;
+        state.graph.upsert_entity(&reaching).unwrap();
+        link(&state, &reaching, &tested, kin_model::RelationKind::Calls);
+
+        let (status, payload) = ranked_entities(
+            Arc::clone(&state),
+            &repo_id,
+            "order=importance&limit=5&untested=12",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let untested = payload.untested.expect("the list was asked for");
+        assert_eq!(
+            untested
+                .entities
+                .iter()
+                .map(|entity| (entity.name.as_str(), entity.dependents))
+                .collect::<Vec<_>>(),
+            [
+                ("hub", Some(3)),
+                ("callee_0", Some(1)),
+                ("callee_1", Some(1)),
+                ("callee_2", Some(1)),
+                ("callee_3", Some(1)),
+                ("callee_4", Some(1)),
+            ],
+            "relied on, defined here, no test, no module, and unreached, most relied-on first"
+        );
+        assert_eq!(untested.total, 6);
+
+        // A test that calls hub reaches it, and a recorded test case covers
+        // what it names.
+        let entity_named = |name: &str| {
+            let row = payload
+                .entities
+                .iter()
+                .chain(untested.entities.iter())
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the answer"));
+            let id = EntityId(uuid::Uuid::parse_str(&row.id).unwrap());
+            state.graph.get_entity(&id).unwrap().unwrap()
+        };
+        link(
+            &state,
+            &reaching,
+            &entity_named("hub"),
+            kin_model::RelationKind::Calls,
+        );
+        state
+            .graph
+            .create_test_case(&TestCase {
+                test_id: kin_model::TestId::new(),
+                name: "covers_callee_0".to_string(),
+                language: "python".to_string(),
+                kind: TestKind::Unit,
+                scopes: vec![WorkScope::Entity(entity_named("callee_0").id)],
+                runner: TestRunner::Pytest,
+                file_origin: None,
+            })
+            .unwrap();
+        let (_, payload) =
+            ranked_entities(Arc::clone(&state), &repo_id, "order=importance&untested=1").await;
+        let untested = payload.untested.expect("the list was asked for");
+        assert_eq!(
+            untested
+                .entities
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["callee_1"],
+            "one row was asked for"
+        );
+        assert_eq!(untested.total, 4, "hub and callee_0 are reached now");
+
+        let (_, unasked) =
+            ranked_entities(Arc::clone(&state), &repo_id, "order=importance&limit=5").await;
+        assert!(unasked.untested.is_none());
+        for refused in ["untested=0", "untested=101"] {
+            let (status, _) = ranked_entities(Arc::clone(&state), &repo_id, refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_entity_list_follows_test_dependencies_and_ignores_run_metadata() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let mut reaching = test_entity("check_outer", "tests/test_outer.py");
+        reaching.role = EntityRole::Test;
+        let outer = test_entity("outer", "src/outer.py");
+        let middle = test_entity("middle", "src/middle.py");
+        let leaf = test_entity("leaf", "src/leaf.py");
+        for entity in [&reaching, &outer, &middle, &leaf] {
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        link(&state, &outer, &middle, RelationKind::Calls);
+        link(&state, &middle, &leaf, RelationKind::Calls);
+
+        let hub = state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "hub")
+            .unwrap();
+        let now = Timestamp::now();
+        let run = kin_model::VerificationRun {
+            run_id: kin_model::VerificationRunId::from_hash(Hash256::from_bytes([0x71; 32])),
+            test_ids: Vec::new(),
+            status: kin_model::VerificationStatus::Passing,
+            runner: TestRunner::Pytest,
+            started_at: now.clone(),
+            finished_at: Some(now),
+            duration_ms: Some(1),
+            evidence_blob: None,
+            exit_code: Some(0),
+            ran_against: vec![kin_model::RunFingerprint {
+                entity: hub.id,
+                behavior_hash: hub.fingerprint.behavior_hash,
+            }],
+            proof: Some(kin_model::VerificationProof {
+                entities: vec![hub.id],
+                work_items: Vec::new(),
+            }),
+        };
+        state.graph.create_verification_run(&run).unwrap();
+        state
+            .graph
+            .link_run_proves_entity(&run.run_id, &hub.id)
+            .unwrap();
+        assert_eq!(
+            state.graph.list_runs_proving_entity(&hub.id).unwrap().len(),
+            1
+        );
+
+        let (_, before) = ranked_entities(
+            Arc::clone(&state),
+            &repo_id,
+            "order=importance&limit=1&untested=12",
+        )
+        .await;
+        let before = before.untested.expect("the list was asked for");
+        assert_eq!(before.total, 8);
+        for entity in [&middle, &leaf] {
+            assert!(
+                before
+                    .entities
+                    .iter()
+                    .any(|row| row.id == entity.id.to_string()),
+                "{} has no recorded test reach before the test calls outer",
+                entity.name
+            );
+        }
+
+        link(&state, &reaching, &outer, RelationKind::Calls);
+        let (status, after) =
+            ranked_entities(state, &repo_id, "order=importance&limit=1&untested=12").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after.entities.len(), 1, "the entity window stays bounded");
+        let after = after.untested.expect("the list was asked for");
+        assert_eq!(after.total, 6);
+        assert_eq!(after.entities[0].name, "hub");
+        assert_eq!(after.entities[0].dependents, Some(3));
+        for entity in [&outer, &middle, &leaf] {
+            assert!(
+                after
+                    .entities
+                    .iter()
+                    .all(|row| row.id != entity.id.to_string()),
+                "{} is reached through the test's dependency graph",
+                entity.name
+            );
+        }
+        assert_eq!(
+            after.entities[0].id,
+            hub.id.to_string(),
+            "a run's DerivedFrom proof metadata does not supply test reach"
+        );
     }
 
     /// P1: a request that asks for nothing new gets the response this route has
@@ -56587,6 +57770,77 @@ pub(crate) mod tests {
             guessed.degree,
             Some(1),
             "the control: the edge is still there and still counts toward degree"
+        );
+    }
+
+    /// A match by name alone is counted as relying on an entity only where the
+    /// reference read would count it: where nothing proves more. `hub` has
+    /// three proven callers across files, so this store proves Python
+    /// references across files, and a fourth caller matched by name alone is a
+    /// candidate, as the entity page lists it. A Go entity in a store that
+    /// proves no Go reference across files counts its match by name alone, as
+    /// the reference read does there.
+    ///
+    /// Breaking it: count every match by name alone that is no receiver guess,
+    /// and `hub` reads four, beside a page that lists three that rely on it
+    /// and one candidate.
+    #[tokio::test]
+    async fn a_repo_entity_list_counts_a_match_by_name_alone_only_where_nothing_proves_more() {
+        let (state, repo_id) = ranked_entities_state().await;
+        let named_only = |source: &Entity, destination: &Entity| kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: GraphNodeId::Entity(source.id),
+            dst: GraphNodeId::Entity(destination.id),
+            confidence: 0.5,
+            origin: kin_model::RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let hub = state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "hub")
+            .unwrap();
+        let by_name = test_entity("by_name", "src/by_name.py");
+        state.graph.upsert_entity(&by_name).unwrap();
+        state
+            .graph
+            .upsert_relation(&named_only(&by_name, &hub))
+            .unwrap();
+        let mut lone = test_entity("lone", "src/lone.go");
+        lone.language = LanguageId::Go;
+        let mut lone_caller = test_entity("lone_caller", "src/lone_caller.go");
+        lone_caller.language = LanguageId::Go;
+        state.graph.upsert_entity(&lone).unwrap();
+        state.graph.upsert_entity(&lone_caller).unwrap();
+        state
+            .graph
+            .upsert_relation(&named_only(&lone_caller, &lone))
+            .unwrap();
+
+        let (status, payload) = ranked_entities(state, &repo_id, "include=ranking&limit=50").await;
+        assert_eq!(status, StatusCode::OK);
+        let dependents = |name: &str| {
+            payload
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed"))
+                .dependents
+        };
+        assert_eq!(
+            dependents("hub"),
+            Some(3),
+            "the match by name alone is a candidate"
+        );
+        assert_eq!(
+            dependents("lone"),
+            Some(1),
+            "where nothing proves more, the match by name alone counts"
         );
     }
 
@@ -58250,6 +59504,9 @@ pub(crate) mod tests {
     include!("api/tests/entity_draft_platform.rs");
     include!("api/tests/artifact_entities.rs");
     include!("api/tests/rust_crate_names.rs");
+    include!("api/tests/entity_keep.rs");
+    include!("api/tests/review_read_runtime.rs");
+    include!("api/tests/write_outcomes.rs");
 
     #[tokio::test]
     async fn mcp_transaction_stage_unknown_id_still_fails() {
@@ -64911,6 +66168,496 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn verification_proof_links_survive_metadata_writes_admission_and_commit() {
+        async fn post(
+            state: &Arc<DaemonState>,
+            endpoint: &str,
+            request: serde_json::Value,
+        ) -> serde_json::Value {
+            let response = router(Arc::clone(state))
+                .oneshot(
+                    Request::post(endpoint)
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{endpoint}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let state = test_state();
+        install_admitted_query_sources(&state, &[("src/lib.py", "def handler():\n    return 1\n")])
+            .await;
+        let layout = state.layout.clone();
+        let entity = state
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == "handler" && entity.kind == EntityKind::Function)
+            .unwrap();
+        assert!(state
+            .graph
+            .semantic_observation()
+            .verified_binding_history
+            .is_some());
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let before = authority
+            .manager
+            .read_authority()
+            .metadata()
+            .workspaces
+            .clone();
+        drop(authority);
+
+        for request in [
+            (
+                "/verify/run",
+                json!({"entity": "handler", "runner": "printf", "depth": 1}),
+            ),
+            (
+                "/review/flags",
+                json!({
+                    "op": "set", "entity": entity.id, "note": "Keep the recorded proof",
+                    "fingerprint": format!("behavior:{}", entity.fingerprint.behavior_hash),
+                    "operation_id": kin_model::OperationId::new(), "author": "Proof Reviewer",
+                }),
+            ),
+            (
+                "/review",
+                json!({
+                    "op": "create", "title": "Review after verification", "base": "main", "head": "HEAD",
+                }),
+            ),
+            (
+                "/verify/run",
+                json!({"entity": "handler", "runner": "printf", "depth": 1}),
+            ),
+        ] {
+            post(&state, request.0, request.1).await;
+            let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+            let lease = authority.manager.read_authority();
+            let workspace = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == authority.workspace_id)
+                .unwrap();
+            let parent = lease
+                .resolve_target_change_id(workspace.base_target.as_ref().unwrap())
+                .unwrap();
+            let pending = crate::commit_deltas::compute_deltas_vs_repository_authority(
+                &state.graph,
+                lease.snapshot(),
+                Some(&parent),
+            )
+            .unwrap();
+            assert!(
+                pending.entity_deltas.is_empty()
+                    && pending.relation_deltas.is_empty()
+                    && pending.tree_deltas.is_empty()
+                    && pending.external_reference_deltas.is_empty()
+                    && pending.resolution_record_deltas.is_empty(),
+                "{} must leave the source commit diff clean: {pending:?}",
+                request.0
+            );
+            assert_eq!(
+                lease.metadata().workspaces,
+                before,
+                "{} must not manufacture a semantic workspace transition from proof links",
+                request.0
+            );
+            let selected = lease
+                .workspace_graph_snapshot(&authority.workspace_id)
+                .unwrap()
+                .unwrap();
+            let projected =
+                kin_db::InMemoryGraph::from_snapshot_without_text_index(selected).unwrap();
+            assert_eq!(
+                projected
+                    .list_runs_proving_entity(&entity.id)
+                    .unwrap()
+                    .len(),
+                state
+                    .graph
+                    .list_runs_proving_entity(&entity.id)
+                    .unwrap()
+                    .len(),
+                "{} must retain the durable proof links",
+                request.0
+            );
+            assert!(state
+                .graph
+                .semantic_observation()
+                .verified_binding_history
+                .is_some());
+        }
+        assert_eq!(
+            state
+                .graph
+                .list_runs_proving_entity(&entity.id)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        install_working_copy_file(
+            &state,
+            "src/lib.py",
+            b"def handler():\n    return 2\n",
+            false,
+        );
+        let (_, admitted) = admit_through_api(&router(Arc::clone(&state))).await;
+        assert_eq!(admitted["report"]["admitted"], json!(true));
+        assert_eq!(admitted["mutated"], json!(true));
+        assert_eq!(
+            state
+                .graph
+                .list_runs_proving_entity(&entity.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        assert!(lease.metadata().workspaces.iter().all(|workspace| {
+            workspace
+                .semantic_overlay
+                .relation_deltas()
+                .iter()
+                .all(|delta| {
+                    let relation = match delta {
+                        kin_model::RelationDelta::Added { new }
+                        | kin_model::RelationDelta::Modified { new, .. } => new,
+                        kin_model::RelationDelta::Removed { old } => old,
+                    };
+                    !matches!(relation.src, GraphNodeId::VerificationRun(_))
+                })
+        }));
+        drop(lease);
+        drop(authority);
+
+        command_commit(
+            axum::http::HeaderMap::new(),
+            State(Arc::clone(&state)),
+            Json(CommandCommitRequest {
+                operation_id: kin_model::OperationId::new(),
+                timestamp: Timestamp::now(),
+                message: Some("Commit source after verification".into()),
+                amend: false,
+                expected_head: None,
+                author: AuthorId::new("proof-test"),
+                session_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .graph
+                .list_runs_proving_entity(&entity.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(state);
+        let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(
+            reopened
+                .graph
+                .list_runs_proving_entity(&entity.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(reopened.graph.open_review_flags().len(), 1);
+    }
+
+    /// Deleting an entity a recorded test run proved, and a test still calls,
+    /// is admitted through the same complete admission the local app runs
+    /// before it plans tests. The admission used to be refused with
+    /// `transaction relation <run proof> has unadmitted destination endpoint
+    /// entity:<removed>`: the proof link is a record's, so the semantic delta
+    /// that removed the entity could not carry it, and the run reported only
+    /// that Kin could not read the latest edits. Now the link leaves with the
+    /// entity, the run keeps its recorded proof, the planner reaches the
+    /// removal and refuses it in its own words, and the store reopens.
+    #[tokio::test]
+    async fn deleting_an_entity_a_recorded_run_proved_is_admitted_and_planned_as_removed() {
+        const PACKAGE: &str =
+            r#"{"name":"tally","type":"module","scripts":{"test":"node --test"}}"#;
+        const MATH: &str = "export function add(a, b) {\n  return a + b;\n}\n\nexport function negate(value) {\n  return 0 - value;\n}\n";
+        const MATH_WITHOUT_NEGATE: &str = "export function add(a, b) {\n  return a + b;\n}\n";
+        const TESTS: &str = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { add, negate } from '../src/math.js';\n\nexport function checkAdd() {\n  assert.equal(add(2, 3), 5);\n}\n\nexport function checkSign() {\n  assert.equal(negate(2), -2);\n}\n\ntest('add', checkAdd);\ntest('sign', checkSign);\n";
+
+        let state = test_state();
+        install_admitted_query_sources(
+            &state,
+            &[
+                ("package.json", PACKAGE),
+                ("src/math.js", MATH),
+                ("test/math.test.js", TESTS),
+            ],
+        )
+        .await;
+        let layout = state.layout.clone();
+        let named = |name: &str| {
+            state
+                .graph
+                .list_all_entities()
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name && entity.kind == EntityKind::Function)
+                .unwrap_or_else(|| panic!("the fixture defines {name}"))
+        };
+        let negate = named("negate");
+        let add = named("add");
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/verify/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"entity": "negate", "runner": "printf", "depth": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let proved = state.graph.list_runs_proving_entity(&negate.id).unwrap();
+        assert_eq!(proved.len(), 1, "the recorded run proves negate");
+        let run = proved[0].clone();
+        assert!(run
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.entities.contains(&negate.id)));
+
+        install_working_copy_file(&state, "src/math.js", MATH_WITHOUT_NEGATE.as_bytes(), false);
+        let (_, admitted) = admit_through_api(&router(Arc::clone(&state))).await;
+        assert_eq!(
+            admitted["report"]["admitted"],
+            json!(true),
+            "deleting an entity a run proved must not block admission: {admitted}"
+        );
+        assert!(state.graph.get_entity(&negate.id).unwrap().is_none());
+        assert!(state.graph.get_entity(&add.id).unwrap().is_some());
+        assert!(
+            state
+                .graph
+                .traverse(&GraphNodeId::Entity(negate.id), &[], 1)
+                .unwrap()
+                .relations
+                .is_empty(),
+            "no relation of any kind is left naming the removed entity"
+        );
+        assert_eq!(
+            state.graph.get_verification_run(&run.run_id).unwrap(),
+            Some(run.clone()),
+            "the run keeps the proof it recorded"
+        );
+
+        // The planner now reads the removal, as the local app asks it to.
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/verify/work")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"mode": "plan"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "Kin cannot plan tests for removed entities yet."
+        );
+
+        drop(state);
+        let reopened = DaemonState::open(layout).unwrap();
+        assert!(reopened.graph.get_entity(&negate.id).unwrap().is_none());
+        assert!(reopened
+            .graph
+            .list_runs_proving_entity(&negate.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reopened.graph.get_verification_run(&run.run_id).unwrap(),
+            Some(run)
+        );
+    }
+
+    /// A repository whose manifests declare no test command is told so in
+    /// one sentence, whether it asks what its command is or asks for a run,
+    /// and nothing is run or recorded.
+    #[tokio::test]
+    async fn verify_work_says_in_one_sentence_when_there_is_no_test_command() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        for request in [
+            serde_json::json!({"mode": "test_command"}),
+            serde_json::json!({"mode": "run", "entities": [entity.id.to_string()]}),
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/verify/work")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let answer: kin_cli::commands::verify::WorkVerifyResponse =
+                serde_json::from_slice(&body).unwrap();
+            assert!(!answer.runnable);
+            assert_eq!(
+                answer.unavailable.as_deref(),
+                Some(kin_cli::commands::verify::NO_TEST_COMMAND)
+            );
+            assert!(answer.run.is_none());
+        }
+        assert!(state
+            .graph
+            .list_runs_proving_entity(&entity.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A repository whose test command names a runner that is not installed,
+    /// as a JavaScript repository with no `node_modules`, records a run that
+    /// could not run. It attests nothing, keeps the shell's reason, its exit
+    /// code and the end of its output, and the tests it planned read as not
+    /// run rather than failed, in this daemon and after the store reopens.
+    #[tokio::test]
+    async fn verify_work_records_a_missing_runner_as_a_run_that_could_not_run() {
+        const PACKAGE: &str =
+            r#"{"name":"tally","type":"module","scripts":{"test":"kin-missing-runner --test"}}"#;
+        const MATH: &str = "export function add(a, b) {\n  return a + b;\n}\n";
+        const TESTS: &str = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { add } from '../src/math.js';\n\nexport function checkAdd() {\n  assert.equal(add(2, 3), 5);\n}\n\ntest('add', checkAdd);\n";
+
+        let state = test_state();
+        install_admitted_query_sources(
+            &state,
+            &[
+                ("package.json", PACKAGE),
+                ("src/math.js", MATH),
+                ("test/math.test.js", TESTS),
+            ],
+        )
+        .await;
+        let layout = state.layout.clone();
+        let named = |name: &str| {
+            state
+                .graph
+                .list_all_entities()
+                .unwrap()
+                .into_iter()
+                .find(|entity| entity.name == name && entity.kind == EntityKind::Function)
+                .unwrap_or_else(|| panic!("the fixture defines {name}"))
+        };
+        let add = named("add");
+        let check_add = named("checkAdd");
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/verify/work")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mode": "run", "entities": [add.id.to_string()]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let answer: kin_cli::commands::verify::WorkVerifyResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(answer.tests.iter().any(|test| test.name == "checkAdd"));
+        let run = answer.run.expect("the attempt is recorded");
+        assert_eq!(run.outcome, "could_not_run");
+        // The shell exits 127 whether `npm` or the runner it starts is missing.
+        assert_eq!(run.exit_code, Some(127));
+        let reason = run.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with("The shell could not find `")
+                && reason.ends_with("`, so no test ran."),
+            "{reason}"
+        );
+        assert!(run
+            .output_tail
+            .as_deref()
+            .is_some_and(|tail| tail.contains("command not found") || tail.contains("not found")));
+
+        let recorded = state.graph.list_runs_proving_entity(&add.id).unwrap();
+        assert_eq!(recorded.len(), 1);
+        let stored = recorded[0].clone();
+        assert!(stored.could_not_run());
+        assert_eq!(stored.exit_code, Some(127));
+        assert!(
+            stored.evidence_blob.is_some(),
+            "its output is kept as evidence"
+        );
+        let reading = |graph: &kin_db::InMemoryGraph| {
+            kin_cli::commands::verify::test_result(
+                graph,
+                &check_add.id,
+                Some(&add.id),
+                &mut std::collections::HashMap::new(),
+            )
+            .unwrap()
+        };
+        let not_run = reading(state.graph.as_ref());
+        assert_eq!(
+            not_run.state,
+            kin_cli::commands::verify::TestResultState::NotRun
+        );
+        assert_eq!(
+            not_run.summary.as_deref(),
+            Some("The test command could not run, so this test did not run. It exited 127.")
+        );
+
+        drop(state);
+        let reopened = DaemonState::open(layout).unwrap();
+        assert_eq!(
+            reopened.graph.get_verification_run(&stored.run_id).unwrap(),
+            Some(stored)
+        );
+        assert_eq!(reading(reopened.graph.as_ref()).state, not_run.state);
+    }
+
+    #[tokio::test]
     async fn mcp_bootstrap_route_is_not_available() {
         let state = test_state();
         let app = router(state);
@@ -70926,9 +72673,12 @@ pub(crate) mod tests {
         state.graph.invalidate_binding_history();
         let revoked = capture();
         assert!(!Arc::ptr_eq(&history.graph, &revoked.graph));
-        state.graph.restore_binding_history_from(&revoked.graph);
+        // Restoring from a graph that holds no proof onto one that holds none
+        // writes nothing, so the capture taken before it is still current. A
+        // restore that does change the proof is covered below.
+        assert!(!state.graph.restore_binding_history_from(&revoked.graph));
         let restored = capture();
-        assert!(!Arc::ptr_eq(&revoked.graph, &restored.graph));
+        assert!(Arc::ptr_eq(&revoked.graph, &restored.graph));
         assert_eq!(state.graph.compute_root_hash(), root);
         assert_eq!(state.stable_graph_authority_epoch(), Some(daemon_epoch));
         assert_eq!(

@@ -53,6 +53,7 @@ a.chip:hover { color: var(--accent); }
 .lane-chip { max-width: 260px; height: 24px; padding: 0 10px; border-radius: 12px; background: var(--bg-hover); font-size: 12px; line-height: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lane-chip:hover { color: var(--accent); }
 .lane-last .agent-entity { font: inherit; font-weight: 500; }
+.lane-chips .lane-more { align-self: center; }
 .lane .agent-open-list { margin-top: 0; }
 .lane-detail { margin-top: 4px; }
 .lanes-earlier .lane:not(.is-open) { background: none; box-shadow: none; }
@@ -78,4 +79,7 @@ a.chip:hover { color: var(--accent); }
 @media (max-width: 760px) {
   .lane-body { padding-left: 20px; }
   .lane-row { grid-template-columns: minmax(0, 1fr); }
+  /* When a session was, and how much it did, on a line of its own rather than cut short. */
+  .lane-head { flex-wrap: wrap; row-gap: 2px; padding-top: 12px; padding-bottom: 12px; }
+  .lane-when { order: 3; flex-basis: 100%; padding-left: 18px; white-space: normal; }
 }

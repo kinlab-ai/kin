@@ -449,6 +449,60 @@ mod tests {
         );
     }
 
+    /// An edit's admission publishes through the authority the daemon already
+    /// holds. It opens none of its own, and the reader after it finds the held
+    /// authority already at the successor the admission wrote, instead of
+    /// loading the store again to read it. Each of those opens decodes the
+    /// whole persisted authority and re-verifies every body, and together they
+    /// were 17 of the 41 seconds the first guide read after a one-function edit
+    /// took on a converted fastify store in a debug build.
+    #[tokio::test]
+    async fn an_edit_admission_publishes_through_the_authority_the_daemon_holds() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let source = state.layout.working_dir().join("edited.rs");
+        std::fs::write(&source, "pub fn edited() -> u8 {\n    1\n}\n").unwrap();
+        let first = execute(&state).await.expect("the pass reported an outcome");
+        assert!(first.report.expect("a report").admitted);
+        crate::api::held_repository_authority(&state).unwrap();
+        let loads = state.projection_authority.loads();
+
+        std::fs::write(&source, "pub fn edited() -> u8 {\n    2\n}\n").unwrap();
+        crate::local_repository_authority::reset_authority_open_count();
+        let response = execute(&state).await.expect("the pass reported an outcome");
+        let report = response.report.expect("a reported pass carries its report");
+        assert!(report.admitted, "{:?}", report.failure);
+        assert_eq!(report.tree_moved, Some(true), "the edit moved the tree");
+        assert_eq!(
+            crate::local_repository_authority::authority_open_count(),
+            0,
+            "the publication borrows the held authority rather than opening one"
+        );
+
+        let held = crate::api::held_repository_authority(&state).unwrap();
+        assert_eq!(
+            state.projection_authority.loads(),
+            loads,
+            "the reader after the admission keeps the authority it published through"
+        );
+        let workspace_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .workspace_id();
+        let lease = held.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("the bound workspace");
+        assert_eq!(
+            workspace.tree,
+            state.graph.resolved_tree(),
+            "the held authority carries the edit the admission published"
+        );
+    }
+
     #[tokio::test]
     async fn automatic_recovery_keeps_a_newer_loss_and_then_admits_its_source() {
         use kin_model::EntityStore as _;

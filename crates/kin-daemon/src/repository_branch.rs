@@ -843,6 +843,11 @@ fn list(authority: &ActiveLocalRepositoryAuthority) -> Result<BranchResponse> {
         .map(|repository_ref| BranchListEntry {
             name: repository_ref.name.clone(),
             target: repository_ref.target.clone(),
+            change_id: lease
+                .resolve_ref_target(&repository_ref.name)
+                .ok()
+                .flatten()
+                .and_then(|target| lease.resolve_target_change_id(&target).ok()),
             active: active_ref == Some(&repository_ref.name),
             default: default_ref.as_ref() == Some(&repository_ref.name),
         })

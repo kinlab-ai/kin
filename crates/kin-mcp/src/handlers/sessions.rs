@@ -124,6 +124,10 @@ pub async fn handle_session_start(
     let transport = parse_transport(transport_str);
 
     let pid = args.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+    let watch_pid = args
+        .get("watch_pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u32::try_from(p).ok());
     let cwd = PathBuf::from(&cwd_str);
     let capabilities = parse_capabilities(args);
 
@@ -134,6 +138,7 @@ pub async fn handle_session_start(
             &client_name,
             transport_str,
             pid,
+            watch_pid,
             &cwd_str,
             capabilities.as_ref(),
         )
@@ -1533,11 +1538,12 @@ pub fn reject_truncated_bodies(
 /// it recorded before this argument existed, so a caller that sends nothing
 /// sees no change at all.
 pub fn commit_message_argument(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
-    let summary = arguments
-        .get("summary")
-        .and_then(serde_json::Value::as_str)?
-        .trim();
-    (!summary.is_empty()).then(|| summary.to_string())
+    ["summary", "message"]
+        .iter()
+        .filter_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|summary| !summary.is_empty())
+        .map(str::to_string)
 }
 
 pub const MUTATE_DESC: &str = "\

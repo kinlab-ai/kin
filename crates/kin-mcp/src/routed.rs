@@ -694,7 +694,7 @@ fn registered(tool: &str) -> Option<&'static ToolDefinition> {
 
 /// Whether the registry annotates `tool` read-only. Anything else, `kin_init`
 /// included, is a write, and the read-only surface never runs it.
-fn is_read_only(tool: &str) -> bool {
+pub(crate) fn is_read_only(tool: &str) -> bool {
     registered(tool).is_some_and(|definition| definition.annotations.read_only_hint)
 }
 

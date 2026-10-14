@@ -41,6 +41,7 @@ fn make_annotation(body: &str, kind: AnnotationKind, entity: &Entity) -> Annotat
         authored_by: IdentityRef::human("test"),
         created_at: Timestamp::now(),
         staleness: StalenessState::Fresh,
+        review: None,
     }
 }
 
@@ -491,6 +492,7 @@ fn work_relationships_and_work_targeted_annotations_are_queryable() {
         authored_by: IdentityRef::assistant("acceptance-test"),
         created_at: Timestamp::now(),
         staleness: StalenessState::Fresh,
+        review: None,
     };
     graph.create_annotation(&annotation).unwrap();
     graph

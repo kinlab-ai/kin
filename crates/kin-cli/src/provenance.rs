@@ -27,6 +27,7 @@ where
                 identifier: label,
                 url: None,
             }],
+            agent_session: None,
         };
         graph
             .create_actor(&actor)
@@ -90,6 +91,7 @@ where
                 identifier: label.to_string(),
                 url: None,
             }],
+            agent_session: None,
         })
     } else {
         None

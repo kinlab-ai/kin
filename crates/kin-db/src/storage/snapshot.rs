@@ -4271,6 +4271,7 @@ mod tests {
             kind: ActorKind::Assistant,
             display_name: "cleanup-test".into(),
             external_refs: Vec::new(),
+            agent_session: None,
         };
         graph.create_actor(&actor).unwrap();
         mgr.save().unwrap();
@@ -5804,6 +5805,7 @@ mod tests {
             authored_by: IdentityRef::assistant("codex"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
         graph.create_annotation(&annotation).unwrap();
         graph
@@ -5837,6 +5839,8 @@ mod tests {
             duration_ms: Some(12),
             evidence_blob: None,
             exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: None,
         };
         graph.create_verification_run(&run).unwrap();
         graph
@@ -5853,6 +5857,7 @@ mod tests {
             kind: ActorKind::Assistant,
             display_name: "Codex".into(),
             external_refs: Vec::new(),
+            agent_session: None,
         };
         graph.create_actor(&actor).unwrap();
         graph

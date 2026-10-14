@@ -2498,13 +2498,9 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
             "core" => collect_transfer_core_keys(section, &mut refusals),
             // Split out of the arm below because it is the one section here a
             // user reaches without ever configuring transport: `git submodule
-            // add` writes it for them.
-            "submodule" => refusals.push(unsafe_submodule_reason(
-                section
-                    .header()
-                    .subsection_name()
-                    .and_then(|name| name.to_str().ok()),
-            )),
+            // add` writes it for them, and GUI clients write `[submodule]`
+            // defaults on clone.
+            "submodule" => collect_submodule_keys(section, &mut refusals),
             "lfs" => collect_lfs_keys(section, &mut refusals),
             "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
             | "fetch" | "receive" | "uploadpack" | "ssh" => {
@@ -2627,6 +2623,36 @@ fn collect_unknown_config_keys(
         }
     }
     refusals.len() != before
+}
+
+/// Classify one `[submodule]` section rather than refusing an un-subsectioned
+/// client preference wholesale.
+///
+/// A subsectioned `[submodule "<name>"]` entry binds a specific submodule, so it
+/// always refuses with the submodule's path. An un-subsectioned `[submodule]`
+/// section is where Git clients and `git clone --recurse-submodules` record
+/// repository-wide defaults (`submodule.active = .`, `submodule.recurse`, and
+/// `submodule.fetchJobs`) even when the repository has no `.gitmodules` and zero
+/// gitlinks. Those three keys do not define a submodule or alter remote ref
+/// transport on a repository without gitlinks, while any actual gitlink or
+/// `.gitmodules` entry is still refused by the tree, index, and `.gitmodules`
+/// checks. Any other key in an un-subsectioned `[submodule]` section still
+/// fails closed.
+fn collect_submodule_keys(section: &gix::config::file::Section<'_>, refusals: &mut Vec<String>) {
+    if let Some(subsection) = section.header().subsection_name() {
+        refusals.push(unsafe_submodule_reason(subsection.to_str().ok()));
+        return;
+    }
+    for name in section.value_names() {
+        let name = name.to_string();
+        let admissible = name.eq_ignore_ascii_case("active")
+            || name.eq_ignore_ascii_case("recurse")
+            || name.eq_ignore_ascii_case("fetchjobs");
+        if !admissible {
+            refusals.push(unsafe_submodule_reason(None));
+            return;
+        }
+    }
 }
 
 /// Classify one `[lfs]` section key by key rather than refusing it wholesale.
@@ -5740,6 +5766,41 @@ mod tests {
         assert!(
             message.contains("git submodule deinit"),
             "must state the workaround: {message}"
+        );
+    }
+
+    #[test]
+    fn unsubsectioned_submodule_client_preferences_are_admitted_while_other_keys_refuse() {
+        let (temp, repo) = config_only_repository();
+        FixtureGitBatch::new()
+            .git(["config", "submodule.active", "."])
+            .git(["config", "submodule.recurse", "true"])
+            .git(["config", "submodule.fetchJobs", "4"])
+            .run_in(&repo);
+        remote_mapping_facts(&open_repo(&repo).expect("open client preference fixture"))
+            .expect("un-subsectioned [submodule] client preferences must be admitted");
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
+            .expect("preflight must admit repository with [submodule] active/recurse/fetchJobs");
+        drop(temp);
+
+        let (_temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "submodule.url",
+                "https://example.invalid/unexpected.git",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open unknown key fixture"))
+            .expect_err("unknown un-subsectioned [submodule] key must reject");
+        let message = error.to_string();
+        assert!(message.contains("safe exact subset"), "{message}");
+        assert!(
+            message.contains("unsupported submodule section"),
+            "{message}"
         );
     }
 

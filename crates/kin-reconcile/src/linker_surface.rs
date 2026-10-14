@@ -56,7 +56,21 @@ const BODY_DERIVED_ENTITY_KEYS: &[&str] = &[
     // when another file binds.
     kin_parser::NESTED_DEFINITIONS_NOT_ADMITTED_KEY,
     kin_parser::FILE_NESTED_DEFINITIONS_NOT_ADMITTED_KEY,
+    // The census of computed member writes the file's code makes, each with
+    // the span it sits at. It discloses what a question about the file's
+    // members cannot enumerate, and no linker reads it: a member a write does
+    // mint is an entity of its own, compared like any other declaration. Left
+    // in, every edit that moved a byte above one `object[key] = value` read as
+    // a moved surface, and the edit re-derived every file binding against this
+    // one, re-parsing each of them that still held an import from outside.
+    kin_model::derivation::MEMBER_COVERAGE_KEY,
 ];
+
+/// The parts of a derived member's record that say where its generating
+/// syntax sits and which bytes it was read from. The owner, the member key,
+/// the rule and its conditions are the declaration another file binds
+/// against, and they stay.
+const DERIVATION_POSITION_FIELDS: &[&str] = &["generator", "assignment", "source_blob_hash"];
 
 /// Whether the edit that produced `indexed` over a file whose graph
 /// declarations are `existing` can change how another file binds.
@@ -214,6 +228,11 @@ fn declaration(entity: &Entity) -> String {
         for key in BODY_DERIVED_ENTITY_KEYS {
             strip(metadata, key);
         }
+        if let Some(derivation) = metadata.get_mut(kin_model::derivation::ENTITY_DERIVATION_KEY) {
+            for field in DERIVATION_POSITION_FIELDS {
+                strip(derivation, field);
+            }
+        }
     }
     value.to_string()
 }
@@ -306,5 +325,66 @@ mod tests {
         );
         let after = indexed("pkg/__init__.py", "VERSION = 1\nfrom .impl import execute as public\nif enabled:\n    public = replacement\n");
         assert_ne!(LinkerSurface::of(&before), LinkerSurface::of(&after));
+    }
+
+    /// A JavaScript file that writes members through computed keys carries a
+    /// census of those writes on its module, each with the span it sits at,
+    /// and every member a write mints records its generator's span and the
+    /// bytes it was read from. An edit inside another function's body moves
+    /// those positions and changes those bytes without changing anything
+    /// another file binds against, so the surface holds still. Before, it read
+    /// as moved, and every body edit to such a file re-derived the files
+    /// binding against it.
+    #[test]
+    fn a_body_edit_above_computed_member_writes_leaves_the_surface_where_it_was() {
+        let source = |label: &str, keys: &str| {
+            format!(
+                "const app = {{}}\nfunction describe () {{\n  return {label}\n}}\nfunction install (enabled) {{\n  for (const key of [{keys}]) {{\n    if (enabled) {{ app[key] = () => {{}} }}\n  }}\n  app[unknown()] = () => {{}}\n}}\nmodule.exports = {{ describe, install }}\n"
+            )
+        };
+        let before = indexed("lib/install.js", &source("'installs'", "'get', 'post'"));
+        let after = indexed(
+            "lib/install.js",
+            &source(
+                "'installs every handler,\\n one per method'",
+                "'get', 'post'",
+            ),
+        );
+        for key in [
+            kin_model::derivation::MEMBER_COVERAGE_KEY,
+            kin_model::derivation::ENTITY_DERIVATION_KEY,
+        ] {
+            assert!(
+                carries(&before, key),
+                "the fixture must carry `{key}`, or it proves nothing about it"
+            );
+        }
+        let derivations = |indexed: &IndexedFile| -> Vec<serde_json::Value> {
+            indexed
+                .entities
+                .iter()
+                .filter_map(|entity| {
+                    entity
+                        .metadata
+                        .extra
+                        .get(kin_model::derivation::ENTITY_DERIVATION_KEY)
+                        .cloned()
+                })
+                .collect()
+        };
+        assert_ne!(
+            derivations(&before),
+            derivations(&after),
+            "the edit must move the positions and bytes the records name"
+        );
+        assert_eq!(LinkerSurface::of(&before), LinkerSurface::of(&after));
+
+        // A member the loop newly mints is a declaration another file can
+        // bind to, and still moves the surface.
+        let minted = indexed(
+            "lib/install.js",
+            &source("'installs'", "'get', 'post', 'put'"),
+        );
+        assert_ne!(LinkerSurface::of(&before), LinkerSurface::of(&minted));
     }
 }

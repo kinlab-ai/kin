@@ -24,6 +24,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod file_limit;
 pub mod git_init;
+pub mod git_update;
 pub mod graph_section;
 pub mod history_attach;
 pub mod history_state;
@@ -128,6 +129,7 @@ pub use tree::{
     validate_portable_source_symlink, validate_source_entry, validate_source_paths,
     validate_source_tree, verify_observed_target_tree_and_commit_repository_transaction,
     verify_repository_workspace_projection,
+    verify_repository_workspace_projection_and_commit_repository_transaction,
     verify_unchanged_source_tree_and_commit_repository_transaction, ExactProjectionDetachTarget,
     ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
     ExactProjectionVerification, ExactSessionProjection, SourceProjectionDisposition,

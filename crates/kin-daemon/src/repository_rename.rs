@@ -1442,6 +1442,7 @@ mod tests {
             authored_by: IdentityRef::assistant("rename-annotation-test"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
         fixture.state.graph.create_annotation(&annotation).unwrap();
 

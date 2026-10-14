@@ -152,6 +152,49 @@ pub struct RankedImpactReport {
     pub score_semantics: String,
     pub score_formula: String,
     pub candidates: Vec<RankedImpactCandidate>,
+    /// The tests this walk reaches, one per test ([`is_test_unit`]), nearest
+    /// first and, at one distance, the ones whose route is all calls first.
+    /// Test code that is not itself a test, such as a constant or a type in a
+    /// test module, is counted as the test that holds it. Defaulted on read so
+    /// a report recorded before tests were counted this way still reads.
+    #[serde(default)]
+    pub tests: Vec<TestReach>,
+}
+
+/// One test this walk reaches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestReach {
+    /// The test: a test entity, a test module, or what a recorded `tests` or
+    /// `covers` relation names.
+    pub entity_id: EntityId,
+    pub identity: StableEntityIdentity,
+    /// Recorded impact edges between the walk's root and the test code.
+    pub hop: u32,
+    /// How many of those edges are calls, or recorded `tests` and `covers`
+    /// relations. Equal to `hop` when running the test runs the root along
+    /// one recorded route ([`TestReach::by_call`]).
+    pub call_hops: u32,
+    /// The candidate the walk reached it through: the test itself, or the
+    /// test code inside it that is not a test of its own.
+    pub via: EntityId,
+}
+
+impl TestReach {
+    /// Whether every edge on the route to the root is a call, so the test
+    /// runs the root rather than only naming its type or module.
+    pub fn by_call(&self) -> bool {
+        self.hop > 0 && self.call_hops == self.hop
+    }
+}
+
+impl RankedImpactReport {
+    /// Every candidate of test code in this recorded impact walk, a test or
+    /// not. [`RankedImpactReport::tests`] is what a reader counts as tests.
+    pub fn test_candidates(&self) -> impl Iterator<Item = &RankedImpactCandidate> {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.bucket == ImpactBucket::Test)
+    }
 }
 
 /// The deepest hop any impact walk answers at.
@@ -299,6 +342,7 @@ pub fn rank_impact_at<I: ImpactGraph>(
             .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
 
+    let tests = test_reach(graph, &candidates)?;
     Ok(RankedImpactReport {
         schema_version: RANKED_IMPACT_SCHEMA_VERSION.to_string(),
         root_entity_id: *root,
@@ -308,7 +352,123 @@ pub fn rank_impact_at<I: ImpactGraph>(
             .to_string(),
         score_formula: PRIORITY_SCORE_FORMULA.to_string(),
         candidates,
+        tests,
     })
+}
+
+/// The tests among `candidates`, each counted once by its nearest route.
+fn test_reach<I: ImpactGraph>(
+    graph: &I,
+    candidates: &[RankedImpactCandidate],
+) -> Result<Vec<TestReach>, ReviewError> {
+    let mut best: BTreeMap<EntityId, TestReach> = BTreeMap::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.bucket == ImpactBucket::Test)
+    {
+        let Some(entity) = graph.get_entity(&candidate.entity_id)? else {
+            continue;
+        };
+        let declared = matches!(
+            candidate.relation,
+            RelationKind::Tests | RelationKind::Covers
+        );
+        let test = if declared || is_test_unit(&entity) {
+            Some(entity)
+        } else {
+            test_unit_holding(graph, &entity)?
+        };
+        let Some(test) = test else {
+            continue;
+        };
+        let call_hops = candidate
+            .path
+            .iter()
+            .filter(|step| is_call_route(step.relation_kind))
+            .count() as u32;
+        let reach = TestReach {
+            entity_id: test.id,
+            identity: StableEntityIdentity::from_entity(&test),
+            hop: candidate.hop,
+            call_hops,
+            via: candidate.entity_id,
+        };
+        match best.get(&test.id) {
+            Some(kept) if !reach_is_nearer(&reach, kept) => {}
+            _ => {
+                best.insert(test.id, reach);
+            }
+        }
+    }
+    let mut tests: Vec<TestReach> = best.into_values().collect();
+    tests.sort_by(test_reach_order);
+    Ok(tests)
+}
+
+/// The order tests are read in: nearest first, then the routes with the most
+/// calls, so a test that runs the root comes before one that names its type.
+pub fn test_reach_order(left: &TestReach, right: &TestReach) -> std::cmp::Ordering {
+    left.hop
+        .cmp(&right.hop)
+        .then_with(|| right.call_hops.cmp(&left.call_hops))
+        .then_with(|| left.identity.name.cmp(&right.identity.name))
+        .then_with(|| left.identity.cmp(&right.identity))
+        .then_with(|| left.entity_id.cmp(&right.entity_id))
+}
+
+fn reach_is_nearer(reach: &TestReach, kept: &TestReach) -> bool {
+    test_reach_order(reach, kept) == std::cmp::Ordering::Less
+        || (reach.hop == kept.hop && reach.call_hops == kept.call_hops && reach.via < kept.via)
+}
+
+/// Whether an edge on a test's route runs its destination: a call, or a
+/// recorded `tests` or `covers` relation.
+pub fn is_call_route(kind: RelationKind) -> bool {
+    matches!(
+        kind,
+        RelationKind::Calls
+            | RelationKind::Spawns
+            | RelationKind::Instantiates
+            | RelationKind::Tests
+            | RelationKind::Covers
+    )
+}
+
+/// How far up its containers test code is read for the test that holds it.
+const TEST_UNIT_CONTAINER_DEPTH: usize = 8;
+
+/// The test that holds `entity`, test code that is not a test of its own:
+/// its nearest container that is one, by the `Contains` relation with the
+/// smallest id at each level so one graph always answers the same.
+pub fn test_unit_holding<I: ImpactGraph + ?Sized>(
+    graph: &I,
+    entity: &Entity,
+) -> Result<Option<Entity>, ReviewError> {
+    let mut current = entity.id;
+    let mut seen = HashSet::from([current]);
+    for _ in 0..TEST_UNIT_CONTAINER_DEPTH {
+        let container = graph
+            .get_all_relations_for_entity(&current)?
+            .into_iter()
+            .filter(|relation| {
+                relation.kind == RelationKind::Contains
+                    && relation.dst == GraphNodeId::Entity(current)
+            })
+            .filter_map(|relation| relation.src.as_entity().map(|source| (relation.id, source)))
+            .min()
+            .map(|(_, container)| container);
+        let Some(container) = container.filter(|container| seen.insert(*container)) else {
+            return Ok(None);
+        };
+        let Some(held) = graph.get_entity(&container)? else {
+            return Ok(None);
+        };
+        if is_test_unit(&held) {
+            return Ok(Some(held));
+        }
+        current = container;
+    }
+    Ok(None)
 }
 
 fn candidate_is_better(
@@ -394,6 +554,15 @@ pub fn is_impact_relation(kind: RelationKind) -> bool {
 /// Both walks call this, rather than each applying the per-kind predicate
 /// separately, so their agreement is structural instead of conventional.
 pub fn inbound_impact_relations(all: &[Relation], id: &EntityId) -> Vec<Relation> {
+    inbound_impact_relation_refs(all, id)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// [`inbound_impact_relations`] without the copies, for a caller that reads
+/// the relations of every entity in a repository and keeps none of them.
+pub fn inbound_impact_relation_refs<'a>(all: &'a [Relation], id: &EntityId) -> Vec<&'a Relation> {
     let node = GraphNodeId::Entity(*id);
     let declaring: HashSet<EntityId> = all
         .iter()
@@ -410,8 +579,37 @@ pub fn inbound_impact_relations(all: &[Relation], id: &EntityId) -> Vec<Relation
                     .as_entity()
                     .is_none_or(|src| !declaring.contains(&src))
         })
-        .cloned()
         .collect()
+}
+
+/// Whether this entity is test code in a recorded impact traversal: a test,
+/// or anything else a test module declares. Generated, vendored and derived
+/// members retain their derived classification.
+///
+/// Test code is what reach is read from: a constant in a test module runs
+/// when its module does. It is not what a reader counts as tests; see
+/// [`is_test_unit`].
+pub fn is_test_impact_source(entity: &Entity) -> bool {
+    !kin_model::is_derived_member(entity)
+        && !matches!(entity.role, EntityRole::Generated | EntityRole::Vendored)
+        && (entity.role == EntityRole::Test || entity.kind == kin_model::EntityKind::Test)
+}
+
+/// Whether this entity is a test a reader counts: test code that is a test
+/// by its kind, a function, method or class of test code, or a test module.
+///
+/// A constant, a type alias, an interface, a field or a variant inside a test
+/// module is what its tests use, not a test. Counted as tests, a module's
+/// fixtures multiplied the count: zod's `_toLowerCase` read "144 tests reach
+/// it" where half were constants and types inside test modules. Such test
+/// code is counted as the test that holds it ([`test_unit_holding`]).
+pub fn is_test_unit(entity: &Entity) -> bool {
+    use kin_model::EntityKind;
+    is_test_impact_source(entity)
+        && (matches!(
+            entity.kind,
+            EntityKind::Test | EntityKind::Function | EntityKind::Method | EntityKind::Class
+        ) || kin_model::is_module_container(entity))
 }
 
 fn impact_bucket(entity: &Entity, relation: RelationKind) -> ImpactBucket {
@@ -420,7 +618,7 @@ fn impact_bucket(entity: &Entity, relation: RelationKind) -> ImpactBucket {
         || relation == RelationKind::DerivedFrom
     {
         ImpactBucket::Derived
-    } else if entity.role == EntityRole::Test
+    } else if is_test_impact_source(entity)
         || matches!(relation, RelationKind::Tests | RelationKind::Covers)
     {
         ImpactBucket::Test
@@ -818,5 +1016,113 @@ mod tests {
         assert_eq!(candidate.score_components.relation_points, 110);
         assert_eq!(candidate.path[0].relation_kind, RelationKind::Spawns);
         assert!(candidate.path[0].evidence[0].source_span.is_some());
+    }
+
+    fn test_code(name: &str, file: &str, kind: EntityKind) -> Entity {
+        let mut value = entity(name, file, 1);
+        value.id = EntityId::from_content(file, name, &format!("{kind:?}"), 1);
+        value.kind = kind;
+        value.role = EntityRole::Test;
+        value
+    }
+
+    /// Tests are what a runner runs: test functions and test modules. A
+    /// constant, an interface or a type a test module declares is counted as
+    /// the module that holds it, once, and test code no test holds is not
+    /// counted at all. The nearest come first and, at one distance, the ones
+    /// that reach the root by calls alone.
+    #[test]
+    fn test_reach_counts_tests_not_the_code_inside_them() {
+        let root = entity("_toLowerCase", "src/core/api.ts", 1128);
+        let string_class = entity("_ZodString", "src/classic/schemas.ts", 289);
+        let mut checks = entity("checks", "src/classic/checks.ts", 1);
+        checks.kind = EntityKind::Module;
+        let string_test = test_code("string.test", "tests/string.test.ts", EntityKind::Module);
+        let apply_test = test_code("apply.test", "tests/apply.test.ts", EntityKind::Module);
+        let schema = test_code("schema", "tests/apply.test.ts", EntityKind::Constant);
+        let make_schema = test_code("makeSchema", "tests/apply.test.ts", EntityKind::Function);
+        let object_test = test_code("object.test", "tests/object.test.ts", EntityKind::Module);
+        let fixture = test_code("Test", "tests/object.test.ts", EntityKind::Constant);
+        let loose = test_code("Shape", "tests/loose.test.ts", EntityKind::Interface);
+
+        let mut graph = Graph::default();
+        for value in [
+            &root,
+            &string_class,
+            &checks,
+            &string_test,
+            &apply_test,
+            &schema,
+            &make_schema,
+            &object_test,
+            &fixture,
+            &loose,
+        ] {
+            graph.entities.insert(value.id, value.clone());
+        }
+        graph.relations.insert(
+            root.id,
+            vec![
+                edge(&string_class, &root, RelationKind::Calls, true),
+                edge(&checks, &root, RelationKind::References, true),
+            ],
+        );
+        graph.relations.insert(
+            string_class.id,
+            vec![
+                edge(&string_test, &string_class, RelationKind::Calls, true),
+                edge(&make_schema, &string_class, RelationKind::Calls, true),
+            ],
+        );
+        graph.relations.insert(
+            checks.id,
+            vec![
+                edge(&schema, &checks, RelationKind::UsesType, true),
+                edge(&fixture, &checks, RelationKind::UsesType, true),
+                edge(&object_test, &checks, RelationKind::References, true),
+                edge(&loose, &checks, RelationKind::UsesType, true),
+            ],
+        );
+        graph.relations.insert(
+            schema.id,
+            vec![edge(&apply_test, &schema, RelationKind::Contains, false)],
+        );
+        graph.relations.insert(
+            fixture.id,
+            vec![edge(&object_test, &fixture, RelationKind::Contains, false)],
+        );
+
+        let report = rank_impact_at(&graph, &root.id, 3).unwrap();
+        assert_eq!(
+            report.test_candidates().count(),
+            6,
+            "every piece of test code is still read as reaching the root"
+        );
+        let read: Vec<(&str, u32, u32, bool)> = report
+            .tests
+            .iter()
+            .map(|test| {
+                (
+                    test.identity.name.as_str(),
+                    test.hop,
+                    test.call_hops,
+                    test.by_call(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("makeSchema", 2, 2, true),
+                ("string.test", 2, 2, true),
+                ("apply.test", 2, 0, false),
+                ("object.test", 2, 0, false),
+            ]
+        );
+        let apply = &report.tests[2];
+        assert_eq!(apply.via, schema.id, "a fixture is counted as its module");
+        assert!(is_test_unit(&make_schema) && is_test_unit(&apply_test));
+        assert!(!is_test_unit(&schema) && !is_test_unit(&loose));
+        assert!(!is_test_unit(&string_class), "source code is never a test");
     }
 }

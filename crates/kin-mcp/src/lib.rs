@@ -44,6 +44,7 @@ pub mod replies;
 pub(crate) mod reply_budget;
 pub mod request_schema;
 pub mod requests;
+pub mod review_flags;
 pub mod routed;
 #[cfg(test)]
 pub(crate) mod schema_check;
@@ -103,8 +104,9 @@ pub use handlers::LocalRepositoryAuthorityBinding;
 pub use negative::NEGATIVE_KEY;
 pub use outside_graph::OUTSIDE_GRAPH_KEY;
 pub use server::{
-    present_for_client, process_daemon_message, process_message, run_stdio, run_stdio_daemon,
-    BoundRepo, McpServerConfig, RepoBinder, SessionAuthorityMode, WorkspaceBinding,
+    present_flagged_for_client, present_for_client, process_daemon_message, process_message,
+    run_stdio, run_stdio_daemon, BoundRepo, McpServerConfig, RepoBinder, SessionAuthorityMode,
+    WorkspaceBinding,
 };
 pub use session::{
     AssistantSession, CommitRefusal, CommitRefusalCode, CoordinationEnforcementMode,

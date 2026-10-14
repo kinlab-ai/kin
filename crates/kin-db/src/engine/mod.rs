@@ -6,6 +6,8 @@ pub mod incremental;
 mod index;
 mod traverse;
 
+pub use graph::is_semantic_relation;
+
 #[cfg(feature = "vector")]
 pub use graph::VectorSalvageStats;
 pub use graph::{

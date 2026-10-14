@@ -307,14 +307,13 @@ pub fn inspect_with_endpoint_entities_at(
     // Build the immutable history resolver from the exact snapshot carried by
     // this lease. The authority envelope is excluded from the query graph; it
     // remains owned by `lease` and cannot be confused with graph content.
+    // No root hash is computed for it: the constructor that took one ignored
+    // it, and computing it walked and digested every entity on every diff,
+    // which the review guide pays again each time the graph moves.
     let mut history_snapshot = lease.snapshot().clone();
     history_snapshot.repository_authority = None;
-    let expected_root_hash = kin_db::compute_graph_root_hash(&history_snapshot);
-    let history = kin_db::InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-        history_snapshot,
-        expected_root_hash,
-    )
-    .context("open immutable repository-v6 history for diff")?;
+    let history = kin_db::InMemoryGraph::from_snapshot_without_text_index(history_snapshot)
+        .context("open immutable repository-v6 history for diff")?;
 
     // Git-compatible default: HEAD is the committed workspace base and the
     // implicit right side is Kin's exact graph-owned workspace tree.
@@ -708,17 +707,26 @@ fn diff_entities(
     (deltas, withheld)
 }
 
+/// How the relationships between semantic nodes differ. A link a test run or
+/// a work item records (run proof, test coverage) belongs to that record, not
+/// to the work being compared, so it is never a relationship change here.
 fn diff_relations(
     base: &HashMap<RelationId, Relation>,
     head: &HashMap<RelationId, Relation>,
 ) -> Vec<RelationDelta> {
+    fn semantic(relation: Option<&Relation>) -> Option<&Relation> {
+        relation.filter(|relation| kin_db::is_semantic_relation(relation))
+    }
     base.keys()
         .copied()
         .chain(head.keys().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter_map(
-            |relation_id| match (base.get(&relation_id), head.get(&relation_id)) {
+        .filter_map(|relation_id| {
+            match (
+                semantic(base.get(&relation_id)),
+                semantic(head.get(&relation_id)),
+            ) {
                 (None, Some(new)) => Some(RelationDelta::Added { new: new.clone() }),
                 (Some(old), Some(new)) if old != new => Some(RelationDelta::Modified {
                     old: old.clone(),
@@ -726,8 +734,8 @@ fn diff_relations(
                 }),
                 (Some(old), None) => Some(RelationDelta::Removed { old: old.clone() }),
                 (Some(_), Some(_)) | (None, None) => None,
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -1981,7 +1989,17 @@ mod tests {
             evidence: Vec::new(),
         };
         let base_relations = HashMap::new();
-        let head_relations = HashMap::from([(relation_id, relation.clone())]);
+        // A test run's proof link to the entity is the run's record, and a
+        // diff of the work never lists it.
+        let proof_id = RelationId::new();
+        let proof = Relation {
+            id: proof_id,
+            kind: RelationKind::DerivedFrom,
+            src: GraphNodeId::VerificationRun(kin_model::VerificationRunId::new()),
+            dst: GraphNodeId::Entity(retained_id),
+            ..relation.clone()
+        };
+        let head_relations = HashMap::from([(relation_id, relation.clone()), (proof_id, proof)]);
 
         let (entity_deltas, _) = diff_entities(&base_entities, &head_entities);
         let relation_deltas = diff_relations(&base_relations, &head_relations);

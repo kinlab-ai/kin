@@ -15,8 +15,10 @@ mod application;
 pub(crate) use application::call as apply;
 use serde::{Deserialize, Serialize};
 
-const STORE_DIR: &str = "entity-drafts-v1";
-const LOCK_FILE: &str = "store.lock";
+// Both names are the history attach's to know as well: it waits while this
+// store holds a draft, and reads the store without this crate.
+const STORE_DIR: &str = kin_core::history_attach::ENTITY_DRAFTS_DIR;
+const LOCK_FILE: &str = kin_core::history_attach::ENTITY_DRAFTS_LOCK;
 const MAX_RECORD_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize)]

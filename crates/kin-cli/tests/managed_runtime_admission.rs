@@ -168,4 +168,20 @@ fn commands_with_their_own_requests_are_admitted_by_a_daemon_that_requires_runti
 
     // The intent commands built bare requests too.
     require_kin(&runtime, &repo, &["intent", "list"]);
+
+    // Single-entity restore also builds its own daemon request without a reply
+    // deadline.
+    let located = require_kin(&runtime, &repo, &["locate", "shipped", "--json"]);
+    let located: serde_json::Value =
+        serde_json::from_slice(&located.stdout).expect("kin locate emits JSON");
+    let shipped_id = located["entities"][0]["entity_id"]
+        .as_str()
+        .expect("locate returns the entity id of shipped")
+        .to_string();
+    fs::write(repo.join("src/lib.rs"), b"pub fn shipped() -> u8 { 3 }\n").expect("edit source");
+    require_kin(&runtime, &repo, &["checkout", "--entity", &shipped_id]);
+    assert_eq!(
+        fs::read_to_string(repo.join("src/lib.rs")).expect("read restored source"),
+        "pub fn shipped() -> u8 { 2 }\n"
+    );
 }

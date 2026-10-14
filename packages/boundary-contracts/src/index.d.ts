@@ -1076,6 +1076,23 @@ export interface RepoEntityEntry {
   summary?: string;
 }
 
+/**
+ * The entities others rely on that no test reaches, most relied-on first.
+ *
+ * An entity is listed when at least one other depends on it, it is defined in
+ * this repository, it is neither a test nor a module, and no test reaches it:
+ * neither a test entity nor a recorded test case's covered scope reaches it
+ * through the recorded dependency graph, including transitive dependencies.
+ * This is structural reach, not measured runtime coverage. It is the coverage
+ * `kin verify --missing` reads.
+ */
+export interface RepoUntested {
+  /** The most relied-on of them, as many as were asked for, each with its ranking numbers. */
+  entities: RepoEntityEntry[];
+  /** How many there are among the entities the request matched. */
+  total: number;
+}
+
 /** The entities of one repository's graph. */
 export interface RepoEntitiesResponse {
   repo_id: string;
@@ -1085,6 +1102,11 @@ export interface RepoEntitiesResponse {
    * request asked for one with limit or offset.
    */
   total?: number;
+  /**
+   * What others rely on that no test reaches. Present only when the request
+   * asked for it with untested, which names how many rows to list.
+   */
+  untested?: RepoUntested;
 }
 
 /**

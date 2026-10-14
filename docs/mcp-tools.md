@@ -563,6 +563,41 @@ admission has reached both read that way until their graph is loaded. The status
 also names the daemon that gave it under `_kin.answered_by`: its pid, repository
 root, route and uptime, the same fields `kin daemon status` prints for it.
 
+### A reviewer's flags
+
+A person reviewing uncommitted work in the local app can flag an entity with a note. The flag
+is held in the repository as an annotation on that entity, scoped to the version the reviewer
+was looking at, and it reaches the agent that made the change through the answers it already
+reads. New app flags name the exact reviewed entity source span by its digest, including
+comments and literal values. Changes elsewhere do not make that entity's flag stale. Older
+flags retain their original semantic revision guard:
+
+- Every answer that returns a flagged entity, from `locate`, `source`, `context`, `trace`,
+  `refs`, `impact`, `neighbors` or a write, carries `_kin.flags`: one object per open flag with
+  `entity` (the id to pass back), `name`, the reviewer's `note`, `by` and `at`. `changed_since`
+  is `true` once the entity is no longer the version that was flagged. At most five are
+  listed on one answer. `source_unavailable` means Kin could not confirm the current
+  recorded source, so it makes no claim that the source is unchanged.
+- `_kin.advice` says the same in a sentence, for example `A reviewer flagged
+  ServerReply.send: a second send must fail loudly. Address it before committing.` An answer
+  served as text carries every delivered flag's entity, author and full note as its first
+  lines. `ask` prompt answers and refusals carry the same notes.
+- `status` lists open flags in `_kin.flags`, oldest first, with up to 25 per page. Pass
+  `_kin.flags_next_cursor` back as `flags_cursor` to reach the next page, independently of
+  the enrichment `cursor`. Closing or replacing the cursor's flag makes it stale; restart
+  without `flags_cursor`. An agent asked to address what was flagged starts there.
+  With no flag open, no answer
+  carries `_kin.flags`, and every answer is served exactly as it would be without this
+  feature.
+
+The flags are written after the response budget, so an answer that carries them can exceed
+its `max_chars` by their size: at most five flags on an answer and 25 on `status`, each note
+at most 400 characters. A reviewer's note is never cut to fit.
+
+A flag is advisory. It refuses no call and no commit, and it stays open until the reviewer
+closes it: committing a flagged entity does not close it. The repository records each agent
+session an answer handed a flag to, which is how the reviewer sees that the note arrived.
+
 ---
 
 ## Configuring the server

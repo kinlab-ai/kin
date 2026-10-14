@@ -250,11 +250,12 @@ pub(crate) fn shell_config() -> kin_mcp::McpServerConfig {
 /// Answer one request through the server path `kin mcp start` answers it on.
 pub(crate) async fn send(request: &Value, config: &kin_mcp::McpServerConfig) -> Result<Answer> {
     let message = request.to_string();
-    let response = kin_mcp::process_daemon_message(&message, config)
-        .await
-        .context("the routed kin tool gave no answer")?;
+    // A shell is told what a reviewer flagged the way an agent's client is.
+    let (response, review_flags) =
+        kin_mcp::review_flags::collecting(kin_mcp::process_daemon_message(&message, config)).await;
+    let response = response.context("the routed kin tool gave no answer")?;
     // Answered in the words that profile's client reads.
-    let response = kin_mcp::present_for_client(response, &message, config);
+    let response = kin_mcp::present_flagged_for_client(response, &message, config, &review_flags);
     if let Some(error) = response.error {
         anyhow::bail!("the routed kin tool refused the call: {}", error.message);
     }

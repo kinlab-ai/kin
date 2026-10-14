@@ -119,3 +119,17 @@ KIN_FIR3064_REPO
 # Read only by that cfg(test) helper; no product runtime reads it as an
 # operator control.
 KIN_TEST_BUILT_IN_EMBEDDINGS_CHILD
+
+# ---- kin-db freezing-ref kill test: child-process handshake ----------------
+# `a_killed_freezing_ref_commit_leaves_the_old_ref_or_the_new_one` in kin-db's
+# storage/repository.rs re-runs its own test binary as a child and passes the
+# store root and the kill point through these two names. Only that `#[test]`
+# reads them, so no kin process an operator runs ever does.
+KIN_DB_FREEZING_FRAME_KILL_ROOT
+KIN_DB_FREEZING_FRAME_KILL_POINT
+
+# kin-db storage/repository.rs: the ignored collaboration_commit_measurement
+# test times one collaboration-only and one change-admitting commit on a scratch
+# copy of a real store that these two name. Only that test reads them.
+KIN_DB_MEASURE_STORE
+KIN_DB_MEASURE_REPO

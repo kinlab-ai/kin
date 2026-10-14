@@ -82,8 +82,9 @@ files = [
 ]
 
 [[excluded]]
-reason = "records people, tests and reviews add (work items and annotations, test cases and runs, actors and approvals, reviews, contracts, specs, test evidence); derivation creates none, leaves a change's risk_summary, spec_link and evidence empty, and never builds the Test, Work or VerificationRun node variants whose ids are defined here"
+reason = "records people, tests, reviews and agents add (work items and annotations, test cases and runs, actors and approvals, what an agent session did, reviews, contracts, specs, test evidence); derivation creates none, leaves a change's risk_summary, spec_link and evidence empty, and never builds the Test, Work or VerificationRun node variants whose ids are defined here"
 files = [
+    "src/agent_session.rs",
     "src/contract.rs",
     "src/evidence.rs",
     "src/provenance.rs",
@@ -188,13 +189,12 @@ items = [
 
 [[excluded_items]]
 file = "src/repository.rs"
-reason = "predicates merge, session and status code ask about a workspace's state; they write nothing derivation reads"
+# The uncommitted-work and enrichment-only predicates remain graph inputs:
+# exact Git admission reaches them before constructing stored descendants.
+reason = "replicated-root comparison and dirty snapshot predicates used by merge, session and status code; exact Git admission does not call these remaining report predicates"
 items = [
     "impl RootBundle / fn has_same_replicated_truth",
-    "impl WorkspaceSemanticOverlay / fn is_language_server_enrichment_only",
-    "impl WorkspaceSemanticOverlay / fn is_language_server_enrichment_only_at",
     "impl WorkspaceSnapshotBinding / fn is_dirty",
-    "impl WorkspaceState / fn holds_uncommitted_work",
     "impl WorkspaceState / fn is_dirty",
 ]
 

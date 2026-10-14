@@ -454,6 +454,10 @@ enum Command {
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
+        /// Commit only this entity's uncommitted change, leaving every other
+        /// change uncommitted (repeat for more entities)
+        #[arg(long = "entity", value_name = "ENTITY_ID", conflicts_with = "amend")]
+        entities: Vec<String>,
     },
     /// Show the immutable repository-v6 change log
     Log {
@@ -1365,6 +1369,12 @@ enum Command {
         /// Change ID (defaults to current branch head)
         #[arg(long)]
         change: Option<String>,
+        /// Restore one entity's source, as an uncommitted edit, instead of a path
+        #[arg(long, value_name = "ENTITY_ID", conflicts_with_all = ["path", "path_hex"])]
+        entity: Option<String>,
+        /// Refuse unless the entity is exactly as last read: source:<body_hash> from a review, or absent
+        #[arg(long, value_name = "FINGERPRINT", requires = "entity")]
+        expected: Option<String>,
     },
     /// Verify test coverage for entities
     Verify {
@@ -1569,6 +1579,8 @@ enum Command {
         /// Print the daemon's agents payload as JSON
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<AgentsAction>,
     },
     /// Manage assistant adapters
     Assistant {
@@ -2880,6 +2892,21 @@ enum ReviewAction {
         /// Serve the page without opening a browser
         #[arg(long, default_value_t = false)]
         no_browser: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentsAction {
+    /// Answer an agent client's edit hook: read the hook's JSON on stdin and
+    /// tell this repository's daemon which session made the edit
+    #[command(name = "record-edit", hide = true)]
+    RecordEdit {
+        /// The client whose hook this is
+        #[arg(long, value_parser = commands::agent_edits::EDIT_HOOK_CLIENTS)]
+        client: String,
+        /// Wait for the daemon and print what became of the report
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -4301,9 +4328,10 @@ fn run() -> Result<()> {
                     message,
                     quiet,
                     amend,
+                    entities,
                 } => {
                     commands::capabilities::require_ready("commit")?;
-                    commands::commit::run(message, quiet, amend).await
+                    commands::commit::run(message, quiet, amend, entities).await
                 }
                 Command::Log { count, json } => commands::log::run(count, json).await,
                 Command::Branch { action } => match action {
@@ -5329,9 +5357,16 @@ fn run() -> Result<()> {
                     path,
                     path_hex,
                     change,
+                    entity,
+                    expected,
                 } => {
                     commands::capabilities::require_ready("checkout")?;
-                    commands::checkout::run(path, path_hex, change).await
+                    match entity {
+                        Some(entity) => {
+                            commands::entity_work::run_restore(entity, change, expected).await
+                        }
+                        None => commands::checkout::run(path, path_hex, change).await,
+                    }
                 }
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
@@ -5579,7 +5614,20 @@ fn run() -> Result<()> {
                     TrafficAction::Show { scope } => commands::traffic::run(scope).await,
                     TrafficAction::Sessions => commands::traffic::sessions().await,
                 },
-                Command::Agents { json } => commands::agents::run(json).await,
+                Command::Agents {
+                    action: Some(AgentsAction::RecordEdit { client, wait }),
+                    ..
+                } => {
+                    let mut raw = String::new();
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw);
+                    if let Some(printed) =
+                        commands::agent_edits::record_edit(&client, &raw, wait).await
+                    {
+                        println!("{printed}");
+                    }
+                    Ok(())
+                }
+                Command::Agents { json, action: None } => commands::agents::run(json).await,
                 Command::Assistant { action } => match action {
                     AssistantAction::Install { assistant } => {
                         commands::assistant::install(assistant).await
@@ -8522,6 +8570,42 @@ mod tests {
                     ..
                 }
             ));
+        });
+    }
+
+    /// `--entity` repeats, never rides with an amend, and makes a checkout
+    /// restore one entity instead of a path.
+    #[test]
+    fn commit_and_checkout_take_entities() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin", "commit", "-m", "keep two", "--entity", "a", "--entity", "b",
+            ])
+            .unwrap();
+            assert!(
+                matches!(&cli.command, Command::Commit { entities, amend: false, .. } if entities == &["a", "b"])
+            );
+            assert!(
+                Cli::try_parse_from(["kin", "commit", "--amend", "--entity", "a"]).is_err(),
+                "an amend replaces a whole change and chooses no entities"
+            );
+            let cli = Cli::try_parse_from([
+                "kin",
+                "checkout",
+                "--entity",
+                "a",
+                "--change",
+                "c",
+                "--expected",
+                "f",
+            ])
+            .unwrap();
+            assert!(matches!(
+                &cli.command,
+                Command::Checkout { entity: Some(entity), expected: Some(_), path: None, .. } if entity == "a"
+            ));
+            assert!(Cli::try_parse_from(["kin", "checkout", "src", "--entity", "a"]).is_err());
+            assert!(Cli::try_parse_from(["kin", "checkout", "--expected", "f"]).is_err());
         });
     }
 

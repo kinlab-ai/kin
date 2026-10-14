@@ -60,7 +60,8 @@
         "preserve all unsupported-language and non-code artifacts, modes, symlinks, gitlinks, and byte-exact paths",
         "publish the target ref with generation and root-bundle compare-and-swap and no raw-filesystem rebuild",
         "explicit --amend replaces the exact selected head with full working state, retaining the original immutable change, author, message unless overridden, and every ordered parent",
-        "refuse stale amend selection before admission, unborn workspaces, open merges, and conflicting entity leases; detached amend advances only its workspace"
+        "refuse stale amend selection before admission, unborn workspaces, open merges, and conflicting entity leases; detached amend advances only its workspace",
+        "--entity records only the chosen entities' uncommitted changes in a change planned from the head, moves the workspace base without moving its tree or writing the working copy, proves every derived entity before publication, and refuses work it cannot separate exactly"
       ],
       "evidence_tests": [
         "kin_daemon::repository_commit::tests::native_commit_atomically_projects_exact_non_code_tree_and_ref",
@@ -79,9 +80,12 @@
         "kin_daemon::repository_commit::tests::amend_refuses_unborn_stale_selection_and_stale_publication",
         "kin_daemon::api::tests::commit_amend_rejects_stale_head_before_admitting_pending_files",
         "kin_daemon::api::tests::commit_amend_cannot_drop_a_leased_entity_by_reverting_its_old_change",
-        "kin_daemon::api::tests::commit_amend_during_open_merge_refuses_before_admission"
+        "kin_daemon::api::tests::commit_amend_during_open_merge_refuses_before_admission",
+        "crates/kin-daemon/src/api/tests/entity_keep.rs::entity_keep_commits_only_the_chosen_entities_and_leaves_the_rest_exactly",
+        "crates/kin-daemon/src/api/tests/entity_keep.rs::entity_keep_keeps_one_member_of_a_container_and_new_content_whole",
+        "crates/kin-daemon/src/api/tests/entity_keep.rs::entity_keep_refuses_what_it_cannot_commit_and_records_nothing"
       ],
-      "note": "Commit consumes one complete host observation that carries the scanner's completion proof into publication, binds the observed manifest to the authority roots and prior workspace tree it was planned against, and refuses rather than replans when authority moved. An unconfirmed mass deletion refuses the whole observation, so no addition, modification, or derived admission-policy state published beside it. Explicit amend includes the full working state; path and hunk selection remain unavailable."
+      "note": "Commit consumes one complete host observation that carries the scanner's completion proof into publication, binds the observed manifest to the authority roots and prior workspace tree it was planned against, and refuses rather than replans when authority moved. An unconfirmed mass deletion refuses the whole observation, so no addition, modification, or derived admission-policy state published beside it. Explicit amend includes the full working state. Entity selection records only the chosen entities and leaves every other change uncommitted in an unwritten working copy; path and hunk selection remain unavailable."
     },
     {
       "command": "log",
@@ -281,7 +285,8 @@
         "verify complete selected tree, semantic graph, and source CAS closure before one projection and authority transaction",
         "preserve every unsupported-language and non-code artifact, executable bit, symlink, gitlink, opaque binary, and host-unrepresentable byte path in graph authority while materializing only host-representable entries",
         "reject every session-scoped request before mutation and preserve independently dirty unselected paths",
-        "replay the exact caller-stable operation across same-daemon and restart crash gaps without advancing authority twice"
+        "replay the exact caller-stable operation across same-daemon and restart crash gaps without advancing authority twice",
+        "--entity restores one entity's source from the head or a selected change as an uncommitted edit through the exact workspace transition, keeps its identity, refuses a stale expected fingerprint, and replays the caller-stable operation without writing twice"
       ],
       "evidence_tests": [
         "kin_daemon::api::tests::command_checkout_projects_universal_selected_tree_and_replays_exactly",
@@ -292,7 +297,8 @@
         "kin_daemon::api::tests::command_checkout_refuses_replaced_repository_namespace_without_mutation",
         "kin_daemon::api::tests::command_checkout_refuses_detached_repository_namespace_without_mutation",
         "kin_core::repository_authority::tests::retained_binding_rejects_identical_repository_namespace_replacement",
-        "kin_core::repository_authority::tests::retained_binding_rejects_detached_repository_namespace"
+        "kin_core::repository_authority::tests::retained_binding_rejects_detached_repository_namespace",
+        "crates/kin-daemon/src/api/tests/entity_keep.rs::entity_restore_undoes_one_entity_and_round_trips"
       ],
       "note": "Checkout binds only the repository and workspace identity this daemon pinned at startup, revalidates the retained per-repository storage namespace before planning, and answers a namespace replaced at the same ambient path, detached, or absent from the pinned store with a typed conflict instead of mismatched truth. Exact projection, universal artifact preservation, and caller-stable replay are proven across same-daemon and restart gaps. The retained-identity refusals are proven on Unix; the Windows file-identity path is implemented but not covered by CI."
     },

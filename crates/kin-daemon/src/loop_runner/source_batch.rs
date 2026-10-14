@@ -421,6 +421,11 @@ impl PreparedLiveBatch {
         self.prepared.snapshot()
     }
 
+    /// The units whose complete parse this batch carries.
+    pub(super) fn handled(&self) -> &BTreeSet<RepoPath> {
+        &self.handled
+    }
+
     pub(super) fn finish(
         self,
         state: &DaemonState,

@@ -309,6 +309,11 @@ pub(crate) fn search_names<G: GraphStore>(
             if narrowed { &name_matched } else { &entities },
         );
         crate::declaration_coverage::place_residue(&mut reading, store);
+        if let Some(within) = &within {
+            crate::declaration_coverage::scope_residue(&mut reading, |module| {
+                within.lists_module(module)
+            });
+        }
         let held = crate::handlers::common::HeldSourceAuthority::new(store, repository_authority);
         crate::declaration_coverage::name_reexports(&mut reading, store, &|module| {
             crate::handlers::common::module_surface_text(&held, module, source_scope)
@@ -11483,7 +11488,10 @@ missing dependencies remain explicit. Follow `enrichment.page.next_cursor` with 
 dependencies; any observation change or restart rejects continuation. `page.complete` means \
 all requested metadata rows fit this page, not that enrichment completed. Cached responses \
 carry `enrichment.current=false`. This tool requires the Kin daemon; it does not invent \
-an offline approximation.";
+an offline approximation. The answer also lists, under `_kin.flags`, open flags a \
+reviewer set on entities in this repository, each with the reviewer's note. Follow \
+`_kin.flags_next_cursor` as `flags_cursor` for the next 25 flags, separately from the \
+enrichment cursor. Closing or replacing the cursor's flag requires restarting the listing.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphStatusObservation {

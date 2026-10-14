@@ -1512,6 +1512,14 @@ pub(crate) fn first_difference(
 }
 
 fn same_changes(left: &super::ChangeMap, right: &super::ChangeMap) -> Result<bool, KinDbError> {
+    // Two maps over the same base and the same overlay are one history, not
+    // two equal ones: a clone shares both, and admitting a change detaches the
+    // overlay. A frame that carries no change reconstructs exactly such a
+    // clone, so the proof for it reads no record. Decoding every change of
+    // both maps to conclude that was a whole-history read per ref write.
+    if left.shares_storage(right) {
+        return Ok(true);
+    }
     if left.len() != right.len() {
         return Ok(false);
     }

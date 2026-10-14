@@ -46,6 +46,12 @@ pub struct DaemonConfig {
     /// flush. Off by default: the serial path is deterministic and is what the
     /// proof profile relies on. Enabled only under the throughput profile.
     pub embed_pipeline_overlap: bool,
+    /// Whether this daemon hands its store over, at a quiet point, when a
+    /// worker has staged the store's complete history: it stops serving and a
+    /// successor attaches the history as it starts. Off by default, because a
+    /// daemon that leaves needs someone to start the next one; the process
+    /// entrypoint turns it on for a local store and starts that successor.
+    pub history_handoff: bool,
 }
 
 impl Default for DaemonConfig {
@@ -59,9 +65,13 @@ impl Default for DaemonConfig {
             lsp_enabled: true,
             idle_timeout: None,
             embed_pipeline_overlap: false,
+            history_handoff: false,
         }
     }
 }
+
+/// How long a stop waits to write what agents did that is still held.
+const AGENT_RECORDS_STOP_BUDGET: Duration = Duration::from_secs(10);
 
 /// How often the session sweeper looks for sessions whose client is gone.
 ///
@@ -10676,7 +10686,7 @@ pub async fn run_with_authority_on(
 
     // This registration borrows singleton authority until normal run teardown.
     // Any unresolved publication stops synchronously before that lock can drop.
-    let _prepared_runtime = state
+    let prepared_runtime = state
         .prepared_publication
         .register(&daemon_lock, state.layout.root())?;
 
@@ -10803,6 +10813,9 @@ pub async fn run_with_authority_on(
     // A path that must stop this daemon serving sends on the same channel a
     // cooperative stop request does.
     let _ = state.stop_trigger.set(cancel_tx.clone());
+    if config.history_handoff {
+        crate::history_schedule::spawn_handoff_watch(Arc::clone(&state), cancel_rx.clone());
+    }
     // A planned sweep supplies readiness from the actual servers it starts.
     // A warm no-op sweep probes skipped languages once at its tail. A sweep
     // refused for memory leaves readiness to the sweep that does run, which is
@@ -11188,6 +11201,24 @@ pub async fn run_with_authority_on(
                     error!(error = %e, "session sweeper error");
                 }
             }
+        }
+    });
+
+    // Write what agents did into repository authority as their sessions end
+    // or go quiet. Not drained: the stop writes what is still held itself,
+    // before the daemon stops taking writes.
+    let records_state = Arc::clone(&state);
+    let mut records_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(crate::agent_authorship::SETTLE_TICK) => {}
+                _ = records_cancel.changed() => break,
+            }
+            if *records_cancel.borrow() {
+                break;
+            }
+            crate::agent_authorship::settle(&records_state, false).await;
         }
     });
 
@@ -12721,6 +12752,15 @@ pub async fn run_with_authority_on(
     // daemon cannot start while this process is still draining persistent state.
     crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
 
+    drop(prepared_runtime);
+    if state.handing_off_for_history() {
+        // The successor replaces this store's contents as it starts. A thread
+        // of this process that outlives the runtime's teardown must not be
+        // able to write into what it installs, so the authority is not
+        // released here: it ends with the process.
+        crate::history_schedule::keep_authority_until_exit(daemon_lock);
+    }
+
     result
 }
 
@@ -12826,6 +12866,13 @@ async fn select_with_signals(
         }
     };
 
+    // What agents did that is still held is written while the daemon still
+    // takes writes, so a session that ended moments ago is not lost with it.
+    let _ = tokio::time::timeout(
+        AGENT_RECORDS_STOP_BUDGET,
+        crate::agent_authorship::settle(state, true),
+    )
+    .await;
     state.prepared_publication.shutdown();
 
     // The escalation watchdog's grace began when the stop was signalled, so a
@@ -13194,6 +13241,13 @@ async fn select_with_signals(
         }
     };
 
+    // What agents did that is still held is written while the daemon still
+    // takes writes, so a session that ended moments ago is not lost with it.
+    let _ = tokio::time::timeout(
+        AGENT_RECORDS_STOP_BUDGET,
+        crate::agent_authorship::settle(state, true),
+    )
+    .await;
     state.prepared_publication.shutdown();
 
     // The escalation watchdog's grace began when the stop was signalled, so a

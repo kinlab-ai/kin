@@ -96,6 +96,11 @@ pub fn build_overview_response(
                 relation_ids.insert(rel.id);
             }
         }
+        // Whether every call site the store holds is known and settled, read
+        // the way the store-wide call-site status reads it. While it is not,
+        // a count of what calls or relies on an entity can miss callers, so a
+        // reader shows such counts as lower bounds.
+        let call_sites_settled = kin_mcp::call_sites::tally_callers(graph, &entities).is_settled();
 
         return Ok(OverviewResponse {
             lines: vec![serde_json::to_string(&serde_json::json!({
@@ -104,6 +109,7 @@ pub fn build_overview_response(
                 "files": unique_files.len(),
                 "kinds": kinds,
                 "languages": languages,
+                "call_sites_settled": call_sites_settled,
             }))?],
         });
     }
@@ -376,6 +382,48 @@ mod tests {
             answer["languages"][LanguageId::Python.to_string()],
             2,
             "{answer}"
+        );
+    }
+
+    /// The machine answer says whether every call site the store holds is
+    /// settled, so a reader can tell an exact count of what relies on an
+    /// entity from one that can miss callers. An entity with no span holds no
+    /// call site; a spanned one no ledger describes is a caller whose sites
+    /// are not known yet.
+    #[test]
+    fn the_json_answer_says_whether_the_stores_call_sites_are_settled() {
+        let settled_of = |graph: &InMemoryGraph| {
+            let response = build_overview_response(
+                "probe-repo",
+                graph,
+                &OverviewRequest {
+                    json: true,
+                    compact: true,
+                },
+            )
+            .expect("build overview");
+            let answer: serde_json::Value =
+                serde_json::from_str(&response.lines[0]).expect("one JSON line");
+            answer["call_sites_settled"].clone()
+        };
+
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&overview_entity("spanless", "src/probe.py", None))
+            .expect("upsert entity");
+        assert_eq!(
+            settled_of(&graph),
+            serde_json::json!(true),
+            "nothing in the store holds a call site Kin has not read"
+        );
+
+        graph
+            .upsert_entity(&overview_entity("unread", "src/probe.py", Some(3)))
+            .expect("upsert entity");
+        assert_eq!(
+            settled_of(&graph),
+            serde_json::json!(false),
+            "a caller with no ledger leaves the store's call sites unsettled"
         );
     }
 }

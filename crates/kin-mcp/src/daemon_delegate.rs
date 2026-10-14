@@ -1961,11 +1961,27 @@ impl DaemonCallSeam for RealDaemonSeam {
         let resp = send_admitted_daemon_request("MCP tool call", base, request, patience).await?;
         note_session_status(&resp, args);
         if !resp.status().is_success() {
-            return Err(daemon_http_error("MCP tool call", resp).await);
+            return Err(daemon_http_error_waiting_out(
+                "MCP tool call",
+                resp,
+                crate::routed::is_read_only(name),
+            )
+            .await);
         }
-        let result = resp.json::<ToolCallResult>().await.map_err(|e| {
+        let parse_failed = |e: &dyn std::fmt::Display| {
             DaemonCallError::DaemonError(format!("daemon MCP tool call response parse failed: {e}"))
-        })?;
+        };
+        let mut answered = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| parse_failed(&e))?;
+        // The open review flags this answer reaches travel beside it, and are
+        // written into the reply the agent reads once every budget has run.
+        if let Some(reached) = crate::review_flags::take(&mut answered) {
+            crate::review_flags::note_reached(reached);
+        }
+        let result =
+            serde_json::from_value::<ToolCallResult>(answered).map_err(|e| parse_failed(&e))?;
         Ok(Some(result))
     }
 }
@@ -2098,6 +2114,15 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 
     let kin_dir =
         discover_kin_dir().ok_or_else(|| "MCP revival: cannot find .kin directory".to_string())?;
+    // Another process may hold the repository already: a daemon starting in
+    // place of one that stopped, such as one taking over a store whose full
+    // history it attaches as it starts, or one a sibling client started. A
+    // daemon spawned now could only lose to it and exit, and the caller would
+    // be told to restart a session that was about to work. Wait for that
+    // daemon instead, and spawn only if it goes away without serving.
+    if let Some(started) = await_daemon_started_elsewhere(&kin_dir).await? {
+        return Ok(started);
+    }
     let working_dir = kin_core::layout::working_dir_of_store(&kin_dir)
         .ok_or_else(|| "MCP revival: invalid .kin layout (no parent directory)".to_string())?;
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
@@ -2144,6 +2169,91 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     // the startup failures below leave a daemon running on purpose too.
     kin_daemon_spawn::adopt_watched_daemon_child(child, watch);
     revived
+}
+
+/// Wait for a daemon another process holds the repository for, and answer its
+/// base URL once it can serve, or `None` when no other process holds the
+/// repository, or it let go without serving, so a revival should start one.
+///
+/// Patience is the same a revival grants the daemon it starts, priced off what
+/// this store's last open cost, because the daemon being waited for is doing
+/// exactly that work. Running out of it is an error that says a daemon is
+/// still starting, never that one exited.
+async fn await_daemon_started_elsewhere(
+    kin_dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !kin_daemon_spawn::repository_runtime_authority_is_held(kin_dir)
+        .map_err(|error| format!("MCP revival: inspect repository runtime authority: {error}"))?
+    {
+        return Ok(None);
+    }
+    let last_open_ms = kin_daemon_spawn::read_boot_cost(kin_dir).map(|cost| cost.total_ms);
+    let patience = kin_daemon_spawn::daemon_startup_patience(
+        last_open_ms,
+        kin_daemon_spawn::daemon_startup_patience_override(),
+    );
+    await_daemon_started_elsewhere_within(
+        kin_dir,
+        patience,
+        last_open_ms.map(Duration::from_millis),
+    )
+    .await
+}
+
+async fn await_daemon_started_elsewhere_within(
+    kin_dir: &std::path::Path,
+    patience: Duration,
+    last_open: Option<Duration>,
+) -> Result<Option<String>, String> {
+    let probe = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
+    let started = tokio::time::Instant::now();
+    let deadline = started + patience;
+    let mut pacer = ProgressPacer::default();
+    tracing::info!("MCP revival: another process holds this repository; waiting for its daemon");
+    loop {
+        if pacer.due() {
+            report_call_progress(|| {
+                format!(
+                    "waiting for the repository daemon that is starting: {}",
+                    crate::startup_binding::how_far(started.elapsed(), last_open)
+                )
+            });
+        }
+        if let Some(port) = kin_daemon_spawn::read_reported_port(kin_dir) {
+            if kin_daemon_spawn::recorded_owner_is_alive(kin_dir) {
+                let base = format!("http://127.0.0.1:{port}");
+                if poll_revival_readiness(&probe, &base).await == ReadinessPoll::Ready {
+                    await_revived_catch_up(&probe, &base, deadline).await;
+                    if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+                        *guard = Some(base.clone());
+                    }
+                    tracing::info!(url = %base, "MCP revival: the daemon that was starting is ready");
+                    return Ok(Some(base));
+                }
+            }
+        }
+        // A daemon killed after publishing can leave its port behind. Its
+        // authority, rather than the presence of that record, decides whether
+        // there is still a holder to wait for.
+        if !kin_daemon_spawn::repository_runtime_authority_is_held(kin_dir).map_err(|error| {
+            format!("MCP revival: inspect repository runtime authority: {error}")
+        })? {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MCP revival: the repository daemon another process started is still starting \
+                 after {}s; it holds the repository, so no second daemon was started. Retry the \
+                 call",
+                patience.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// The route a revival polls to decide the daemon it started can serve a call.
@@ -2914,7 +3024,25 @@ const MAX_DAEMON_ERROR_BODY_BYTES: usize = 8 * 1024;
 ///
 /// Reading by chunks enforces the bound while the response is in flight rather
 /// than collecting an arbitrarily large body and truncating only afterward.
-async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> DaemonCallError {
+async fn daemon_http_error(operation: &str, response: reqwest::Response) -> DaemonCallError {
+    daemon_http_error_waiting_out(operation, response, false).await
+}
+
+/// [`daemon_http_error`] for a call that is safe to send again, which may
+/// also wait out the daemon publishing a prepared repository state.
+///
+/// While the daemon swaps in a prepared publication, such as history it
+/// staged while it served, it refuses a request that overlaps the swap with
+/// `prepared_publication_unavailable` and asks for the same operation again.
+/// A read answers the same question against the published state, so it is
+/// waited out like a daemon that is still opening. A write is not: the
+/// refusal can arrive after it ran, so its caller must read the outcome
+/// rather than send it twice.
+async fn daemon_http_error_waiting_out(
+    operation: &str,
+    mut response: reqwest::Response,
+    publication_retryable: bool,
+) -> DaemonCallError {
     let status = response.status();
     let mut body = Vec::with_capacity(MAX_DAEMON_ERROR_BODY_BYTES);
     let mut truncated = false;
@@ -2956,7 +3084,9 @@ async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> 
     let detail = String::from_utf8_lossy(&body);
     let detail = detail.trim();
     let truncation = if truncated { " … [truncated]" } else { "" };
-    if is_warming_refusal(status, detail) {
+    if is_warming_refusal(status, detail)
+        || (publication_retryable && is_publication_refusal(status, detail))
+    {
         return DaemonCallError::Warming(format!("HTTP {status}: {detail}{truncation}"));
     }
     if detail.is_empty() {
@@ -2966,6 +3096,16 @@ async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> 
             "daemon {operation} failed: HTTP {status}: {detail}{truncation}"
         ))
     }
+}
+
+/// Whether a refusal is the daemon's serving fence asking for the same
+/// operation again once a prepared publication has landed.
+fn is_publication_refusal(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+            value.get("error").and_then(serde_json::Value::as_str)
+                == Some("prepared_publication_unavailable")
+        })
 }
 
 /// Whether a refusal is the daemon reporting that it is still opening its
@@ -3052,6 +3192,7 @@ pub async fn forward_tool_call(
             let cwd = required_string(arguments, "cwd")?;
             let transport = optional_string(arguments, "transport").unwrap_or("mcp");
             let pid = optional_u32(arguments, "pid");
+            let watch_pid = optional_u32(arguments, "watch_pid");
             let capabilities = parse_capabilities(arguments);
             forward_session_start_with_id(
                 optional_string(arguments, "session_id"),
@@ -3059,6 +3200,7 @@ pub async fn forward_tool_call(
                 &client_name,
                 transport,
                 pid,
+                watch_pid,
                 &cwd,
                 capabilities.as_ref(),
             )
@@ -3784,18 +3926,31 @@ pub async fn forward_session_start(
     cwd: &str,
     capabilities: Option<&SessionCapabilities>,
 ) -> Result<Option<serde_json::Value>, String> {
-    forward_session_start_with_id(None, vendor, client_name, transport, pid, cwd, capabilities)
-        .await
+    forward_session_start_with_id(
+        None,
+        vendor,
+        client_name,
+        transport,
+        pid,
+        None,
+        cwd,
+        capabilities,
+    )
+    .await
 }
 
 /// Register the caller's original UUID through the daemon's authenticated
 /// session API. This grants no ownership beyond the daemon's bearer identity.
+///
+/// `watch_pid` names a process whose exit ends a session that names no `pid`,
+/// without keeping it alive while it runs.
 pub async fn forward_session_start_with_id(
     session_id: Option<&str>,
     vendor: &str,
     client_name: &str,
     transport: &str,
     pid: Option<u32>,
+    watch_pid: Option<u32>,
     cwd: &str,
     capabilities: Option<&SessionCapabilities>,
 ) -> Result<Option<serde_json::Value>, String> {
@@ -3818,6 +3973,8 @@ pub async fn forward_session_start_with_id(
     }
     if let Some(p) = pid {
         body["pid"] = serde_json::json!(p);
+    } else if let Some(watched) = watch_pid {
+        body["watch_pid"] = serde_json::json!(watched);
     }
     let value = daemon_json_request("session start", &base, |client, base| {
         with_auth(client.post(format!("{base}/session")).json(&body))
@@ -4954,6 +5111,111 @@ mod tests {
         }
     }
 
+    /// A revival that finds the repository held by a daemon another process
+    /// is starting waits for that daemon and uses it, instead of starting one
+    /// that could only lose the repository to it and exit. A holder that lets
+    /// go without serving leaves the revival to start one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revival_waits_for_the_daemon_another_process_is_starting() {
+        let store = tempfile::tempdir().unwrap();
+        let kin_dir = store.path().join(".kin");
+        std::fs::create_dir(&kin_dir).unwrap();
+
+        // Nobody holds the repository: start one.
+        assert_eq!(
+            await_daemon_started_elsewhere_within(&kin_dir, Duration::from_secs(5), None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Held, and still opening: nothing published yet.
+        let held = kin_daemon_spawn::acquire_repository_runtime_authority(&kin_dir, "starting")
+            .unwrap()
+            .expect("the test holds the repository");
+        let catching_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let checked_catch_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (base, server) = stub_daemon_raw_with_body(200, "OK", {
+            let catching_up = std::sync::Arc::clone(&catching_up);
+            let checked_catch_up = std::sync::Arc::clone(&checked_catch_up);
+            move |request| {
+                if request.starts_with(b"GET /health ") {
+                    let owes = catching_up.load(std::sync::atomic::Ordering::SeqCst);
+                    checked_catch_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if owes {
+                        return r#"{"reconcile":{"changed_path_count":1,"admission_failure_streak":0}}"#;
+                    }
+                }
+                "{}"
+            }
+        })
+        .await;
+        let port = base.rsplit(':').next().unwrap().to_string();
+        let waiting = tokio::spawn({
+            let kin_dir = kin_dir.clone();
+            async move {
+                await_daemon_started_elsewhere_within(&kin_dir, Duration::from_secs(30), None).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the revival gave up on a starting daemon"
+        );
+        // It publishes and serves.
+        std::fs::write(kin_dir.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(kin_dir.join("daemon.port"), &port).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !checked_catch_up.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    !waiting.is_finished(),
+                    "the revival skipped the catch-up check"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the revival checks what the ready daemon still owes");
+        assert!(
+            !waiting.is_finished(),
+            "the revival skipped admission of changes made during the handover"
+        );
+        catching_up.store(false, std::sync::atomic::Ordering::SeqCst);
+        let found = tokio::time::timeout(Duration::from_secs(20), waiting)
+            .await
+            .expect("the revival waits only until the daemon serves")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.as_deref(), Some(base.as_str()));
+        server.abort();
+        drop(held);
+
+        // Held, then let go after publishing an endpoint that no longer
+        // answers: start one even though the stale records remain.
+        let held = kin_daemon_spawn::acquire_repository_runtime_authority(&kin_dir, "dying")
+            .unwrap()
+            .expect("the test holds the repository");
+        let waiting = tokio::spawn({
+            let kin_dir = kin_dir.clone();
+            async move {
+                await_daemon_started_elsewhere_within(&kin_dir, Duration::from_secs(30), None).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(20), waiting)
+                .await
+                .expect("a holder that lets go ends the wait")
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+            *guard = None;
+        }
+    }
+
     #[tokio::test]
     async fn a_refusing_endpoint_keeps_its_port_reserved() {
         let endpoint = RefusingEndpoint::new();
@@ -4994,14 +5256,25 @@ mod tests {
         reason: &'static str,
         body: &'static str,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        stub_daemon_raw_with_body(status, reason, move |_| body).await
+    }
+
+    async fn stub_daemon_raw_with_body(
+        status: u16,
+        reason: &'static str,
+        body: impl Fn(&[u8]) -> &'static str + Send + Sync + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
         let handle = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                let body = std::sync::Arc::clone(&body);
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = [0u8; 8192];
-                    let _ = socket.read(&mut buf).await;
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let body = body(&buf[..read]);
                     let response = format!(
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -8175,6 +8448,29 @@ mod tests {
                 "{why}: HTTP {status} {body}"
             );
         }
+    }
+
+    /// The serving fence's refusal during a publication is recognised by its
+    /// own marker and status, and nothing else reads as it.
+    #[test]
+    fn the_publication_guard_recognises_only_the_serving_fence() {
+        let fence = r#"{"error":"prepared_publication_unavailable","reason":"prepared publication unavailable: ObservationChanged","live":true,"semantic_ready":false}"#;
+        assert!(is_publication_refusal(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            fence
+        ));
+        assert!(!is_publication_refusal(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            fence
+        ));
+        assert!(!is_publication_refusal(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"embedder_unavailable"}"#
+        ));
+        assert!(!is_warming_refusal(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            fence
+        ));
     }
 
     /// A request that is sent and not answered must not classify as the same

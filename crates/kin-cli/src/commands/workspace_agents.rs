@@ -10,9 +10,12 @@
 //! on disk. A call is the tool the agent used and the entities it was about,
 //! never the words it asked with, which the daemon does not keep.
 //!
-//! The daemon forgets a session when it ends. This server remembers the
-//! sessions it has seen while it runs, with their last call log, so the page
-//! can still show what an agent did after it disconnected.
+//! An agent that has gone is read from what the daemon keeps past a session's
+//! end, `/agents/ended`: the sessions that ended inside the window it keeps
+//! them for, with their calls, and the ones it knows only by what they wrote.
+//! That record is repository authority, so it is there after this server or
+//! the daemon restarts. This server also remembers the sessions it has seen while it
+//! runs, which covers a daemon that keeps nothing past a session's end.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
@@ -40,11 +43,19 @@ const READ_TIMEOUT: Duration = Duration::from_secs(8);
 const NAME_TIMEOUT: Duration = Duration::from_secs(4);
 const NAME_CONCURRENCY: usize = 6;
 /// The most entities one answer looks up names for. The rest are counted.
-const NAMES_PER_READ: usize = 48;
+const NAMES_PER_READ: usize = 96;
 const NAMES_KEPT: usize = 4096;
-/// The most agent sessions this server remembers, live and ended.
-const AGENTS_KEPT: usize = 24;
-const EARLIER_SHOWN: usize = 8;
+/// The most agent sessions this server remembers, live and ended. Above the
+/// ended sessions the daemon keeps, with room for the live ones.
+const AGENTS_KEPT: usize = 64;
+const EARLIER_SHOWN: usize = 12;
+/// The newest calls read for each agent that has gone.
+const ENDED_CALLS_READ: usize = 5;
+/// The entities an agent's lane names for what it read and what it wrote.
+const LANE_ENTITIES: usize = 6;
+/// How long a change no recent history held is left untitled before it is
+/// looked for again.
+const UNTITLED_RETRY: Duration = Duration::from_secs(300);
 /// The most calls remembered for one session, and the most a timeline shows.
 const CALLS_KEPT: usize = 200;
 const TIMELINE_DEFAULT: usize = 100;
@@ -111,6 +122,37 @@ fn known_agent(raw: &str) -> Option<&'static str> {
     })
 }
 
+/// The id `kin setup clients` lists a coding agent by, from the vendor and
+/// client name a session's connection gave, when the session came from one
+/// of the coding agents Kin connects. A client names itself in its own
+/// words, so the id is matched whole or as what the name begins with:
+/// `codex-mcp-client` is Codex. Claude's desktop app is not Claude Code.
+pub(super) fn agent_client_id(vendor: &str, client: &str) -> Option<&'static str> {
+    const BEGINNINGS: [(&str, &str); 11] = [
+        ("claude-code", "claude-code"),
+        ("cursor", "cursor"),
+        ("codex", "codex"),
+        ("openai-codex", "codex"),
+        ("gemini", "gemini-cli"),
+        ("windsurf", "windsurf"),
+        ("antigravity", "antigravity"),
+        ("google-antigravity", "antigravity"),
+        ("lm-studio", "lm-studio"),
+        ("lmstudio", "lm-studio"),
+        ("grok", "grok"),
+    ];
+    [vendor, client].into_iter().find_map(|raw| {
+        let name = raw.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+        BEGINNINGS
+            .iter()
+            .find(|(beginning, _)| {
+                name.strip_prefix(beginning)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            })
+            .map(|(_, id)| *id)
+    })
+}
+
 /// A client name a reader can be shown, in title case. Nothing that is a
 /// placeholder, an id or a place on disk.
 fn titled(raw: &str) -> Option<String> {
@@ -154,6 +196,9 @@ pub(super) fn agent_key(session: &str) -> String {
 pub(super) struct AgentAuthor {
     pub(super) name: String,
     pub(super) session: String,
+    /// The coding agent Kin connects that the change came from, by the id
+    /// `kin setup clients` lists it by, when it is one of them.
+    pub(super) client: Option<&'static str>,
 }
 
 pub(super) fn agent_author(raw: &str) -> Option<AgentAuthor> {
@@ -165,15 +210,16 @@ pub(super) fn agent_author(raw: &str) -> Option<AgentAuthor> {
         return None;
     }
     let label = text[..open].trim();
+    let (vendor, client) = label.split_once('/').unwrap_or((label, ""));
     let name = if label.is_empty() || label.eq_ignore_ascii_case(session) {
         "Unnamed agent".to_string()
     } else {
-        let (vendor, client) = label.split_once('/').unwrap_or((label, ""));
         agent_display_name(vendor, client)
     };
     Some(AgentAuthor {
         name,
         session: session.to_ascii_lowercase(),
+        client: agent_client_id(vendor, client),
     })
 }
 
@@ -297,6 +343,9 @@ struct Memory {
     /// The name an author line gives a session the daemon no longer lists.
     author_names: HashMap<String, String>,
     change_rows: HashMap<String, Value>,
+    /// Changes the newest recorded history did not hold when last read, and
+    /// when that was.
+    untitled: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +355,9 @@ struct Seen {
     transport: String,
     started_at: String,
     last_activity_at: String,
+    /// When it ended, as Kin recorded it. Empty while it is live, and for one
+    /// only this server saw go.
+    ended_at: String,
     live: bool,
     last_listed: Instant,
     calls_total: u64,
@@ -315,6 +367,44 @@ struct Seen {
     changes: Vec<String>,
     /// The daemon's last answer for this session while it was live.
     snapshot: Value,
+    /// Whether the daemon keeps this ended session's calls, so they can be
+    /// read from it again.
+    kept_by_kin: bool,
+    /// Whether what it read is known. Not for an agent Kin knows only by what
+    /// it wrote.
+    reads_known: bool,
+    /// What its kept reads were about, newest first, as the daemon counted
+    /// them over every call it kept. Empty when it is counted here instead.
+    read: Vec<String>,
+    read_total: usize,
+    /// What it wrote, newest first.
+    edited: Vec<String>,
+    edited_total: usize,
+}
+
+impl Seen {
+    fn new(session: &str, name: &str, now: Instant) -> Self {
+        Self {
+            session: session.to_string(),
+            name: name.to_string(),
+            transport: String::new(),
+            started_at: String::new(),
+            last_activity_at: String::new(),
+            ended_at: String::new(),
+            live: true,
+            last_listed: now,
+            calls_total: 0,
+            calls: BTreeMap::new(),
+            changes: Vec::new(),
+            snapshot: Value::Null,
+            kept_by_kin: false,
+            reads_known: true,
+            read: Vec::new(),
+            read_total: 0,
+            edited: Vec::new(),
+            edited_total: 0,
+        }
+    }
 }
 
 impl AgentMemory {
@@ -334,8 +424,9 @@ fn seq(call: &Value) -> u64 {
 }
 
 /// One call as the page may see it: what tool, about which entities, how many
-/// entities the answer named, and whether it was refused. Nothing else of the
-/// daemon's entry is passed on.
+/// entities the answer named, whether it was refused, and, for a write, the
+/// change it committed and whether it finished after the agent stopped
+/// waiting for it. Nothing else of the daemon's entry is passed on.
 fn call_json(call: &Value) -> Option<Value> {
     let seq = call["seq"].as_u64()?;
     let tool = tool_name(text(&call["tool"]));
@@ -347,7 +438,7 @@ fn call_json(call: &Value) -> Option<Value> {
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .take(IDS_PER_CALL)
         .collect();
-    Some(json!({
+    let mut shown = json!({
         "seq": seq,
         "at": text(&call["at"]),
         "tool": tool,
@@ -355,7 +446,17 @@ fn call_json(call: &Value) -> Option<Value> {
         "result_count": call["result_count"].as_u64().unwrap_or(0),
         "duration_ms": call["duration_ms"].as_u64().unwrap_or(0),
         "is_error": call["is_error"].as_bool().unwrap_or(false),
-    }))
+    });
+    if let Some(change) = call["change_id"]
+        .as_str()
+        .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        shown["change_id"] = json!(change.to_ascii_lowercase());
+    }
+    if call["caller_left"].as_bool() == Some(true) {
+        shown["caller_left"] = json!(true);
+    }
+    Some(shown)
 }
 
 /// A registered tool's name, which is an identifier; anything else is not
@@ -437,19 +538,7 @@ fn observe(memory: &AgentMemory, payload: &Value) -> Vec<String> {
         let seen = memory
             .agents
             .entry(session.clone())
-            .or_insert_with(|| Seen {
-                session: session.clone(),
-                name: name.clone(),
-                transport: String::new(),
-                started_at: String::new(),
-                last_activity_at: String::new(),
-                live: true,
-                last_listed: now,
-                calls_total: 0,
-                calls: BTreeMap::new(),
-                changes: Vec::new(),
-                snapshot: Value::Null,
-            });
+            .or_insert_with(|| Seen::new(&session, &name, now));
         seen.name = name;
         seen.transport = text(&agent["transport"]).to_string();
         seen.started_at = text(&agent["started_at"]).to_string();
@@ -485,6 +574,13 @@ fn observe(memory: &AgentMemory, payload: &Value) -> Vec<String> {
             seen.live = false;
         }
     }
+    bound_agents(&mut memory);
+    live
+}
+
+/// Forget the ended sessions heard of least recently past what is kept, and
+/// the attribution only they held.
+fn bound_agents(memory: &mut Memory) {
     while memory.agents.len() > AGENTS_KEPT {
         let Some(oldest) = memory
             .agents
@@ -497,8 +593,84 @@ fn observe(memory: &AgentMemory, payload: &Value) -> Vec<String> {
         };
         memory.agents.remove(&oldest);
     }
-    prune_attribution(&mut memory);
-    live
+    prune_attribution(memory);
+}
+
+fn ids_of(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(str::to_string)
+        .collect()
+}
+
+fn count_of(value: &Value, floor: usize) -> usize {
+    value
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
+        .max(floor)
+}
+
+/// Take in one `/agents/ended` answer: the agents that worked here and are
+/// gone, from what Kin keeps past a session's end. A session listed live
+/// is left as it is.
+fn observe_ended(memory: &AgentMemory, payload: &Value) {
+    let mut memory = memory.lock();
+    let now = Instant::now();
+    for agent in payload["agents"].as_array().into_iter().flatten() {
+        let Some(session) = agent["session_id"].as_str().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        if memory.agents.get(&session).is_some_and(|seen| seen.live) {
+            continue;
+        }
+        let name = agent_display_name(text(&agent["vendor"]), text(&agent["client"]));
+        let seen = memory
+            .agents
+            .entry(session.clone())
+            .or_insert_with(|| Seen::new(&session, &name, now));
+        seen.name = name;
+        let transport = text(&agent["transport"]);
+        if !transport.is_empty() {
+            seen.transport = transport.to_string();
+        }
+        seen.started_at = text(&agent["started_at"]).to_string();
+        seen.last_activity_at = text(&agent["last_activity_at"]).to_string();
+        seen.ended_at = text(&agent["ended_at"]).to_string();
+        seen.live = false;
+        seen.last_listed = now;
+        let kept = agent["calls_kept"].as_bool().unwrap_or(false);
+        seen.kept_by_kin = kept;
+        seen.reads_known = kept || !seen.calls.is_empty();
+        seen.calls_total = agent["calls_total"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(seen.calls_total);
+        remember_calls(
+            seen,
+            agent["recent_calls"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice),
+        );
+        seen.read = ids_of(&agent["read_entity_ids"]);
+        seen.read_total = count_of(&agent["read_entities"], seen.read.len());
+        seen.edited = ids_of(&agent["edited_entity_ids"]);
+        seen.edited_total = count_of(&agent["edited_entities"], seen.edited.len());
+        let changes: Vec<String> = agent["change_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|id| is_change_id(id))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        remember_changes(&mut memory, &session, &changes);
+    }
+    bound_agents(&mut memory);
 }
 
 fn is_change_id(text: &str) -> bool {
@@ -569,10 +741,20 @@ async fn names_for(memory: &AgentMemory, client: &DaemonClient, wanted: &[String
 
 /// Rows for changes an agent made: title, time and how many entities moved.
 /// Read from the newest recorded changes, once; a change's row never changes.
+///
+/// A change older than the history read has no row, and is shown by its id
+/// alone, so its review can still be opened. It is looked for again only
+/// after [`UNTITLED_RETRY`].
 async fn change_rows(memory: &AgentMemory, client: &DaemonClient, ids: &[String]) -> Vec<Value> {
     let missing = {
         let memory = memory.lock();
-        ids.iter().any(|id| !memory.change_rows.contains_key(id))
+        ids.iter().any(|id| {
+            !memory.change_rows.contains_key(id)
+                && memory
+                    .untitled
+                    .get(id)
+                    .is_none_or(|at| at.elapsed() >= UNTITLED_RETRY)
+        })
     };
     if missing {
         let request = super::log::LogRequest {
@@ -606,13 +788,28 @@ async fn change_rows(memory: &AgentMemory, client: &DaemonClient, ids: &[String]
                     });
                     memory.change_rows.insert(id, row);
                 }
+                let now = Instant::now();
+                for id in ids {
+                    if !memory.change_rows.contains_key(id) {
+                        memory.untitled.insert(id.clone(), now);
+                    }
+                }
+                memory
+                    .untitled
+                    .retain(|_, at| at.elapsed() < UNTITLED_RETRY * 2);
                 prune_attribution(&mut memory);
             }
         }
     }
     let memory = memory.lock();
     ids.iter()
-        .filter_map(|id| memory.change_rows.get(id).cloned())
+        .map(|id| {
+            memory
+                .change_rows
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "id": id }))
+        })
         .collect()
 }
 
@@ -681,6 +878,42 @@ fn intents(snapshot: &Value, scope_names: &mut Map<String, Value>) -> Vec<Value>
         .collect()
 }
 
+/// What an agent's kept calls read: what each read asked about first,
+/// newest first, then what the answers named, each once.
+fn reads_of(seen: &Seen) -> (Vec<String>, usize) {
+    if !seen.read.is_empty() {
+        return (seen.read.clone(), seen.read_total.max(seen.read.len()));
+    }
+    let reads: Vec<&Value> = seen
+        .calls
+        .values()
+        .rev()
+        .filter(|call| is_read(text(&call["tool"])) && call["is_error"] != true)
+        .collect();
+    let mut kept = HashSet::new();
+    let mut ids = Vec::new();
+    let all = |call: &&Value| -> Vec<String> {
+        call["entity_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|id| text(id).to_string())
+            .collect()
+    };
+    for id in reads.iter().filter_map(|call| all(call).into_iter().next()) {
+        if kept.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    for id in reads.iter().flat_map(all) {
+        if kept.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    let total = ids.len();
+    (ids, total)
+}
+
 fn agent_json(seen: &Seen, calls_shown: usize, changes: Vec<Value>) -> Value {
     let live = seen.live;
     let mut scope_names = Map::new();
@@ -689,6 +922,7 @@ fn agent_json(seen: &Seen, calls_shown: usize, changes: Vec<Value>) -> Value {
     } else {
         Vec::new()
     };
+    let (read, read_total) = reads_of(seen);
     json!({
         "key": agent_key(&seen.session),
         "name": seen.name,
@@ -701,7 +935,13 @@ fn agent_json(seen: &Seen, calls_shown: usize, changes: Vec<Value>) -> Value {
         },
         "started_at": seen.started_at,
         "last_activity_at": seen.last_activity_at,
+        "ended_at": (!seen.ended_at.is_empty()).then_some(&seen.ended_at),
         "calls_total": seen.calls_total,
+        "reads_known": seen.reads_known,
+        "read": read.into_iter().take(LANE_ENTITIES * 2).collect::<Vec<_>>(),
+        "read_total": read_total,
+        "edited": seen.edited.iter().take(LANE_ENTITIES * 2).collect::<Vec<_>>(),
+        "edited_total": seen.edited_total.max(seen.edited.len()),
         "recent_calls": seen.calls.values().rev().take(calls_shown).cloned().collect::<Vec<_>>(),
         "open_changes": if live { open_changes(&seen.snapshot) } else { Vec::new() },
         "intents": intents,
@@ -726,6 +966,16 @@ fn wanted_ids(agent: &Value) -> Vec<String> {
     }
     for intent in agent["intents"].as_array().into_iter().flatten() {
         for id in intent["entity_ids"].as_array().into_iter().flatten() {
+            ids.push(text(id).to_string());
+        }
+    }
+    for field in ["read", "edited"] {
+        for id in agent[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(LANE_ENTITIES)
+        {
             ids.push(text(id).to_string());
         }
     }
@@ -756,65 +1006,131 @@ fn read_at() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-async fn read_agents(state: &UiState, client: &DaemonClient) -> Result<(Value, Vec<String>)> {
-    let payload = tokio::time::timeout(READ_TIMEOUT, client.agents())
-        .await
-        .context("Kin took too long to say which agents are connected")??;
+/// One read of who is here and who has gone.
+struct AgentsRead {
+    payload: Value,
+    live: Vec<String>,
+    /// The window Kin keeps agents that have gone for, when it keeps them.
+    kept: Option<Value>,
+    /// Kin keeps them, but could not be read this time.
+    earlier_unread: bool,
+}
+
+async fn read_agents(memory: &AgentMemory, client: &DaemonClient) -> Result<AgentsRead> {
+    let (here, gone) = tokio::join!(
+        tokio::time::timeout(READ_TIMEOUT, client.agents()),
+        tokio::time::timeout(READ_TIMEOUT, client.ended_agents(ENDED_CALLS_READ)),
+    );
+    let payload = here.context("Kin took too long to say which agents are connected")??;
     anyhow::ensure!(
         payload["agents"].is_array(),
         "Kin's answer about connected agents was not readable"
     );
-    let live = observe(&state.agents, &payload);
-    Ok((payload, live))
+    let live = observe(memory, &payload);
+    let (kept, earlier_unread) = match gone {
+        Ok(Ok(Some(ended))) if ended["agents"].is_array() => {
+            observe_ended(memory, &ended);
+            let kept = json!({ "days": ended["kept_days"], "sessions": ended["kept_sessions"] });
+            (Some(kept), false)
+        }
+        // A daemon that keeps nothing past a session's end.
+        Ok(Ok(None)) => (None, false),
+        _ => (None, true),
+    };
+    Ok(AgentsRead {
+        payload,
+        live,
+        kept,
+        earlier_unread,
+    })
+}
+
+/// When an agent was last active, for ordering the ones that have gone.
+fn last_active(seen: &Seen) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(seen.last_activity_at.trim())
+        .ok()
+        .map(|at| at.with_timezone(&chrono::Utc))
+}
+
+/// The agents here now and the ones that have gone, as the page shows them.
+async fn agents_answer(memory: &AgentMemory, client: &DaemonClient) -> Result<Value> {
+    let read = read_agents(memory, client).await?;
+    let (live_seen, earlier_seen): (Vec<Seen>, Vec<Seen>) = {
+        let memory = memory.lock();
+        let live_seen = read
+            .live
+            .iter()
+            .filter_map(|session| memory.agents.get(session).cloned())
+            .collect();
+        // An agent that connected and asked nothing has nothing to show once
+        // it has gone.
+        let mut earlier: Vec<Seen> = memory
+            .agents
+            .values()
+            .filter(|seen| {
+                !seen.live
+                    && (seen.calls_total > 0 || !seen.changes.is_empty() || !seen.edited.is_empty())
+            })
+            .cloned()
+            .collect();
+        earlier.sort_by(|a, b| {
+            last_active(b)
+                .cmp(&last_active(a))
+                .then_with(|| b.last_listed.cmp(&a.last_listed))
+        });
+        earlier.truncate(EARLIER_SHOWN);
+        (live_seen, earlier)
+    };
+    // Every change shown is titled from one read of the history.
+    let shown =
+        |seen: &Seen| -> Vec<String> { seen.changes.iter().take(CHANGES_SHOWN).cloned().collect() };
+    let wanted: Vec<String> = live_seen
+        .iter()
+        .chain(earlier_seen.iter())
+        .flat_map(shown)
+        .collect();
+    let rows: HashMap<String, Value> = change_rows(memory, client, &wanted)
+        .await
+        .into_iter()
+        .filter_map(|row| Some((row["id"].as_str()?.to_string(), row)))
+        .collect();
+    let rows_of = |seen: &Seen| -> Vec<Value> {
+        shown(seen)
+            .iter()
+            .filter_map(|id| rows.get(id).cloned())
+            .collect()
+    };
+    let agents: Vec<Value> = live_seen
+        .iter()
+        .map(|seen| agent_json(seen, 5, rows_of(seen)))
+        .collect();
+    let earlier: Vec<Value> = earlier_seen
+        .iter()
+        .map(|seen| agent_json(seen, 3, rows_of(seen)))
+        .collect();
+    let wanted: Vec<String> = agents
+        .iter()
+        .chain(earlier.iter())
+        .flat_map(wanted_ids)
+        .collect();
+    let mut names = names_for(memory, client, &wanted).await;
+    merge_names(&mut names, &agents);
+    Ok(json!({
+        "schema": "kin.workspace.agents.v1",
+        "read_at": read_at(),
+        "active_window_secs": read.payload["active_window_secs"],
+        "agents": agents,
+        "earlier": earlier,
+        "kept": read.kept,
+        "earlier_unread": read.earlier_unread,
+        "names": names,
+    }))
 }
 
 async fn serve_agents(State(state): State<Arc<UiState>>) -> Response {
     let answer = async {
         let client = super::review_ui::daemon(&state).await?;
-        let (payload, live) = read_agents(&state, &client).await?;
-        let (live_seen, earlier_seen): (Vec<Seen>, Vec<Seen>) = {
-            let memory = state.agents.lock();
-            let live_seen = live
-                .iter()
-                .filter_map(|session| memory.agents.get(session).cloned())
-                .collect();
-            let mut earlier: Vec<Seen> = memory
-                .agents
-                .values()
-                .filter(|seen| !seen.live)
-                .cloned()
-                .collect();
-            earlier.sort_by(|a, b| b.last_listed.cmp(&a.last_listed));
-            earlier.truncate(EARLIER_SHOWN);
-            (live_seen, earlier)
-        };
-        let mut agents = Vec::new();
-        for seen in &live_seen {
-            let shown: Vec<String> = seen.changes.iter().take(CHANGES_SHOWN).cloned().collect();
-            let rows = change_rows(&state.agents, &client, &shown).await;
-            agents.push(agent_json(seen, 5, rows));
-        }
-        let mut earlier = Vec::new();
-        for seen in &earlier_seen {
-            let shown: Vec<String> = seen.changes.iter().take(CHANGES_SHOWN).cloned().collect();
-            let rows = change_rows(&state.agents, &client, &shown).await;
-            earlier.push(agent_json(seen, 3, rows));
-        }
-        let wanted: Vec<String> = agents
-            .iter()
-            .chain(earlier.iter())
-            .flat_map(wanted_ids)
-            .collect();
-        let mut names = names_for(&state.agents, &client, &wanted).await;
-        merge_names(&mut names, &agents);
-        Ok::<_, anyhow::Error>(json!({
-            "schema": "kin.workspace.agents.v1",
-            "read_at": read_at(),
-            "active_window_secs": payload["active_window_secs"],
-            "agents": agents,
-            "earlier": earlier,
-            "names": names,
-        }))
+        agents_answer(&state.agents, &client).await
     }
     .await;
     match answer {
@@ -870,14 +1186,14 @@ async fn serve_timeline(
     };
     // The agents read refreshes what this server remembers; when it fails the
     // timeline is still drawn from what was remembered.
-    let listed = read_agents(&state, &client).await.is_ok();
+    let listed = read_agents(&state.agents, &client).await.is_ok();
     let Some(seen) = session_for_key(&state.agents, &query.agent) else {
         return unavailable(
             StatusCode::NOT_FOUND,
-            "Kin has no record of this agent any more. Its session ended before this page saw it.",
+            "Kin has no record of this agent any more.",
         );
     };
-    if seen.live {
+    if seen.live || seen.kept_by_kin {
         if let Ok(Ok(calls)) = tokio::time::timeout(
             READ_TIMEOUT,
             client.session_calls(&seen.session, Some(limit)),
@@ -1018,7 +1334,7 @@ pub(super) async fn serve_change_agent(
             )
         }
     };
-    let _ = read_agents(&state, &client).await;
+    let _ = read_agents(&state.agents, &client).await;
     let mut owner = state.agents.lock().change_owner.get(&change).cloned();
     if owner.is_none() {
         let _ = change_rows(&state.agents, &client, std::slice::from_ref(&change)).await;
@@ -1044,7 +1360,7 @@ pub(super) async fn serve_change_agent(
         }))
         .into_response();
     };
-    if seen.live {
+    if seen.live || seen.kept_by_kin {
         if let Ok(Ok(calls)) = tokio::time::timeout(
             READ_TIMEOUT,
             client.session_calls(&session, Some(CALLS_KEPT)),
@@ -1332,6 +1648,30 @@ async fn serve_events(State(state): State<Arc<UiState>>) -> Response {
 mod tests {
     use super::*;
 
+    /// The commit an agent's client gave up on reaches the page as what the
+    /// agent did: its change, and that it finished after the agent stopped
+    /// waiting. A read passes on neither.
+    #[test]
+    fn a_write_says_the_change_it_committed_and_whether_its_agent_waited() {
+        let change = "C".repeat(64);
+        let commit = call_json(&json!({
+            "seq": 3, "at": "2026-10-14T13:08:30Z", "tool": "kin_transaction_commit",
+            "entity_ids": [], "result_count": 1, "duration_ms": 461_000, "is_error": false,
+            "change_id": change, "caller_left": true, "repo_id": "elsewhere",
+        }))
+        .unwrap();
+        assert_eq!(commit["change_id"], "c".repeat(64));
+        assert_eq!(commit["caller_left"], true);
+        assert!(commit.get("repo_id").is_none());
+        let read = call_json(&json!({
+            "seq": 1, "at": "2026-10-14T13:00:48Z", "tool": "semantic_locate",
+            "entity_ids": [], "change_id": "not a change", "caller_left": false,
+        }))
+        .unwrap();
+        assert!(read.get("change_id").is_none());
+        assert!(read.get("caller_left").is_none());
+    }
+
     #[test]
     fn agents_are_named_as_a_reader_knows_them() {
         assert_eq!(
@@ -1354,6 +1694,37 @@ mod tests {
         assert_eq!(agent_display_name("mcp-client", ""), "Unnamed agent");
         assert_eq!(agent_display_name("x", "/Users/someone/bin/agent"), "X");
         assert_eq!(agent_display_name("", "src/agent.py"), "Unnamed agent");
+    }
+
+    #[test]
+    fn a_session_is_matched_to_the_coding_agent_kin_connects() {
+        for (vendor, client, id) in [
+            ("claude-code", "claude-code", Some("claude-code")),
+            ("codex-mcp-client", "codex-mcp-client", Some("codex")),
+            ("cursor-vscode", "Cursor VSCode", Some("cursor")),
+            (
+                "gemini-cli-mcp-client",
+                "gemini-cli-mcp-client",
+                Some("gemini-cli"),
+            ),
+            ("windsurf-client", "windsurf-client", Some("windsurf")),
+            ("lm-studio", "LM Studio", Some("lm-studio")),
+            ("", "Grok CLI", Some("grok")),
+            ("antigravity", "", Some("antigravity")),
+            // Claude's desktop app is another product, and a name that only
+            // begins like an id is another name.
+            ("claude-ai", "Claude", None),
+            ("cursory-helper", "cursory helper", None),
+            ("my-helper", "my-helper", None),
+            ("", "", None),
+        ] {
+            assert_eq!(agent_client_id(vendor, client), id, "{vendor} / {client}");
+        }
+        let author =
+            agent_author("codex-mcp-client/Codex <mcp-agent:0C4E2A10-7B1C-4E2A-9F00-1234567890AB>")
+                .unwrap();
+        assert_eq!(author.client, Some("codex"));
+        assert_eq!(agent_author("ada <ada@example.com>"), None);
     }
 
     #[test]
@@ -1427,19 +1798,11 @@ mod tests {
     const C: &str = "0c3d7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10";
 
     fn seen_with(calls: &[Value], changes: &[&str]) -> Seen {
-        let mut seen = Seen {
-            session: "s".into(),
-            name: "Claude Code".into(),
-            transport: "mcp".into(),
-            started_at: String::new(),
-            last_activity_at: String::new(),
-            live: true,
-            last_listed: Instant::now(),
-            calls_total: calls.len() as u64,
-            calls: BTreeMap::new(),
-            changes: changes.iter().map(|c| c.to_string()).collect(),
-            snapshot: json!({ "state": "active" }),
-        };
+        let mut seen = Seen::new("s", "Claude Code", Instant::now());
+        seen.transport = "mcp".into();
+        seen.calls_total = calls.len() as u64;
+        seen.changes = changes.iter().map(|c| c.to_string()).collect();
+        seen.snapshot = json!({ "state": "active" });
         remember_calls(&mut seen, calls);
         seen
     }
@@ -1576,6 +1939,165 @@ mod tests {
         let shown = agent_json(&ended, 3, Vec::new());
         assert_eq!(shown["open_changes"], json!([]));
         assert_eq!(shown["recent_calls"].as_array().unwrap().len(), 2);
+    }
+
+    /// A daemon on a free port that answers `/agents` with nobody here and
+    /// `/agents/ended` with `ended`, or with `status` when it is not 200.
+    async fn daemon_answering(
+        ended: Value,
+        status: StatusCode,
+    ) -> (DaemonClient, tokio::task::JoinHandle<()>) {
+        let mut identity =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("hosted-daemon").unwrap();
+        identity.namespace = None;
+        let app = Router::new()
+            .route(
+                "/runtime/identity",
+                get(move || {
+                    let identity = identity.clone();
+                    async move { Json(identity) }
+                }),
+            )
+            .route(
+                "/agents",
+                get(|| async { Json(json!({ "schema": "kin.agents.v1", "active_window_secs": 60, "agents": [] })) }),
+            )
+            .route(
+                "/agents/ended",
+                get(move || {
+                    let ended = ended.clone();
+                    async move {
+                        if status == StatusCode::OK {
+                            Json(ended).into_response()
+                        } else {
+                            status.into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DaemonClient::from_base_url_with_explicit_authority(
+            format!("http://{address}"),
+            None,
+            None,
+        )
+        .unwrap();
+        (client, server)
+    }
+
+    fn ended_answer(session: &str, change: &str) -> Value {
+        json!({ "schema": "kin.agents-ended.v1", "kept_days": 30, "kept_sessions": 32, "agents": [
+            { "session_id": session, "client": "claude-code", "vendor": "claude-code", "transport": "mcp",
+              "started_at": "2026-10-14T07:43:01Z", "last_activity_at": "2026-10-14T07:44:07Z",
+              "ended_at": "2026-10-14T07:44:30Z", "calls_kept": true, "calls_total": 4,
+              "calls_retained": 4,
+              "recent_calls": [call(4, "kin_transaction_commit", &[A]), call(3, "get_entity_source", &[A]),
+                               call(2, "semantic_locate", &[A, B])],
+              "read_entity_ids": [A, B], "read_entities": 2,
+              "edited_entity_ids": [A], "edited_entities": 1,
+              "change_ids": [change] },
+            { "session_id": "6f1d2c3b-0a9e-4c8d-b7a6-5e4f3a2b1c0d", "client": "codex", "vendor": "codex",
+              "transport": "", "started_at": "2026-10-13T09:00:00Z", "last_activity_at": "2026-10-13T09:05:00Z",
+              "ended_at": "2026-10-13T09:05:00Z", "calls_kept": false, "calls_total": 0, "calls_retained": 0,
+              "recent_calls": [], "read_entity_ids": [], "read_entities": 0,
+              "edited_entity_ids": [C], "edited_entities": 1, "change_ids": ["d".repeat(64)] },
+        ]})
+    }
+
+    /// The Agents page is drawn by a server that saw none of it: the agent had
+    /// ended before it started, as after a restart. Who it was, when, what it
+    /// read, what it wrote and the change it committed still come from what
+    /// Kin kept, and the window Kin keeps is said.
+    #[tokio::test]
+    async fn an_agent_that_ended_before_this_server_started_is_an_earlier_lane() {
+        let session = "dbecbbcd-c382-4559-93ba-9f08bbf28ab6";
+        let change = "7a484793eb222d07dc925f52d65f98e0cea1f4d4d376315588e90bc20082be07";
+        let (client, server) =
+            daemon_answering(ended_answer(session, change), StatusCode::OK).await;
+        let memory = AgentMemory::default();
+        let answer = agents_answer(&memory, &client).await.unwrap();
+        server.abort();
+        assert_eq!(answer["agents"], json!([]));
+        assert_eq!(answer["kept"], json!({ "days": 30, "sessions": 32 }));
+        assert_eq!(answer["earlier_unread"], false);
+        let earlier = answer["earlier"].as_array().unwrap();
+        assert_eq!(earlier.len(), 2, "{answer}");
+        let lane = &earlier[0];
+        assert_eq!(lane["name"], "Claude Code");
+        assert_eq!(lane["state"], "ended");
+        assert_eq!(lane["key"], agent_key(session));
+        assert_eq!(lane["ended_at"], "2026-10-14T07:44:30Z");
+        assert_eq!(lane["calls_total"], 4);
+        assert_eq!(lane["reads_known"], true);
+        assert_eq!(lane["read"], json!([A, B]));
+        assert_eq!(lane["edited"], json!([A]));
+        assert_eq!(
+            lane["changes"],
+            json!([{ "id": change }]),
+            "its review opens by id even untitled"
+        );
+        assert_eq!(lane["changes_total"], 1);
+        assert_eq!(lane["recent_calls"][0]["tool"], "kin_transaction_commit");
+        let wrote_only = &earlier[1];
+        assert_eq!(wrote_only["name"], "Codex");
+        assert_eq!(
+            wrote_only["reads_known"], false,
+            "what it read was not kept"
+        );
+        assert_eq!(wrote_only["edited"], json!([C]));
+        let text = answer.to_string();
+        assert!(
+            !text.contains(session),
+            "no session id reaches the page: {text}"
+        );
+        // The review of that change names the agent from the same record.
+        assert_eq!(
+            memory.lock().change_owner.get(change).map(String::as_str),
+            Some(session)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_says_when_kin_keeps_no_earlier_agents_and_when_it_could_not_read_them() {
+        let (client, server) = daemon_answering(json!({}), StatusCode::NOT_FOUND).await;
+        let answer = agents_answer(&AgentMemory::default(), &client)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(answer["kept"], Value::Null);
+        assert_eq!(answer["earlier_unread"], false);
+        let (client, server) = daemon_answering(json!({}), StatusCode::INTERNAL_SERVER_ERROR).await;
+        let answer = agents_answer(&AgentMemory::default(), &client)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(answer["kept"], Value::Null);
+        assert_eq!(answer["earlier_unread"], true);
+        assert_eq!(answer["earlier"], json!([]));
+    }
+
+    #[test]
+    fn a_live_session_is_not_taken_for_one_that_ended() {
+        let memory = AgentMemory::default();
+        let session = "dbecbbcd-c382-4559-93ba-9f08bbf28ab6";
+        observe(
+            &memory,
+            &json!({ "agents": [{ "session_id": session, "client": "claude-code", "vendor": "claude-code",
+                "recent_calls": [call(1, "semantic_locate", &[A])], "calls_total": 1 }] }),
+        );
+        observe_ended(&memory, &ended_answer(session, &"a".repeat(64)));
+        let seen = memory.lock().agents.get(session).cloned().unwrap();
+        assert!(seen.live);
+        assert!(seen.ended_at.is_empty());
+        // Once it is gone, what Kin kept of it is taken in.
+        observe(&memory, &json!({ "agents": [] }));
+        observe_ended(&memory, &ended_answer(session, &"a".repeat(64)));
+        let seen = memory.lock().agents.get(session).cloned().unwrap();
+        assert!(!seen.live && seen.kept_by_kin);
+        assert_eq!(state_of(&seen), "ended");
+        assert_eq!(seen.calls_total, 4);
     }
 
     #[test]

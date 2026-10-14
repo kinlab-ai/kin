@@ -14,6 +14,10 @@
 //! crate root takes its crate's name from the Cargo manifest above it. The
 //! manifests reach an adapter at ingestion through [`ProjectFiles`], and what
 //! it reads from them travels with the parse as a [`UnitContext`].
+//!
+//! A manifest also says how its project's tests are run, where its language
+//! has a convention for that ([`ProjectManifest::declared_tests`]). Kin runs a
+//! repository's tests the way its own manifest declares them.
 
 /// The manifest at the root of a language's projects, and how it declares
 /// the project's name.
@@ -36,7 +40,25 @@ pub struct ProjectManifest {
     /// The project name the manifest's text declares, as written there, or
     /// `None` when it declares none.
     pub declared_name: fn(&str) -> Option<String>,
+    /// How the manifest's text says the project's tests are run, or `None`
+    /// when it says nothing Kin can run.
+    pub declared_tests: fn(&str) -> Option<DeclaredTests>,
 }
+
+/// How a project's manifest says its tests are run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredTests {
+    /// A test runner Kin knows by name and can narrow to the tests it plans:
+    /// `cargo`, `pytest` or `go`.
+    Runner(&'static str),
+    /// The command the project declares for its tests, as its program and
+    /// arguments. Kin cannot narrow it, so it runs whole.
+    Command(&'static [&'static str]),
+}
+
+/// What `npm init` writes as a package's test script: a placeholder that
+/// fails, not a test command.
+const NPM_PLACEHOLDER_TEST: &str = "no test specified";
 
 /// A Python project's: `[project] name`, or Poetry's `[tool.poetry] name`.
 pub const PYPROJECT: ProjectManifest = ProjectManifest {
@@ -45,6 +67,11 @@ pub const PYPROJECT: ProjectManifest = ProjectManifest {
     directory_names_level: false,
     names_units: false,
     declared_name: |text| toml_name(text, &["project", "tool.poetry"]),
+    // A project that configures or depends on pytest is tested with it.
+    declared_tests: |text| {
+        text.contains("pytest")
+            .then_some(DeclaredTests::Runner("pytest"))
+    },
 };
 
 /// A JavaScript or TypeScript package's: `name`, known by the part after its
@@ -59,6 +86,14 @@ pub const PACKAGE_JSON: ProjectManifest = ProjectManifest {
         let name = value.get("name")?.as_str()?;
         Some(name.rsplit('/').next().unwrap_or(name).to_string())
     },
+    // The package's own `test` script, through the package manager that
+    // runs scripts, unless it is the placeholder `npm init` leaves.
+    declared_tests: |text| {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let script = value.get("scripts")?.get("test")?.as_str()?.trim();
+        (!script.is_empty() && !script.contains(NPM_PLACEHOLDER_TEST))
+            .then_some(DeclaredTests::Command(&["npm", "test"]))
+    },
 };
 
 /// A Rust crate's: `[package] name`.
@@ -68,6 +103,13 @@ pub const CARGO_TOML: ProjectManifest = ProjectManifest {
     directory_names_level: false,
     names_units: true,
     declared_name: |text| toml_name(text, &["package"]),
+    // A crate or a workspace of them.
+    declared_tests: |text| {
+        text.lines()
+            .map(str::trim)
+            .any(|line| line == "[package]" || line == "[workspace]")
+            .then_some(DeclaredTests::Runner("cargo"))
+    },
 };
 
 /// A Go module's: the last segment of its module path.
@@ -85,6 +127,8 @@ pub const GO_MOD: ProjectManifest = ProjectManifest {
                 .map(|module| module.rsplit('/').next().unwrap_or(module).to_string())
         })
     },
+    // A module's packages are tested by `go test`.
+    declared_tests: |text| (GO_MOD.declared_name)(text).map(|_| DeclaredTests::Runner("go")),
 };
 
 /// The `name` a TOML document sets in the first of `tables` that sets one.
@@ -305,6 +349,52 @@ mod tests {
         assert!(!is_manifest_path("crates/db/src/lib.rs"));
         assert!(!is_manifest_path("crates/db/Cargo.lock"));
         assert!(!is_manifest_path("notCargo.toml"));
+    }
+
+    #[test]
+    fn a_manifest_declares_how_its_project_is_tested_or_says_nothing() {
+        let package = |scripts: &str| format!(r#"{{"name":"tally","scripts":{scripts}}}"#);
+        assert_eq!(
+            (PACKAGE_JSON.declared_tests)(&package(r#"{"test":"node --test"}"#)),
+            Some(DeclaredTests::Command(&["npm", "test"]))
+        );
+        // What `npm init` leaves is a script that fails, not a test command.
+        assert_eq!(
+            (PACKAGE_JSON.declared_tests)(&package(
+                r#"{"test":"echo \"Error: no test specified\" && exit 1"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            (PACKAGE_JSON.declared_tests)(&package(r#"{"build":"tsc"}"#)),
+            None
+        );
+        assert_eq!((PACKAGE_JSON.declared_tests)("not json"), None);
+
+        assert_eq!(
+            (CARGO_TOML.declared_tests)("[package]\nname = \"tally\"\n"),
+            Some(DeclaredTests::Runner("cargo"))
+        );
+        assert_eq!(
+            (CARGO_TOML.declared_tests)("[workspace]\nmembers = [\"a\"]\n"),
+            Some(DeclaredTests::Runner("cargo"))
+        );
+        assert_eq!((CARGO_TOML.declared_tests)("[dependencies]\n"), None);
+
+        assert_eq!(
+            (GO_MOD.declared_tests)("module example.com/tally\n\ngo 1.22\n"),
+            Some(DeclaredTests::Runner("go"))
+        );
+        assert_eq!((GO_MOD.declared_tests)("go 1.22\n"), None);
+
+        assert_eq!(
+            (PYPROJECT.declared_tests)("[tool.pytest.ini_options]\naddopts = \"-q\"\n"),
+            Some(DeclaredTests::Runner("pytest"))
+        );
+        assert_eq!(
+            (PYPROJECT.declared_tests)("[project]\nname = \"tally\"\n"),
+            None
+        );
     }
 
     #[test]

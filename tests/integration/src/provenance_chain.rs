@@ -27,12 +27,14 @@ fn delegation_chain_provenance() {
         kind: ActorKind::Human,
         display_name: "Alice (principal)".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let delegate = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Assistant,
         display_name: "Claude (delegate)".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&principal).unwrap();
     store.create_actor(&delegate).unwrap();
@@ -130,18 +132,21 @@ fn multi_hop_delegation_chain() {
         kind: ActorKind::Human,
         display_name: "Alice".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let bob = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Human,
         display_name: "Bob".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let claude = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Assistant,
         display_name: "Claude".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&alice).unwrap();
     store.create_actor(&bob).unwrap();
@@ -219,12 +224,14 @@ fn expired_delegation_still_queryable() {
         kind: ActorKind::Human,
         display_name: "Owner".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let delegate = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Service,
         display_name: "CI Bot".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&principal).unwrap();
     store.create_actor(&delegate).unwrap();

@@ -64,6 +64,11 @@ pub enum ArtifactKind {
     /// owned slice is that one hook entry; every other hook and key is the
     /// person's.
     PromptHook,
+    /// The paired edit hook groups Kin added to an agent client's settings:
+    /// Claude Code's `PreToolUse` and `PostToolUse` groups that run
+    /// `kin agents record-edit` around its edit tools. The owned slice is those
+    /// groups; every other hook and key is the person's.
+    EditHook,
 }
 
 impl ArtifactKind {
@@ -86,6 +91,7 @@ impl ArtifactKind {
             Self::DiscoveryReminder => "discovery reminder",
             Self::DaemonConfig => "daemon config",
             Self::PromptHook => "prompt hook",
+            Self::EditHook => "edit hook",
         }
     }
 }
@@ -164,6 +170,22 @@ impl LedgerEntry {
             target: target.into(),
             path,
             fingerprint: sha256_hex(hook.to_string().as_bytes()),
+            snippet: None,
+            kin_version: kin_version(),
+            written_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Build an entry for the edit hook groups Kin added to a client's
+    /// settings, fingerprinted together by event.
+    pub fn edit_hook(target: impl Into<String>, path: PathBuf, groups: &serde_json::Value) -> Self {
+        let now = now_rfc3339();
+        Self {
+            kind: ArtifactKind::EditHook,
+            target: target.into(),
+            path,
+            fingerprint: sha256_hex(groups.to_string().as_bytes()),
             snippet: None,
             kin_version: kin_version(),
             written_at: now.clone(),
@@ -343,6 +365,29 @@ fn current_owned_fingerprint_from_bytes(entry: &LedgerEntry, content: &[u8]) -> 
             let root: serde_json::Value = serde_json::from_slice(content).ok()?;
             let hook = super::setup_hooks::current_prompt_hook(&root)?;
             Some(sha256_hex(hook.to_string().as_bytes()))
+        }
+        ArtifactKind::EditHook => {
+            let root: serde_json::Value = serde_json::from_slice(content).ok()?;
+            let groups = super::setup_hooks::current_edit_hook(&root)?;
+            // A legacy install recorded only its post group. Preserve safe
+            // teardown before setup upgrades it, but never validate a partial
+            // pair against a newer paired fingerprint.
+            if groups
+                .get(super::setup_hooks::PRE_EDIT_HOOK_EVENT)
+                .is_none()
+            {
+                if let Some([group]) = groups
+                    .get(super::setup_hooks::EDIT_HOOK_EVENT)
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+                {
+                    let legacy = sha256_hex(group.to_string().as_bytes());
+                    if legacy == entry.fingerprint {
+                        return Some(legacy);
+                    }
+                }
+            }
+            Some(sha256_hex(groups.to_string().as_bytes()))
         }
         ArtifactKind::ShellHook | ArtifactKind::VfsShim | ArtifactKind::DaemonConfig => {
             Some(sha256_hex(content))
@@ -630,6 +675,20 @@ fn remove_owned_slice_locked(
         lock.write_guarded(&entry.path, &formatted, Some(&original))?;
         return Ok(format!(
             "removed Kin's prompt hook from {}",
+            entry.path.display()
+        ));
+    }
+    if entry.kind == ArtifactKind::EditHook {
+        let mut root: serde_json::Value = serde_json::from_slice(&original)
+            .with_context(|| format!("{} is not valid JSON", entry.path.display()))?;
+        super::setup_hooks::without_edit_hook(&mut root);
+        // The settings file stays: Kin removes only its own hook groups.
+        let mut formatted =
+            serde_json::to_vec_pretty(&root).context("failed to serialize client settings")?;
+        formatted.push(b'\n');
+        lock.write_guarded(&entry.path, &formatted, Some(&original))?;
+        return Ok(format!(
+            "removed Kin's edit hook from {}",
             entry.path.display()
         ));
     }
@@ -1005,6 +1064,111 @@ mod tests {
 
         fs::remove_file(&file).unwrap();
         assert_eq!(verify_entry(&entry).state, EntryState::Removed);
+    }
+
+    #[test]
+    fn edit_hook_verification_covers_both_phases_and_preserves_modified_settings() {
+        use super::super::setup_hooks::{current_edit_hook, with_edit_hook, without_edit_hook};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let command = "/managed/kin agents record-edit --client claude";
+        let (root, _) = with_edit_hook(None, command).unwrap();
+        write(&path, &root.to_string());
+        let entry =
+            LedgerEntry::edit_hook("claude", path.clone(), &current_edit_hook(&root).unwrap());
+        assert_eq!(verify_entry(&entry).state, EntryState::Verified);
+
+        let mut unrelated = root.clone();
+        unrelated["model"] = serde_json::json!("opus");
+        unrelated["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "matcher": "Bash", "hooks": [{"type": "command", "command": "echo ready"}],
+            }));
+        write(&path, &unrelated.to_string());
+        assert_eq!(verify_entry(&entry).state, EntryState::Verified);
+
+        let mut modified = unrelated.clone();
+        modified["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!(20);
+        let modified_bytes = modified.to_string();
+        write(&path, &modified_bytes);
+        assert_eq!(verify_entry(&entry).state, EntryState::Modified);
+        assert_eq!(
+            uninstall_entry(&entry, false, false).action,
+            RemovalAction::SkippedModified
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), modified_bytes);
+
+        let mut partial = unrelated.clone();
+        partial["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PreToolUse");
+        write(&path, &partial.to_string());
+        assert_eq!(verify_entry(&entry).state, EntryState::Modified);
+
+        let mut duplicate = unrelated.clone();
+        duplicate["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(root["hooks"]["PreToolUse"][0].clone());
+        write(&path, &duplicate.to_string());
+        assert_eq!(verify_entry(&entry).state, EntryState::Modified);
+
+        write(&path, &unrelated.to_string());
+        assert_eq!(
+            uninstall_entry(&entry, false, false).action,
+            RemovalAction::Removed
+        );
+        without_edit_hook(&mut unrelated);
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after, unrelated,
+            "both Kin groups removed and the person's sibling retained"
+        );
+        assert_eq!(verify_entry(&entry).state, EntryState::Removed);
+    }
+
+    #[test]
+    fn a_legacy_post_only_ledger_can_uninstall_or_upgrade_under_the_same_identity() {
+        use super::super::setup_hooks::{
+            current_edit_hook, edit_hook_group, with_edit_hook, PromptHookWrite,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let command = "/managed/kin agents record-edit --client claude";
+        let post = edit_hook_group(command);
+        let legacy_root = serde_json::json!({"hooks": {"PostToolUse": [post.clone()]}});
+        let legacy_entry = LedgerEntry::edit_hook("claude", path.clone(), &post);
+        write(&path, &legacy_root.to_string());
+        assert_eq!(verify_entry(&legacy_entry).state, EntryState::Verified);
+        assert_eq!(
+            uninstall_entry(&legacy_entry, false, false).action,
+            RemovalAction::Removed
+        );
+
+        let mut ledger = SetupLedger::default();
+        ledger.record(legacy_entry.clone());
+        let (root, write_kind) = with_edit_hook(Some(legacy_root), command).unwrap();
+        assert_eq!(write_kind, PromptHookWrite::Replaced);
+        write(&path, &root.to_string());
+        assert_eq!(verify_entry(&legacy_entry).state, EntryState::Modified);
+        ledger.record(LedgerEntry::edit_hook(
+            "claude",
+            path,
+            &current_edit_hook(&root).unwrap(),
+        ));
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].written_at, legacy_entry.written_at);
+        assert_ne!(ledger.entries[0].fingerprint, legacy_entry.fingerprint);
+        assert_eq!(verify_entry(&ledger.entries[0]).state, EntryState::Verified);
+        assert_eq!(
+            uninstall_entry(&ledger.entries[0], false, false).action,
+            RemovalAction::Removed
+        );
     }
 
     #[test]

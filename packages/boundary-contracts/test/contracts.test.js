@@ -1075,6 +1075,29 @@ test('an entity list is identity first, and everything ranked rides along', asyn
     'the ranked answer is the same contract with more of it filled in'
   );
 
+  // What others rely on that no test reaches rides along when asked for: the
+  // same rows, each with its ranking numbers, and how many there are in all.
+  const untested = structuredClone(ranked);
+  untested.untested = {
+    entities: [{ ...ranked.entities[0] }],
+    total: 7
+  };
+  assert.equal((await validateContract('repoEntities', untested)).ok, true);
+  const { total: _uncounted, ...uncounted } = untested.untested;
+  assert.equal(
+    (await validateContract('repoEntities', { ...untested, untested: uncounted })).ok,
+    false,
+    'a list of what is untested without its total cannot say how much it left out'
+  );
+  assert.equal(
+    (await validateContract('repoEntities', {
+      ...untested,
+      untested: { ...untested.untested, reason: 'guessed' }
+    })).ok,
+    false,
+    'the list carries its rows and its total, and nothing nobody agreed on'
+  );
+
   const { file_path: _dropped, ...noPath } = minimalEntities.entities[0];
   assert.equal(
     (await validateContract('repoEntities', { ...minimalEntities, entities: [noPath] })).ok,
@@ -1115,6 +1138,11 @@ test('the entity list shape is one contract the Rust, the schema and the declara
       'RepoEntitiesResponse',
       rustStructFields(apiSource, 'RepoEntitiesResponse').fields,
       Object.keys(schema.properties)
+    ],
+    [
+      'RepoUntested',
+      rustStructFields(apiSource, 'RepoUntested').fields,
+      Object.keys(schema.$defs.untested.properties)
     ]
   ];
 
@@ -1414,4 +1442,62 @@ test('MCP response accounting validates the canonical serialized budget field na
     {...envelope.response, chars_before_budget: '9200'},
     {...envelope.response, chars_after_budget: -1}
   ]) assert.equal((await validateContract('mcpEnvelopeV2', {...envelope, response})).ok, false);
+});
+
+test("MCP envelope carries a reviewer's open flags in the shape the producer writes", async () => {
+  const envelope = JSON.parse(await fs.readFile(path.join(packageRoot,
+    'test/fixtures/mcp-budget-envelope-v2.json'), 'utf8'));
+  const flag = {entity: '50ba786c', name: 'ServerReply.send', note: 'a second send must fail loudly',
+    by: 'Ada Reviewer', at: '2026-10-13T23:40:00Z'};
+  const {note, ...noteless} = flag;
+  for (const flags of [[], [flag], [noteless], [{...flag, changed_since: true}],
+    [{...flag, source_unavailable: true}]]) {
+    const checked = await validateContract('mcpEnvelopeV2', {...envelope, flags});
+    assert.equal(checked.ok, true, JSON.stringify(checked.errors));
+  }
+  const {name, ...nameless} = flag;
+  for (const flags of [flag, 'ServerReply.send', [nameless], [{...flag, changed_since: 'yes'}],
+    [{...flag, note: 7}], [{...flag, source_unavailable: 'yes'}]]) {
+    assert.equal((await validateContract('mcpEnvelopeV2', {...envelope, flags})).ok, false,
+      JSON.stringify(flags));
+  }
+  // The schema names the fields the producer serializes, and no other.
+  const producer = await fs.readFile(
+    path.join(repositoryRoot, 'crates/kin-mcp/src/review_flags.rs'), 'utf8');
+  const declared = producer.match(/pub struct FlagNotice \{([\s\S]*?)\n\}/)[1];
+  const fields = [...declared.matchAll(/^\s*pub (\w+):/gm)].map(match => match[1]);
+  const schema = await loadSchema('mcpEnvelopeV2');
+  assert.deepEqual(fields, Object.keys(schema.properties.flags.items.properties));
+  assert.equal((await validateContract('mcpEnvelopeV2', {
+    ...envelope, flags: [flag], flags_next_cursor: 'review-flags:50ba786c-1111-4222-8333-444455556666'
+  })).ok, true);
+  assert.equal((await validateContract('mcpEnvelopeV2', {
+    ...envelope, flags: [flag], flags_next_cursor: 7
+  })).ok, false);
+});
+
+test('the annotation contract declares a review flag as its producer serializes one', async () => {
+  const schema = JSON.parse(await fs.readFile(
+    path.join(packageRoot, 'schemas/annotation.schema.json'), 'utf8'));
+  // An annotation that is not a review flag carries no such field.
+  assert.equal(schema.required.includes('review'), false);
+  const producer = await fs.readFile(
+    path.join(repositoryRoot, 'crates/kin-model/src/work.rs'), 'utf8');
+  const fieldsOf = name => {
+    const declared = producer.match(new RegExp(`pub struct ${name} \\{([\\s\\S]*?)\\n\\}`))[1];
+    return [...declared.matchAll(/^\s*pub (\w+):/gm)].map(match => match[1]);
+  };
+  const review = schema.properties.review;
+  assert.deepEqual(fieldsOf('ReviewFlag'), Object.keys(review.properties));
+  assert.deepEqual(fieldsOf('ReviewFlag').filter(field => !['flagged_behavior', 'flagged_source'].includes(field)), review.required);
+  for (const field of ['flagged_behavior', 'flagged_source']) {
+    assert.equal(review.required.includes(field), false);
+    assert.deepEqual(review.properties[field].oneOf, [{ $ref: 'kin://contracts/hash256' }, { type: 'null' }]);
+  }
+  const resolution = review.properties.resolution.oneOf[0];
+  assert.deepEqual(fieldsOf('ReviewFlagResolution'), Object.keys(resolution.properties));
+  assert.deepEqual(fieldsOf('ReviewFlagResolution'), resolution.required);
+  const sighting = review.properties.seen_by.items;
+  assert.deepEqual(fieldsOf('ReviewFlagSighting'), Object.keys(sighting.properties));
+  assert.deepEqual(fieldsOf('ReviewFlagSighting'), sighting.required);
 });

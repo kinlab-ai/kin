@@ -2520,6 +2520,12 @@ fn configure_claude_code() -> Result<PathBuf> {
     };
 
     merge_mcp_config(&target, "claude")?;
+    // Connecting Claude Code also has it tell Kin which edits are its own.
+    // The server entry stands whether or not the hook could be written: a
+    // person's settings Kin cannot read are left as they are.
+    if let Err(error) = install_edit_hook_for_claude() {
+        tracing::debug!("Claude Code's edit hook was not written: {error:#}");
+    }
     Ok(target)
 }
 
@@ -3602,6 +3608,70 @@ fn install_prompt_hook_for_claude() {
         }
         Err(error) => say!("  {} not installed: {error:#}", style("✗").red()),
     }
+}
+
+/// Write Kin's paired edit hooks into Claude Code's user settings under `home`,
+/// beside every hook already there. Returns the settings path, what changed
+/// and the groups Kin owns, for the install ledger. Settings that do not parse
+/// are left untouched and refused.
+fn install_claude_edit_hook(
+    home: &Path,
+    launcher: &str,
+) -> Result<(
+    PathBuf,
+    crate::commands::setup_hooks::PromptHookWrite,
+    serde_json::Value,
+)> {
+    let path = crate::commands::setup_hooks::claude_settings_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let lock = ConfigLock::acquire(&path)?;
+    let original = lock.original_bytes(&path)?;
+    let root = original
+        .as_deref()
+        .filter(|bytes| !bytes.iter().all(u8::is_ascii_whitespace))
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "{} is not valid JSON, so Kin leaves it untouched",
+                path.display()
+            )
+        })?;
+    let command = crate::commands::setup_hooks::edit_hook_command(launcher);
+    let (root, write) = crate::commands::setup_hooks::with_edit_hook(root, &command)
+        .with_context(|| format!("Kin leaves {} untouched", path.display()))?;
+    if write != crate::commands::setup_hooks::PromptHookWrite::Unchanged {
+        let mut bytes = serde_json::to_vec_pretty(&root).context("serialize Claude settings")?;
+        bytes.push(b'\n');
+        lock.write_guarded(&path, &bytes, original.as_deref())?;
+    }
+    let groups = crate::commands::setup_hooks::current_edit_hook(&root)
+        .context("installed Claude edit hooks are missing")?;
+    Ok((path, write, groups))
+}
+
+/// Add Kin's edit hooks to Claude Code's user settings and record them in the
+/// install ledger, so the same teardown that removes Kin's server entry
+/// removes both. Writing them again changes nothing.
+///
+/// Connecting Claude Code is what asks for it. The agent edits code with its
+/// own tools far more often than through Kin, and without the hook Kin sees
+/// those edits with no one's name on them.
+fn install_edit_hook_for_claude() -> Result<(PathBuf, crate::commands::setup_hooks::PromptHookWrite)>
+{
+    use crate::commands::setup_hooks::CLAUDE_TARGET;
+    use crate::commands::setup_ledger::{ledger_path, LedgerEntry, SetupLedger};
+    let launcher = resolve_mcp_launcher()?;
+    let (path, write, groups) = install_claude_edit_hook(&home_dir()?, &launcher.command)?;
+    let ledger = ledger_path()?;
+    SetupLedger::update(&ledger, |ledger| {
+        ledger.record(LedgerEntry::edit_hook(CLAUDE_TARGET, path.clone(), &groups));
+        Ok(())
+    })?;
+    Ok((path, write))
 }
 
 fn record_discovery_reminders(written: &[WrittenReminder]) {
@@ -15384,6 +15454,18 @@ async fn apply_plan(
                     if let Some(choice) = &choice {
                         say!("      {}", written_profile_line(choice));
                     }
+                    if *idx == IDX_CLAUDE_CODE {
+                        // Written with the server entry; said here, because
+                        // it is a second place in a person's settings.
+                        match install_edit_hook_for_claude() {
+                            Ok((settings, _)) => say!(
+                                "      edit hook in {}: an edit Claude Code makes with its own \
+                                 tools names it on the entities it changed",
+                                settings.display()
+                            ),
+                            Err(error) => say!("      edit hook not written: {error:#}"),
+                        }
+                    }
                     // Which repository a client ends up bound to is decided by
                     // the directory this ran in, and nothing said so. A later
                     // run from a different directory rebound the client
@@ -25998,6 +26080,88 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         fs::write(&primary, b"{}\n").unwrap();
         assert_eq!(configure_claude_code().unwrap(), primary);
         assert!(read_kin_mcp_entry(&primary).is_some());
+    }
+
+    /// Connecting Claude Code writes the paired edit hooks beside whatever
+    /// hooks a person keeps, records them in the ledger, changes nothing when
+    /// it runs again, and takes both back out through the server's teardown.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn connecting_claude_code_writes_the_edit_hook_and_teardown_removes_it() {
+        use crate::commands::setup_ledger::{
+            ledger_path, run_uninstall, verify_ledger, ArtifactKind, EntryState, RemovalAction,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
+        let settings = home.join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let theirs = serde_json::json!({
+            "model": "opus",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "echo ready"}],
+                }],
+                "PostToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "echo ran"}],
+                }],
+            },
+        });
+        fs::write(&settings, serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        configure_claude_code().unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        let command = format!(
+            "{} agents record-edit --client claude",
+            launcher_spelling(&managed)
+        );
+        for event in ["PreToolUse", "PostToolUse"] {
+            assert_eq!(
+                written["hooks"][event],
+                serde_json::json!([
+                    theirs["hooks"][event][0],
+                    {
+                        "matcher": "Edit|Write|MultiEdit",
+                        "hooks": [{"type": "command", "command": command, "timeout": 10}],
+                    },
+                ])
+            );
+        }
+        assert_eq!(written["model"], "opus");
+
+        let once = fs::read(&settings).unwrap();
+        configure_claude_code().unwrap();
+        assert_eq!(
+            fs::read(&settings).unwrap(),
+            once,
+            "a second run changes nothing"
+        );
+
+        let ledger = ledger_path().unwrap();
+        let hooks: Vec<_> = verify_ledger(&ledger)
+            .unwrap()
+            .into_iter()
+            .filter(|verified| verified.entry.kind == ArtifactKind::EditHook)
+            .collect();
+        assert_eq!(hooks.len(), 1, "recorded once");
+        assert_eq!(hooks[0].state, EntryState::Verified);
+        assert_eq!(hooks[0].entry.path, settings);
+
+        let removed = run_uninstall(&ledger, false, false).unwrap();
+        assert!(removed.iter().any(|outcome| {
+            outcome.entry.kind == ArtifactKind::EditHook && outcome.action == RemovalAction::Removed
+        }));
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(after, theirs, "only Kin's groups went");
     }
 
     /// A temp home plus the ledger path a test drives directly.

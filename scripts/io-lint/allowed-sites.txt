@@ -378,6 +378,7 @@ crates/kin-cli/src/commands/setup.rs	git_authority_output_with_resolution_policy
 crates/kin-cli/src/commands/setup.rs	has_kin_mcp_config	std::fs::read_to_string
 crates/kin-cli/src/commands/setup.rs	has_kin_mcp_config	std::path::Path::exists
 crates/kin-cli/src/commands/setup.rs	incomplete_full_uninstall_artifacts	std::fs::read_dir
+crates/kin-cli/src/commands/setup.rs	install_claude_edit_hook	std::fs::create_dir_all
 crates/kin-cli/src/commands/setup.rs	install_claude_prompt_hook	std::fs::create_dir_all
 crates/kin-cli/src/commands/setup.rs	install_root_identity	std::fs::OpenOptions::open
 crates/kin-cli/src/commands/setup.rs	install_root_identity	std::fs::symlink_metadata
@@ -599,7 +600,9 @@ crates/kin-cli/src/commands/upgrade.rs	remove_legacy_owed_work_records	std::fs::
 crates/kin-cli/src/commands/upgrade.rs	rewrite_upgrade_sidecar	std::fs::File::open
 crates/kin-cli/src/commands/upgrade.rs	rewrite_upgrade_sidecar	tempfile::NamedTempFile::new_in
 crates/kin-cli/src/commands/verify.rs	verification_command	std::process::Command::new
+crates/kin-cli/src/commands/workspace_git_remote.rs	stage_projection	tempfile::TempDir::new
 crates/kin-cli/src/commands/workspace_graph.rs	make_editor_uri	std::path::Path::canonicalize
+crates/kin-cli/src/commands/workspace_home.rs	look_around	kin_blobs::authority::Grant::ambient
 crates/kin-cli/src/commands/workspace_home.rs	look_at	kin_blobs::authority::Grant::ambient
 crates/kin-cli/src/commands/workspace_home.rs	resolve_location	std::path::Path::canonicalize
 crates/kin-cli/src/commands/workspace_home.rs	run_child	kin_blobs::authority::Grant::ambient
@@ -729,6 +732,8 @@ crates/kin-core/src/git_init.rs	init_current_commit_from_git_with_hooks	kin_blob
 crates/kin-core/src/git_init.rs	refresh_git_coexistence_config	kin_blobs::authority::Grant::ambient
 crates/kin-core/src/git_init.rs	require_git_boundary	std::fs::symlink_metadata
 crates/kin-core/src/git_init.rs	source_is_shallow	gix::open_opts
+crates/kin-core/src/git_update.rs	prepare_git_update	kin_blobs::authority::Grant::ambient
+crates/kin-core/src/history_attach.rs	holds_an_entry	std::fs::read_dir
 crates/kin-core/src/history_attach.rs	new_stage_parent	std::fs::create_dir
 crates/kin-core/src/history_attach.rs	read_entries	std::fs::read_dir
 crates/kin-core/src/history_attach.rs	reap_abandoned_stages	std::fs::read_dir
@@ -744,8 +749,6 @@ crates/kin-core/src/history_attach.rs	roll_forward	std::fs::remove_file
 crates/kin-core/src/history_attach.rs	roll_forward	std::fs::rename
 crates/kin-core/src/history_attach.rs	roll_forward	std::path::Path::exists
 crates/kin-core/src/history_attach.rs	sync_directory	std::fs::File::open
-crates/kin-core/src/history_attach.rs	verify_nothing_would_be_lost	std::fs::read_dir
-crates/kin-core/src/history_attach.rs	verify_nothing_would_be_lost	std::fs::symlink_metadata
 crates/kin-core/src/history_attach.rs	write_journal	std::fs::File::create
 crates/kin-core/src/history_attach.rs	write_journal	std::fs::rename
 crates/kin-core/src/hydration_semantics.rs	invalidate_for_unversioned_transfer	std::fs::remove_file
@@ -1034,6 +1037,7 @@ crates/kin-daemon-spawn/src/lib.rs	write_open_transaction	std::fs::rename
 crates/kin-daemon-spawn/src/lib.rs	write_open_transaction	std::fs::write
 crates/kin-daemon-spawn/src/lib.rs	write_sweep_interruptions	std::fs::write
 crates/kin-daemon-spawn/src/runtime_authority.rs	acquire_lifecycle_coordination	std::fs::OpenOptions::open
+crates/kin-daemon-spawn/src/runtime_authority.rs	repository_runtime_authority_is_held	std::fs::OpenOptions::open
 crates/kin-daemon-spawn/src/runtime_authority.rs	try_acquire_repository_runtime_authority	std::fs::OpenOptions::open
 crates/kin-daemon-spawn/src/runtime_authority.rs	try_acquire_repository_runtime_authority	std::path::Path::canonicalize
 crates/kin-daemon-spawn/src/test_runtime.rs	durable_json	std::fs::File::open
@@ -1097,6 +1101,7 @@ crates/kin-daemon/src/entity_drafts.rs	scan	std::fs::read_dir
 crates/kin-daemon/src/entity_drafts.rs	scan	std::fs::symlink_metadata
 crates/kin-daemon/src/entity_drafts.rs	sync_dir	std::fs::OpenOptions::open
 crates/kin-daemon/src/history_schedule.rs	kin_binary	std::path::Path::is_file
+crates/kin-daemon/src/history_schedule.rs	start_successor	std::process::Command::new
 crates/kin-daemon/src/language_server_command.rs	proxy_rustup_for	std::fs::canonicalize
 crates/kin-daemon/src/language_server_command.rs	proxy_rustup_for	std::fs::metadata
 crates/kin-daemon/src/language_server_command.rs	run_rustup	std::process::Command::new

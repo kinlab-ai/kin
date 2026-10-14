@@ -413,7 +413,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
         ),
         (
             crate::verbs::STATUS,
-            "Graph health; not needed to trust a reply. last_settled_selected_graph is older.",
+            "Health/review flags; not needed to trust a reply. last_settled_selected_graph is older.",
         ),
         // The one fact an agent cannot discover for itself: that the list it was
         // handed is partial on purpose, and how to reach the rest. Every other
@@ -1226,6 +1226,7 @@ mod tests {
         (crate::impact_pages::TOOL, "next_cursor", "cursor"),
         // The status and enrichment pages: `crate::status_pages`.
         ("kin_graph_status", "next_cursor", "cursor"),
+        ("kin_graph_status", "_kin.flags_next_cursor", "flags_cursor"),
         // Older changes: `crate::handlers::provenance`.
         ("kin_provenance_query", "next_offset", "offset"),
         // Draft pages: `crate::entity_drafts`, whose `next_cursor` is passed
@@ -1406,6 +1407,12 @@ mod tests {
                 serde_json::json!({"cursor": "c"}),
                 "kin_graph_status",
                 "cursor",
+            ),
+            (
+                crate::verbs::STATUS,
+                serde_json::json!({"flags_cursor": "c"}),
+                "kin_graph_status",
+                "flags_cursor",
             ),
             (
                 crate::verbs::HISTORY,

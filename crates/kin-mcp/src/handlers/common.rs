@@ -4796,9 +4796,24 @@ fn imports_into<'r>(
 
 /// A committed generation for the census: the replayed state's tree,
 /// entities and relations.
+///
+/// The census asks, for every focal, which edges land on it, and, for every
+/// file it reads, which imports are written there. A replayed state keeps its
+/// relations in one map keyed by relation id, so answering each question by a
+/// pass over every relation made a guide of one committed change cost the
+/// number of focals times the number of relations: on a repository of 120
+/// thousand relations, most of a minute. The relations are put in order once
+/// here, by the entity they land on and by the files their import evidence
+/// sits in, and each question reads its own few. Every list keeps the order
+/// the map yields, so each answer is the one a full pass gave.
 struct StateCensus<'h> {
     state: &'h kin_model::graph::ResolvedGraphState,
     by_file: HashMap<String, Vec<Entity>>,
+    /// The `Calls`, `Imports` and `References` edges landing on each entity.
+    uses_by_target: HashMap<EntityId, Vec<&'h kin_model::Relation>>,
+    /// The `Imports` edges with evidence in each file, each listed once per
+    /// file.
+    imports_by_file: HashMap<&'h str, Vec<&'h kin_model::Relation>>,
 }
 
 impl<'h> StateCensus<'h> {
@@ -4812,7 +4827,46 @@ impl<'h> StateCensus<'h> {
                     .push(entity.clone());
             }
         }
-        Self { state, by_file }
+        let mut uses_by_target: HashMap<EntityId, Vec<&'h kin_model::Relation>> = HashMap::new();
+        let mut imports_by_file: HashMap<&'h str, Vec<&'h kin_model::Relation>> = HashMap::new();
+        for relation in state.relations.values() {
+            if !kin_db::StoredUse::KINDS.contains(&relation.kind) {
+                continue;
+            }
+            if let Some(target) = relation.dst.as_entity() {
+                uses_by_target.entry(target).or_default().push(relation);
+            }
+            if relation.kind != RelationKind::Imports {
+                continue;
+            }
+            for evidence in &relation.evidence {
+                let Some(span) = evidence.source_span.as_ref() else {
+                    continue;
+                };
+                let listed = imports_by_file.entry(span.file.0.as_str()).or_default();
+                if !listed
+                    .last()
+                    .is_some_and(|last| std::ptr::eq(*last, relation))
+                {
+                    listed.push(relation);
+                }
+            }
+        }
+        Self {
+            state,
+            by_file,
+            uses_by_target,
+            imports_by_file,
+        }
+    }
+
+    /// The `Calls`, `Imports` and `References` edges landing on `target`.
+    fn landing_on(&self, target: EntityId) -> impl Iterator<Item = &'h kin_model::Relation> + '_ {
+        self.uses_by_target
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .copied()
     }
 }
 
@@ -4829,11 +4883,11 @@ impl kin_db::call_site_escape::EscapeCensusGraph for StateCensus<'_> {
     }
 
     fn import_evidence_into(&self, target: EntityId) -> Option<Vec<kin_model::RelationEvidence>> {
-        Some(imports_into(self.state.relations.values(), target))
+        Some(imports_into(self.landing_on(target), target))
     }
 
     fn uses_into(&self, target: EntityId) -> Option<Vec<kin_db::StoredUse>> {
-        uses_into(self.state.relations.values(), target, |source| {
+        uses_into(self.landing_on(target), target, |source| {
             Ok::<_, std::convert::Infallible>(
                 self.state
                     .entities
@@ -4869,9 +4923,131 @@ impl kin_db::call_site_escape::EscapeCensusGraph for StateCensus<'_> {
         &self,
         file: &kin_db::call_site_escape::CensusFile,
     ) -> Vec<kin_db::call_site_escape::WrittenImport> {
-        kin_index::written_imports(self.state.relations.values(), &file.path.0, |id| {
+        let written_here = self
+            .imports_by_file
+            .get(file.path.0.as_str())
+            .into_iter()
+            .flatten()
+            .copied();
+        kin_index::written_imports(written_here, &file.path.0, |id| {
             self.state.entities.get(&id).map(|entity| entity.kind)
         })
+    }
+}
+
+#[cfg(test)]
+mod state_census_tests {
+    use super::{imports_into, uses_into, StateCensus};
+    use kin_db::call_site_escape::{CensusFile, EscapeCensusGraph};
+    use kin_model::graph::ResolvedGraphState;
+    use kin_model::relation::{Relation, RelationEvidence, RelationOrigin};
+    use kin_model::{
+        EntityId, FilePathId, GraphNodeId, Hash256, LanguageId, RelationKind, SourceSpan,
+    };
+
+    fn span(file: &str, start: usize) -> SourceSpan {
+        SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: start,
+            end_byte: start + 4,
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 4,
+        }
+    }
+
+    fn edge(kind: RelationKind, src: EntityId, dst: EntityId, sites: &[(&str, usize)]) -> Relation {
+        Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: sites
+                .iter()
+                .map(|(file, start)| RelationEvidence {
+                    source_span: Some(span(file, *start)),
+                    token: Some(format!("t{start}")),
+                    ..RelationEvidence::default()
+                })
+                .collect(),
+        }
+    }
+
+    fn census_file(path: &str) -> CensusFile {
+        CensusFile {
+            path: FilePathId::new(path),
+            language: LanguageId::TypeScript,
+            blob: Hash256::from_bytes([0; 32]),
+            parsed: Some(true),
+        }
+    }
+
+    /// The census of a replayed state answers each focal from the edges that
+    /// land on it, and each file from the imports written there, exactly as a
+    /// pass over every relation of the state answered them: the same rows in
+    /// the same order, for edges of every kind the census reads, edges it does
+    /// not read, edges whose evidence sits in several files or twice in one,
+    /// and an entity nothing lands on.
+    #[test]
+    fn a_replayed_state_census_answers_as_a_pass_over_every_relation_did() {
+        let focal = EntityId::new();
+        let other = EntityId::new();
+        let lonely = EntityId::new();
+        let caller = EntityId::new();
+        let mut state = ResolvedGraphState::default();
+        for relation in [
+            edge(
+                RelationKind::Imports,
+                caller,
+                focal,
+                &[("src/a.ts", 0), ("src/b.ts", 8)],
+            ),
+            edge(
+                RelationKind::Imports,
+                caller,
+                focal,
+                &[("src/a.ts", 16), ("src/a.ts", 32)],
+            ),
+            edge(RelationKind::Calls, caller, focal, &[("src/a.ts", 40)]),
+            edge(RelationKind::References, caller, focal, &[]),
+            edge(RelationKind::Contains, caller, focal, &[("src/a.ts", 48)]),
+            edge(RelationKind::Imports, caller, other, &[("src/b.ts", 56)]),
+            edge(RelationKind::Calls, focal, other, &[("src/c.ts", 64)]),
+        ] {
+            state.relations.insert(relation.id, relation);
+        }
+        let census = StateCensus::new(&state);
+        let span_of = |_: EntityId| Ok::<_, std::convert::Infallible>(None);
+        for target in [focal, other, lonely] {
+            assert_eq!(
+                census.import_evidence_into(target),
+                Some(imports_into(state.relations.values(), target)),
+            );
+            assert_eq!(
+                census.uses_into(target),
+                uses_into(state.relations.values(), target, span_of),
+            );
+        }
+        assert_eq!(
+            census
+                .import_evidence_into(focal)
+                .map(|evidence| evidence.len()),
+            Some(4)
+        );
+        for path in ["src/a.ts", "src/b.ts", "src/c.ts", "src/none.ts"] {
+            let file = census_file(path);
+            assert_eq!(
+                census.imports_written_in(&file),
+                kin_index::written_imports(state.relations.values(), path, |_| None),
+                "{path}"
+            );
+        }
+        assert_eq!(census.imports_written_in(&census_file("src/a.ts")).len(), 3);
     }
 }
 
@@ -7866,5 +8042,65 @@ mod reference_site_tests {
         ] {
             assert_eq!(call_callee_text(text), callee, "{text:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod state_census_import_index_tests {
+    use super::{imports_into, StateCensus};
+    use kin_db::call_site_escape::EscapeCensusGraph;
+    use kin_model::{EntityId, GraphNodeId, Relation, RelationKind, RelationOrigin};
+
+    fn edge(kind: RelationKind, src: EntityId, dst: EntityId, rule: &str) -> Relation {
+        Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::RelationEvidence {
+                parser_rule: Some(rule.to_string()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// The census reads each focal's imports from an index built once, and
+    /// it answers exactly what filtering every relation of the generation
+    /// answered.
+    #[test]
+    fn a_replayed_census_reads_the_imports_into_a_focal_from_one_index() {
+        let (focal, other, importer) = (EntityId::new(), EntityId::new(), EntityId::new());
+        let mut state = kin_model::graph::ResolvedGraphState::default();
+        for relation in [
+            edge(RelationKind::Imports, importer, focal, "first"),
+            edge(RelationKind::Imports, other, focal, "second"),
+            edge(RelationKind::Calls, importer, focal, "a call"),
+            edge(RelationKind::Imports, importer, other, "elsewhere"),
+        ] {
+            state.relations.insert(relation.id, relation);
+        }
+        let census = StateCensus::new(&state);
+        let rules = |evidence: Vec<kin_model::RelationEvidence>| {
+            let mut rules: Vec<String> = evidence
+                .into_iter()
+                .filter_map(|evidence| evidence.parser_rule)
+                .collect();
+            rules.sort();
+            rules
+        };
+        for target in [focal, other, EntityId::new()] {
+            assert_eq!(
+                rules(census.import_evidence_into(target).unwrap()),
+                rules(imports_into(state.relations.values(), target)),
+            );
+        }
+        assert_eq!(
+            rules(census.import_evidence_into(focal).unwrap()),
+            vec!["first".to_string(), "second".to_string()]
+        );
     }
 }

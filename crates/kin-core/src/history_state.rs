@@ -218,8 +218,10 @@ impl DerivationState {
 pub struct HistoryDerivationProgress {
     pub schema: String,
     pub state: DerivationState,
-    /// The admission step the derivation is on, as the conversion ladder
-    /// names it.
+    /// The admission step a running derivation is on, as the conversion ladder
+    /// names it. For a staged derivation, what the switch to the full history
+    /// is waiting for, when a daemon has found it has to wait; see
+    /// [`Self::staged_waiting_for`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +263,22 @@ impl HistoryDerivationProgress {
             let _ = pid;
             true
         }
+    }
+
+    /// The stage a staged derivation left its complete store in.
+    pub fn staged_at(&self) -> Option<PathBuf> {
+        (self.state == DerivationState::Staged)
+            .then(|| self.detail.as_deref().map(PathBuf::from))
+            .flatten()
+    }
+
+    /// What the switch to a staged history is waiting for, as a clause that
+    /// follows "waiting for". `None` when the history is not staged, or when
+    /// nothing is known to hold the switch back.
+    pub fn staged_waiting_for(&self) -> Option<&str> {
+        (self.state == DerivationState::Staged)
+            .then_some(self.phase.as_deref())
+            .flatten()
     }
 
     pub fn new(state: DerivationState) -> Self {
@@ -436,9 +454,15 @@ fn derivation_clause(mode: HistoryMode, progress: Option<&HistoryDerivationProgr
                 _ => "the full history is deriving in the background".to_string(),
             }
         }
-        Some((DerivationState::Staged, _)) => "the full history is derived and replaces this \
-                                                store when the daemon is next idle"
-            .to_string(),
+        Some((DerivationState::Staged, progress)) => match progress.staged_waiting_for() {
+            Some(waiting_for) => format!(
+                "the full history is derived, and this repository switches to it at its next \
+                 quiet point (waiting for {waiting_for})"
+            ),
+            None => "the full history is derived, and this repository switches to it at its \
+                     next quiet point"
+                .to_string(),
+        },
         Some((DerivationState::Failed, progress)) => format!(
             "the last background derivation failed{} and is retried later",
             detail(progress)
@@ -559,6 +583,31 @@ pub fn write_progress(
     write_json_atomically(layout.root(), &progress_path(layout), progress)
 }
 
+/// Record what the switch to a staged history is waiting for, or with `None`
+/// that nothing is known to hold it back.
+///
+/// Changes nothing but that note and the time, and only on a progress that is
+/// staged, so it can never turn a running or failed derivation into a staged
+/// one. Answers whether it wrote: a note that already says this is left alone,
+/// so a daemon that looks every few seconds does not rewrite the record every
+/// few seconds.
+pub fn note_staged_wait(layout: &KinLayout, waiting_for: Option<&str>) -> std::io::Result<bool> {
+    let HistoryStanding::Partial {
+        progress: Some(mut progress),
+        ..
+    } = standing(layout)
+    else {
+        return Ok(false);
+    };
+    if progress.state != DerivationState::Staged || progress.phase.as_deref() == waiting_for {
+        return Ok(false);
+    }
+    progress.phase = waiting_for.map(str::to_string);
+    progress.updated_at = Utc::now();
+    write_progress(layout, &progress)?;
+    Ok(true)
+}
+
 /// Remove the derivation progress, for a store whose derivation is over.
 pub fn clear_progress(layout: &KinLayout) -> std::io::Result<()> {
     crate::store_records::remove(layout.root(), &progress_path(layout)).map(|_| ())
@@ -641,9 +690,73 @@ mod tests {
         write_progress(&layout, &progress).unwrap();
         let read = standing(&layout);
         assert!(!read.is_complete());
-        assert!(read.sentence().unwrap().contains("replaces this store"));
+        let sentence = read.sentence().unwrap();
+        assert!(
+            sentence.ends_with("switches to it at its next quiet point."),
+            "{sentence}"
+        );
         clear_progress(&layout).unwrap();
         clear_progress(&layout).unwrap();
+    }
+
+    /// A staged history that has to wait says what it waits for, in the
+    /// sentence and to a program, and names its stage only while it is staged.
+    #[test]
+    fn a_staged_history_that_waits_says_what_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        stamp_staged(&layout, &record(HistoryMode::Background)).unwrap();
+        let mut progress = HistoryDerivationProgress::new(DerivationState::Staged);
+        progress.detail = Some("/stages/one".to_string());
+        assert_eq!(progress.staged_at(), Some(PathBuf::from("/stages/one")));
+        assert_eq!(progress.staged_waiting_for(), None);
+        progress.phase = Some("an agent's open transaction to be committed".to_string());
+        write_progress(&layout, &progress).unwrap();
+        let HistoryStanding::Partial {
+            progress: Some(read),
+            ..
+        } = standing(&layout)
+        else {
+            panic!("the store reads back partial with its progress");
+        };
+        assert_eq!(
+            read.staged_waiting_for(),
+            Some("an agent's open transaction to be committed")
+        );
+        let sentence = standing(&layout).sentence().unwrap();
+        assert!(
+            sentence.contains("(waiting for an agent's open transaction to be committed)"),
+            "{sentence}"
+        );
+
+        // The note is written once, cleared once, and never onto a
+        // derivation that is not staged.
+        assert!(!note_staged_wait(&layout, read.staged_waiting_for()).unwrap());
+        assert!(note_staged_wait(&layout, Some("an open merge to be finished")).unwrap());
+        assert!(note_staged_wait(&layout, None).unwrap());
+        assert!(!note_staged_wait(&layout, None).unwrap());
+        let HistoryStanding::Partial {
+            progress: Some(cleared),
+            ..
+        } = standing(&layout)
+        else {
+            panic!("the store reads back partial with its progress");
+        };
+        assert_eq!(cleared.staged_waiting_for(), None);
+        assert_eq!(cleared.staged_at(), Some(PathBuf::from("/stages/one")));
+        write_progress(
+            &layout,
+            &HistoryDerivationProgress::new(DerivationState::Failed),
+        )
+        .unwrap();
+        assert!(!note_staged_wait(&layout, Some("anything")).unwrap());
+
+        // A running derivation's phase is its admission step, never a wait.
+        let mut running = HistoryDerivationProgress::new(DerivationState::Running);
+        running.phase = Some("admit history".to_string());
+        running.detail = Some("/stages/one".to_string());
+        assert_eq!(running.staged_waiting_for(), None);
+        assert_eq!(running.staged_at(), None);
     }
 
     #[test]

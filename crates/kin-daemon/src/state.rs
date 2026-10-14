@@ -936,7 +936,9 @@ pub(crate) fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Resul
 /// silently drop staged-but-uncommitted work — stdio-MCP and HTTP-MCP then
 /// behave identically across a restart, not just across HTTP calls.
 pub(crate) fn mcp_transactions_disk_path(layout: &KinLayout) -> std::path::PathBuf {
-    layout.root().join("mcp_transactions.json")
+    layout
+        .root()
+        .join(kin_core::history_attach::AGENT_TRANSACTIONS_RECORD)
 }
 
 /// Wall-clock cost of each blocking phase of a daemon open.
@@ -1060,7 +1062,9 @@ fn mcp_transaction_recovery_error(
 }
 
 fn mcp_lifecycle_recovery_path(layout: &KinLayout) -> std::path::PathBuf {
-    layout.root().join("mcp_transactions.lifecycle.json")
+    layout
+        .root()
+        .join(kin_core::history_attach::AGENT_TRANSACTIONS_RECOVERY_RECORD)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1969,6 +1973,24 @@ pub(crate) enum RequestGraphAuthority {
     Head,
     SessionScope,
 }
+
+/// The spine build a read started on a task of its own.
+#[derive(Debug, Default)]
+struct SpineBackgroundBuild {
+    running: bool,
+    /// When the last one ended without a spine, as one does when a
+    /// repository moved while the others were read.
+    ended_without_spine_at: Option<Instant>,
+}
+
+/// How long a spine build that ended without a spine keeps a read from
+/// starting another. Each opens every sibling repository's authority.
+const SPINE_BACKGROUND_RETRY: Duration = Duration::from_secs(60);
+
+/// Why a read while the spine builds has no references from the other
+/// repositories on this machine.
+const SPINE_BUILDING_REASON: &str = "Kin is still reading the other repositories on this machine, \
+     so references from them are not in this answer yet";
 
 /// Type of entity change for SSE events.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -4482,6 +4504,17 @@ pub struct DaemonState {
     pub coordination_mode: std::sync::RwLock<kin_mcp::CoordinationEnforcementMode>,
     /// Durable, release-attributed coordination event collector.
     pub coordination_events: CoordinationEventLog,
+    /// What agents did here: which entities each wrote through Kin, change
+    /// by change, the edits they made with their own tools, and what each
+    /// session did once it ended. Kept past the session, in repository
+    /// authority; shared with the session coordinator.
+    pub agent_authorship: Arc<crate::agent_authorship::AgentAuthorship>,
+    /// The guides of committed changes this daemon built, kept while what
+    /// they read holds still, and the builds running now.
+    pub(crate) committed_guides: crate::committed_guides::CommittedGuides,
+    /// Each unit's admission steps, for an agent client that reports an edit
+    /// it made with its own tools.
+    pub client_edits: crate::client_edits::ClientEdits,
     /// Runtime completeness signal for the durable collector. Citable runs
     /// must require zero; an append failure never masquerades as a recorded
     /// event merely because the product action itself completed.
@@ -4754,6 +4787,9 @@ pub struct DaemonState {
     /// and its own repo is served, but a cross-repo surface is materializing.
     /// Clients must treat it as alive-and-waiting, never as a dead endpoint.
     spine_warming: AtomicBool,
+    /// The spine build a read started on a task of its own, when one did; see
+    /// [`DaemonState::acquire_spine_read_authority_for_read`].
+    spine_background_build: Mutex<SpineBackgroundBuild>,
     /// Deterministic blocking seam for concurrency and runtime-starvation
     /// regression tests. Production initialization has no injected hook.
     #[cfg(test)]
@@ -4943,6 +4979,9 @@ pub struct DaemonState {
     /// needs it. The idle monitor then treats the window as zero, so the exit
     /// still waits on every gate an idle exit waits on.
     retirement_requested: AtomicBool,
+    /// Set when this daemon stops serving so that its successor can attach the
+    /// complete history a worker staged. See [`crate::history_schedule`].
+    history_handoff: AtomicBool,
     /// Number of API requests currently being handled.
     pub active_requests: AtomicU64,
     /// Channel for LSP enrichment messages (incremental or sweep).
@@ -7688,7 +7727,13 @@ impl DaemonState {
             crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));
         reconciler.set_traffic_checker(Box::new(traffic_checker));
 
-        let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        // What agents did here, read from and kept in repository authority:
+        // the sessions that end are kept in it too.
+        let agent_authorship = Arc::new(crate::agent_authorship::AgentAuthorship::new(Arc::clone(
+            &graph,
+        )));
+        let mut coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        coordinator.keep_ended_sessions_in(Arc::clone(&agent_authorship));
 
         // Resume from the last persisted VFS version so kin-vfs clients
         // don't see a reset after daemon restart.
@@ -7725,6 +7770,9 @@ impl DaemonState {
                 kin_mcp::CoordinationEnforcementMode::from_env(),
             ),
             coordination_events,
+            agent_authorship,
+            committed_guides: Default::default(),
+            client_edits: crate::client_edits::ClientEdits::default(),
             coordination_event_persist_failures: AtomicU64::new(
                 coordination_event_persist_failures,
             ),
@@ -7808,6 +7856,7 @@ impl DaemonState {
             hosted_durable_spine_for_test: Mutex::new(None),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            spine_background_build: Mutex::new(SpineBackgroundBuild::default()),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
             admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
@@ -7845,6 +7894,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
+            history_handoff: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
@@ -8209,7 +8259,13 @@ impl DaemonState {
             crate::traffic_adapter::CoordinatorTrafficChecker::new(Arc::clone(&graph));
         reconciler.set_traffic_checker(Box::new(traffic_checker));
 
-        let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        // What agents did here, read from and kept in repository authority:
+        // the sessions that end are kept in it too.
+        let agent_authorship = Arc::new(crate::agent_authorship::AgentAuthorship::new(Arc::clone(
+            &graph,
+        )));
+        let mut coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        coordinator.keep_ended_sessions_in(Arc::clone(&agent_authorship));
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
@@ -8238,6 +8294,9 @@ impl DaemonState {
                 kin_mcp::CoordinationEnforcementMode::from_env(),
             ),
             coordination_events,
+            agent_authorship,
+            committed_guides: Default::default(),
+            client_edits: crate::client_edits::ClientEdits::default(),
             coordination_event_persist_failures: AtomicU64::new(
                 coordination_event_persist_failures,
             ),
@@ -8321,6 +8380,7 @@ impl DaemonState {
             hosted_durable_spine_for_test: Mutex::new(None),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            spine_background_build: Mutex::new(SpineBackgroundBuild::default()),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
             admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
@@ -8358,6 +8418,7 @@ impl DaemonState {
             idle_timeout_ms: AtomicU64::new(0),
             idle_floor_leases: crate::idle_floor::IdleFloorLeases::default(),
             retirement_requested: AtomicBool::new(false),
+            history_handoff: AtomicBool::new(false),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
@@ -9778,6 +9839,79 @@ impl DaemonState {
                     Some(refusal.into_reason());
                 CachedReadAuthority::Refuse
             }
+        }
+    }
+
+    /// [`Self::acquire_spine_read_authority`] for a read that can answer
+    /// without the spine, saying what it lacks, as a reference read can.
+    ///
+    /// A local daemon builds its spine the first time a read needs it, from
+    /// this repository and every sibling registered on the machine, and each
+    /// sibling's whole persisted authority is opened and verified for it. The
+    /// read that asked used to wait for all of it. Measured on fastify beside
+    /// axum, fastapi and zod on a busy host, that took more than ten minutes,
+    /// and the entity page's references read, which gives up at 20 s, never
+    /// saw an answer: it said Kin could not read the references. So while no
+    /// spine is built and there are siblings to load, the build runs on a
+    /// blocking task of its own, one at a time, and the read is answered
+    /// without references from the other repositories, the way a deferred
+    /// spine is ([`kin_spine::DaemonSpine::Deferred`]). A read after the build
+    /// lands is answered with them. With no sibling the build reads this
+    /// repository alone and is as quick as before, so the read builds it.
+    pub(crate) async fn acquire_spine_read_authority_for_read(
+        self: &Arc<Self>,
+    ) -> Option<SpineAuthorityReadGuard<'_>> {
+        if self.storage_backend.is_none()
+            && !self.spine_disabled()
+            && self.spine.get().is_none()
+            && self.spine_peer_repositories() > 0
+        {
+            self.build_spine_in_background();
+            return None;
+        }
+        self.acquire_spine_read_authority().await
+    }
+
+    /// Start the spine's first build on a blocking task, unless one is
+    /// running or the last ended without a spine less than
+    /// [`SPINE_BACKGROUND_RETRY`] ago.
+    fn build_spine_in_background(self: &Arc<Self>) {
+        {
+            let mut build = self
+                .spine_background_build
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if build.running {
+                return;
+            }
+            if build
+                .ended_without_spine_at
+                .is_some_and(|ended| ended.elapsed() < SPINE_BACKGROUND_RETRY)
+            {
+                return;
+            }
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            build.running = true;
+            self.record_spine_unavailable(SPINE_BUILDING_REASON.to_string());
+            let state = Arc::clone(self);
+            drop(runtime.spawn_blocking(move || {
+                let started = Instant::now();
+                let built = state.ensure_spine().is_some();
+                info!(
+                    built,
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    siblings = state.spine_peer_repositories(),
+                    "spine build a read started has ended"
+                );
+                let mut build = state
+                    .spine_background_build
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                build.running = false;
+                build.ended_without_spine_at = (!built).then(Instant::now);
+            }));
         }
     }
 
@@ -13728,8 +13862,12 @@ impl DaemonState {
                     "frozen repository authority has no workspace {workspace_id}"
                 )))
             })?;
+        // Never searched: it is read for its tree, compared domain by domain
+        // with the live graph, and asked for its binding-history capability.
+        // A text index over it would index every entity to answer no query.
         let authority_graph =
-            kin_db::InMemoryGraph::from_snapshot(authority_snapshot).map_err(DaemonError::from)?;
+            kin_db::InMemoryGraph::from_snapshot_without_text_index(authority_snapshot)
+                .map_err(DaemonError::from)?;
         if authority_graph.resolved_tree() != *desired_tree {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                 format!(
@@ -16008,6 +16146,12 @@ impl DaemonState {
         Ok((combined, debts, retired))
     }
 
+    /// The committed workspace graph a finalization or a vector checkpoint
+    /// compares against. Its readers take its tree, its counts, its entities
+    /// for the read index and its proof, and none of them searches it, so it is
+    /// built without a text index. Indexing every entity's text, and digesting
+    /// the graph to decide whether that index was current, was paid by the
+    /// flush that follows every edit for a graph dropped a moment later.
     fn load_committed_authority_graph(
         &self,
         generation: u64,
@@ -16028,7 +16172,7 @@ impl DaemonState {
                     let (query_snapshot, _) =
                         materialize_hosted_repository_snapshot(recovered.snapshot)?;
                     Arc::new(
-                        kin_db::InMemoryGraph::from_snapshot(query_snapshot)
+                        kin_db::InMemoryGraph::from_snapshot_without_text_index(query_snapshot)
                             .map_err(DaemonError::from)?,
                     )
                 }
@@ -16065,7 +16209,14 @@ impl DaemonState {
                         binding.workspace_id()
                     )))
                 })?;
-            Arc::new(kin_db::InMemoryGraph::from_snapshot(snapshot).map_err(DaemonError::from)?)
+            // Its readers take a tree, entity and relation counts, a read
+            // index built from its entities, and its binding-history
+            // capability. None of them searches it, so it carries no text
+            // index.
+            Arc::new(
+                kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)
+                    .map_err(DaemonError::from)?,
+            )
         };
         Ok(authority_graph)
     }
@@ -16497,6 +16648,28 @@ impl DaemonState {
     /// Whether a caller has asked this daemon to exit once nothing needs it.
     pub fn retirement_requested(&self) -> bool {
         self.retirement_requested.load(Ordering::SeqCst)
+    }
+
+    /// Stop serving so the next daemon on this store attaches its staged
+    /// history as it starts. Answers whether this daemon is now stopping for
+    /// that: a state no daemon loop runs has nothing to stop.
+    ///
+    /// The stop is the cooperative one, so a request already being answered is
+    /// answered and the graph is flushed before the process ends. The mark is
+    /// set first, so the teardown that follows knows to keep the repository's
+    /// runtime authority until the process is gone.
+    pub(crate) fn hand_off_for_history(&self) -> bool {
+        self.history_handoff.store(true, Ordering::SeqCst);
+        if self.stop_serving() {
+            return true;
+        }
+        self.history_handoff.store(false, Ordering::SeqCst);
+        false
+    }
+
+    /// Whether this daemon is stopping to hand its store over.
+    pub(crate) fn handing_off_for_history(&self) -> bool {
+        self.history_handoff.load(Ordering::SeqCst)
     }
 
     /// Duration since the last recorded external activity.
@@ -21599,6 +21772,92 @@ mod tests {
                 "aggregate warning must carry {field}: {summary}"
             );
         }
+    }
+
+    /// A reference read is not held while the spine's first build opens the
+    /// repositories registered beside this one. Measured on fastify beside
+    /// axum, fastapi and zod on a busy host, that build ran for more than ten
+    /// minutes, and the entity page's read of references, which gives up at
+    /// 20 s, said Kin could not read them every time. The read is answered at
+    /// once without the spine, saying why; one build runs however many reads
+    /// arrive; and once it lands, reads have the spine.
+    ///
+    /// Breaking it: have the read build the spine itself again, and the first
+    /// read waits on the held build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_read_is_answered_while_the_spine_loads_its_siblings() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _fixture = registered_sibling_fixture();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = Arc::new(test_state(primary_init.layout, primary_dir.path()));
+        assert_eq!(state.spine_peer_repositories(), 1, "the sibling is pinned");
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let builds_in_hook = Arc::clone(&builds);
+        let release_in_hook = Arc::clone(&release);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            builds_in_hook.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            let (released, wake) = &*release_in_hook;
+            let released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = wake
+                .wait_timeout_while(released, Duration::from_secs(120), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        })));
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.acquire_spine_read_authority_for_read(),
+        )
+        .await
+        .expect("a read does not wait for the spine's first build")
+        .is_some();
+        assert!(!first, "no spine is ready while its build is held");
+        assert_eq!(
+            state.spine_initialization_deferral().as_deref(),
+            Some(SPINE_BUILDING_REASON)
+        );
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .unwrap()
+            .expect("the build runs on a task of its own");
+        assert!(state.spine_warming());
+        assert!(state
+            .acquire_spine_read_authority_for_read()
+            .await
+            .is_none());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a read while a build runs starts no second one"
+        );
+
+        {
+            let (released, wake) = &*release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while state
+            .acquire_spine_read_authority_for_read()
+            .await
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "the spine never landed");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(!state.spine_warming());
     }
 
     #[test]

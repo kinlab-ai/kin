@@ -299,7 +299,54 @@ fn binding_history_binds_whole_scope_graph_and_invalidates_before_mutation() {
         .unwrap()
         .unwrap();
     let metadata = lease.metadata().clone();
-    binding_history::bind_selected_graph(&metadata, workspace.workspace_id, &mut selected).unwrap();
+    binding_history::bind_selected_graph(
+        &metadata,
+        workspace.workspace_id,
+        &mut selected,
+        None,
+        None,
+    )
+    .unwrap();
+    // A digest the caller holds is compared with the witness, never trusted
+    // past it.
+    assert!(binding_history::bind_selected_graph(
+        &metadata,
+        workspace.workspace_id,
+        &mut selected.clone(),
+        Some(Hash256::from_bytes([7; 32])),
+        None
+    )
+    .is_err());
+    // Identities the caller holds stand in for hashing the log: the log's own
+    // bind, a wrong one is refused exactly as a wrong record is, and a list of
+    // another length describes another log and is not consulted.
+    let mut identities = lease.operation_identities().unwrap().as_ref().clone();
+    binding_history::bind_selected_graph(
+        &metadata,
+        workspace.workspace_id,
+        &mut selected.clone(),
+        None,
+        Some(&identities),
+    )
+    .unwrap();
+    *identities.last_mut().unwrap() = Hash256::from_bytes([7; 32]);
+    assert!(binding_history::bind_selected_graph(
+        &metadata,
+        workspace.workspace_id,
+        &mut selected.clone(),
+        None,
+        Some(&identities)
+    )
+    .is_err());
+    identities.pop();
+    binding_history::bind_selected_graph(
+        &metadata,
+        workspace.workspace_id,
+        &mut selected.clone(),
+        None,
+        Some(&identities),
+    )
+    .unwrap();
     let graph = InMemoryGraph::from_snapshot_without_text_index(selected.clone()).unwrap();
     assert!(matches!(
         graph.binding_history_observation(),
@@ -314,7 +361,9 @@ fn binding_history_binds_whole_scope_graph_and_invalidates_before_mutation() {
     assert!(binding_history::bind_selected_graph(
         &wrong_root,
         workspace.workspace_id,
-        &mut selected
+        &mut selected,
+        None,
+        None
     )
     .is_err());
     let mut wrong_graph = selected.clone();
@@ -322,7 +371,9 @@ fn binding_history_binds_whole_scope_graph_and_invalidates_before_mutation() {
     assert!(binding_history::bind_selected_graph(
         &metadata,
         workspace.workspace_id,
-        &mut wrong_graph
+        &mut wrong_graph,
+        None,
+        None
     )
     .is_err());
     graph

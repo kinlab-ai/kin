@@ -33,7 +33,7 @@ use kin_parser::declaration_lifecycle::{
 use kin_parser::member_placement::{member_placement_for, member_placement_languages};
 
 use crate::local_repository_authority::LocalRepositoryAuthorityContext;
-use crate::repository_commit::{load_native_source_blob, NativeCommitBase};
+use crate::repository_commit::load_native_source_blob;
 use crate::state::DaemonState;
 
 pub(crate) struct LifecyclePlan {
@@ -529,16 +529,45 @@ fn ensure_source_cache(
     Ok(())
 }
 
+/// A removal takes every line of the declaration with it, so an edit to
+/// anything written inside it in the same transaction would be planned and
+/// then silently dropped. Refuse that pairing instead of reporting a commit
+/// that lost work.
+fn refuse_dropping_an_edit(
+    graph: &kin_db::GraphSnapshot,
+    edited: &std::collections::HashSet<kin_model::EntityId>,
+    removed: &Entity,
+    file: &FilePathId,
+    removal: &Range<usize>,
+) -> Result<(), String> {
+    let inside = graph.entities.values().find(|entity| {
+        entity.id != removed.id
+            && edited.contains(&entity.id)
+            && entity.file_origin.as_ref() == Some(file)
+            && entity.span.as_ref().is_some_and(|held| {
+                removal.start <= held.start_byte && held.end_byte <= removal.end
+            })
+    });
+    match inside {
+        Some(entity) => Err(format!(
+            "removing {} would drop the edit to {} written inside it; remove it and edit {} in separate transactions",
+            removed.name, entity.name, entity.name
+        )),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn prepare(
     state: &DaemonState,
     context: &LocalRepositoryAuthorityContext,
-    base: &NativeCommitBase,
+    prospective_graph: &kin_db::InMemoryGraph,
+    edited_entities: &std::collections::HashSet<kin_model::EntityId>,
     operations: &[McpMutationOperation],
 ) -> Result<Option<LifecyclePlan>, String> {
     if !operations.iter().any(is_lifecycle) {
         return Ok(None);
     }
-    let before = base.graph.to_snapshot();
+    let before = prospective_graph.to_snapshot();
     ensure_source_cache(state, context, &before)?;
     let prospective =
         kin_db::InMemoryGraph::from_snapshot(before.clone()).map_err(|error| error.to_string())?;
@@ -557,13 +586,20 @@ pub(crate) fn prepare(
                     create.anchor().ok_or("anchored creation lost its anchor")?;
                 (source_base, Some((create, placement)))
             }
-            McpMutationPayload::EntityRemove(remove) => (&remove.source_base, None),
+            McpMutationPayload::EntityRemove(remove) => {
+                if edited_entities.contains(&remove.source_base.entity_id) {
+                    return Err(
+                        "an entity cannot be both edited and removed in one transaction".into(),
+                    );
+                }
+                (&remove.source_base, None)
+            }
             _ => unreachable!(),
         };
-        let anchor = base
-            .graph
-            .get_entity(&source_base.entity_id)
-            .map_err(|error| error.to_string())?
+        let anchor = before
+            .entities
+            .get(&source_base.entity_id)
+            .cloned()
             .ok_or("lifecycle anchor no longer exists")?;
         kin_model::require_targeted_source(&anchor)?;
         let member_declaration = is_member_declaration(&anchor, create.map(|(create, _)| create));
@@ -579,19 +615,36 @@ pub(crate) fn prepare(
             .as_ref()
             .ok_or("lifecycle anchor has no source owner")?;
         let path = RepoPath::from_utf8(file.0.clone()).map_err(|error| error.to_string())?;
-        let artifact = base
-            .tree
+        let artifact = before
+            .resolved_tree
             .artifact_at_path(&path)
             .ok_or("lifecycle source artifact is absent")?;
         let TreeEntry::Blob { hash, executable } = artifact.entry else {
             return Err("lifecycle source is not a regular blob".into());
         };
-        let original = load_native_source_blob(context, hash).map_err(|error| error.to_string())?;
+        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let original = if state
+            .blobs
+            .exists(&digest)
+            .map_err(|error| error.to_string())?
+        {
+            state
+                .blobs
+                .read(&digest)
+                .map_err(|error| error.to_string())?
+        } else {
+            load_native_source_blob(context, hash).map_err(|error| error.to_string())?
+        };
         let mut removed_span = None;
         let mut enclosing = BTreeSet::new();
         let mut nested = false;
         let (target, projected, created, removed) = if member_declaration {
             let planned = plan_member_declaration(&before, &anchor, file, &original, create)?;
+            if planned.removed.is_some() {
+                if let Some(removal) = planned.removed_span.as_ref() {
+                    refuse_dropping_an_edit(&before, edited_entities, &anchor, file, removal)?;
+                }
+            }
             removed_span = planned.removed_span;
             enclosing = planned.enclosing;
             nested = true;
@@ -727,13 +780,12 @@ pub(crate) fn prepare(
             // The declaration goes with its own lines, its whole statement and
             // its doc comment, and the space that set it apart, so what stood
             // around it is as far apart as before.
+            let removal = kin_parser::code_placement::removal_of(&original, proven.extent.clone());
+            refuse_dropping_an_edit(&before, edited_entities, &anchor, file, &removal)?;
             let projected = kin_projection::apply_splices(
                 &original,
                 vec![kin_projection::Splice {
-                    byte_range: kin_parser::code_placement::removal_of(
-                        &original,
-                        proven.extent.clone(),
-                    ),
+                    byte_range: removal,
                     new_content: Vec::new(),
                 }],
             )

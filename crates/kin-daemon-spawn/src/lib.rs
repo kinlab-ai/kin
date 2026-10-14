@@ -44,7 +44,8 @@ mod runtime_authority;
 
 pub use runtime_authority::{
     acquire_repository_runtime_authority, acquire_repository_runtime_authority_within,
-    RepositoryRuntimeAuthority, REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+    repository_runtime_authority_is_held, RepositoryRuntimeAuthority,
+    REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
 };
 
 /// The port argument every daemon spawn passes.

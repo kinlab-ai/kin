@@ -88,6 +88,7 @@ fn served_digest_does_not_copy_history() {
             authored_by: kin_model::IdentityRef::human("fixture"),
             created_at: Timestamp(chrono::Utc::now()),
             staleness: kin_model::StalenessState::default(),
+            review: None,
         })
         .unwrap();
     let mut parent = None;

@@ -232,3 +232,9 @@ KIN_ESCAPE_NAMES
 # marker; no product runtime reads either variable.
 KIN_RUNTIME_LSP_FIXTURE
 KIN_RUNTIME_LSP_MARKER
+
+# kin-db storage/repository.rs: the ignored collaboration_commit_measurement
+# test times one collaboration-only and one change-admitting commit on a scratch
+# copy of a real store that these two name. Only that test reads them.
+KIN_DB_MEASURE_STORE
+KIN_DB_MEASURE_REPO

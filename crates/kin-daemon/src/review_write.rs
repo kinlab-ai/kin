@@ -158,6 +158,66 @@ pub(crate) fn commit_review_event<A, E>(
     Ok(planned.answer)
 }
 
+/// Commit collaboration records that are not a review event, a reviewer's flag
+/// on an entity and the record of who saw it, as one repository transaction,
+/// then make the live graph hold them with `apply`.
+///
+/// The same order as [`commit_review_event`], for the same reason: authority
+/// holds the records before the graph shows them, so a daemon that reopens the
+/// store serves every flag this one answered with. The caller holds
+/// `coordination_gate` and a graph-authority mutation guard for the whole call.
+/// Returns the authority generation the records were committed at.
+pub(crate) fn commit_collaboration_records(
+    state: &DaemonState,
+    delta: CollaborationDelta,
+    reason: &str,
+    actor_label: &str,
+    apply: impl FnOnce(&kin_db::InMemoryGraph) -> Result<(), String>,
+) -> Result<u64, ReviewWriteRefusal<std::convert::Infallible>> {
+    if state.storage_backend.is_some() {
+        return Err(ReviewWriteRefusal::Hosted);
+    }
+    let _persistence = state
+        .persist_lock
+        .lock()
+        .map_err(|_| ReviewWriteRefusal::Authority("daemon persistence lock poisoned".into()))?;
+    let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+        .map_err(|refusal| ReviewWriteRefusal::Authority(format!("{:#}", refusal.into_error())))?;
+    let receipt = commit_collaboration(
+        state,
+        &authority,
+        delta,
+        reason,
+        &AuthorId::new(actor_label.to_string()),
+    )?;
+
+    // Durable from here, as in `commit_review_event`.
+    let diverged = |detail: String| ReviewWriteRefusal::Diverged {
+        generation: receipt.generation,
+        detail,
+    };
+    state
+        .record_repository_authority_commit(receipt.generation)
+        .map_err(|error| diverged(error.to_string()))?;
+    apply(state.graph.as_ref()).map_err(diverged)?;
+    crate::binding_history::restore_review_publication(state, &authority)
+        .map_err(|error| diverged(error.to_string()))?;
+
+    state.bump_version();
+    state.mark_dirty();
+    state.emit_event(DaemonEvent::GraphRootChanged {
+        old_root_hash: None,
+        new_root_hash: "review-flag-state".to_string(),
+    });
+    state.emit_event(DaemonEvent::RepositoryAuthorityChanged {
+        repository_id: receipt.repository_id.to_string(),
+        operation_id: receipt.operation_id,
+        previous_generation: receipt.roots_before.generation,
+        new_generation: receipt.generation,
+    });
+    Ok(receipt.generation)
+}
+
 /// Commit one MCP review write tool through [`commit_review_event`].
 ///
 /// The dispatch that calls this already holds the coordination gate and a
@@ -298,7 +358,9 @@ impl ReviewPublication {
 /// Unknown collaboration records can retry once against fresh roots as before.
 /// A checked observation cannot: an intervening writer changed its authority,
 /// so the whole operation must be retried from an actually observed state.
-fn commit_collaboration<E>(
+///
+/// Shared with the verification writer, which commits its runs the same way.
+pub(crate) fn commit_collaboration<E>(
     state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
     delta: CollaborationDelta,

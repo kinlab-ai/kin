@@ -607,3 +607,30 @@ async fn a_detached_switch_retires_the_previous_trees_enrichment_markers() {
     );
     assert!(workspace_of(&history.state).enrichment_marks.is_empty());
 }
+
+/// A branch imported from Git targets its Git commit, and the branch list
+/// reports the change that commit resolves to through its alias. The local
+/// app's remotes and Git update read a branch's head from exactly this, so a
+/// reading of the raw target alone found no head on a freshly imported branch.
+#[tokio::test]
+async fn the_branch_list_reports_the_change_a_git_branch_stands_on() {
+    let history = history("branch-list-git-head");
+    let head = history.commits[2].clone();
+    let request = kin_cli::commands::branch::BranchRequest::List;
+    let (status, body) = post_branch_request(Arc::clone(&history.state), &request, None).await;
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: kin_cli::commands::branch::BranchResponse = serde_json::from_str(&body).unwrap();
+    let report = response.report.expect("the list carries its report");
+    let main = report
+        .branches
+        .iter()
+        .find(|entry| entry.name == kin_model::RefName::branch(b"main").unwrap())
+        .expect("main is listed");
+    assert!(
+        matches!(main.target, kin_model::RefTarget::ExternalObject { .. }),
+        "an imported branch targets its Git commit: {:?}",
+        main.target
+    );
+    assert_eq!(main.change_id, Some(change_for(&history.state, &head)));
+}

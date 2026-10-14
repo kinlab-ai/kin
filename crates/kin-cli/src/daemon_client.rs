@@ -544,6 +544,17 @@ impl fmt::Display for RefusedBeforeWriteError {
 
 impl std::error::Error for RefusedBeforeWriteError {}
 
+/// What came of one push or pull sent once by [`DaemonClient::transfer_once`].
+#[derive(Debug)]
+pub enum TransferDispatch {
+    /// The daemon finished the command and said how it went.
+    Answered(Box<crate::commands::transfer::CommandTransferResponse>),
+    /// The daemon answered with a refusal. The command has ended there.
+    Refused { status: u16, body: String },
+    /// Nothing says how the request ended. The daemon may still be running it.
+    Lost(anyhow::Error),
+}
+
 /// Proof carried by a successful acknowledgement of a non-idempotent command.
 ///
 /// Requiring this trait at the one-dispatch transport boundary makes it
@@ -1165,10 +1176,36 @@ impl DaemonClient {
         limit: usize,
         offset: usize,
     ) -> Result<serde_json::Value> {
+        self.workspace_entities_and_untested(repo_id, query, limit, offset, None)
+            .await
+    }
+
+    /// [`Self::workspace_entities`], and with `untested` the most relied-on
+    /// entities no test reaches, that many of them, under the answer's
+    /// `untested`. Both come from the daemon's one ranking pass. A daemon that
+    /// predates the list answers without the field.
+    pub async fn workspace_entities_and_untested(
+        &self,
+        repo_id: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        untested: Option<usize>,
+    ) -> Result<serde_json::Value> {
         anyhow::ensure!(
             (1..=100).contains(&limit),
             "entity page limit must be 1..100"
         );
+        let mut asked = vec![
+            ("query", query.to_string()),
+            ("order", "importance".to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+            ("include", "ranking,signature,summary".to_string()),
+        ];
+        if let Some(rows) = untested {
+            asked.push(("untested", rows.to_string()));
+        }
         let response = self
             .send(
                 self.client
@@ -1177,13 +1214,7 @@ impl DaemonClient {
                         self.base_url,
                         urlencoding::encode(repo_id)
                     ))
-                    .query(&[
-                        ("query", query.to_string()),
-                        ("order", "importance".to_string()),
-                        ("limit", limit.to_string()),
-                        ("offset", offset.to_string()),
-                        ("include", "ranking,signature,summary".to_string()),
-                    ]),
+                    .query(&asked),
                 "workspace entity inventory",
             )
             .await?;
@@ -1242,7 +1273,19 @@ impl DaemonClient {
         .await
     }
 
-    // Only the two named, read-only wrappers above reach this transport.
+    /// What contains one entity, read without its text.
+    pub async fn workspace_entity_owners(&self, entity_id: &str) -> Result<serde_json::Value> {
+        uuid::Uuid::parse_str(entity_id).context("invalid entity id")?;
+        self.workspace_graph_read(
+            "get_entity_source",
+            serde_json::json!({
+                "entity_id": entity_id, "full_body": false,
+            }),
+        )
+        .await
+    }
+
+    // Only the three named, read-only wrappers above reach this transport.
     async fn workspace_graph_read(
         &self,
         name: &str,
@@ -1828,6 +1871,34 @@ impl DaemonClient {
             .context("parse daemon verify run response")
     }
 
+    /// Ask about the tests that reach a piece of work, or run them.
+    ///
+    /// Sent once and never retried: a run executes the repository's tests
+    /// and records what they did, so a replay would run them again. A run
+    /// takes as long as the repository's tests do, so it is given far longer
+    /// than an ordinary request.
+    pub async fn verify_work(
+        &self,
+        request: &crate::commands::verify::WorkVerifyRequest,
+    ) -> Result<crate::commands::verify::WorkVerifyResponse> {
+        const RUN_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
+        let resp = self
+            .send(
+                self.one_dispatch_client
+                    .post(format!("{}/verify/work", self.base_url))
+                    .timeout(RUN_BUDGET)
+                    .json(request),
+                "verify work",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("verify work", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon verify work response")
+    }
+
     pub async fn verify_command(
         &self,
         request: &crate::commands::verify::VerifyCommandRequest,
@@ -1971,6 +2042,73 @@ impl DaemonClient {
             .context("parse daemon command status response")
     }
 
+    pub async fn git_update_status(&self) -> Result<crate::git_update::GitUpdateStatus> {
+        let response = self
+            .send(
+                self.client
+                    .get(format!("{}/commands/git-update/status", self.base_url)),
+                "Git update status",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("Git update status", response).await);
+        }
+        response
+            .json()
+            .await
+            .context("parse daemon Git update status")
+    }
+
+    /// Dispatch an update once. A lost acknowledgement never triggers another
+    /// request, since the original command may already have admitted history.
+    pub async fn git_update_once(
+        &self,
+        request: &crate::git_update::GitUpdateRequest,
+    ) -> crate::git_update::GitUpdateDispatch {
+        use crate::git_update::GitUpdateDispatch;
+        let response = match self
+            .send(
+                self.one_dispatch_client
+                    .post(format!(
+                        "{}/commands/git-update",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .json(request),
+                "Git update",
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return GitUpdateDispatch::Lost(error),
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                return GitUpdateDispatch::Lost(
+                    anyhow!(error).context("read the daemon's Git update answer"),
+                )
+            }
+        };
+        if !status.is_success() {
+            return GitUpdateDispatch::Refused {
+                status: status.as_u16(),
+                body,
+            };
+        }
+        match serde_json::from_str::<crate::git_update::GitUpdateResponse>(&body) {
+            Ok(response) if response.operation_id == request.operation_id => {
+                GitUpdateDispatch::Answered(Box::new(response))
+            }
+            Ok(_) => GitUpdateDispatch::Lost(anyhow!(
+                "Git update acknowledgement names another operation"
+            )),
+            Err(error) => GitUpdateDispatch::Lost(
+                anyhow!(error).context("parse the daemon's Git update answer"),
+            ),
+        }
+    }
+
     pub async fn command_push(
         &self,
         request: &crate::commands::transfer::CommandTransferRequest,
@@ -1990,6 +2128,121 @@ impl DaemonClient {
         request: &crate::commands::transfer::CommandTransferRequest,
     ) -> Result<crate::commands::transfer::CommandTransferPlanResponse> {
         self.transfer_command("transfer-plan", request).await
+    }
+
+    /// Send one push or pull exactly once, and say what came of it.
+    ///
+    /// The local app must never repeat a transfer behind the page when its
+    /// answer is lost, so this goes out on the client that never retries and
+    /// keeps a refusal apart from a lost answer instead of folding both into
+    /// one error. A refusal is the daemon's own answer: the command has ended
+    /// on the daemon, although a transfer that needed several packs may have
+    /// published some before it refused, which only a fresh reading can tell.
+    pub async fn transfer_once(
+        &self,
+        direction: kin_remote::repository_transfer_negotiation::RepositoryTransferDirection,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> TransferDispatch {
+        use kin_remote::repository_transfer_negotiation::RepositoryTransferDirection;
+        let leaf = match direction {
+            RepositoryTransferDirection::Push => "push",
+            RepositoryTransferDirection::Pull => "pull",
+        };
+        let sent = self
+            .send(
+                self.one_dispatch_client
+                    .post(format!(
+                        "{}/commands/{leaf}",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .json(request),
+                leaf,
+            )
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => return TransferDispatch::Lost(error),
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                return TransferDispatch::Lost(
+                    anyhow!(error).context(format!("read the daemon's {leaf} answer")),
+                )
+            }
+        };
+        if !status.is_success() {
+            return TransferDispatch::Refused {
+                status: status.as_u16(),
+                body,
+            };
+        }
+        match serde_json::from_str(&body) {
+            Ok(response) => TransferDispatch::Answered(Box::new(response)),
+            Err(error) => TransferDispatch::Lost(
+                anyhow!(error).context(format!("parse the daemon's {leaf} answer")),
+            ),
+        }
+    }
+
+    /// Negotiate a push plan, keeping the daemon's status apart from a
+    /// transport failure. The outer error is a daemon that did not answer; the
+    /// inner one is the daemon's refusal with its status and its words.
+    pub async fn command_transfer_plan_reading(
+        &self,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<
+        std::result::Result<crate::commands::transfer::CommandTransferPlanResponse, (u16, String)>,
+    > {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/transfer-plan", self.base_url))
+                    .json(request),
+                "transfer-plan",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Ok(Err((status.as_u16(), body)));
+        }
+        Ok(Ok(response
+            .json()
+            .await
+            .context("parse daemon transfer plan response")?))
+    }
+
+    /// What changed between two read points of this daemon's repository,
+    /// entity by entity, from `GET /repos/{repo_id}/semantic-diff`.
+    pub async fn repository_semantic_diff(
+        &self,
+        repo_id: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<std::result::Result<serde_json::Value, (u16, String)>> {
+        let response = self
+            .send(
+                self.client
+                    .get(format!(
+                        "{}/repos/{}/semantic-diff",
+                        self.base_url.trim_end_matches('/'),
+                        urlencoding::encode(repo_id)
+                    ))
+                    .query(&[("base", base), ("head", head)]),
+                "semantic diff",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Ok(Err((status.as_u16(), body)));
+        }
+        Ok(Ok(response
+            .json()
+            .await
+            .context("parse daemon semantic diff response")?))
     }
 
     /// Drive one repository-v6 transfer command in the daemon.
@@ -2751,8 +3004,51 @@ impl DaemonClient {
         resp.json().await.context("parse daemon agents response")
     }
 
-    /// `GET /session/{session_id}/calls`: one live session's call log, newest
-    /// first, at most `limit` entries.
+    /// `POST /agents/edits`: report an edit an agent made with its client's
+    /// own tools. With `wait` the answer says what became of the report;
+    /// without it the daemon answers at once and resolves it behind the answer.
+    pub async fn record_agent_edit(
+        &self,
+        claim: &serde_json::Value,
+        wait: bool,
+    ) -> Result<serde_json::Value> {
+        let url = if wait {
+            format!("{}/agents/edits?wait=true", self.base_url)
+        } else {
+            format!("{}/agents/edits", self.base_url)
+        };
+        let resp = self
+            .send(self.client.post(url).json(claim), "agents/edits")
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("agents/edits", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon edit report response")
+    }
+
+    /// `GET /agents/ended`: the agents that worked in this repository and are
+    /// gone, with at most `calls` of each one's newest calls. `None` from a
+    /// daemon that does not keep sessions past their end.
+    pub async fn ended_agents(&self, calls: usize) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/agents/ended?calls={calls}", self.base_url);
+        let resp = self.send(self.client.get(url), "agents/ended").await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("agents/ended", resp).await);
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .context("parse daemon ended agents response")
+    }
+
+    /// `GET /session/{session_id}/calls`: one session's call log, newest
+    /// first, at most `limit` entries. A session that ended answers from what
+    /// the daemon kept of it.
     pub async fn session_calls(
         &self,
         session_id: &str,
@@ -2820,6 +3116,27 @@ impl DaemonClient {
             return Err(self.http_refusal("note", resp).await);
         }
         resp.json().await.context("parse daemon note response")
+    }
+
+    /// Set, close or list review flags in the repository daemon.
+    pub async fn review_flags(
+        &self,
+        request: &crate::commands::review_flags::ReviewFlagRequest,
+    ) -> Result<crate::commands::review_flags::ReviewFlagResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/review/flags", self.base_url))
+                    .json(request),
+                "review flags",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("review flags", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon review flags response")
     }
 
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
@@ -10056,7 +10373,15 @@ async fn ensure_daemon_running_inner(
 /// Only the version gap is answered here. Any other failure to read the marker
 /// is recorded and left to the daemon, whose gate sees the same file.
 fn refuse_incompatible_store(kin_root: &Path) -> std::result::Result<(), AutoStartError> {
-    match kin_core::KinLayout::new(kin_root.to_path_buf()).check_version() {
+    let layout = kin_core::KinLayout::new(kin_root.to_path_buf());
+    // A store whose history attach a crash interrupted may hold no version
+    // marker at all until the attach is finished, and a missing marker reads
+    // as the oldest layout. The daemon this start is about to spawn finishes
+    // the attach before it reads the store, so the refusal is left to it.
+    if kin_core::history_attach::attach_is_interrupted(&layout) {
+        return Ok(());
+    }
+    match layout.check_version() {
         Ok(()) => Ok(()),
         Err(error @ kin_core::KinError::IncompatibleVersion { .. }) => {
             Err(AutoStartError::IncompatibleStore(
