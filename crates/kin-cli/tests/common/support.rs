@@ -991,6 +991,7 @@ impl IsolatedDaemonRuntime {
     }
 
     pub fn kin_command(&self) -> Command<'_> {
+        let _ = self.daemon_bin();
         self.command(env!("CARGO_BIN_EXE_kin"))
     }
 
@@ -1231,7 +1232,7 @@ impl IsolatedDaemonRuntime {
                 .envs(cleanup.env.iter().map(|(key, value)| (key, value)));
             command
         } else {
-            let mut command = self.kin_command();
+            let mut command = self.command(env!("CARGO_BIN_EXE_kin"));
             command.args(["daemon", "stop", "--all"]);
             command
         }
@@ -3281,6 +3282,15 @@ fn daemon_rebuild_target<'a>(kin_bin: &Path, triple: &'a str) -> Option<&'a str>
     (profile_parent.file_name()?.to_str() == Some(triple)).then_some(triple)
 }
 
+fn daemon_rebuild_target_dir<'a>(kin_bin: &'a Path, triple: &str) -> Option<&'a Path> {
+    let profile_parent = kin_bin.parent()?.parent()?;
+    if daemon_rebuild_target(kin_bin, triple).is_some() {
+        profile_parent.parent()
+    } else {
+        Some(profile_parent)
+    }
+}
+
 /// The profile arguments a `kin-daemon` rebuild has to carry to land beside
 /// `kin`.
 ///
@@ -3357,8 +3367,13 @@ fn fresh_daemon_bin_with_deadline(
         // the stderr this call captures, so the wait is bounded here.
         let mut build = Command::new(env!("CARGO"));
         scrub_inherited_kin_authority(build.inner_mut());
+        build.args(&args);
+        if let Some(target_dir) =
+            daemon_rebuild_target_dir(&kin_bin, env!("KIN_CLI_TARGET_TRIPLE"))
+        {
+            build.arg("--target-dir").arg(target_dir);
+        }
         let output = build
-            .args(&args)
             .current_dir(workspace_root)
             .output_within(daemon_preparation_budget(
                 deadline,

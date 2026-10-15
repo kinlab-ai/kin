@@ -85,7 +85,7 @@ test('binaryName adds .exe only on Windows', () => {
 });
 
 test('kinHome honors $KIN_HOME then falls back to ~/.kin', () => {
-  assert.equal(kinHome({ KIN_HOME: '/custom/kin' }, '/home/u'), '/custom/kin');
+  assert.equal(kinHome({ KIN_HOME: '/custom/kin' }, '/home/u'), path.resolve('/custom/kin'));
   assert.equal(kinHome({}, '/home/u'), path.join('/home/u', '.kin'));
   assert.equal(kinHome({ KIN_HOME: '' }, '/home/u'), path.join('/home/u', '.kin'));
   assert.equal(kinHome({ KIN_HOME: '   ' }, '/home/u'), path.resolve('   '), 'nonempty path spelling matches the shell and native resolver');

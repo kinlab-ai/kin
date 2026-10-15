@@ -7302,12 +7302,26 @@ mod tests {
         async fn start(
             answer: impl Fn(&FakeRequest, u32, &dyn Fn()) -> (u16, String) + Send + Sync + 'static,
         ) -> Self {
+            use std::io::{Read, Write};
             let mut child = std::process::Command::new("/bin/cat")
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("spawn the stand-in daemon");
+            child
+                .stdin
+                .as_mut()
+                .expect("stand-in stdin")
+                .write_all(b"\n")
+                .expect("signal stand-in exec completion");
+            let mut ready = [0_u8; 1];
+            child
+                .stdout
+                .as_mut()
+                .expect("stand-in stdout")
+                .read_exact(&mut ready)
+                .expect("wait for stand-in exec completion");
             let pid = child.id();
             let identity = process_identity(pid).unwrap().unwrap();
             let exit = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));
@@ -7369,6 +7383,7 @@ mod tests {
 
     #[cfg(unix)]
     fn runtime_identity(pid: u32, version: &str, commit: &str, mode: &str) -> (u16, String) {
+        let current = kin_core::runtime_identity::RuntimeIdentity::current();
         (
             200,
             serde_json::json!({
@@ -7378,7 +7393,7 @@ mod tests {
                     "commit_sha": commit,
                     "source_dirty": false,
                     "source_known": true,
-                    "target": "aarch64-apple-darwin",
+                    "target": current.target,
                     "build_profile": "release",
                 },
                 "mode": mode,
@@ -7837,14 +7852,23 @@ mod tests {
             Some(fixture.path().join("home").join(".kin"))
         );
 
+        use std::io::{Read, Write};
         let mut child = OwnedTestChild(
             std::process::Command::new("/bin/cat")
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap(),
         );
+        child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
         let pid = child.id();
         let identity = process_identity(pid).unwrap().unwrap();
         let input = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));

@@ -4148,9 +4148,12 @@ fn run() -> Result<()> {
         || matches!(
             &cli.command,
             Command::Runtime { .. }
-                | Command::BenchMeta {
-                    prepared_state: false,
-                    ..
+                | Command::BenchMeta { .. }
+                | Command::Registry {
+                    action: Some(RegistryAction::Authority { .. }),
+                }
+                | Command::Daemon {
+                    action: DaemonAction::Status { .. } | DaemonAction::Stop { .. },
                 }
                 | Command::Update { .. }
                 | Command::Capabilities { .. }

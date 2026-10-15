@@ -713,6 +713,7 @@ class Suite(object):
         self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = self.kin_home
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
+        self.env["KIN_DAEMON_DISABLE_LSP"] = "1"
         self.env["KIN_VFS_DISABLE"] = "1"
         # Written against a store that holds its complete history.
         self.env["KIN_INIT_HISTORY"] = "full"
@@ -1249,7 +1250,7 @@ def grade_impact_pages(whole, paged):
         if (paged.get(key) or []) != (whole.get(key) or []):
             problems.append("impact pages changed or lost %s" % key)
     for key in ("degradations", "edge_coverage", "negative"):
-        if paged.get(key) != whole.get(key):
+        if without_observation_times(paged.get(key)) != without_observation_times(whole.get(key)):
             problems.append("impact pages changed the original %s reading" % key)
     for key in ("verdict", "completeness"):
         if (paged.get("_kin") or {}).get(key) != (whole.get("_kin") or {}).get(key):

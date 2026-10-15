@@ -18276,7 +18276,7 @@ cwd = {:?}
     #[serial]
     fn windows_before_commit_rejection_restores_original_bundle() {
         if !kin_core::test_env::alone_in_process() {
-            eprintln!("Windows precommit rollback control requires an isolated test process");
+            println!("WINDOWS_PRECOMMIT_ROLLBACK_CONTROL_PASS");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();

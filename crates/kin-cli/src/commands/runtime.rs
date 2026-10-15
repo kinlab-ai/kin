@@ -111,8 +111,8 @@ fn explicit_home() -> Option<std::ffi::OsString> {
 }
 
 fn default_home() -> Result<PathBuf> {
-    let home = directories::BaseDirs::new().context("cannot resolve the user's home directory")?;
-    Ok(home.home_dir().join(".kin"))
+    let home = super::setup::home_dir().context("cannot resolve the user's home directory")?;
+    Ok(home.join(".kin"))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -121,7 +121,23 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    Ok(absolute.canonicalize().unwrap_or(absolute))
+    let canonical = absolute.canonicalize().unwrap_or(absolute);
+    Ok(strip_windows_verbatim(canonical))
+}
+
+fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(raw) = path.to_str() {
+        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
 }
 
 fn binary_name(name: &str) -> String {

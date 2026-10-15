@@ -2593,6 +2593,9 @@ fn open_path_handle(
 ) -> Result<OwnedHandle> {
     let path_wide = wide_null(path.as_os_str())?;
     let mut access = FILE_READ_ATTRIBUTES | READ_CONTROL;
+    if block_writes && !expect_directory {
+        access |= GENERIC_READ;
+    }
     if write_security {
         access |= WRITE_DAC | WRITE_OWNER;
     }

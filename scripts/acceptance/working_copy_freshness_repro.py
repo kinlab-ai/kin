@@ -673,10 +673,13 @@ CALL_DOMAIN_INPUTS = ("call_sites", "absence_gate")
 def reference_completion_qualification(payload, negative, verdict):
     """A settled Call census does not certify requested non-call completion.
 
-    Accept only this recorded gap, with a lower bound and no absence claim.
-    This qualifies the returned positives; it never certifies their whole set.
+    Accept only this recorded gap (along with an unproven prior local binding
+    when LSP has enriched an uncommitted working copy), with a lower bound and
+    no absence claim. This qualifies the returned positives; it never certifies
+    their whole set.
     """
     code = "reference_completion_unmeasured"
+    binding_code = "local_binding_unproven"
     kinds = payload.get("relation_kinds")
     inputs = verdict.get("inputs")
     comp = (payload.get("_kin") or {}).get("completeness") or {}
@@ -690,15 +693,26 @@ def reference_completion_qualification(payload, negative, verdict):
             or inputs.get("absence_gate") != "inconclusive"
             or inputs.get("call_sites") != "certified"):
         return False, "the verdict does not separately attribute the non-call completion gap"
+    unproven_binding = inputs.get("source_derivation") == "inconclusive"
+    allowed_inputs = ("reference_completion", "absence_gate") + (
+        ("source_derivation",) if unproven_binding else ())
     if any(reading not in ("certified", "not_applicable") for name, reading in inputs.items()
-           if name not in ("reference_completion", "absence_gate")):
+           if name not in allowed_inputs):
         return False, "another verdict input limits the positive beyond non-call completion"
     codes = [part.strip() for part in str(verdict.get("limiting_factor") or "").split(";")
              if part.strip()]
+    expected_codes = [binding_code, code] if unproven_binding else [code]
+    expected_reason = (
+        binding_code + ": prior local binding is not proven; "
+        + code + ": non-call completion is unmeasured"
+        if unproven_binding
+        else code + ": non-call completion is unmeasured"
+    )
     reason = negative.get("trust_reason")
-    if (codes != [code]
-            or reason != code + ": non-call completion is unmeasured"
-            or code not in str(negative.get("advice") or "")):
+    advice = str(negative.get("advice") or "")
+    if (codes != expected_codes
+            or reason != expected_reason
+            or any(expected not in advice for expected in expected_codes)):
         return False, "non-call completion provenance does not match its exact limiting code"
     if (verdict.get("absence_claim") != "not_applicable"
             or verdict.get("safe_to_conclude_absent") is not False
@@ -1535,6 +1549,21 @@ def self_test():
 
     expect("a settled Call census preserves separately unmeasured Reference completion",
            qualify(completion), PASS)
+    unproven_binding = copy.deepcopy(completion)
+    unproven_binding["_kin"]["verdict"]["inputs"]["source_derivation"] = "inconclusive"
+    unproven_binding["_kin"]["verdict"]["limiting_factor"] = (
+        "local_binding_unproven; reference_completion_unmeasured")
+    unproven_binding["negative"]["trust_reason"] = (
+        "local_binding_unproven: prior local binding is not proven; "
+        "reference_completion_unmeasured: non-call completion is unmeasured")
+    unproven_binding["negative"]["advice"] = (
+        "local_binding_unproven, reference_completion_unmeasured")
+    expect("a settled Call census over an uncommitted LSP-enriched tree qualifies",
+           qualify(unproven_binding), PASS)
+    unproven_mismatch = copy.deepcopy(unproven_binding)
+    unproven_mismatch["_kin"]["verdict"]["limiting_factor"] = "reference_completion_unmeasured"
+    expect("source_derivation inconclusive without local_binding_unproven fails",
+           qualify(unproven_mismatch), FAIL)
     unsettled = copy.deepcopy(completion)
     unsettled["_kin"]["verdict"]["inputs"].update(
         call_sites="inconclusive", reference_completion="not_applicable")

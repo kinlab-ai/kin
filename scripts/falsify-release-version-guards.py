@@ -61,6 +61,12 @@ COPIED = (
     "Cargo.toml",
     "server.json",
     "packages/kin/package.json",
+    "packages/kin/bin/kin.mjs",
+    "packages/kin/bin/kin-mcp.mjs",
+    "packages/kin/lib/resolve.mjs",
+    "packages/kin/lib/provision.mjs",
+    "packages/kin-mcp/package.json",
+    "packages/kin-mcp/package-lock.json",
 )
 
 
