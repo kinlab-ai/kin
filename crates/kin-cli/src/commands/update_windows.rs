@@ -2041,8 +2041,29 @@ pub(crate) fn dispose_managed_file_handle_exact(file: &File, label: &str) -> Res
         FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
     };
 
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+    const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+    const FILE_DISPOSITION_POSIX_DELETE: u32 = 0x0000_0001 | 0x0000_0002;
+
     object_identity(file.as_raw_handle().cast(), false)
         .with_context(|| format!("{label} exact handle lost object authority"))?;
+    let posix_disposition = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_POSIX_DELETE,
+    };
+    let posix_removed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FILE_DISPOSITION_INFO_EX_CLASS,
+            (&posix_disposition as *const FileDispositionInfoEx).cast(),
+            size_of::<FileDispositionInfoEx>() as u32,
+        )
+    };
+    if posix_removed != 0 {
+        return Ok(());
+    }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     let removed = unsafe {
         SetFileInformationByHandle(
@@ -3041,20 +3062,40 @@ impl WindowsWorkerCleanupObject {
 
     fn dispose_directory(self, user: &CurrentUserSid) -> Result<()> {
         use windows_sys::Win32::Storage::FileSystem::{FileDispositionInfo, FILE_DISPOSITION_INFO};
+        #[repr(C)]
+        struct FileDispositionInfoEx {
+            flags: u32,
+        }
+        const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+        const FILE_DISPOSITION_POSIX_DELETE: u32 = 0x0000_0001 | 0x0000_0002;
+
         self.revalidate_worker_cleanup_object(user)?;
         self.require_names(&[], user)?;
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-        let removed = unsafe {
+        let posix_disposition = FileDispositionInfoEx {
+            flags: FILE_DISPOSITION_POSIX_DELETE,
+        };
+        let posix_removed = unsafe {
             SetFileInformationByHandle(
                 self.file.as_raw_handle().cast(),
-                FileDispositionInfo,
-                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                size_of::<FILE_DISPOSITION_INFO>() as u32,
+                FILE_DISPOSITION_INFO_EX_CLASS,
+                (&posix_disposition as *const FileDispositionInfoEx).cast(),
+                size_of::<FileDispositionInfoEx>() as u32,
             )
         };
-        if removed == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to dispose exact empty Windows worker directory; retained");
+        if posix_removed == 0 {
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            let removed = unsafe {
+                SetFileInformationByHandle(
+                    self.file.as_raw_handle().cast(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            if removed == 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to dispose exact empty Windows worker directory; retained");
+            }
         }
         let path = self.path.clone();
         drop(self);
@@ -3063,16 +3104,35 @@ impl WindowsWorkerCleanupObject {
 }
 
 fn require_worker_cleanup_absent(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => anyhow::bail!(
-            "disposed Windows worker object remains visible at {}; cleanup is incomplete",
-            path.display()
-        ),
-        Err(error) => {
-            Err(error).context("could not confirm exact Windows worker object disposition")
+    const ATTEMPTS: usize = 50;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(_) => {
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                anyhow::bail!(
+                    "disposed Windows worker object remains visible at {}; cleanup is incomplete",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                return Err(error)
+                    .context("could not confirm exact Windows worker object disposition");
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("could not confirm exact Windows worker object disposition");
+            }
         }
     }
+    Ok(())
 }
 
 pub(super) struct WindowsWorkerCleanup {

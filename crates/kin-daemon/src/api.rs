@@ -2209,7 +2209,8 @@ async fn validate_runtime_request(
         .path()
         .strip_prefix("/v2")
         .unwrap_or(request.uri().path());
-    let diagnostic = matches!(path, "/health" | "/ready" | "/readiness" | "/auth/rotation");
+    let diagnostic = matches!(path, "/health" | "/ready" | "/readiness" | "/auth/rotation")
+        || (*request.method() == axum::http::Method::GET && path == "/lsp/sweep/status");
     // A peer Kin reaching this repository's transfer or range-read routes is a
     // remote boundary, as hosted authority is. It authenticates with this
     // daemon's bearer credential, which the auth layer inside still checks,
@@ -2231,6 +2232,9 @@ async fn validate_runtime_request(
     let has_runtime_claim = request
         .headers()
         .contains_key(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER);
+    let has_repository_claim = request
+        .headers()
+        .contains_key(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER);
     if let Some(claim) = request
         .headers()
         .get(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
@@ -2250,7 +2254,9 @@ async fn validate_runtime_request(
             return (StatusCode::CONFLICT, "runtime generation changed or differs from the caller; reconnect using the same managed CLI and daemon").into_response();
         }
     }
-    if policy.local && !diagnostic && (policy.require_identity || has_runtime_claim) {
+    if policy.local
+        && ((!diagnostic && (policy.require_identity || has_runtime_claim)) || has_repository_claim)
+    {
         let Some(repository) = policy.repository.as_ref() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2617,6 +2623,69 @@ mod runtime_identity_tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reached.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn sweep_status_diagnostic_polling_admits_bearer_and_validates_supplied_claims() {
+        let home = tempfile::tempdir().unwrap();
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::capture(home.path()).unwrap();
+        let repository = kin_core::runtime_identity::RuntimeRepositoryBinding::capture(
+            &uuid::Uuid::new_v4().to_string(),
+            home.path(),
+        )
+        .unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::clone(&reached);
+        let app = Router::new()
+            .route(
+                "/lsp/sweep/status",
+                get(move || {
+                    let marker = Arc::clone(&marker);
+                    async move {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                        "sweep status read"
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RuntimeRequestPolicy {
+                    require_identity: true,
+                    local: true,
+                    namespace: Some(namespace.clone()),
+                    repository: Some(repository.clone()),
+                },
+                validate_runtime_request,
+            ));
+
+        let unheadered = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/lsp/sweep/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unheadered.status(), StatusCode::OK);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+
+        let wrong_repo = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/lsp/sweep/status")
+                    .header(
+                        kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                        "wrong-repository-claim",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_repo.status(), StatusCode::CONFLICT);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]
@@ -2648,9 +2717,9 @@ mod runtime_repository_binding_tests {
             for directory in [&home, &store_a, &store_b] {
                 std::fs::create_dir(directory).unwrap();
             }
-            let mut environment = kin_core::test_env::EnvVarGuard::set("KIN_HOME", &home);
-            environment.apply("KIN_RUNTIME_MODE", Some("development"));
-            let namespace = RuntimeNamespace::current().unwrap();
+            let environment =
+                kin_core::test_env::EnvVarGuard::set("KIN_RUNTIME_MODE", "development");
+            let namespace = RuntimeNamespace::capture(&home).unwrap();
             let repository_a =
                 RuntimeRepositoryBinding::capture(&uuid::Uuid::new_v4().to_string(), &store_a)
                     .unwrap();
