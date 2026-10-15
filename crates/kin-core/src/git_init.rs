@@ -2386,7 +2386,7 @@ fn git_boundary_error(context: impl std::fmt::Display, error: impl std::fmt::Dis
 /// and the fold keeps a commit's semantic state only while a later commit
 /// still folds against it. What the phase accumulates is the deltas
 /// themselves, which are what the bootstrap transaction carries.
-fn bind_historical_semantics(
+pub(crate) fn bind_historical_semantics(
     plan: kin_git::SemanticGitImportPlan,
     capture_store: &BlobStore,
 ) -> Result<kin_git::SemanticGitImportPlan> {
@@ -4790,16 +4790,149 @@ pub(crate) mod tests {
         );
         assert!(history_state::standing(&complete.layout).is_complete());
 
-        std::fs::write(partial.layout.stashes_dir().join("held"), b"stash").unwrap();
-        let refused =
-            crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap_err();
-        assert!(refused.to_string().contains("stashes"), "{refused}");
-        assert!(!history_state::standing(&partial.layout).is_complete());
-        std::fs::remove_file(partial.layout.stashes_dir().join("held")).unwrap();
+        // Work the partial store holds open is never dropped: the attach
+        // waits for each kind, moves nothing, and leaves the stage whole.
+        {
+            use crate::history_attach::{AttachOutcome, AttachReadiness, OpenWork};
+            let root = partial.layout.root().to_path_buf();
+            let entries = || {
+                let mut names: Vec<_> = std::fs::read_dir(&root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            let drafts = root.join(crate::history_attach::ENTITY_DRAFTS_DIR);
+            let transactions = root.join(crate::history_attach::AGENT_TRANSACTIONS_RECORD);
+            let recovery = root.join(crate::history_attach::AGENT_TRANSACTIONS_RECOVERY_RECORD);
+            type Step<'a> = Box<dyn Fn() + 'a>;
+            let held: Vec<(OpenWork, Step<'_>, Step<'_>)> = vec![
+                (
+                    OpenWork::Stash,
+                    Box::new(|| {
+                        std::fs::write(partial.layout.stashes_dir().join("held"), b"stash").unwrap()
+                    }),
+                    Box::new(|| {
+                        std::fs::remove_file(partial.layout.stashes_dir().join("held")).unwrap()
+                    }),
+                ),
+                (
+                    OpenWork::Merge,
+                    Box::new(|| std::fs::write(partial.layout.merge_state_path(), b"{}").unwrap()),
+                    Box::new(|| std::fs::remove_file(partial.layout.merge_state_path()).unwrap()),
+                ),
+                (
+                    OpenWork::Transaction,
+                    Box::new(|| {
+                        std::fs::write(
+                            &transactions,
+                            br#"{"t1":{"state":"committed"},"t2":{"state":"active"}}"#,
+                        )
+                        .unwrap()
+                    }),
+                    // What a daemon leaves once every transaction is settled.
+                    Box::new(|| {
+                        std::fs::write(
+                            &transactions,
+                            br#"{"t1":{"state":"committed"},"t2":{"state":"aborted"}}"#,
+                        )
+                        .unwrap()
+                    }),
+                ),
+                (
+                    OpenWork::Transaction,
+                    Box::new(|| std::fs::write(&transactions, b"not a transaction map").unwrap()),
+                    Box::new(|| std::fs::write(&transactions, b"{}").unwrap()),
+                ),
+                (
+                    OpenWork::Transaction,
+                    Box::new(|| std::fs::write(&recovery, br#"{"kind":"missing"}"#).unwrap()),
+                    Box::new(|| std::fs::remove_file(&recovery).unwrap()),
+                ),
+                (
+                    OpenWork::Draft,
+                    Box::new(|| {
+                        std::fs::create_dir_all(&drafts).unwrap();
+                        std::fs::write(drafts.join("store.lock"), b"").unwrap();
+                        std::fs::write(drafts.join("draft-1"), b"draft").unwrap();
+                    }),
+                    // The lock a draft store keeps is not a draft.
+                    Box::new(|| std::fs::remove_file(drafts.join("draft-1")).unwrap()),
+                ),
+                (
+                    OpenWork::Release,
+                    Box::new(|| {
+                        std::fs::write(partial.layout.pending_release_path(), b"{}").unwrap()
+                    }),
+                    Box::new(|| {
+                        std::fs::remove_file(partial.layout.pending_release_path()).unwrap()
+                    }),
+                ),
+            ];
+            for (work, open, finish) in &held {
+                open();
+                let before = entries();
+                assert_eq!(
+                    crate::history_attach::open_work(&partial.layout),
+                    Some(*work)
+                );
+                assert_eq!(
+                    crate::history_attach::attach_readiness(&partial.layout, &stage).unwrap(),
+                    AttachReadiness::Waiting(*work)
+                );
+                assert_eq!(
+                    crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap(),
+                    AttachOutcome::Deferred(*work),
+                );
+                assert_eq!(entries(), before, "waiting for {work} moved something");
+                assert!(!history_state::standing(&partial.layout).is_complete());
+                assert!(crate::history_attach::staged_store(&stage)
+                    .join("manifest.json")
+                    .is_file());
+                finish();
+                assert_eq!(crate::history_attach::open_work(&partial.layout), None);
+            }
+            assert_eq!(
+                crate::history_attach::attach_readiness(&partial.layout, &stage).unwrap(),
+                AttachReadiness::Ready
+            );
+        }
 
+        // A swap stopped after any one of its steps, as a crash stops it, is
+        // finished by recovery, however many times recovery is stopped too.
+        // Every stop leaves the journal that makes the next start finish it.
+        {
+            let journal = partial.layout.root().join("history-attach.json");
+            crate::history_attach::interruption::after(Some(0));
+            let stopped =
+                crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap_err();
+            assert!(stopped.to_string().contains("interrupted"), "{stopped}");
+            let mut stops = 1;
+            loop {
+                assert!(journal.is_file(), "stop {stops} left no journal");
+                assert!(stops < 500, "recovery never finished the swap");
+                crate::history_attach::interruption::after(Some(1));
+                match crate::history_attach::recover_interrupted_attach(&partial.layout) {
+                    Ok(finished) => {
+                        assert!(finished, "recovery found no swap to finish");
+                        break;
+                    }
+                    Err(stopped) => {
+                        assert!(stopped.to_string().contains("interrupted"), "{stopped}");
+                        stops += 1;
+                    }
+                }
+            }
+            crate::history_attach::interruption::after(None);
+            // One stop for each entry moved out and in, at the least.
+            assert!(stops > 8, "the swap was stopped only {stops} times");
+            assert!(!journal.exists());
+            assert!(!crate::history_attach::recover_interrupted_attach(&partial.layout).unwrap());
+        }
         assert_eq!(
             crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap(),
-            crate::history_attach::AttachOutcome::Attached
+            crate::history_attach::AttachOutcome::AlreadyComplete
         );
         assert!(history_state::standing(&partial.layout).is_complete());
         assert!(!stage.exists());

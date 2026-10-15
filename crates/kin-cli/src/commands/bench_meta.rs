@@ -26,6 +26,8 @@ pub(crate) struct BenchMeta {
     kin_commit: &'static str,
     kin_dirty: bool,
     kin_source_known: bool,
+    kin_target: &'static str,
+    kin_build_profile: &'static str,
     dependency_provenance: &'static str,
 }
 
@@ -230,6 +232,8 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
         kin_commit: build.sha,
         kin_dirty: build.dirty,
         kin_source_known: build.source_known,
+        kin_target: build.target,
+        kin_build_profile: build.build_profile,
         dependency_provenance: build.dependency_provenance,
     })
 }

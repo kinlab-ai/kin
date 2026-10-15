@@ -206,6 +206,9 @@ jobs:
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
+      - name: Test isolated acceptance runtime consumers
+        run: python3 -m unittest discover -s scripts/acceptance -p test_runtime_fixture.py
+
       # A green suite step is not a verdict, and this makes that a rule rather
       # than a reading: every suite-run step must say the verdict comes from the
       # gate step, keep its exit-code capture, and report a nonzero result as a
@@ -954,14 +957,23 @@ jobs:
           set -uo pipefail
           mkdir -p acceptance
           rc=0
-          docker run --rm --memory=2g --workdir /w \
+          docker run --rm --network=host --memory=2g --workdir /w \
             -v "$PWD:/w" \
             -e KIN_ACCEPTANCE_LABEL \
             ubuntu:24.04 /bin/bash -c '
               set -e
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends git python3
+              # A runner whose nested containers resolve names intermittently
+              # lets apt-get update finish with warnings and no index, and the
+              # install then finds nothing. The suite needs both tools, so the
+              # pair is retried as one rather than the update alone.
+              for attempt in 1 2 3 4 5; do
+                if apt-get update -qq && apt-get install -y -qq --no-install-recommends git python3; then
+                  break
+                fi
+                if [ "$attempt" -eq 5 ]; then exit 1; fi
+                sleep 15
+              done
               git config --global user.name "Kin CI"
               git config --global user.email "ci@kinlab.ai"
               exec python3 scripts/acceptance/memory_pressure_refusal.py \

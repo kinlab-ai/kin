@@ -31,6 +31,9 @@ use kin_model::{
 
 use crate::error::{GitError, Result};
 
+mod capture_ref;
+pub use capture_ref::capture_lossless_git_ref;
+
 #[cfg(test)]
 fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
     kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())

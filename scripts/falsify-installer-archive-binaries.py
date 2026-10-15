@@ -9,10 +9,10 @@ one disagreement between the binary names `scripts/install.sh` uses after
 extracting an archive and the names the release actually packs into it, and
 requires `scripts/verify-installer-archive-binaries.py` to fail.
 
-The first probe reproduces the defect itself: the mandatory-daemon assertion
-naming a bare `kin-daemon` inside a Windows archive that carries
-`kin-daemon.exe`, which aborted the install after the download had already been
-fetched and verified.
+Supported POSIX platforms must install the mandatory names their archives carry.
+Windows POSIX entry points must instead refuse before any download or managed
+write and give the official PowerShell command. Windows release packaging still
+has its independent mandatory `.exe` authority check.
 
 The last two probes are about the guard's own honesty rather than about a
 mismatched name. A guard that cannot read what the installer asks for, or that
@@ -103,33 +103,48 @@ def expect_failure(label: str, expected: str, mutate: Callable[[Path], None]) ->
 
 PROBES: tuple[tuple[str, str, Callable[[Path], None]], ...] = (
     (
-        "the shipped defect: mandatory daemon named without its suffix",
-        "install.sh failed against a complete kin-windows-x86_64 archive",
+        "the mandatory daemon assertion names a missing Unix binary",
+        "install.sh failed against a complete kin-linux-x86_64 archive",
         lambda tree: poison(
             tree,
             "scripts/install.sh",
             'if [ ! -f "$EXTRACT_DIR/kin-daemon$BIN_EXT" ]; then',
-            'if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then',
+            'if [ ! -f "$EXTRACT_DIR/kin-daemon.unexpected" ]; then',
         ),
     ),
     (
-        "the suffix derivation neutered for windows",
-        "install.sh failed against a complete kin-windows-x86_64 archive",
+        "the POSIX suffix incorrectly requires Windows binaries",
+        "install.sh failed against a complete kin-linux-x86_64 archive",
         lambda tree: poison(
             tree,
             "scripts/install.sh",
-            'windows) BIN_EXT=".exe" ;;',
-            'windows) BIN_EXT="" ;;',
+            'BIN_EXT=""',
+            'BIN_EXT=".exe"',
         ),
     ),
     (
         "binaries installed under names the archive never carried",
-        "kin-windows-x86_64",
+        "kin-linux-x86_64",
         lambda tree: poison(
             tree,
             "scripts/install.sh",
             'mv "$EXTRACT_DIR/$bin$BIN_EXT" "$KIN_BIN/$bin$BIN_EXT"',
-            'mv "$EXTRACT_DIR/$bin$BIN_EXT" "$KIN_BIN/$bin"',
+            'mv "$EXTRACT_DIR/$bin$BIN_EXT" "$KIN_BIN/$bin.unexpected"',
+        ),
+    ),
+    (
+        "Windows redirect removed",
+        "official PowerShell redirect",
+        lambda tree: poison(
+            tree, "scripts/install.sh", 'if [ "$OS" = windows ]; then', 'if [ "$OS" = unsupported ]; then'
+        ),
+    ),
+    (
+        "Windows refusal writes managed directories",
+        "official PowerShell redirect",
+        lambda tree: poison(
+            tree, "scripts/install.sh", 'if [ "$OS" = windows ]; then',
+            'if [ "$OS" = windows ]; then\n    mkdir -p "$KIN_BIN" "$KIN_LIB"',
         ),
     ),
     (

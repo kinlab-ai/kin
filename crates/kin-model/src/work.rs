@@ -354,6 +354,11 @@ impl std::fmt::Display for StalenessState {
 /// line numbers, so they are designed to stay attached across renames and
 /// moves. When the anchored entity's fingerprint drifts, staleness is
 /// detected.
+///
+/// Persisted through positional MessagePack, so a field is only ever
+/// appended. `review` is left out of the encoding when absent, which keeps
+/// every annotation that is not a review flag at the bytes, and so the
+/// digest, it always had.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Annotation {
     pub annotation_id: AnnotationId,
@@ -364,6 +369,112 @@ pub struct Annotation {
     pub authored_by: IdentityRef,
     pub created_at: Timestamp,
     pub staleness: StalenessState,
+    /// Present when a reviewer set this annotation as a flag on the entity it
+    /// is scoped to. The annotation's `body` is the reviewer's note,
+    /// `authored_by` the reviewer and `created_at` when the flag was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewFlag>,
+}
+
+impl Annotation {
+    /// The review flag this annotation carries, while it is still open.
+    pub fn open_review_flag(&self) -> Option<&ReviewFlag> {
+        self.review
+            .as_ref()
+            .filter(|flag| flag.resolution.is_none())
+    }
+
+    /// The entity a review flag is on: the one entity it is scoped to.
+    pub fn flagged_entity(&self) -> Option<EntityId> {
+        self.review.as_ref()?;
+        self.scopes.iter().find_map(|scope| match scope {
+            WorkScope::Entity(entity_id) => Some(*entity_id),
+            _ => None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review flags
+// ---------------------------------------------------------------------------
+
+/// Agent sessions one review flag remembers having reached. Past it, the
+/// oldest sighting goes.
+pub const REVIEW_FLAG_SIGHTINGS_MAX: usize = 32;
+
+/// A reviewer's flag on one entity, as the annotation that holds it carries
+/// it.
+///
+/// A flag is scoped to an entity and to the exact version the reviewer was
+/// looking at. It stays open until the reviewer closes it, whatever becomes
+/// of the entity in between: committing the entity does not close it, and an
+/// entity that changes afterwards is told apart by its fingerprint no longer
+/// being the flagged one. A flag is advisory and stops nothing.
+///
+/// Positional like the annotation that holds it, so a field is only ever
+/// appended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewFlag {
+    /// The fingerprint of the entity's syntax as the reviewer saw it.
+    pub flagged_ast: Hash256,
+    /// The entity's name when it was flagged, which is what a reader is shown
+    /// once the graph no longer holds the entity.
+    pub flagged_name: String,
+    /// The request that set the flag, so the same request sets it once.
+    pub operation_id: OperationId,
+    /// Who closed the flag and when. Absent while it is open.
+    pub resolution: Option<ReviewFlagResolution>,
+    /// The agent sessions an answer from Kin handed this flag to, oldest
+    /// first, each session once.
+    pub seen_by: Vec<ReviewFlagSighting>,
+    /// Literal-sensitive fingerprint of the version the reviewer saw. Older
+    /// flags without this field continue to use their syntax fingerprint.
+    // Kept as an explicit null when absent: a later source digest must not
+    // slide into this position in MessagePack.
+    #[serde(default)]
+    pub flagged_behavior: Option<Hash256>,
+    /// Exact reviewed entity span digest, including comments and literals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flagged_source: Option<Hash256>,
+}
+
+impl ReviewFlag {
+    /// Record that `sighting`'s session was handed this flag. A session
+    /// already recorded is left as it was; returns whether anything changed.
+    pub fn record_sighting(&mut self, sighting: ReviewFlagSighting) -> bool {
+        if self
+            .seen_by
+            .iter()
+            .any(|known| known.session == sighting.session)
+        {
+            return false;
+        }
+        self.seen_by.push(sighting);
+        if self.seen_by.len() > REVIEW_FLAG_SIGHTINGS_MAX {
+            let excess = self.seen_by.len() - REVIEW_FLAG_SIGHTINGS_MAX;
+            self.seen_by.drain(..excess);
+        }
+        true
+    }
+}
+
+/// Who closed a review flag, and when.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewFlagResolution {
+    pub by: IdentityRef,
+    pub at: Timestamp,
+    /// The request that closed the flag.
+    pub operation_id: OperationId,
+}
+
+/// One agent session a review flag reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewFlagSighting {
+    /// The name the session's client gave itself.
+    pub agent: String,
+    pub session: SessionId,
+    /// When Kin first handed the session an answer carrying the flag.
+    pub at: Timestamp,
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +701,7 @@ mod tests {
             authored_by: IdentityRef::human("alice"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
 
         let json = serde_json::to_string(&ann).unwrap();
@@ -602,6 +714,142 @@ mod tests {
     #[test]
     fn staleness_default_is_fresh() {
         assert_eq!(StalenessState::default(), StalenessState::Fresh);
+    }
+
+    /// The annotation as every store written before review flags holds it.
+    #[derive(Serialize, Deserialize)]
+    struct AnnotationBeforeReviewFlags {
+        annotation_id: AnnotationId,
+        kind: AnnotationKind,
+        body: String,
+        scopes: Vec<WorkScope>,
+        anchored_fingerprint: Option<SemanticAnchor>,
+        authored_by: IdentityRef,
+        created_at: Timestamp,
+        staleness: StalenessState,
+    }
+
+    fn flagged_annotation(entity_id: EntityId) -> Annotation {
+        Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Warning,
+            body: "a second send must fail loudly".into(),
+            scopes: vec![WorkScope::Entity(entity_id)],
+            anchored_fingerprint: Some(SemanticAnchor {
+                ast_hash: Hash256::from_bytes([0xaa; 32]),
+                signature_hash: Hash256::from_bytes([0xbb; 32]),
+            }),
+            authored_by: IdentityRef::human("ada"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+            review: Some(ReviewFlag {
+                flagged_ast: Hash256::from_bytes([0xaa; 32]),
+                flagged_behavior: Some(Hash256::from_bytes([0xbb; 32])),
+                flagged_source: Some(Hash256::from_bytes([0xcc; 32])),
+                flagged_name: "ServerReply.send".into(),
+                operation_id: OperationId::new(),
+                resolution: None,
+                seen_by: Vec::new(),
+            }),
+        }
+    }
+
+    /// An annotation that is not a review flag keeps the bytes it always had,
+    /// in the positional encoding the store hashes and in JSON, and a store
+    /// written before review flags reads back with none.
+    #[test]
+    fn an_annotation_without_a_review_flag_keeps_its_stored_bytes() {
+        let mut plain = flagged_annotation(EntityId::new());
+        plain.review = None;
+        let before = AnnotationBeforeReviewFlags {
+            annotation_id: plain.annotation_id,
+            kind: plain.kind,
+            body: plain.body.clone(),
+            scopes: plain.scopes.clone(),
+            anchored_fingerprint: plain.anchored_fingerprint.clone(),
+            authored_by: plain.authored_by.clone(),
+            created_at: plain.created_at.clone(),
+            staleness: plain.staleness,
+        };
+        let stored = rmp_serde::to_vec(&before).unwrap();
+        assert_eq!(rmp_serde::to_vec(&plain).unwrap(), stored);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        let read: Annotation = rmp_serde::from_slice(&stored).unwrap();
+        assert_eq!(read, plain);
+        let read: Annotation =
+            serde_json::from_str(&serde_json::to_string(&before).unwrap()).unwrap();
+        assert_eq!(read, plain);
+    }
+
+    #[test]
+    fn a_review_flag_survives_both_encodings_and_names_its_entity() {
+        let entity_id = EntityId::new();
+        let mut flagged = flagged_annotation(entity_id);
+        let flag = flagged.review.as_mut().unwrap();
+        flag.record_sighting(ReviewFlagSighting {
+            agent: "codex".into(),
+            session: SessionId::new(),
+            at: Timestamp::now(),
+        });
+        let read: Annotation =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&flagged).unwrap()).unwrap();
+        assert_eq!(read, flagged);
+        let read: Annotation =
+            serde_json::from_str(&serde_json::to_string(&flagged).unwrap()).unwrap();
+        assert_eq!(read, flagged);
+        assert_eq!(flagged.flagged_entity(), Some(entity_id));
+        assert!(flagged.open_review_flag().is_some());
+
+        flagged.review.as_mut().unwrap().resolution = Some(ReviewFlagResolution {
+            by: IdentityRef::human("ada"),
+            at: Timestamp::now(),
+            operation_id: OperationId::new(),
+        });
+        assert!(flagged.open_review_flag().is_none());
+        assert_eq!(flagged.flagged_entity(), Some(entity_id));
+
+        let mut plain = flagged;
+        plain.review = None;
+        assert_eq!(plain.flagged_entity(), None);
+    }
+
+    #[test]
+    fn exact_source_flag_encoding_keeps_the_behavior_slot_when_absent() {
+        let mut annotation = flagged_annotation(EntityId::new());
+        let flag = annotation.review.as_mut().unwrap();
+        flag.flagged_behavior = None;
+        let expected_source = flag.flagged_source;
+        let read: Annotation =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&annotation).unwrap()).unwrap();
+        assert_eq!(read.review.as_ref().unwrap().flagged_behavior, None);
+        assert_eq!(
+            read.review.as_ref().unwrap().flagged_source,
+            expected_source
+        );
+        assert_eq!(read, annotation);
+    }
+
+    #[test]
+    fn a_review_flag_records_each_session_once_and_keeps_the_newest() {
+        let mut flagged = flagged_annotation(EntityId::new());
+        let flag = flagged.review.as_mut().unwrap();
+        let first = SessionId::new();
+        let sighting = |session| ReviewFlagSighting {
+            agent: "agent".into(),
+            session,
+            at: Timestamp::now(),
+        };
+        assert!(flag.record_sighting(sighting(first)));
+        assert!(!flag.record_sighting(sighting(first)));
+        assert_eq!(flag.seen_by.len(), 1);
+        for _ in 0..REVIEW_FLAG_SIGHTINGS_MAX {
+            assert!(flag.record_sighting(sighting(SessionId::new())));
+        }
+        assert_eq!(flag.seen_by.len(), REVIEW_FLAG_SIGHTINGS_MAX);
+        assert!(flag.seen_by.iter().all(|seen| seen.session != first));
     }
 
     #[test]

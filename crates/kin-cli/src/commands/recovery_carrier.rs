@@ -1461,6 +1461,7 @@ mod tests {
             kind: ActorKind::Human,
             display_name: "Recovery Test".into(),
             external_refs: vec![],
+            agent_session: None,
         };
         let audit = AuditEvent {
             event_id: AuditEventId::new(),

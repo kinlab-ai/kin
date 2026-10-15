@@ -409,6 +409,13 @@ pub trait ChangeStore: Send + Sync {
         &self,
         id: &SemanticChangeId,
     ) -> std::result::Result<Option<SemanticChange>, Self::Error>;
+    /// Whether this store holds `id`, which [`Self::get_change`] answers by
+    /// reading the whole change. A store that keeps its history encoded
+    /// answers from its index instead: a change can carry a whole repository,
+    /// and a ref resolved to it is checked on every read that names one.
+    fn holds_change(&self, id: &SemanticChangeId) -> std::result::Result<bool, Self::Error> {
+        Ok(self.get_change(id)?.is_some())
+    }
     fn get_changes_since(
         &self,
         base: &SemanticChangeId,

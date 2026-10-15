@@ -173,11 +173,15 @@ pub struct OutsideMemberRead {
     pub owner: String,
 }
 
-/// The member reads a graph proves outside, read once for each file a
-/// followed name is read in.
-struct ProvenOutside<'a> {
-    graph: &'a dyn EscapeCensusGraph,
-    files: HashMap<&'a str, &'a CensusFile>,
+/// What a graph holds for each file of a census's domain about the member
+/// reads and import statements written there, read once for the whole census.
+///
+/// Each answer is the file's alone: it does not depend on the focal whose
+/// names led the census there. A batch census used to read it again for every
+/// focal, and a guide of a change asks about every entity the change reaches,
+/// so each file's coverage certificate was read and parsed once per entity.
+#[derive(Default)]
+struct FileReads {
     by_file: std::cell::RefCell<HashMap<String, Vec<OutsideMemberRead>>>,
     /// The member reads a graph types the receiver of, read the same way.
     typed_by_file: std::cell::RefCell<HashMap<String, Vec<TypedMemberRead>>>,
@@ -186,17 +190,27 @@ struct ProvenOutside<'a> {
     imports_by_file: std::cell::RefCell<HashMap<String, Vec<WrittenImport>>>,
 }
 
+/// The member reads a graph proves outside, read once for each file a
+/// followed name is read in.
+struct ProvenOutside<'a> {
+    graph: &'a dyn EscapeCensusGraph,
+    files: HashMap<&'a str, &'a CensusFile>,
+    reads: &'a FileReads,
+}
+
 impl<'a> ProvenOutside<'a> {
-    fn new(graph: &'a dyn EscapeCensusGraph, domain: &[&'a DomainFile]) -> Self {
+    fn new(
+        graph: &'a dyn EscapeCensusGraph,
+        domain: &[&'a DomainFile],
+        reads: &'a FileReads,
+    ) -> Self {
         Self {
             graph,
             files: domain
                 .iter()
                 .map(|file| (file.file.path.0.as_str(), &file.file))
                 .collect(),
-            by_file: Default::default(),
-            typed_by_file: Default::default(),
-            imports_by_file: Default::default(),
+            reads,
         }
     }
 
@@ -214,7 +228,7 @@ impl<'a> ProvenOutside<'a> {
         let Some(file) = self.files.get(path) else {
             return false;
         };
-        let mut by_file = self.imports_by_file.borrow_mut();
+        let mut by_file = self.reads.imports_by_file.borrow_mut();
         let imports = by_file
             .entry(path.to_string())
             .or_insert_with(|| self.graph.imports_written_in(file));
@@ -249,7 +263,7 @@ impl<'a> ProvenOutside<'a> {
         }
         let receiver = occurrence.receiver.as_deref()?;
         let file = self.files.get(path)?;
-        let mut by_file = self.typed_by_file.borrow_mut();
+        let mut by_file = self.reads.typed_by_file.borrow_mut();
         let reads = by_file
             .entry(path.to_string())
             .or_insert_with(|| self.graph.typed_member_reads(file));
@@ -274,7 +288,7 @@ impl<'a> ProvenOutside<'a> {
         }
         let receiver = occurrence.receiver.as_deref()?;
         let file = self.files.get(path)?;
-        let mut by_file = self.by_file.borrow_mut();
+        let mut by_file = self.reads.by_file.borrow_mut();
         let reads = by_file
             .entry(path.to_string())
             .or_insert_with(|| self.graph.outside_member_reads(file));
@@ -830,6 +844,7 @@ pub fn focal_escape_evidence_batch_scoped(
             .collect();
     }
     let domain = read_domain(graph, &languages, include_tests);
+    let reads = FileReads::default();
     let roots = ImportRoots::of(
         domain
             .iter()
@@ -848,7 +863,7 @@ pub fn focal_escape_evidence_batch_scoped(
                     reason: "the selected tree could not be read",
                 };
             };
-            census_one(graph, domain, &roots, focal, names)
+            census_one(graph, domain, &roots, &reads, focal, names)
         })
         .collect()
 }
@@ -1272,6 +1287,7 @@ fn census_one(
     graph: &dyn EscapeCensusGraph,
     domain: &[DomainFile],
     roots: &ImportRoots,
+    reads: &FileReads,
     focal: &Entity,
     names: &[String],
 ) -> FocalEscape {
@@ -1403,7 +1419,7 @@ fn census_one(
     let mut outside: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     // Reads of a followed name on a receiver whose value the graph proves to
     // be of a type outside the repository, by receiver, type and name.
-    let proven = ProvenOutside::new(graph, &in_domain);
+    let proven = ProvenOutside::new(graph, &in_domain, reads);
     let mut outside_values: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     // Reads of a followed member name off the instance receiver of a class
     // that shares no instance with the focal's owner, by receiver, class and

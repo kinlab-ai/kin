@@ -1854,13 +1854,14 @@ jobs:
 
   publish_npm_compatibility:
     name: Publish npm Compatibility Wrapper (@kinlab/kin-mcp)
-    needs: [publish, install_proof, npm_publish_preflight]
+    needs: [publish, install_proof, npm_publish_preflight, publish_npm_canonical]
     if: >-
       ${{
         always() &&
         needs.publish.result == 'success' &&
         needs.install_proof.result == 'success' &&
         needs.npm_publish_preflight.result == 'success' &&
+        needs.publish_npm_canonical.result == 'success' &&
         startsWith(github.ref, 'refs/tags/v')
       }}
     runs-on: ubuntu-latest

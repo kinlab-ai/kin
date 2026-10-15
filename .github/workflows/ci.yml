@@ -161,6 +161,8 @@ jobs:
             ./scripts/advisory-sweep.test.mjs \
             ./scripts/verify-capability-proof.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs \
+            ./scripts/verify-native-release-provenance.test.mjs \
+            ./scripts/docker-entrypoint-runtime.test.mjs \
             ./scripts/review-ui.test.cjs \
             ./scripts/workspace-ui.test.cjs \
             ./scripts/workspace-graph.test.cjs
@@ -652,7 +654,7 @@ jobs:
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test repository_merge_resolution
           run_required_target "editor setup guidance" \
-            "full_setup_output_recommends_install_only_when_the_editor_extension_is_missing" \
+            "development_editor_setup_refuses_with_or_without_an_installed_extension" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test setup_editor_guidance
           # The daemon's own library tests, here rather than beside the other
@@ -872,6 +874,40 @@ jobs:
       # admission change that moves the refusal turns a pull request red
       # instead of first turning a release commit red here. Daemon reopen
       # assertions live in the Linux daemon smoke until the Windows ports land.
+      - name: Prove Windows precommit rejection restores the original bundle
+        shell: bash
+        timeout-minutes: 15
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_RELEASE_LTO: 'off'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+        run: |
+          set -euo pipefail
+          export RUST_BACKTRACE=1
+          source ./scripts/windows-authority-legs.sh
+          test_name="commands::update::tests::windows_before_commit_rejection_restores_original_bundle"
+          unit="$(resolve_leg_unit --locked --release --target x86_64-pc-windows-msvc -p kin-cli --lib)"
+          listing="$(_leg_listing "$unit")"
+          matches="$(printf '%s\n' "$listing" | awk -v expected="$test_name: test" '$0 == expected { count += 1 } END { print count + 0 }')"
+          if [ "$matches" -ne 1 ]; then
+            echo "::error::Windows rollback proof requires exactly one listed native test, found $matches"
+            exit 1
+          fi
+          proof_log="$RUNNER_TEMP/windows-precommit-rollback.log"
+          _leg_exec "$unit" "$test_name" --exact --nocapture --test-threads=1 --quiet | tee "$proof_log"
+          tr -d '\r' < "$proof_log" | grep -Fx 'WINDOWS_PRECOMMIT_ROLLBACK_CONTROL_PASS'
+          tr -d '\r' < "$proof_log" | grep -F '1 passed; 0 failed; 0 ignored'
+
+      - name: Test native worker cleanup ownership (PowerShell 7)
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./scripts/test-windows-worker-cleanup.ps1 -KinCliPath (Join-Path $pwd 'target/x86_64-pc-windows-msvc/release/kin.exe') -KinDaemonPath (Join-Path $pwd 'target/x86_64-pc-windows-msvc/release/kin-daemon.exe') -OutputRoot (Join-Path $env:RUNNER_TEMP ('kin-worker-cleanup-' + [Guid]::NewGuid().ToString('N')))
+
+      - name: Test native worker cleanup ownership (Windows PowerShell 5.1)
+        shell: powershell
+        timeout-minutes: 10
+        run: ./scripts/test-windows-worker-cleanup.ps1 -KinCliPath (Join-Path $pwd 'target/x86_64-pc-windows-msvc/release/kin.exe') -KinDaemonPath (Join-Path $pwd 'target/x86_64-pc-windows-msvc/release/kin-daemon.exe') -OutputRoot (Join-Path $env:RUNNER_TEMP ('kin-worker-cleanup-' + [Guid]::NewGuid().ToString('N')))
+
       - name: Assert the Windows admission contract
         shell: bash
         run: |

@@ -523,6 +523,14 @@ pub(crate) fn observe_units<S: EntityStore>(
     let mut measured_languages: Vec<LanguageId> = Vec::new();
     let mut residue: Vec<Value> = Vec::new();
     let mut residue_total = 0usize;
+    // A declaration two census entries describe alike is one declaration.
+    let mut residue_seen: std::collections::BTreeSet<(
+        String,
+        u32,
+        String,
+        String,
+        Option<String>,
+    )> = std::collections::BTreeSet::new();
     let mut unparsed: Vec<String> = Vec::new();
     let mut unparsed_total = 0usize;
     let mut unmeasured: Vec<Value> = Vec::new();
@@ -616,6 +624,16 @@ pub(crate) fn observe_units<S: EntityStore>(
                     .map(Vec::as_slice)
                     .unwrap_or_default();
                 for declaration in matching(&query.in_file(path), &unadmitted, outer) {
+                    let key = (
+                        path.to_string(),
+                        declaration.line,
+                        declaration.name.clone(),
+                        declaration.kind.label().to_string(),
+                        declaration.owner.clone(),
+                    );
+                    if !residue_seen.insert(key) {
+                        continue;
+                    }
                     residue_total += 1;
                     if residue.len() < LISTED_MAX {
                         let mut row = json!({
@@ -889,6 +907,44 @@ pub(crate) fn read_unread_regions<G: kin_model::GraphStore + ?Sized>(
     }
     if not_read > 0 {
         reading[UNREAD_NOT_READ_COUNT_KEY] = json!(not_read);
+    }
+}
+
+/// Keep only the listed unadmitted declarations whose module `keeps` admits,
+/// so a lookup scoped to one part of the repository does not list what sits
+/// outside it. A row whose module the records cannot name is passed as
+/// `None`. The total drops by what was dropped, and a census left with
+/// nothing unadmitted and nothing unparsed says it is complete.
+pub(crate) fn scope_residue(reading: &mut Value, keeps: impl Fn(Option<&str>) -> bool) {
+    let Some(rows) = reading
+        .get_mut("matching_unadmitted")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let before = rows.len();
+    rows.retain(|row| keeps(row.get("module").and_then(Value::as_str)));
+    let dropped = (before - rows.len()) as u64;
+    if dropped == 0 {
+        return;
+    }
+    let total = reading
+        .get("matching_unadmitted_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(before as u64)
+        .saturating_sub(dropped);
+    if total == 0 {
+        if let Some(map) = reading.as_object_mut() {
+            map.remove("matching_unadmitted");
+            map.remove("matching_unadmitted_total");
+        }
+        if reading["state"] == STATE_COMPLETE_EXCEPT
+            && reading.get("unparsed_files_total").is_none()
+        {
+            reading["state"] = json!(STATE_COMPLETE);
+        }
+    } else {
+        reading["matching_unadmitted_total"] = json!(total);
     }
 }
 
@@ -1182,6 +1238,38 @@ fn plural(count: u64) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A lookup scoped to one part of the repository lists only the
+    /// unadmitted declarations inside it, lowers the total by what it
+    /// dropped, and says complete once nothing unadmitted is left.
+    #[test]
+    fn a_scoped_lookup_lists_only_the_unadmitted_declarations_inside_its_scope() {
+        let mut reading = serde_json::json!({
+            "state": STATE_COMPLETE_EXCEPT,
+            "matching_unadmitted": [
+                {"name": "validate", "module": "app.routes"},
+                {"name": "validate", "module": "tests.routes"},
+                {"name": "validate"},
+            ],
+            "matching_unadmitted_total": 5,
+        });
+        scope_residue(&mut reading, |module| {
+            module.is_none_or(|module| module.starts_with("app"))
+        });
+        assert_eq!(reading["matching_unadmitted"].as_array().unwrap().len(), 2);
+        assert_eq!(reading["matching_unadmitted_total"], 4);
+        assert_eq!(reading["state"], STATE_COMPLETE_EXCEPT);
+
+        let mut reading = serde_json::json!({
+            "state": STATE_COMPLETE_EXCEPT,
+            "matching_unadmitted": [{"name": "validate", "module": "tests.routes"}],
+            "matching_unadmitted_total": 1,
+        });
+        scope_residue(&mut reading, |module| {
+            module.is_some_and(|module| module.starts_with("app"))
+        });
+        assert!(reading.get("matching_unadmitted").is_none());
+        assert_eq!(reading["state"], STATE_COMPLETE);
+    }
     fn unadmitted(name: &str, owner: Option<&str>, start: usize, end: usize) -> Unadmitted {
         Unadmitted {
             name: name.into(),

@@ -4,7 +4,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
@@ -171,6 +171,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "telemetry",
             "resources",
             "daemon",
+            "runtime",
             "registry",
             "update",
             "upgrade",
@@ -323,6 +324,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect the one admitted CLI and daemon runtime pair
+    Runtime {
+        #[command(subcommand)]
+        action: RuntimeAction,
+    },
     /// Show which Git commands Kin replaces, and how ready each one is
     Capabilities {
         /// Output the versioned capability inventory as JSON
@@ -448,6 +454,10 @@ enum Command {
         /// Suppress progress output (only print final summary)
         #[arg(short, long)]
         quiet: bool,
+        /// Commit only this entity's uncommitted change, leaving every other
+        /// change uncommitted (repeat for more entities)
+        #[arg(long = "entity", value_name = "ENTITY_ID", conflicts_with = "amend")]
+        entities: Vec<String>,
     },
     /// Show the immutable repository-v6 change log
     Log {
@@ -1359,6 +1369,12 @@ enum Command {
         /// Change ID (defaults to current branch head)
         #[arg(long)]
         change: Option<String>,
+        /// Restore one entity's source, as an uncommitted edit, instead of a path
+        #[arg(long, value_name = "ENTITY_ID", conflicts_with_all = ["path", "path_hex"])]
+        entity: Option<String>,
+        /// Refuse unless the entity is exactly as last read: source:<body_hash> from a review, or absent
+        #[arg(long, value_name = "FINGERPRINT", requires = "entity")]
+        expected: Option<String>,
     },
     /// Verify test coverage for entities
     Verify {
@@ -1409,6 +1425,14 @@ enum Command {
         /// Include repo-specific prepared-state cache manifest fields
         #[arg(long, default_value_t = false, hide = true)]
         prepared_state: bool,
+        /// Static executable identity, without host or repository configuration
+        #[arg(
+            long,
+            hide = true,
+            requires = "json",
+            conflicts_with = "prepared_state"
+        )]
+        runtime_identity_only: bool,
     },
     /// Hidden prepared-state publish/materialize surfaces for benchmark/runtime orchestration
     #[command(hide = true)]
@@ -1555,6 +1579,8 @@ enum Command {
         /// Print the daemon's agents payload as JSON
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<AgentsAction>,
     },
     /// Manage assistant adapters
     Assistant {
@@ -1818,6 +1844,51 @@ enum Command {
         /// own activity gates.
         #[arg(long, requires = "unattended")]
         force_window: bool,
+        /// Prepare a verified out-of-process Windows update worker
+        #[arg(long, hide = true, conflicts_with_all = [
+            "skip_verify", "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "check_only", "ack_restart", "runtime_sessions", "set_policy", "apply", "dry_run",
+            "unattended", "force_window", "windows_worker"
+        ])]
+        prepare_windows_worker: bool,
+        /// Verify the native updater's exact Windows handoff before replacement
+        #[arg(long, hide = true, value_name = "RECORD", conflicts_with_all = [
+            "prepare_windows_worker", "skip_verify", "check_only", "json", "ack_restart", "runtime_sessions",
+            "set_policy", "unattended", "force_window", "dry_run"
+        ])]
+        windows_worker: Option<PathBuf>,
+        /// Remove an authenticated, completed Windows update worker handoff
+        #[arg(long, hide = true, value_name = "RECORD", conflicts_with_all = [
+            "skip_verify", "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "check_only", "json", "ack_restart", "runtime_sessions", "set_policy", "apply", "dry_run",
+            "unattended", "force_window", "prepare_windows_worker", "windows_worker",
+            "bootstrap_published", "expect_target", "expect_archive_name"
+        ])]
+        cleanup_windows_worker: Option<PathBuf>,
+        /// Admit an independently verified published archive into the managed install
+        #[arg(long, hide = true, requires_all = [
+            "channel", "expect_version", "expect_sha", "expect_archive_sha256",
+            "expect_target", "expect_archive_name"
+        ], conflicts_with_all = [
+            "skip_verify", "check_only", "json", "ack_restart", "runtime_sessions",
+            "set_policy", "dry_run", "unattended", "force_window",
+            "prepare_windows_worker", "windows_worker"
+        ])]
+        bootstrap_published: bool,
+        #[arg(
+            long,
+            hide = true,
+            requires = "bootstrap_published",
+            value_name = "TARGET"
+        )]
+        expect_target: Option<String>,
+        #[arg(
+            long,
+            hide = true,
+            requires = "bootstrap_published",
+            value_name = "ARCHIVE"
+        )]
+        expect_archive_name: Option<String>,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -1834,6 +1905,19 @@ enum Command {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// With --fix: also remove every other copy of Kin that has its own
+        /// uninstall
+        ///
+        /// Runs each copy's own channel (npm, cargo, Homebrew), or deletes a
+        /// standalone release file. Never removes a development build or
+        /// anything in the managed Kin home. `--fix` alone never removes a
+        /// copy, because `kin update` runs it unattended.
+        #[arg(
+            long = "remove-other-copies",
+            requires = "fix",
+            default_value_t = false
+        )]
+        remove_other_copies: bool,
         /// Install the missing language servers this repository's languages need
         ///
         /// Only for the languages the repository uses. An install can write
@@ -2070,6 +2154,21 @@ enum Command {
     Resources {
         #[command(subcommand)]
         action: ResourcesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Report exact executable identities without opening a repository
+    Status {
+        #[arg(long)]
+        json: bool,
+        /// Inspect an isolated development pair instead of the managed install
+        #[arg(long)]
+        development: bool,
+        /// Development CLI whose adjacent daemon should be inspected
+        #[arg(long, requires = "development", value_name = "PATH")]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -2810,6 +2909,21 @@ enum ReviewAction {
 }
 
 #[derive(Subcommand)]
+enum AgentsAction {
+    /// Answer an agent client's edit hook: read the hook's JSON on stdin and
+    /// tell this repository's daemon which session made the edit
+    #[command(name = "record-edit", hide = true)]
+    RecordEdit {
+        /// The client whose hook this is
+        #[arg(long, value_parser = commands::agent_edits::EDIT_HOOK_CLIENTS)]
+        client: String,
+        /// Wait for the daemon and print what became of the report
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrafficAction {
     /// Show active traffic on a scope
     Show {
@@ -3272,6 +3386,19 @@ enum SetupAction {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// With --fix: also remove every other copy of Kin that has its own
+        /// uninstall
+        ///
+        /// Runs each copy's own channel (npm, cargo, Homebrew), or deletes a
+        /// standalone release file. Never removes a development build or
+        /// anything in the managed Kin home. `--fix` alone never removes a
+        /// copy, because `kin update` runs it unattended.
+        #[arg(
+            long = "remove-other-copies",
+            requires = "fix",
+            default_value_t = false
+        )]
+        remove_other_copies: bool,
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -3847,6 +3974,70 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if is_top_level_display_flag() {
+        let _ = parse_cli_or_report_retired_command();
+    }
+    let startup_args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if typed_command_path(&startup_args).first() == Some(&"runtime") {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::Runtime {
+            action:
+                RuntimeAction::Status {
+                    json,
+                    development,
+                    binary,
+                },
+        } = cli.command
+        {
+            let code = commands::runtime::run(
+                json,
+                &commands::runtime::StatusOptions {
+                    development,
+                    binary,
+                },
+            )?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+    }
+    if typed_command_path(&startup_args).first() == Some(&"bench-meta")
+        && startup_args
+            .iter()
+            .any(|arg| arg == "--runtime-identity-only")
+    {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::BenchMeta {
+            json: true,
+            prepared_state: false,
+            runtime_identity_only: true,
+        } = cli.command
+        {
+            return commands::runtime::run_identity_probe();
+        }
+    }
+    if typed_command_path(&startup_args).as_slice() == ["registry", "authority"] {
+        let cli = parse_cli_or_report_retired_command();
+        if let Command::Registry {
+            action:
+                Some(RegistryAction::Authority {
+                    json,
+                    fix: false,
+                    initialize: false,
+                }),
+        } = cli.command
+        {
+            return tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(commands::registry::authority(json, false, false));
+        }
+    }
+    let runtime_mode = commands::runtime::prepare_environment()?;
     // Raise this process's open-file soft limit before anything opens a file.
     // macOS ships that limit at 256, which is below what one admission needs,
     // so on a stock Mac `kin init` died on the first real repository a person
@@ -3871,10 +4062,6 @@ fn run() -> Result<()> {
     // retrieval or resource settings into every repository daemon it opens.
     // Consult the same parser metadata used for leading command paths, so a
     // global option value named `ui` is not mistaken for the command.
-    let startup_args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let workspace_ui_requested = startup_args.iter().any(|arg| arg == "ui")
         && typed_command_path(&startup_args).first() == Some(&"ui");
     // ...then let the repository's recorded profile take over from that default,
@@ -3899,6 +4086,91 @@ fn run() -> Result<()> {
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = parse_cli_or_report_retired_command();
+    let setup_read_only = matches!(
+        &cli.command,
+        Command::Setup {
+            action: None,
+            check: true,
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Status { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Clients { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Ledger { .. }),
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Doctor { fix: false, .. }),
+            install_language_servers: false,
+            ..
+        } | Command::Setup {
+            action: Some(SetupAction::Uninstall { dry_run: true, .. }),
+            ..
+        }
+    );
+    let update_read_only = matches!(
+        &cli.command,
+        Command::Update {
+            check_only: true,
+            cleanup_windows_worker: None,
+            ..
+        } | Command::Update {
+            apply: true,
+            dry_run: true,
+            cleanup_windows_worker: None,
+            ..
+        }
+    );
+    if runtime_mode == kin_core::runtime_identity::RuntimeMode::Development
+        && matches!(&cli.command, Command::Update { .. })
+        && !update_read_only
+    {
+        anyhow::bail!(
+            "development mode cannot mutate the managed installation; run kin update from the admitted managed runtime"
+        );
+    }
+    if runtime_mode == kin_core::runtime_identity::RuntimeMode::Development
+        && ((matches!(&cli.command, Command::Setup { .. }) && !setup_read_only)
+            || matches!(
+                &cli.command,
+                Command::Doctor { fix: true, .. }
+                    | Command::Doctor {
+                        reclaim_staging: true,
+                        ..
+                    }
+            ))
+    {
+        anyhow::bail!("development mode cannot run setup or doctor repairs against global clients and shell configuration; use the admitted managed runtime");
+    }
+    let runtime_exempt = setup_read_only
+        || matches!(
+            &cli.command,
+            Command::Runtime { .. }
+                | Command::BenchMeta { .. }
+                | Command::Registry {
+                    action: Some(RegistryAction::Authority { .. }),
+                }
+                | Command::Daemon {
+                    action: DaemonAction::Status { .. } | DaemonAction::Stop { .. },
+                }
+                | Command::Update { .. }
+                | Command::Capabilities { .. }
+                | Command::Describe { .. }
+                | Command::Languages { .. }
+                | Command::Completions { .. }
+                | Command::SemanticOnlyGuard
+                | Command::Doctor {
+                    fix: false,
+                    heal: false,
+                    reclaim_staging: false,
+                    ..
+                }
+        );
+    if let Some(code) = commands::runtime::route_startup(runtime_mode, runtime_exempt)? {
+        std::process::exit(code);
+    }
     if !is_top_level_display_flag() && !matches!(&cli.command, Command::Ui { .. }) {
         let model_repository = match &cli.command {
             Command::Mcp {
@@ -3994,7 +4266,7 @@ fn run() -> Result<()> {
 
     // A durable MCP marker is an active repair obligation. Ordinary commands
     // retry it; the update command retries while holding the install lock.
-    if !matches!(&cli.command, Command::Update { .. }) {
+    if !runtime_exempt && !matches!(&cli.command, Command::Update { .. }) {
         match commands::update::retry_pending_mcp_repair_from_managed_process() {
             Ok(_) => {}
             Err(error) => eprintln!("kin: MCP repair remains pending: {error:#}"),
@@ -4014,6 +4286,9 @@ fn run() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
+                Command::Runtime { .. } => {
+                    unreachable!("runtime status returned before repository startup")
+                }
                 Command::Capabilities { json, verbose } => {
                     commands::capabilities::run(json, verbose)
                 }
@@ -4082,9 +4357,10 @@ fn run() -> Result<()> {
                     message,
                     quiet,
                     amend,
+                    entities,
                 } => {
                     commands::capabilities::require_ready("commit")?;
-                    commands::commit::run(message, quiet, amend).await
+                    commands::commit::run(message, quiet, amend, entities).await
                 }
                 Command::Log { count, json } => commands::log::run(count, json).await,
                 Command::Branch { action } => match action {
@@ -5110,9 +5386,16 @@ fn run() -> Result<()> {
                     path,
                     path_hex,
                     change,
+                    entity,
+                    expected,
                 } => {
                     commands::capabilities::require_ready("checkout")?;
-                    commands::checkout::run(path, path_hex, change).await
+                    match entity {
+                        Some(entity) => {
+                            commands::entity_work::run_restore(entity, change, expected).await
+                        }
+                        None => commands::checkout::run(path, path_hex, change).await,
+                    }
                 }
                 Command::Verify { action } => match action {
                     VerifyAction::Entity { entity } => commands::verify::run(entity).await,
@@ -5151,6 +5434,7 @@ fn run() -> Result<()> {
                 Command::BenchMeta {
                     json,
                     prepared_state,
+                    runtime_identity_only: _,
                 } => commands::bench_meta::run(json, prepared_state).await,
                 Command::PreparedState { action } => match action {
                     PreparedStateAction::Publish { target, json } => {
@@ -5359,7 +5643,20 @@ fn run() -> Result<()> {
                     TrafficAction::Show { scope } => commands::traffic::run(scope).await,
                     TrafficAction::Sessions => commands::traffic::sessions().await,
                 },
-                Command::Agents { json } => commands::agents::run(json).await,
+                Command::Agents {
+                    action: Some(AgentsAction::RecordEdit { client, wait }),
+                    ..
+                } => {
+                    let mut raw = String::new();
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw);
+                    if let Some(printed) =
+                        commands::agent_edits::record_edit(&client, &raw, wait).await
+                    {
+                        println!("{printed}");
+                    }
+                    Ok(())
+                }
+                Command::Agents { json, action: None } => commands::agents::run(json).await,
                 Command::Assistant { action } => match action {
                     AssistantAction::Install { assistant } => {
                         commands::assistant::install(assistant).await
@@ -5507,7 +5804,32 @@ fn run() -> Result<()> {
                     dry_run,
                     unattended,
                     force_window,
+                    prepare_windows_worker,
+                    windows_worker,
+                    cleanup_windows_worker,
+                    bootstrap_published,
+                    expect_target,
+                    expect_archive_name,
                 } => {
+                    if let Some(record) = cleanup_windows_worker {
+                        return commands::update::cleanup_windows_update_worker(&record);
+                    }
+                    if bootstrap_published {
+                        return commands::update::run_bootstrap_published(
+                            channel.context("published bootstrap requires an explicit channel")?,
+                            expect_version.context("published bootstrap requires a version")?,
+                            expect_sha
+                                .context("published bootstrap requires an exact source commit")?,
+                            expect_archive_sha256
+                                .context("published bootstrap requires an archive digest")?,
+                            expect_target
+                                .context("published bootstrap requires an exact build target")?,
+                            expect_archive_name
+                                .context("published bootstrap requires an exact archive name")?,
+                            apply,
+                        )
+                        .await;
+                    }
                     commands::update::run(
                         skip_verify,
                         channel,
@@ -5523,6 +5845,8 @@ fn run() -> Result<()> {
                         dry_run,
                         unattended,
                         force_window,
+                        prepare_windows_worker,
+                        windows_worker,
                     )
                     .await
                 }
@@ -5557,6 +5881,7 @@ fn run() -> Result<()> {
                 },
                 Command::Doctor {
                     fix,
+                    remove_other_copies,
                     install_language_servers,
                     json,
                     verbose,
@@ -5588,8 +5913,14 @@ fn run() -> Result<()> {
                         // for.
                         commands::health::reclaim_stranded_stages(json)
                     } else {
-                        commands::setup::doctor_with(fix, install_language_servers, json, verbose)
-                            .await
+                        commands::setup::doctor_with(
+                            fix,
+                            install_language_servers,
+                            json,
+                            verbose,
+                            remove_other_copies,
+                        )
+                        .await
                     }
                 }
                 Command::Vfs { action } => match action {
@@ -5679,8 +6010,19 @@ fn run() -> Result<()> {
                         Some(SetupAction::Status { json, verbose }) => {
                             commands::setup::status(json, verbose).await
                         }
-                        Some(SetupAction::Doctor { fix, json }) => {
-                            commands::setup::doctor(fix, install_language_servers, json).await
+                        Some(SetupAction::Doctor {
+                            fix,
+                            remove_other_copies,
+                            json,
+                        }) => {
+                            commands::setup::doctor_with(
+                                fix,
+                                install_language_servers,
+                                json,
+                                false,
+                                remove_other_copies,
+                            )
+                            .await
                         }
                         Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
                         Some(SetupAction::Uninstall {
@@ -8275,6 +8617,42 @@ mod tests {
                     ..
                 }
             ));
+        });
+    }
+
+    /// `--entity` repeats, never rides with an amend, and makes a checkout
+    /// restore one entity instead of a path.
+    #[test]
+    fn commit_and_checkout_take_entities() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin", "commit", "-m", "keep two", "--entity", "a", "--entity", "b",
+            ])
+            .unwrap();
+            assert!(
+                matches!(&cli.command, Command::Commit { entities, amend: false, .. } if entities == &["a", "b"])
+            );
+            assert!(
+                Cli::try_parse_from(["kin", "commit", "--amend", "--entity", "a"]).is_err(),
+                "an amend replaces a whole change and chooses no entities"
+            );
+            let cli = Cli::try_parse_from([
+                "kin",
+                "checkout",
+                "--entity",
+                "a",
+                "--change",
+                "c",
+                "--expected",
+                "f",
+            ])
+            .unwrap();
+            assert!(matches!(
+                &cli.command,
+                Command::Checkout { entity: Some(entity), expected: Some(_), path: None, .. } if entity == "a"
+            ));
+            assert!(Cli::try_parse_from(["kin", "checkout", "src", "--entity", "a"]).is_err());
+            assert!(Cli::try_parse_from(["kin", "checkout", "--expected", "f"]).is_err());
         });
     }
 

@@ -63,6 +63,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 
 PASS = "PASS"
@@ -394,6 +395,8 @@ class Suite(object):
         os.makedirs(self.env["KIN_HOME"], exist_ok=True)
         self.repo = None
         self.owned_repos = set()
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def shutdown(self):
         """Stop only this run's repositories, including a failed initialization."""
@@ -613,27 +616,33 @@ def check_diverged(suite):
     # The control. Nothing can bring a daemon up, so nothing can admit, and the
     # read must say so rather than repeat the verdict above.
     #
-    # A real executable that REFUSES, never a missing path: an absent binary
-    # tests "the binary is absent" and this arm is about "no daemon can run".
-    # And stopping the daemon is not enough, because `kin admit` starts one.
-    refusing = os.path.join(suite.workdir, "kin-daemon-that-refuses")
-    with open(refusing, "w") as handle:
-        handle.write("#!/bin/sh\necho 'stub daemon refuses' >&2\nexit 1\n")
-    os.chmod(refusing, 0o755)
-    if not os.access(refusing, os.X_OK):
-        result.unknown("the refusing-daemon stub is not executable, so the "
-                       "control would test an absent binary instead")
+    # Keep the verified selected pair. Managed routing cannot adopt a shell
+    # override, so that would test selection refusal instead of admission.
+    # The real daemon refuses an unauthenticated non-loopback bind before it
+    # creates a socket. Explicitly disable default loopback-token enforcement,
+    # or its auto-provisioned token would make this a healthy authenticated bind.
+    rc, out = suite.kin_run(["daemon", "stop", "--json"])
+    try:
+        start = out.find("{")
+        end = out.rfind("}")
+        stopped = json.loads(out[start : end + 1]) if start != -1 and end != -1 else {}
+    except (TypeError, ValueError):
+        stopped = {}
+    if (rc != 0 or stopped.get("schema") != "kin.daemon-stop.v1"
+            or stopped.get("scope") != "current-repo" or stopped.get("all_stopped") is not True):
+        result.unknown("the control could not establish absence of its existing daemon: %s"
+                       % tail(out, 300))
         return result
-    suite.kin_run(["daemon", "stop"])
-    restore = suite.env.get("KIN_DAEMON_BIN")
-    suite.env["KIN_DAEMON_BIN"] = refusing
+    restore = suite.env
+    suite.env = dict(restore)
+    suite.env["KIN_DAEMON_BIND_HOST"] = "0.0.0.0"
+    suite.env.pop("KIN_DAEMON_AUTH_TOKEN", None)
+    suite.env["KIN_DAEMON_REQUIRE_TOKEN"] = "0"
+    suite.env.pop("KIN_DAEMON_URL", None)
     try:
         blind = suite.status_text()
     finally:
-        if restore is None:
-            suite.env.pop("KIN_DAEMON_BIN", None)
-        else:
-            suite.env["KIN_DAEMON_BIN"] = restore
+        suite.env = restore
     if ADMITTED_BASIS.search(blind):
         result.bad(
             "with no daemon able to run, the read still claimed a fresh "

@@ -61,6 +61,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -209,6 +210,7 @@ def run_arm(kin, root, file_count, home):
     env["KIN_EMBED_BACKEND"] = "cpu"
     env["KIN_DAEMON_AUTO_EMBED"] = "0"
     env["RUST_LOG"] = "kin_core=info,kin_daemon=info"
+    kin, _ = prepare_runtime_fixture(kin, None, env, home)
     subprocess.call([kin, "init"], cwd=root, env=env,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     log = os.path.join(root, ".kin", "daemon.log")

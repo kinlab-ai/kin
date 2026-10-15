@@ -72,18 +72,42 @@ pub(crate) fn current_repository_base(state: &DaemonState) -> Option<RepositoryB
     repository_base_from(&authority, context.workspace_id())
 }
 
-/// The repository base an already-held authority names for one workspace.
-pub(crate) fn repository_base_from(
+/// The change this daemon's workspace stands on, resolved the way a diff of
+/// the working copy resolves it: a head naming an imported commit reads as
+/// the change that commit became.
+pub(crate) fn workspace_base_change(state: &DaemonState) -> Option<kin_model::SemanticChangeId> {
+    let context = LocalRepositoryAuthorityContext::from_state(state).ok()?;
+    let authority = crate::api::held_repository_authority(state).ok()?;
+    workspace_state_from(&authority, context.workspace_id(), |lease, workspace| {
+        lease
+            .resolve_target_change_id(workspace.base_target.as_ref()?)
+            .ok()
+    })
+}
+
+/// Read one workspace's state from an already-held authority.
+fn workspace_state_from<T>(
     authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
     workspace_id: kin_model::WorkspaceId,
-) -> Option<RepositoryBase> {
+    read: impl FnOnce(&kin_db::RepositoryAuthorityState, &kin_model::WorkspaceState) -> Option<T>,
+) -> Option<T> {
     let lease = authority.read_authority();
     let workspace = lease
         .metadata()
         .workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == workspace_id)?;
-    RepositoryBase::from_workspace(workspace).ok()
+    read(&lease, workspace)
+}
+
+/// The repository base an already-held authority names for one workspace.
+pub(crate) fn repository_base_from(
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+    workspace_id: kin_model::WorkspaceId,
+) -> Option<RepositoryBase> {
+    workspace_state_from(authority, workspace_id, |_, workspace| {
+        RepositoryBase::from_workspace(workspace).ok()
+    })
 }
 
 /// One member of a unit's namespace the graph already holds.

@@ -29,6 +29,7 @@ $KinDir = if ($env:KIN_HOME) {
 } else {
     Join-Path $HOME ".kin"
 }
+$KinDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($KinDir)
 $KinBin = Join-Path $KinDir "bin"
 $KinLib = Join-Path $KinDir "lib"
 $env:KIN_HOME = $KinDir
@@ -224,6 +225,118 @@ function Resolve-ArchiveChecksum {
     return $UniqueHashes[0]
 }
 
+function Normalize-KinRuntimePath([string]$Value) {
+    if ($Value.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $Value = '\\' + $Value.Substring(8)
+    } elseif ($Value.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        $Value = $Value.Substring(4)
+    }
+    return [IO.Path]::GetFullPath($Value).TrimEnd('\', '/')
+}
+
+function Test-SelectedRuntimeIdentity($Status, [string]$Version, [string]$SourceSha, [string]$RustTarget) {
+    if ($null -eq $Status -or $Status.schema -cne "kin.runtime-status.v1" -or
+        $Status.ready -cne $true -or $Status.mode -cne "managed" -or
+        $Status.pair_matches -cne $true -or $Status.restart_needed -cne $false) { return $false }
+    try {
+        if ((Normalize-KinRuntimePath $Status.kin_home) -ne (Normalize-KinRuntimePath $KinDir) -or
+            (Normalize-KinRuntimePath $Status.cli.path) -ne (Normalize-KinRuntimePath $ExistingKinExe) -or
+            (Normalize-KinRuntimePath $Status.daemon.path) -ne (Normalize-KinRuntimePath $ExistingDaemonExe)) { return $false }
+    } catch { return $false }
+    foreach ($Component in @($Status.cli, $Status.daemon)) {
+        if ($null -eq $Component -or $Component.version -cne $Version -or
+            $Component.commit_sha -cne $SourceSha -or $Component.target -cne $RustTarget -or
+            $Component.source_dirty -cne $false -or $Component.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+            [string]::IsNullOrEmpty($Component.build_profile)) { return $false }
+    }
+    return $Status.cli.build_profile -ceq $Status.daemon.build_profile
+}
+
+function ConvertTo-KinWindowsArgument([string]$Value) {
+    # Start-Process joins ArgumentList on Windows. Quote each argument using the
+    # native argv backslash rules, including paths with spaces or trailing slashes.
+    $Escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $Escaped = [regex]::Replace($Escaped, '(\\+)$', '$1$1')
+    return '"' + $Escaped + '"'
+}
+
+function Invoke-KinWindowsProcess(
+    [string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory,
+    [switch]$CaptureOutput
+) {
+    $Parameters = @{
+        FilePath = (Normalize-KinRuntimePath $Executable)
+        ArgumentList = @($Arguments | ForEach-Object { ConvertTo-KinWindowsArgument $_ })
+        WorkingDirectory = (Normalize-KinRuntimePath $WorkingDirectory)
+        NoNewWindow = $true
+        Wait = $true
+        PassThru = $true
+    }
+    $CaptureDirectory = $null
+    $Child = $null
+    try {
+        if ($CaptureOutput) {
+            $CaptureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('kin-native-output-' + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $CaptureDirectory | Out-Null
+            $Parameters.RedirectStandardOutput = Join-Path $CaptureDirectory 'stdout.txt'
+            $Parameters.RedirectStandardError = Join-Path $CaptureDirectory 'stderr.txt'
+        }
+        $Child = Start-Process @Parameters
+        $Child.WaitForExit()
+        $Child.Refresh()
+        if ($null -eq $Child.ExitCode -or $Child.Id -le 0) {
+            throw 'The native child returned without a known exit code and process identity.'
+        }
+        $Result = [pscustomobject]@{ ExitCode = [int]$Child.ExitCode; ProcessId = [int]$Child.Id; Stdout = $null; Stderr = $null }
+        if ($CaptureOutput) {
+            $Result.Stdout = [IO.File]::ReadAllText($Parameters.RedirectStandardOutput)
+            $Result.Stderr = [IO.File]::ReadAllText($Parameters.RedirectStandardError)
+        }
+        return $Result
+    } finally {
+        if ($null -ne $Child) { $Child.Dispose() }
+        if ($null -ne $CaptureDirectory) {
+            foreach ($Name in @('stdout.txt', 'stderr.txt')) {
+                Remove-Item -LiteralPath (Join-Path $CaptureDirectory $Name) -ErrorAction SilentlyContinue
+            }
+            try { [IO.Directory]::Delete($CaptureDirectory, $false) } catch { }
+        }
+    }
+}
+
+function Invoke-KinWindowsWorkerCleanup(
+    [string]$CanonicalCli, $Worker, $WorkerResult, [string]$HandoffHash,
+    [string]$ManagedHome
+) {
+    # Native owns object identity, actor exit, recovery fences and deletion.
+    # This observation ties a consumed handoff to the child this caller waited for.
+    try {
+        if ($null -eq $WorkerResult -or $WorkerResult.ExitCode -isnot [int] -or
+            $WorkerResult.ProcessId -isnot [int] -or $WorkerResult.ProcessId -le 0) { return $false }
+        $ClaimPath = Join-Path ([IO.Path]::GetDirectoryName((Normalize-KinRuntimePath $Worker.worker_executable))) 'claimed'
+        $ClaimFile = Get-Item -LiteralPath $ClaimPath -ErrorAction Stop
+        if ($ClaimFile.PSIsContainer -or
+            ($ClaimFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            $ClaimFile.Length -le 0 -or $ClaimFile.Length -gt 65536) { return $false }
+        $ClaimStream = [IO.File]::Open($ClaimPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            if ($ClaimStream.Length -le 0 -or $ClaimStream.Length -gt 65536) { return $false }
+            $Reader = [IO.StreamReader]::new($ClaimStream, [Text.Encoding]::UTF8, $true)
+            try { $Claim = $Reader.ReadToEnd() | ConvertFrom-Json }
+            finally { $Reader.Dispose() }
+        } finally { $ClaimStream.Dispose() }
+        if ($Claim.schema -cne 'kin.windows-update-worker-consumed.v1' -or
+            $Claim.worker_process.pid -ne $WorkerResult.ProcessId -or
+            $Claim.handoff_sha256 -cne $HandoffHash) { return $false }
+        $Cleanup = Invoke-KinWindowsProcess $CanonicalCli @(
+            'update', '--cleanup-windows-worker', $Worker.handoff_record
+        ) $ManagedHome
+        return $Cleanup.ExitCode -eq 0
+    } catch {
+        return $false
+    }
+}
+
 # ── Detect architecture ─────────────────────────────────────────────────
 
 $Arch = $null
@@ -253,17 +366,72 @@ Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow
 Write-Host "    Details: https://github.com/kinlab-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor DarkGray
 Write-Host ""
 
-# ── Detect an existing install (reinstall / upgrade) ──────────────────
+# ── Existing installs use the native transactional updater ─────────────
 
 $PreviousVersion = $null
+$LegacyBootstrap = $false
 $ExistingKinExe = Join-Path $KinBin "kin.exe"
-if (Test-Path $ExistingKinExe) {
-    $PreviousVersion = (& $ExistingKinExe --version 2>$null | Select-Object -First 1)
-    if ($PreviousVersion) {
-        Write-Info "Existing install found: kin $PreviousVersion (will be replaced)"
-    } else {
-        Write-Info "Existing install found in $KinDir (will be replaced)"
+$ExistingDaemonExe = Join-Path $KinBin "kin-daemon.exe"
+if ((Test-Path $ExistingKinExe) -or (Test-Path $ExistingDaemonExe)) {
+    if (!(Test-Path $ExistingKinExe -PathType Leaf) -or
+        ((Get-Item -LiteralPath $ExistingKinExe).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Write-Err "An incomplete or invalid managed install exists at $KinBin. No component was replaced."
+        exit 1
     }
+    if ($env:KIN_VERSION -or $env:KIN_BASE_URL) {
+        Write-Err "Pinned or mirrored reinstalls cannot replace an existing managed runtime independently."
+        Write-Err "Use kin update with its verified release pins, or select a separate development binary."
+        exit 1
+    }
+    $RuntimeProbe = $null
+    try {
+        $Probe = Invoke-KinWindowsProcess $ExistingKinExe @('runtime', 'status', '--json') $KinDir -CaptureOutput
+        $RuntimeProbe = $Probe.Stdout | ConvertFrom-Json
+    } catch { $RuntimeProbe = $null }
+    if ($null -ne $RuntimeProbe -and $RuntimeProbe.schema -ceq "kin.runtime-status.v1") {
+    Write-Info "Updating the existing managed runtime through its native transaction..."
+    $Prepared = Invoke-KinWindowsProcess $ExistingKinExe @('update', '--prepare-windows-worker') $KinDir -CaptureOutput
+    if ($Prepared.Stderr) { [Console]::Error.Write($Prepared.Stderr) }
+    if ($Prepared.ExitCode -ne 0) { exit $Prepared.ExitCode }
+    $Worker = $Prepared.Stdout | ConvertFrom-Json
+    if ($Worker.schema -ne "kin.windows-update-worker.v1" -or
+        ![IO.Path]::IsPathRooted($Worker.worker_executable) -or
+        ![IO.Path]::IsPathRooted($Worker.handoff_record) -or
+        $Worker.source_commit_sha -notmatch '^[0-9a-fA-F]{40}$' -or
+        $Worker.worker_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+        $Worker.version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        Write-Err "Native Windows worker preparation returned an invalid identity. No component was replaced."
+        exit 1
+    }
+    $WorkerFile = Get-Item -LiteralPath (Normalize-KinRuntimePath $Worker.worker_executable)
+    $RecordFile = Get-Item -LiteralPath (Normalize-KinRuntimePath $Worker.handoff_record)
+    if ($WorkerFile.PSIsContainer -or $RecordFile.PSIsContainer -or
+        ($WorkerFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($RecordFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        (Get-FileHash -LiteralPath (Normalize-KinRuntimePath $Worker.worker_executable) -Algorithm SHA256).Hash -ne $Worker.worker_sha256) {
+        Write-Err "Prepared Windows worker identity changed. Refusing to launch it."
+        exit 1
+    }
+    $HandoffHash = (Get-FileHash -LiteralPath (Normalize-KinRuntimePath $Worker.handoff_record) -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Waiting through Start-Process preserves native nonzero exits even when
+    # PowerShell's inherited native-error policy turns failures into exceptions.
+    $WorkerResult = Invoke-KinWindowsProcess $Worker.worker_executable @(
+        'update', '--windows-worker', $Worker.handoff_record, '--apply'
+    ) $WorkerFile.DirectoryName
+    $WorkerExit = $WorkerResult.ExitCode
+    if (-not (Invoke-KinWindowsWorkerCleanup $ExistingKinExe $Worker $WorkerResult $HandoffHash $KinDir)) {
+        Write-Info 'Native worker cleanup retained pending or changed authority; the update result is unchanged.'
+    }
+    if ($WorkerExit -ne 0) { exit $WorkerExit }
+    $FinalRuntime = Invoke-KinWindowsProcess $ExistingKinExe @('runtime', 'status', '--json') $KinDir -CaptureOutput
+    if ($FinalRuntime.Stdout) { [Console]::Out.Write($FinalRuntime.Stdout) }
+    if ($FinalRuntime.Stderr) { [Console]::Error.Write($FinalRuntime.Stderr) }
+    if ($FinalRuntime.ExitCode -ne 0) { exit $FinalRuntime.ExitCode }
+    Write-Ok "Managed runtime updated and verified"
+    exit 0
+    }
+    $LegacyBootstrap = $true
+    Write-Info "Older managed runtime detected. Staging an official release for native migration..."
 }
 
 # ── Resolve version ─────────────────────────────────────────────────────
@@ -289,10 +457,61 @@ $Url = "$BaseUrl/download/v$Version/$Archive"
 
 Write-Info "Downloading $Archive..."
 
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "kin-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$StageParent = [System.IO.Path]::GetTempPath()
+if ($LegacyBootstrap) {
+    $ManagedRoot = Normalize-KinRuntimePath $KinDir
+    $StageParentPath = Normalize-KinRuntimePath $StageParent
+    if ($StageParentPath.Equals($ManagedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $StageParentPath.StartsWith($ManagedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Migration staging must be outside the managed Kin home."
+    }
+}
+$TmpDir = Join-Path $StageParent "kin-install-$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $TmpDir | Out-Null
+$KeepStage = $false
+$SavedRuntimeEnvironment = $null
 
 try {
+if ($LegacyBootstrap) {
+    $ManagedRoot = Normalize-KinRuntimePath $KinDir
+    $StageRoot = Normalize-KinRuntimePath $TmpDir
+    if ($StageRoot.Equals($ManagedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $StageRoot.StartsWith($ManagedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Migration staging must be outside the managed Kin home."
+    }
+    if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+        throw "Official release metadata returned an invalid version. No component was replaced."
+    }
+    $Prerelease = ($Version -replace '\+.*$', '') -match '-'
+    $Channel = if ($Prerelease) { 'alpha' } else { 'stable' }
+    $RustTarget = 'x86_64-pc-windows-msvc'
+    $ReleaseMetadata = Invoke-RestMethod "https://api.github.com/repos/$GitHubOrg/$GitHubRepo/releases/tags/v$Version"
+    if ($ReleaseMetadata.tag_name -cne "v$Version" -or $ReleaseMetadata.draft -cne $false -or
+        $ReleaseMetadata.prerelease -cne $Prerelease) {
+        throw "Official release metadata does not admit the selected version and channel."
+    }
+    $ReleaseMetadata | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $TmpDir 'release.json')
+    $TagMetadata = Invoke-RestMethod "https://api.github.com/repos/$GitHubOrg/$GitHubRepo/git/ref/tags/v$Version"
+    if ($TagMetadata.ref -cne "refs/tags/v$Version") { throw 'Official tag metadata did not identify the exact selected release tag.' }
+    $TagMetadata | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $TmpDir 'tag-ref.json')
+    $TagDepth = 0
+    while ($true) {
+        if ($TagMetadata.object.sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Official tag metadata did not resolve to a full source commit. No component was replaced."
+        }
+        $SourceSha = $TagMetadata.object.sha.ToLowerInvariant()
+        if ($TagMetadata.object.type -ceq 'commit') { break }
+        if ($TagMetadata.object.type -cne 'tag') { throw 'Official release tag does not resolve to a commit.' }
+        if ($TagDepth -ge 5) { throw 'Official tag metadata exceeded the supported annotation depth.' }
+        $TagDepth++
+        $RequestedTagSha = $SourceSha
+        $TagMetadata = Invoke-RestMethod "https://api.github.com/repos/$GitHubOrg/$GitHubRepo/git/tags/$SourceSha"
+        if ($TagMetadata.sha -notmatch '^[0-9a-fA-F]{40}$' -or $TagMetadata.sha.ToLowerInvariant() -cne $RequestedTagSha) {
+            throw 'Official annotation metadata did not identify the requested tag object.'
+        }
+        $TagMetadata | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $TmpDir "tag-$TagDepth.json")
+    }
+}
 # `irm ... | iex` still has a real ConsoleHost, so first installs launched from
 # the documented one-liner get live byte/percent feedback. Redirected and CI
 # hosts skip progress records while preserving the exact same download bytes.
@@ -355,8 +574,10 @@ Write-Ok "SHA-256 checksum verified"
 
 Write-Info "Installing to $KinDir..."
 
-New-Item -ItemType Directory -Path $KinBin -Force | Out-Null
-New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
+if (-not $LegacyBootstrap) {
+    New-Item -ItemType Directory -Path $KinBin -Force | Out-Null
+    New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
+}
 
 Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
 
@@ -366,6 +587,48 @@ Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Forc
 if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     Write-Err "kin-daemon.exe missing from the downloaded archive. Refusing a daemon-less install."
     exit 1
+}
+
+if ($LegacyBootstrap) {
+    $StagedCli = Join-Path $TmpDir 'kin.exe'
+    foreach ($ComponentPath in @($StagedCli, (Join-Path $TmpDir 'kin-daemon.exe'))) {
+        $ComponentFile = Get-Item -LiteralPath $ComponentPath
+        if ($ComponentFile.PSIsContainer -or ($ComponentFile.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "The official archive contains unsafe native components. No component was replaced."
+        }
+    }
+    $KeepStage = $true
+    $SavedRuntimeEnvironment = @{}
+    foreach ($Name in @('KIN_DIR', 'KIN_DAEMON_BIN', 'KIN_MANAGED_BIN', 'KIN_BINARY_PATH', 'KIN_MCP_KIN_BINARY', 'KIN_DAEMON_URL', 'KIN_RUNTIME_MODE')) {
+        $SavedRuntimeEnvironment[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+    }
+    $env:KIN_HOME = $KinDir
+    $env:KIN_RUNTIME_MODE = 'managed'
+    Push-Location -LiteralPath $TmpDir
+    try {
+        & $StagedCli update --bootstrap-published --channel $Channel `
+            --expect-version $Version --expect-sha $SourceSha `
+            --expect-archive-sha256 $ActualHash --expect-target $RustTarget `
+            --expect-archive-name $Archive --apply
+        $BootstrapExit = $LASTEXITCODE
+    } finally { Pop-Location }
+    if ($BootstrapExit -ne 0) {
+        Write-Err 'Native migration refused or requires recovery. The installer performed no direct component replacement.'
+        exit $BootstrapExit
+    }
+    $FinalJson = & $ExistingKinExe runtime status --json
+    $FinalExit = $LASTEXITCODE
+    $FinalJson -join "`n" | Set-Content -LiteralPath (Join-Path $TmpDir 'final-status.json')
+    $FinalStatus = $null
+    try { $FinalStatus = ($FinalJson -join "`n") | ConvertFrom-Json } catch { }
+    if ($FinalExit -ne 0 -or -not (Test-SelectedRuntimeIdentity $FinalStatus $Version $SourceSha $RustTarget)) {
+        Write-Err 'Native migration has not produced the selected ready runtime. Completion remains pending.'
+        exit 1
+    }
+    $KeepStage = $false
+    Write-Ok 'Managed runtime migrated and verified'
+    exit 0
 }
 
 # Report the downloaded binary's registry-authority capability before replacing
@@ -399,6 +662,9 @@ if (Test-Path $shimSrc) {
     Move-Item -Path $shimSrc -Destination (Join-Path $KinLib "kin_vfs_shim.dll") -Force
     $HaveShim = $true
 }
+
+& (Join-Path $KinBin "kin.exe") runtime status --json
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Ok "Binaries installed (kin, kin-daemon)"
 
@@ -448,10 +714,19 @@ if (Test-KinTruthy $env:KIN_NO_SETUP) {
 # ── Cleanup ─────────────────────────────────────────────────────────────
 
 } finally {
+    if ($null -ne $SavedRuntimeEnvironment) {
+        foreach ($Name in $SavedRuntimeEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($Name, $SavedRuntimeEnvironment[$Name], 'Process')
+        }
+    }
     # `finally` runs for success, terminating errors, and every `exit` above.
     # Cleanup remains best-effort so a filesystem cleanup error cannot replace
     # the installer failure that the caller actually needs to diagnose.
-    Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($KeepStage) {
+        Write-Err "Migration is pending. Verified staging files were retained at $TmpDir."
+    } else {
+        Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host ""

@@ -2328,6 +2328,7 @@ mod tests {
             authored_by: IdentityRef::human("dev"),
             created_at: kin_model::timestamp::Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         };
 
         let impact = ImpactReport {

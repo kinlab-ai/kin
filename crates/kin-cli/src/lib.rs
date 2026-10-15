@@ -18,6 +18,7 @@ pub mod embed_model;
 pub mod entity_identity;
 pub mod entity_ref;
 pub mod first_run;
+pub mod git_update;
 pub mod mark;
 pub mod model_residency;
 pub mod model_slots;

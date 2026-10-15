@@ -46,6 +46,12 @@ pub struct DaemonConfig {
     /// flush. Off by default: the serial path is deterministic and is what the
     /// proof profile relies on. Enabled only under the throughput profile.
     pub embed_pipeline_overlap: bool,
+    /// Whether this daemon hands its store over, at a quiet point, when a
+    /// worker has staged the store's complete history: it stops serving and a
+    /// successor attaches the history as it starts. Off by default, because a
+    /// daemon that leaves needs someone to start the next one; the process
+    /// entrypoint turns it on for a local store and starts that successor.
+    pub history_handoff: bool,
 }
 
 impl Default for DaemonConfig {
@@ -59,9 +65,13 @@ impl Default for DaemonConfig {
             lsp_enabled: true,
             idle_timeout: None,
             embed_pipeline_overlap: false,
+            history_handoff: false,
         }
     }
 }
+
+/// How long a stop waits to write what agents did that is still held.
+const AGENT_RECORDS_STOP_BUDGET: Duration = Duration::from_secs(10);
 
 /// How often the session sweeper looks for sessions whose client is gone.
 ///
@@ -2752,6 +2762,39 @@ impl ShutdownBlocker {
             Self::SweepWaiter => "a command is waiting to read a language-server sweep's result",
         }
     }
+
+    /// The stable name a client reads this blocker by. Sentences may be
+    /// reworded; these never change meaning.
+    pub(crate) fn code(self) -> &'static str {
+        use kin_cli::daemon_client::replacement::blocker;
+        match self {
+            Self::PreparedPublication => blocker::PREPARED_PUBLICATION,
+            Self::RequestInFlight => blocker::REQUEST_IN_FLIGHT,
+            Self::FirstScan => blocker::FIRST_SCAN,
+            Self::Reconciliation => blocker::RECONCILIATION,
+            Self::Embedding => blocker::EMBEDDING,
+            Self::EmbeddingHeldForMemory => blocker::EMBEDDING_HELD_FOR_MEMORY,
+            Self::Enrichment => blocker::ENRICHMENT,
+            Self::EventSubscriber => blocker::EVENT_SUBSCRIBER,
+            Self::AttachedSession => blocker::ATTACHED_SESSION,
+            Self::SweepWaiter => blocker::SWEEP_WAITER,
+        }
+    }
+
+    /// Whether this blocker still holds a replacement asked at `requested_at`,
+    /// judged at `now`.
+    fn holds_replacement(self, requested_at: Instant, now: Instant) -> bool {
+        use kin_cli::daemon_client::replacement::{
+            replacement_wait, ReplacementWait, REPLACEMENT_BACKGROUND_GRACE,
+        };
+        match replacement_wait(self.code()) {
+            ReplacementWait::Always => true,
+            ReplacementWait::Bounded => {
+                now.saturating_duration_since(requested_at) < REPLACEMENT_BACKGROUND_GRACE
+            }
+            ReplacementWait::Never => false,
+        }
+    }
 }
 
 /// Work a shutdown would destroy rather than merely interrupt, independent of
@@ -2824,13 +2867,39 @@ fn client_blockers(state: &DaemonState) -> Vec<ShutdownBlocker> {
 
 /// Everything keeping this daemon from retiring right now, for the caller
 /// that asked it to. See [`work_blockers`] for `requests_to_ignore`.
+///
+/// A daemon making way for another release keeps fewer: see
+/// [`replacement_blockers`].
 pub(crate) fn retirement_blockers(
     state: &DaemonState,
     requests_to_ignore: u64,
 ) -> Vec<ShutdownBlocker> {
+    if let Some(replacement) = state.replacement() {
+        return replacement_blockers(state, requests_to_ignore, &replacement, Instant::now());
+    }
     let mut blockers = work_blockers(state, requests_to_ignore);
     blockers.extend(client_blockers(state));
     blockers
+}
+
+/// What still holds a daemon that a client of another release asked to make
+/// way for it, judged at `now`.
+///
+/// Writes, a publication being prepared and the first scan always finish,
+/// because an interruption loses them. Background passes the successor redoes
+/// hold it only for the grace after the request. Attached clients and event
+/// subscribers never do: they belong to the release being replaced, which the
+/// successor would refuse anyway, and they are told to restart.
+fn replacement_blockers(
+    state: &DaemonState,
+    requests_to_ignore: u64,
+    replacement: &crate::state::Replacement,
+    now: Instant,
+) -> Vec<ShutdownBlocker> {
+    work_blockers(state, requests_to_ignore)
+        .into_iter()
+        .filter(|blocker| blocker.holds_replacement(replacement.requested_at, now))
+        .collect()
 }
 
 fn ready_for_idle_shutdown(
@@ -2838,6 +2907,11 @@ fn ready_for_idle_shutdown(
     idle_timeout: Duration,
     control_plane: ControlPlane,
 ) -> bool {
+    if let Some(replacement) = state.replacement() {
+        // The window is zero and the client gates are gone; only what a
+        // replacement waits for is left to decide.
+        return replacement_blockers(state, 0, &replacement, Instant::now()).is_empty();
+    }
     if work_would_be_lost_by_shutdown(state) {
         return false;
     }
@@ -3678,7 +3752,12 @@ async fn run_idle_monitor(
                     }
                 }
             }
-            if retiring {
+            if let Some(replacement) = state.replacement() {
+                info!(
+                    successor = %replacement.successor,
+                    "daemon replaced by another release and its work is finished, shutting down"
+                );
+            } else if retiring {
                 info!("daemon asked to retire and nothing needs it now, shutting down");
             } else {
                 info!(
@@ -10676,7 +10755,7 @@ pub async fn run_with_authority_on(
 
     // This registration borrows singleton authority until normal run teardown.
     // Any unresolved publication stops synchronously before that lock can drop.
-    let _prepared_runtime = state
+    let prepared_runtime = state
         .prepared_publication
         .register(&daemon_lock, state.layout.root())?;
 
@@ -10803,6 +10882,9 @@ pub async fn run_with_authority_on(
     // A path that must stop this daemon serving sends on the same channel a
     // cooperative stop request does.
     let _ = state.stop_trigger.set(cancel_tx.clone());
+    if config.history_handoff {
+        crate::history_schedule::spawn_handoff_watch(Arc::clone(&state), cancel_rx.clone());
+    }
     // A planned sweep supplies readiness from the actual servers it starts.
     // A warm no-op sweep probes skipped languages once at its tail. A sweep
     // refused for memory leaves readiness to the sweep that does run, which is
@@ -11188,6 +11270,24 @@ pub async fn run_with_authority_on(
                     error!(error = %e, "session sweeper error");
                 }
             }
+        }
+    });
+
+    // Write what agents did into repository authority as their sessions end
+    // or go quiet. Not drained: the stop writes what is still held itself,
+    // before the daemon stops taking writes.
+    let records_state = Arc::clone(&state);
+    let mut records_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(crate::agent_authorship::SETTLE_TICK) => {}
+                _ = records_cancel.changed() => break,
+            }
+            if *records_cancel.borrow() {
+                break;
+            }
+            crate::agent_authorship::settle(&records_state, false).await;
         }
     });
 
@@ -12721,6 +12821,15 @@ pub async fn run_with_authority_on(
     // daemon cannot start while this process is still draining persistent state.
     crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
 
+    drop(prepared_runtime);
+    if state.handing_off_for_history() {
+        // The successor replaces this store's contents as it starts. A thread
+        // of this process that outlives the runtime's teardown must not be
+        // able to write into what it installs, so the authority is not
+        // released here: it ends with the process.
+        crate::history_schedule::keep_authority_until_exit(daemon_lock);
+    }
+
     result
 }
 
@@ -12826,6 +12935,13 @@ async fn select_with_signals(
         }
     };
 
+    // What agents did that is still held is written while the daemon still
+    // takes writes, so a session that ended moments ago is not lost with it.
+    let _ = tokio::time::timeout(
+        AGENT_RECORDS_STOP_BUDGET,
+        crate::agent_authorship::settle(state, true),
+    )
+    .await;
     state.prepared_publication.shutdown();
 
     // The escalation watchdog's grace began when the stop was signalled, so a
@@ -13194,6 +13310,13 @@ async fn select_with_signals(
         }
     };
 
+    // What agents did that is still held is written while the daemon still
+    // takes writes, so a session that ended moments ago is not lost with it.
+    let _ = tokio::time::timeout(
+        AGENT_RECORDS_STOP_BUDGET,
+        crate::agent_authorship::settle(state, true),
+    )
+    .await;
     state.prepared_publication.shutdown();
 
     // The escalation watchdog's grace began when the stop was signalled, so a
@@ -20082,6 +20205,118 @@ while True:
             .expect("an unused daemon asked to retire must go")
             .expect("the idle monitor must not panic");
         assert!(*cancel_tx.borrow());
+    }
+
+    /// What holds a daemon making way for another release: the first scan
+    /// always, background passes only for the grace after the request, and an
+    /// attached client never, though that client still holds a plain
+    /// retirement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_waits_for_the_first_scan_bounds_background_work_and_skips_clients() {
+        use super::ShutdownBlocker;
+        use kin_cli::daemon_client::replacement::REPLACEMENT_BACKGROUND_GRACE;
+        let (_repo, state) = open_idle_daemon(Some(Duration::from_secs(3600))).await;
+        let client = StandInClient::spawn();
+        client.attach(&state);
+        state.is_initialized.store(false, Ordering::Relaxed);
+        state
+            .reconciliation_status
+            .store(crate::state::RECON_PROCESSING, Ordering::Relaxed);
+        assert!(
+            super::retirement_blockers(&state, 0).contains(&ShutdownBlocker::AttachedSession),
+            "an attached client holds a plain retirement"
+        );
+
+        assert!(state.request_replacement("Kin 9.9.9 (0123abc)"));
+        let replacement = state.replacement().expect("the replacement is recorded");
+        let asked = replacement.requested_at;
+        assert_eq!(
+            super::replacement_blockers(&state, 0, &replacement, asked),
+            vec![ShutdownBlocker::FirstScan, ShutdownBlocker::Reconciliation],
+            "inside the grace the background pass still holds it; the client never does"
+        );
+        assert_eq!(
+            super::retirement_blockers(&state, 0),
+            vec![ShutdownBlocker::FirstScan, ShutdownBlocker::Reconciliation],
+            "the /retire answer reads the same gates"
+        );
+        let after_grace = asked + REPLACEMENT_BACKGROUND_GRACE;
+        assert_eq!(
+            super::replacement_blockers(&state, 0, &replacement, after_grace),
+            vec![ShutdownBlocker::FirstScan],
+            "the first scan does not resume, so it outlasts the grace"
+        );
+        state.is_initialized.store(true, Ordering::Relaxed);
+        assert!(super::replacement_blockers(&state, 0, &replacement, after_grace).is_empty());
+        assert!(
+            !super::ready_for_idle_shutdown(&state, Duration::ZERO, ControlPlane::Ours),
+            "on the real clock the grace has not run out yet"
+        );
+        state
+            .reconciliation_status
+            .store(RECON_IDLE, Ordering::Relaxed);
+        assert!(super::ready_for_idle_shutdown(
+            &state,
+            Duration::ZERO,
+            ControlPlane::Ours
+        ));
+        drop(client);
+    }
+
+    /// Asked to make way for another release, a daemon goes with a client
+    /// still attached, but only once the request already in flight has
+    /// finished, and it flushes its graph on the way out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacing_daemon_finishes_its_write_flushes_and_goes_under_an_attached_client() {
+        use super::ShutdownBlocker;
+        let window = Duration::from_secs(3600);
+        let (_repo, state) = open_idle_daemon(Some(window)).await;
+        let client = StandInClient::spawn();
+        client.attach(&state);
+        state.mark_dirty();
+        // A write that started before the replacement was asked.
+        state.begin_request();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&state),
+            Some(window),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+
+        assert!(state.request_replacement("Kin 9.9.9 (0123abc)"));
+        assert!(
+            !state.request_replacement("Kin 10.0.0 (fedcba9)"),
+            "a repeat changes nothing"
+        );
+        assert_eq!(
+            state.replacement().map(|replacement| replacement.successor),
+            Some("Kin 9.9.9 (0123abc)".to_string())
+        );
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a replacing daemon went with a write still in flight"
+        );
+        assert_eq!(
+            super::retirement_blockers(&state, 0),
+            vec![ShutdownBlocker::RequestInFlight]
+        );
+
+        state.end_request();
+        tokio::time::timeout(Duration::from_secs(10), monitor)
+            .await
+            .expect("a replacing daemon must go once its write has finished")
+            .expect("the idle monitor must not panic");
+        assert!(*cancel_tx.borrow());
+        assert!(
+            !state.is_dirty(),
+            "a replacing daemon flushes its graph before it goes"
+        );
+        drop(client);
     }
 
     #[tokio::test]

@@ -1221,6 +1221,7 @@ pub fn resolve_actor_from_session(vendor: &str, client_name: &str, _kind: &Assis
         kind: ActorKind::Assistant,
         display_name: key,
         external_refs: Vec::new(),
+        agent_session: None,
     }
 }
 
@@ -1236,6 +1237,7 @@ pub fn resolve_human_actor(name: &str) -> Actor {
         kind: ActorKind::Human,
         display_name: name.to_string(),
         external_refs: Vec::new(),
+        agent_session: None,
     }
 }
 

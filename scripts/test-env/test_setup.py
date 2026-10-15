@@ -19,6 +19,7 @@ RUNNER = Path(__file__).with_name("cargo-runner.sh")
 PROBE = """#!/bin/sh
 for arg in "$@"; do printf 'arg=%s\\n' "$arg"; done
 printf 'KIN_REGISTRY_PATH=%s\\n' "${KIN_REGISTRY_PATH-<unset>}"
+printf 'KIN_HOME=%s\\n' "${KIN_HOME-<unset>}"
 printf 'KIN_TEST_FLUSH=%s\\n' "${KIN_TEST_FLUSH-<unset>}"
 printf 'TMPDIR=%s\\n' "${TMPDIR-<unset>}"
 if [ -n "${PROBE_SIGNAL:-}" ]; then kill -s "$PROBE_SIGNAL" $$; fi
@@ -40,6 +41,7 @@ class SharedScratchTests(unittest.TestCase):
                 settings = dict(line.split("=", 1) for line in exports.read_text().splitlines())
                 self.assertNotIn("TMPDIR", settings, "shared mode must retain the caller's scratch")
                 registry = Path(settings["KIN_REGISTRY_PATH"])
+                self.assertEqual(Path(settings["KIN_HOME"]), registry.parent)
                 self.assertTrue(registry.is_relative_to(scratch), settings)
                 self.assertEqual(registry.parent.stat().st_dev, scratch.stat().st_dev)
                 self.assertEqual(registry.parent.stat().st_mode & 0o777, 0o700)
@@ -96,6 +98,7 @@ class CargoRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(passed, args)
         self.assertEqual(seen["KIN_REGISTRY_PATH"], "<unset>")
+        self.assertEqual(seen["KIN_HOME"], "<unset>")
         self.assertEqual(seen["KIN_TEST_FLUSH"], "<unset>")
         self.assertEqual(seen["TMPDIR"], owned)
 
@@ -113,6 +116,7 @@ class CargoRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3, result.stderr)
             self.assertEqual(passed, ["--exact", "a::test"])
             registry = Path(seen["KIN_REGISTRY_PATH"])
+            self.assertEqual(Path(seen["KIN_HOME"]), registry.parent)
             self.assertTrue(registry.is_relative_to(owned), seen)
             self.assertTrue(registry.parent.is_dir(), seen)
             self.assertEqual(seen["KIN_TEST_FLUSH"], "fsync")
@@ -126,6 +130,7 @@ class CargoRunnerTests(unittest.TestCase):
                         Path(owned) / "target/debug/deps", [], TMPDIR=owned, **marker)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(seen["KIN_REGISTRY_PATH"], "<unset>")
+                    self.assertEqual(seen["KIN_HOME"], "<unset>")
                     self.assertEqual(seen["TMPDIR"], owned)
 
 

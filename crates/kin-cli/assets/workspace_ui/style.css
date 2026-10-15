@@ -211,6 +211,8 @@ kbd {
 .repo-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; border: 1.5px solid var(--text-3); }
 .repo-dot[data-state="work"] { border-color: var(--warn); background: var(--warn); }
 .repo-dot[data-state="live"] { border-color: var(--good); background: var(--good); }
+/* An agent's committed change waits for your review: amber, as what waits on you is, and open, as nothing of yours is in flight. */
+.repo-dot[data-state="review"] { border-color: var(--warn); }
 .repo-pages { margin: 2px 0 8px 11px; padding-left: 8px; border-left: 1px solid var(--line); }
 
 .side-foot { padding: 8px 16px 12px; border-top: 1px solid var(--line); }
@@ -326,7 +328,7 @@ a.table-row:hover { background: var(--bg-raised); }
 .cell { color: var(--text-2); }
 .cell-main { font-weight: 500; color: var(--text); }
 .cell-num { font-variant-numeric: tabular-nums; color: var(--text-2); }
-.review-grid { grid-template-columns: 24px minmax(160px, 1.3fr) minmax(120px, 1fr) minmax(0, 2fr) 88px; }
+.review-grid { grid-template-columns: 24px minmax(160px, 1.3fr) minmax(120px, 1fr) minmax(0, 2fr) minmax(88px, max-content); }
 .review-grid .state { text-align: right; }
 .cell.state-good { color: var(--good); }
 .cell.state-warn { color: var(--warn); }
@@ -410,18 +412,21 @@ details.more > summary:hover { color: var(--text); }
 .review-tick.is-fine { background: var(--good); }
 .review-tick.is-flagged { background: var(--warn); }
 .review-tick.is-here { height: 4px; margin-top: -1px; background: var(--text); }
-.review-decide { position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 32px; padding: 12px 0; border-top: 1px solid var(--line); background: var(--bg); }
-.review-note { flex: 1; max-width: 420px; }
+.review-decide { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-top: 32px; padding: 16px 0 0; border-top: 1px solid var(--line); background: var(--bg); }
+.review-note { flex: 1 1 260px; min-width: 0; max-width: 420px; }
+.review-decide .page-actions { flex: 1 1 auto; justify-content: flex-end; max-width: 100%; }
 .button kbd { min-width: 0; height: auto; padding: 0; border: 0; background: none; font: 400 12px var(--font-sans); color: inherit; opacity: 0.6; }
 .review-finish textarea { margin-bottom: 12px; max-width: 640px; }
 
 .step-name { font-size: 26px; font-weight: 600; line-height: 32px; letter-spacing: -0.02em; }
 .step-name .ent-name { font-weight: 600; }
+/* The entity a step is about is its title, so a long name wraps rather than losing its end. */
+.step-name .ent { display: inline; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
 .step-place { margin-top: 4px; font-size: 12px; color: var(--text-2); }
 .step-verdict { margin-top: 12px; max-width: 56ch; font-size: 17px; line-height: 26px; padding-left: 14px; border-left: 2px solid var(--line-strong); text-wrap: balance; }
 .step-verdict-warn { border-left-color: var(--warn); }
 .step-verdict-bad { border-left-color: var(--bad); }
-.step-part { margin-top: 32px; }
+.step-part { margin-top: 32px; container-type: inline-size; }
 .step-part h2 { margin-bottom: 8px; }
 .rows { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .rows-item { display: flex; align-items: baseline; gap: 12px; min-height: 40px; padding: 10px 0; }
@@ -429,7 +434,7 @@ details.more > summary:hover { color: var(--text); }
 .rows-item .state { margin-left: auto; }
 .rows-more { font-size: 12px; color: var(--text-2); }
 
-.diff-lines { display: grid; grid-template-columns: auto auto 16px minmax(0, 1fr); padding: 8px 0; font: 12px/20px var(--font-mono); }
+.diff-lines { display: grid; grid-template-columns: auto auto 16px minmax(max-content, 1fr); padding: 8px 0; font: 12px/20px var(--font-mono); }
 .diff-no { padding: 0 4px 0 12px; text-align: right; color: var(--text-2); user-select: none; font-variant-numeric: tabular-nums; }
 .diff-mark { text-align: center; color: var(--text-2); user-select: none; }
 .diff-text { padding-right: 16px; white-space: pre; }
@@ -500,9 +505,9 @@ button.conn-node-more:hover { color: var(--accent); }
 .conn-focus .ent-name { font-weight: 600; }
 .conn-empty { font-size: 12px; color: var(--text-2); }
 
-.codeview { border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--card-shadow); overflow: auto; max-height: 640px; }
-.code-lines { display: grid; grid-template-columns: auto minmax(0, 1fr); padding: 8px 0; font: 12px/20px var(--font-mono); }
-.code-lines-plain { grid-template-columns: minmax(0, 1fr); }
+.codeview { max-width: 100%; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--card-shadow); overflow: auto; max-height: 640px; }
+.code-lines { display: grid; grid-template-columns: auto minmax(max-content, 1fr); padding: 8px 0; font: 12px/20px var(--font-mono); }
+.code-lines-plain { grid-template-columns: minmax(max-content, 1fr); }
 .code-no { padding: 0 12px; text-align: right; color: var(--text-2); user-select: none; font-variant-numeric: tabular-nums; }
 .code-text { padding: 0 16px 0 0; white-space: pre; }
 .code-lines-plain .code-text { padding-left: 12px; }
@@ -532,7 +537,14 @@ button.relier, button.rel-row { width: 100%; border: 0; border-top: 1px solid va
 
 /* ── Branches ───────────────────────────────────────────────────────────── */
 
-.branch-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; min-height: 56px; padding: 8px 0; }
+.branch-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; min-height: 56px; padding: 8px 0; }
+/* A branch with work of its own opens from anywhere on its row; its buttons stay its own. */
+.branch-open::after { content: ""; position: absolute; inset: 0; }
+.branch-row-opens:hover { background: var(--bg-raised); }
+.branch-row-opens:hover .branch-label { color: var(--accent); }
+.branch-actions, .branch-detail .read-failed { position: relative; z-index: 1; }
+/* A name that is one word to the reader stays on one line. */
+.nobreak { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 .branch-name { display: flex; align-items: baseline; gap: 12px; font-weight: 500; }
 .branch-name svg { display: none; }
 .branch-detail { margin-top: 0; }
@@ -569,6 +581,12 @@ button.relier, button.rel-row { width: 100%; border: 0; border-top: 1px solid va
 /* ── Narrow windows ─────────────────────────────────────────────────────── */
 
 @media (max-width: 1020px) {
+  .page { padding: 28px 24px 72px; }
+  .review-note { flex-basis: 100%; max-width: none; }
+  .diff-lines { grid-template-columns: auto auto 16px minmax(0, 1fr); }
+  .code-lines { grid-template-columns: auto minmax(0, 1fr); }
+  .code-lines-plain { grid-template-columns: minmax(0, 1fr); }
+  .diff-text, .code-text { white-space: pre-wrap; overflow-wrap: anywhere; }
   .explore-grid { grid-template-columns: minmax(0, 1fr); }
   .conn { grid-template-columns: minmax(0, 1fr); gap: 16px; }
   .conn svg.conn-lines { display: none; }
@@ -577,7 +595,8 @@ button.relier, button.rel-row { width: 100%; border: 0; border-top: 1px solid va
 }
 
 @media (max-width: 760px) {
-  .app { grid-template-columns: minmax(0, 1fr); }
+  /* The bar keeps its own height; a short page never stretches it with the space below. */
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
   .side { position: sticky; height: auto; max-height: 100vh; border-right: 0; border-bottom: 1px solid var(--line); }
   .icon-button.side-toggle { display: inline-flex; }
   .side:not([data-menu="open"]) .side-body,
@@ -630,6 +649,11 @@ a.impact-node:hover { border-color: var(--line-strong); background: var(--bg-hov
 .impact-text { display: flex; flex-direction: column; min-width: 0; }
 .impact-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .impact-place { font-size: 12px; line-height: 16px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* What tells apart two entities a view would otherwise show with one name. */
+.name-qualifier { font-weight: 400; color: var(--text-2); }
+.rows-item .name-qualifier { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+/* A row that holds a long place wraps, so its result stays on the page on a narrow window. */
+.rows-item:has(.name-qualifier) { flex-wrap: wrap; row-gap: 2px; }
 .impact-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
 .impact-node[data-tone="warn"] .impact-dot { background: var(--warn); box-shadow: 0 0 0 4px var(--warn-soft); }
 .impact-node[data-tone="bad"] .impact-dot { background: var(--bad); box-shadow: 0 0 0 4px var(--bad-soft); }
@@ -637,11 +661,9 @@ a.impact-node:hover { border-color: var(--line-strong); background: var(--bg-hov
 .impact-more { padding: 4px 14px; font-size: 12px; color: var(--text-2); }
 a.impact-more:hover { color: var(--accent); }
 svg.impact-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; fill: none; }
-svg.impact-lines path { stroke: var(--text-3); stroke-width: 1.5; opacity: 0.7; stroke-dasharray: 1; stroke-dashoffset: 0; }
+svg.impact-lines path { stroke: var(--text-3); stroke-width: 1.5; opacity: 0.7; }
 svg.impact-lines path[data-tone="warn"] { stroke: var(--warn); }
 svg.impact-lines path[data-tone="bad"] { stroke: var(--bad); }
-svg.impact-lines:not([data-drawn]) path { animation: edge-in 700ms var(--ease) both; }
-@keyframes edge-in { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
 
 /* Agents at work. */
 .agent-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
@@ -683,7 +705,7 @@ a.agent-card:hover { border-color: var(--line-strong); }
 .lang-key[data-at="0"]::before { background: var(--accent); }
 .lang-key[data-at="1"]::before { background: var(--info); }
 .lang-key[data-at="2"]::before { background: var(--good); }
-.lang-pending .lang-bar { margin-bottom: 44px; animation: pulse 1.4s var(--ease) infinite; }
+.lang-pending { display: none; }
 .repo-card-foot { display: flex; align-items: baseline; gap: 12px; margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; white-space: nowrap; }
 .repo-card-foot .state { overflow: hidden; text-overflow: ellipsis; }
 .repo-card-time { flex: none; margin-left: auto; color: var(--text-2); }
@@ -714,6 +736,20 @@ svg.impact-lines path[data-tone="good"] { stroke: var(--good); }
 .impact-focus .impact-name { font-weight: 600; }
 .step-part .impact-step { padding: 20px 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--card-shadow); }
 .step-part .impact-step svg.impact-lines { inset: 0; }
+@container (max-width: 700px) {
+  .impact-step { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .step-part .impact-step { padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; }
+  .impact-step .impact-gap, .impact-step svg.impact-lines { display: none; }
+  .impact-step .impact-node { flex-wrap: wrap; }
+  .impact-step .impact-text { flex: 1 1 calc(100% - 32px); }
+  .impact-step .impact-name { white-space: normal; overflow-wrap: anywhere; }
+  .impact-step .impact-mark { flex-basis: 100%; margin-left: 20px; padding-left: 0; }
+}
+@media (max-width: 1020px) {
+  .impact-step { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .step-part .impact-step { padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none; }
+  .impact-step .impact-gap, .impact-step svg.impact-lines { display: none; }
+}
 
 /* One question for every repository. */
 .home-ask-box { margin-top: 24px; max-width: 720px; }
@@ -721,6 +757,12 @@ svg.impact-lines path[data-tone="good"] { stroke: var(--good); }
 .home-answers { margin-top: 8px; }
 .home-answer { margin-top: 32px; }
 .home-answer > .section-head { margin-bottom: 4px; }
+/* A repository that matched only loosely is one line under the stronger answers. */
+.home-answers-loose { margin-top: 32px; border-top: 1px solid var(--line); }
+.home-answers-loose > .home-answer:first-child { margin-top: 16px; }
+.home-answer-loose { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; min-height: 48px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.home-answer-loose-name { font-weight: 600; }
+.home-answer-loose-text { flex: 1 1 24ch; min-width: 0; color: var(--text-2); }
 .agent-card .agent-entity, .agent-card-action .agent-entity { font: inherit; font-weight: 500; color: var(--text); }
 .agent-card-trail { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; font-size: 12px; line-height: 18px; color: var(--text-2); }
 .agent-card-trail li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -730,8 +772,10 @@ svg.impact-lines path[data-tone="good"] { stroke: var(--good); }
 /* Views of one thing: a change at its three stages, or the facets of an entity. */
 
 .page-head-tabs { margin-bottom: 20px; }
-.tabs { display: flex; gap: 28px; margin-top: 16px; border-bottom: 1px solid var(--line); }
-.tab { display: inline-flex; align-items: center; gap: 8px; height: 40px; margin-bottom: -1px; padding: 0; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; font-size: 14px; font-weight: 500; color: var(--text-2); }
+/* A row of tabs wider than the window scrolls inside its own box; the page never grows sideways. The line under it is drawn inside, so the scroll box keeps it. */
+.tabs { display: flex; gap: 28px; margin-top: 16px; box-shadow: inset 0 -1px 0 var(--line); max-width: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab { display: inline-flex; flex: none; align-items: center; gap: 8px; height: 40px; padding: 0; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; font-size: 14px; font-weight: 500; color: var(--text-2); white-space: nowrap; }
 .tab:hover { color: var(--text); }
 .tab[aria-current="page"], .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 .tab-count { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 18px; padding: 0 6px; border-radius: 9px; background: var(--bg-hover); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--text-2); }
@@ -748,3 +792,58 @@ svg.impact-lines path[data-tone="good"] { stroke: var(--good); }
 .change-consequence-good .impact-dot { background: var(--good); }
 .structure-name { display: inline-flex; align-items: baseline; gap: 10px; min-width: 0; }
 .home-start { margin-top: 20px; }
+
+/* Engine pieces the review and Work use. */
+.tests-line { margin-top: 8px; font-size: 13px; color: var(--text-2); }
+.work-authors { margin-top: 6px; font-size: 13px; color: var(--text-2); }
+.step-undo { margin-top: 16px; }
+.step-undo-confirm { margin-top: 16px; align-items: center; }
+.commit-only { margin-top: 12px; }
+.repo-card-live { display: flex; align-items: center; gap: 8px; margin-top: -8px; font-size: 12px; color: var(--good); }
+.repo-card-live .pulse { background: var(--good); }
+.repo-card-live .pulse::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--good); animation: ping 1.8s var(--ease) infinite; }
+.ent-tag { font-weight: 400; font-size: 12px; color: var(--text-2); }
+/* On a narrow window a box keeps its name and puts its state under it. */
+@media (max-width: 760px) {
+  .tabs { gap: 16px; }
+  /* A narrow card keeps its Review button the size of its word. */
+  .focus-agents .change-row .button { justify-self: start; }
+  .impact-node { flex-wrap: wrap; }
+  .impact-text { flex: 1 1 60%; }
+  .impact-mark { flex-basis: 100%; margin-left: 20px; padding-left: 0; }
+}
+
+/* The lines of a relier that name the changed entity. */
+.sites { margin-top: 20px; }
+.sites-title { margin-bottom: 8px; font-size: 12px; font-weight: 400; color: var(--text-2); }
+.sites-loading { margin-top: 12px; }
+.site + .site { margin-top: 12px; }
+.site-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.site-code { max-height: none; box-shadow: none; }
+
+/* A traced answer: the entities the work passes through, in order. */
+.answer { margin-bottom: 24px; padding: 20px 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--card-shadow); }
+.answer-sentence { max-width: 64ch; font-size: 15px; line-height: 24px; }
+.answer-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
+.answer-step { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.answer-node { min-height: 44px; }
+.answer-link { font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.answer-link::after { content: " →"; }
+.candidates { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+
+/* How far each test is from the entity it reaches. */
+.rows-how { font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.rows-in { font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
+.doc-change { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; font-size: 13px; }
+.doc-change dt { color: var(--text-2); }
+.doc-change dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .doc-change { grid-template-columns: 1fr; } .doc-change dd + dt { margin-top: 6px; } }
+.rows-more .button { margin-left: -8px; }
+
+/* Agent changes nobody has reviewed, beside a repository's uncommitted work on Home. */
+.focus-agents { margin-top: 24px; }
+.focus-agents .change-row { min-height: 48px; }
+.focus-caption { margin-top: 24px; margin-bottom: 0; }
+.focus-caption + .impact { margin-top: 12px; }
+/* Where Kin's record of a converted repository begins, said on a line of its own under the oldest change. */
+.change-start { display: block; margin-top: 2px; font-size: 12px; color: var(--text-2); }

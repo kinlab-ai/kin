@@ -31,6 +31,57 @@
         },
         { "type": "null" }
       ]
+    },
+    "review": {
+      "description": "Present when a reviewer set this annotation as a flag on the entity it is scoped to. The annotation's body is the reviewer's note. Absent on every other annotation.",
+      "type": "object",
+      "required": ["flagged_ast", "flagged_name", "operation_id", "resolution", "seen_by"],
+      "properties": {
+        "flagged_ast": { "$ref": "kin://contracts/hash256" },
+        "flagged_name": { "type": "string" },
+        "operation_id": { "type": "string" },
+        "resolution": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["by", "at", "operation_id"],
+              "properties": {
+                "by": {
+                  "type": "object",
+                  "required": ["name", "kind"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["Human", "Assistant"] }
+                  }
+                },
+                "at": { "type": "string" },
+                "operation_id": { "type": "string" }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "seen_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["agent", "session", "at"],
+            "properties": {
+              "agent": { "type": "string" },
+              "session": { "type": "string" },
+              "at": { "type": "string" }
+            }
+          }
+        },
+        "flagged_behavior": {
+          "description": "Legacy literal-sensitive revision guard; absent on older flags.",
+          "oneOf": [{ "$ref": "kin://contracts/hash256" }, { "type": "null" }]
+        },
+        "flagged_source": {
+          "description": "Exact reviewed entity-span digest, including comments and literals.",
+          "oneOf": [{ "$ref": "kin://contracts/hash256" }, { "type": "null" }]
+        }
+      }
     }
   }
 }

@@ -71,6 +71,7 @@ fn run_configured_probe_session(
     extra_env: &[(&str, std::ffi::OsString)],
 ) -> McpRun {
     let started = Instant::now();
+    let _ = common::ensure_sibling_daemon_built();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kin"));
     command
         .args(["mcp", "start"])
@@ -177,7 +178,7 @@ fn response_with_id(run: &McpRun, id: u64) -> &serde_json::Value {
         })
 }
 
-fn assert_four_frame_contract(run: &McpRun) {
+fn assert_four_frame_protocol(run: &McpRun) {
     assert!(
         run.elapsed < FOUR_FRAME_BOUND,
         "the probe session took {:?} against a {FOUR_FRAME_BOUND:?} bound",
@@ -196,8 +197,12 @@ fn assert_four_frame_contract(run: &McpRun) {
         .unwrap_or(0);
     assert!(
         tool_count > 0,
-        "tools/list must serve the tool surface with no daemon: {tools:#?}"
+        "tools/list must serve the tool surface: {tools:#?}"
     );
+}
+
+fn assert_four_frame_contract(run: &McpRun) {
+    assert_four_frame_protocol(run);
 
     // The graph-backed call is answered with a structured error naming the
     // situation, never with silence or a dead process.
@@ -209,7 +214,8 @@ fn assert_four_frame_contract(run: &McpRun) {
     assert_eq!(
         call.pointer("/result/isError").and_then(|v| v.as_bool()),
         Some(true),
-        "with no daemon anywhere the graph call is an error result: {call:#?}"
+        "with no daemon anywhere the graph call is an error result: {call:#?}; stderr:\n{}",
+        run.stderr
     );
     assert!(
         content.contains("daemon") || content.contains("repository"),
@@ -267,29 +273,175 @@ fn the_four_frame_probe_is_answered_inside_a_repository_whose_daemon_is_absent()
 /// session started a fresh daemon from inside the probe, the mechanism behind
 /// the 2026-08-15 boot spawn storm.
 ///
-/// The spawn detector is a stub `kin-daemon` injected through `KIN_DAEMON_BIN`
-/// that records every invocation to a marker file. The positive control runs
-/// the identical session without `--no-spawn` and requires the marker to
-/// appear, which is what proves the detector can see a spawn at all; only then
-/// does the absent marker under `--no-spawn` mean zero daemon processes rather
-/// than a check that cannot fail. Unix-only because the stub is a shell script.
+/// The negative control preserves the dead endpoint and leaves actors absent.
+/// The unrestricted control must revive the admitted real daemon and answer
+/// for the repository UUID emitted by initialization. Both sessions run inside
+/// the existing owned runtime containment, including cleanup on assertion failure.
 #[cfg(unix)]
 #[test]
 fn a_no_spawn_probe_over_a_dead_daemon_record_spawns_nothing() {
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::PermissionsExt as _;
 
+    struct DeadPortReservation {
+        _socket: std::fs::File,
+        port: u16,
+    }
+
+    fn reserve_dead_port() -> DeadPortReservation {
+        // SAFETY: socket has no pointer arguments; the returned descriptor is
+        // immediately transferred to the RAII owner below.
+        let descriptor = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(
+            descriptor >= 0,
+            "create reserved socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a successful socket call returned this owned descriptor.
+        let socket = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        // SAFETY: the retained file owns a live descriptor for both fcntl calls.
+        let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "inspect reserved socket flags");
+        // SAFETY: this sets descriptor flags without transferring ownership.
+        assert_eq!(
+            unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+            0
+        );
+        // SAFETY: sockaddr_in is a plain C data structure with valid zero fields.
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            address.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        // SAFETY: address is aligned and remains live for the supplied length.
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&address as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            },
+            0,
+            "reserve dead loopback port: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        // SAFETY: address and length are writable buffers of the declared sizes.
+        assert_eq!(
+            unsafe {
+                libc::getsockname(
+                    socket.as_raw_fd(),
+                    (&mut address as *mut libc::sockaddr_in).cast(),
+                    &mut length,
+                )
+            },
+            0,
+            "read reserved port"
+        );
+        DeadPortReservation {
+            _socket: socket,
+            port: u16::from_be(address.sin_port),
+        }
+    }
+
+    fn run_owned_probe_session(
+        runtime: &common::IsolatedDaemonRuntime,
+        repository: &Path,
+        captures: &Path,
+        label: &str,
+        extra_args: &[&str],
+        dead_port: u16,
+    ) -> McpRun {
+        let input_path = captures.join(format!("{label}.stdin"));
+        let stdout_path = captures.join(format!("{label}.stdout"));
+        let stderr_path = captures.join(format!("{label}.stderr"));
+        std::fs::write(&input_path, probe_frames()).expect("write owned probe frames");
+        let started = Instant::now();
+        let mut child = runtime
+            .kin_command()
+            .args(["mcp", "start"])
+            .args(extra_args)
+            .current_dir(repository)
+            .env("KIN_MCP_MACHINE_REPLIES", "1")
+            .env("KIN_RUNTIME_MODE", "development")
+            .env_remove("KIN_NO_DAEMON")
+            .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{dead_port}"))
+            .stdin(Stdio::from(
+                std::fs::File::open(&input_path).expect("open probe frames"),
+            ))
+            .stdout(Stdio::from(
+                std::fs::File::create(&stdout_path).expect("capture probe stdout"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(&stderr_path).expect("capture probe stderr"),
+            ))
+            .spawn_owned()
+            .expect("spawn contained MCP probe");
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll owned MCP probe") {
+                break status;
+            }
+            assert!(
+                started.elapsed() < FOUR_FRAME_BOUND,
+                "contained MCP probe {label} exceeded {FOUR_FRAME_BOUND:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stderr = std::fs::read_to_string(&stderr_path).expect("read probe stderr");
+        assert!(
+            status.success(),
+            "contained MCP probe {label} exited with {status}; stderr:\n{stderr}"
+        );
+        let responses = std::fs::read_to_string(&stdout_path)
+            .expect("read probe stdout")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("stdout lines are JSON-RPC"))
+            .collect();
+        McpRun {
+            responses,
+            stderr,
+            elapsed: started.elapsed(),
+        }
+    }
+
     let root = tempfile::tempdir().expect("temp root");
-    let home = root.path().join("home");
-    std::fs::create_dir_all(&home).expect("create home");
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let environment = runtime.kin_command();
+    let home = std::path::PathBuf::from(
+        environment
+            .configured_env_for_test(std::ffi::OsStr::new("HOME"))
+            .flatten()
+            .expect("owned HOME"),
+    );
+    let kin_home = std::path::PathBuf::from(
+        environment
+            .configured_env_for_test(std::ffi::OsStr::new("KIN_HOME"))
+            .flatten()
+            .expect("owned Kin home"),
+    );
+    drop(environment);
+    std::fs::create_dir_all(&home).expect("create owned configuration home");
+    std::fs::set_permissions(&kin_home, std::fs::Permissions::from_mode(0o700))
+        .expect("secure isolated Kin home");
 
-    let init = common::Command::new(env!("CARGO_BIN_EXE_kin"))
-        .arg("init")
+    let init = runtime
+        .kin_command()
+        .args(["init", "--no-enrich", "--json"])
         .arg(&repo)
-        .env("HOME", &home)
+        .env("KIN_RUNTIME_MODE", "development")
         .env("KIN_NO_DAEMON", "1")
-        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
         .output()
         .expect("run kin init");
     assert!(
@@ -298,98 +450,194 @@ fn a_no_spawn_probe_over_a_dead_daemon_record_spawns_nothing() {
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
+    let initialized: serde_json::Value =
+        serde_json::from_slice(&init.stdout).unwrap_or_else(|error| {
+            panic!(
+                "init JSON failed: {error}; status={} stdout={} stderr={}",
+                init.status,
+                String::from_utf8_lossy(&init.stdout),
+                String::from_utf8_lossy(&init.stderr)
+            )
+        });
+    assert_eq!(initialized["schema"], "kin.init-result.v6");
+    let intended_repository = initialized["repository_id"]
+        .as_str()
+        .expect("init repository UUID")
+        .to_string();
+    uuid::Uuid::parse_str(&intended_repository).expect("init names a repository UUID");
 
-    // A pid that provably belonged to a real process and provably no longer
-    // does: reap a child and record its pid.
     let dead_pid = {
-        let mut child = std::process::Command::new("/usr/bin/true")
-            .spawn()
-            .or_else(|_| std::process::Command::new("/bin/true").spawn())
-            .expect("spawn short-lived child");
+        let mut child = runtime
+            .process_command_for_test("/usr/bin/true")
+            .spawn_owned()
+            .or_else(|_| runtime.process_command_for_test("/bin/true").spawn_owned())
+            .expect("spawn short-lived owned child");
         let pid = child.id();
-        child.wait().expect("reap short-lived child");
+        child.wait().expect("reap short-lived owned child");
         pid
     };
-    // A loopback port that was free at selection time: bind, read, release.
-    let dead_port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
-        listener.local_addr().expect("read reserved port").port()
-    };
-    let mut store_command = common::Command::new(env!("CARGO_BIN_EXE_kin"));
-    store_command
-        .env("HOME", &home)
-        .env("KIN_REGISTRY_PATH", home.join("registry.toml"));
-    let kin_dir = common::repository_layout(store_command, &repo)
-        .root()
-        .to_path_buf();
-    std::fs::write(
-        kin_dir.join(kin_daemon_spawn::PID_FILE_NAME),
-        dead_pid.to_string(),
-    )
-    .expect("plant stale pid record");
-    std::fs::write(
-        kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME),
-        dead_port.to_string(),
-    )
-    .expect("plant stale port record");
+    let dead_endpoint = reserve_dead_port();
+    let dead_port = dead_endpoint.port;
+    let kin_dir = runtime.layout().root().to_path_buf();
+    let supervisor_services = runtime
+        .registry_path()
+        .parent()
+        .expect("owned registry parent")
+        .join("services");
+    assert!(
+        !kin_dir.join(kin_daemon_spawn::PID_FILE_NAME).exists(),
+        "preparation must not leave a daemon PID before injecting the dead record"
+    );
+    assert!(
+        !kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME).exists(),
+        "preparation must not leave a daemon port before injecting the dead record"
+    );
+    assert!(
+        !kin_home.join("services").exists(),
+        "preparation must not start services in the owned Kin home"
+    );
+    assert!(
+        !supervisor_services.exists(),
+        "preparation must not start supervisor services beside the owned registry"
+    );
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", dead_port)).is_err(),
+        "the retained non-listening socket must not accept connections"
+    );
+    let stale_pid = dead_pid.to_string();
+    let stale_port = dead_port.to_string();
+    std::fs::write(kin_dir.join(kin_daemon_spawn::PID_FILE_NAME), &stale_pid)
+        .expect("plant stale PID record");
+    std::fs::write(kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME), &stale_port)
+        .expect("plant stale port record");
 
-    // The stub daemon: records its invocation and exits, so a run that spawns
-    // leaves evidence and leaves no process behind.
-    let marker = root.path().join("daemon-spawned.marker");
-    let stub = root.path().join("kin-daemon-stub");
-    std::fs::write(
-        &stub,
-        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 7\n", marker.display()),
-    )
-    .expect("write stub daemon");
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-        .expect("mark stub executable");
-
-    let fixture_env = |ready_timeout: Option<&str>| {
-        let mut env: Vec<(&str, std::ffi::OsString)> = vec![
-            (
-                "KIN_DAEMON_URL",
-                format!("http://127.0.0.1:{dead_port}").into(),
-            ),
-            ("KIN_DAEMON_BIN", stub.clone().into_os_string()),
-        ];
-        if let Some(secs) = ready_timeout {
-            env.push(("KIN_DAEMON_READY_TIMEOUT_SECS", secs.into()));
-        }
-        env
-    };
-
-    // The claim: under --no-spawn the whole session answers and nothing is
-    // started. The tools/call error must name KIN_NO_DAEMON, which proves the
-    // binding settled, the dead daemon was observed, and revival was consulted
-    // and refused. Without that assertion, an early failure anywhere on the
-    // path would also leave the marker absent and the test would prove nothing.
-    let no_spawn = run_configured_probe_session(&repo, &home, &["--no-spawn"], &fixture_env(None));
+    let no_spawn = run_owned_probe_session(
+        &runtime,
+        &repo,
+        root.path(),
+        "no-spawn",
+        &["--no-spawn"],
+        dead_port,
+    );
     assert_four_frame_contract(&no_spawn);
     let refusal = response_with_id(&no_spawn, 3)
         .pointer("/result/content/0/text")
         .and_then(|text| text.as_str())
-        .expect("tools/call carries a content block")
-        .to_string();
+        .expect("tools/call carries a content block");
     assert!(
         refusal.contains("KIN_NO_DAEMON"),
         "the no-spawn refusal must reach the tool answer: {refusal}"
     );
+    assert_eq!(
+        std::fs::read_to_string(kin_dir.join(kin_daemon_spawn::PID_FILE_NAME)).unwrap(),
+        stale_pid,
+        "no-spawn must preserve the dead PID record"
+    );
+    assert_eq!(
+        std::fs::read_to_string(kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME)).unwrap(),
+        stale_port,
+        "no-spawn must preserve the dead port record"
+    );
+    assert!(!kin_home.join("services").exists());
     assert!(
-        !marker.exists(),
-        "--no-spawn probe invoked the daemon binary: {}",
-        std::fs::read_to_string(&marker).unwrap_or_default()
+        !supervisor_services.exists(),
+        "no-spawn must leave supervisor actors absent"
+    );
+    assert!(std::net::TcpStream::connect(("127.0.0.1", dead_port)).is_err());
+
+    // The unrestricted control starts from absence after the no-spawn control
+    // proved these deliberately incomplete records were preserved.
+    let fabricated_pid = kin_dir.join(kin_daemon_spawn::PID_FILE_NAME);
+    let fabricated_port = kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME);
+    assert_eq!(
+        std::fs::read_to_string(&fabricated_pid).unwrap(),
+        stale_pid,
+        "discard only the test's unchanged fabricated PID record"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fabricated_port).unwrap(),
+        stale_port,
+        "discard only the test's unchanged fabricated port record"
+    );
+    std::fs::remove_file(&fabricated_pid).expect("discard fabricated PID record");
+    std::fs::remove_file(&fabricated_port).expect("discard fabricated port record");
+    assert!(!fabricated_pid.exists());
+    assert!(!fabricated_port.exists());
+
+    let unrestricted =
+        run_owned_probe_session(&runtime, &repo, root.path(), "unrestricted", &[], dead_port);
+    assert_four_frame_protocol(&unrestricted);
+    let call = response_with_id(&unrestricted, 3);
+    assert_ne!(
+        call.pointer("/result/isError")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "unrestricted graph call must succeed: {call}; stderr:\n{}",
+        unrestricted.stderr
+    );
+    let graph_text = call
+        .pointer("/result/content/0/text")
+        .and_then(|text| text.as_str())
+        .expect("successful graph reply carries JSON text");
+    let graph: serde_json::Value = serde_json::from_str(graph_text).expect("graph reply is JSON");
+    assert_eq!(
+        graph
+            .pointer("/repository_base/context/repository_id")
+            .and_then(|value| value.as_str()),
+        Some(intended_repository.as_str()),
+        "unrestricted graph reply must identify the initialized repository: {graph}"
     );
 
-    // Positive control: the identical session without --no-spawn must reach
-    // the stub, proving the marker detects spawns. The short ready timeout
-    // bounds the supervisor-spawn arm should binary validation ever start
-    // accepting the stub.
-    let unrestricted = run_configured_probe_session(&repo, &home, &[], &fixture_env(Some("2")));
-    assert_four_frame_contract(&unrestricted);
+    let pid: u32 = std::fs::read_to_string(kin_dir.join(kin_daemon_spawn::PID_FILE_NAME))
+        .expect("real daemon PID published")
+        .trim()
+        .parse()
+        .expect("real daemon PID");
+    let port: u16 = std::fs::read_to_string(kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME))
+        .expect("real daemon port published")
+        .trim()
+        .parse()
+        .expect("real daemon port");
+    assert_ne!(
+        port, dead_port,
+        "a real daemon cannot listen on the retained non-listening reservation"
+    );
     assert!(
-        marker.exists(),
-        "the control run must spawn the stub daemon, or the marker check cannot fail; stderr:\n{}",
-        unrestricted.stderr
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "the admitted real daemon must listen on its published port"
+    );
+    let async_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("peer metadata runtime");
+    let peer = async_runtime
+        .block_on(kin_cli::daemon_client::read_runtime_endpoint(&format!(
+            "http://127.0.0.1:{port}"
+        )))
+        .expect("real daemon runtime identity");
+    assert_eq!(peer.schema, "kin.runtime-service.v1");
+    assert_eq!(peer.component, "daemon");
+    assert_eq!(peer.pid, pid);
+    assert_eq!(
+        peer.mode,
+        kin_core::runtime_identity::RuntimeMode::Development
+    );
+    assert_eq!(
+        peer.identity,
+        kin_core::runtime_identity::RuntimeIdentity::current()
+    );
+    let expected_namespace = kin_core::runtime_identity::RuntimeNamespace::capture(&kin_home)
+        .expect("owned runtime namespace");
+    assert_eq!(peer.namespace.as_deref(), Some(expected_namespace.token()));
+    let incarnation = kin_cli::daemon_client::process_identity(pid)
+        .expect("capture real daemon incarnation")
+        .expect("real daemon is alive");
+    drop(async_runtime);
+    // The fixture's existing Drop uses product stop and owned containment on
+    // both success and unwinding; it never signals an arbitrary recorded PID.
+    drop(runtime);
+    assert!(
+        !kin_cli::daemon_client::process_identity_is_current(&incarnation)
+            .expect("confirm owned daemon cleanup")
     );
 }

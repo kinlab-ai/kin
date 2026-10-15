@@ -27,6 +27,7 @@ fn actor_crud() {
             identifier: "alice".into(),
             url: None,
         }],
+        agent_session: None,
     };
 
     let assistant = Actor {
@@ -34,6 +35,7 @@ fn actor_crud() {
         kind: ActorKind::Assistant,
         display_name: "Claude".into(),
         external_refs: vec![],
+        agent_session: None,
     };
 
     store.create_actor(&human).unwrap();
@@ -77,12 +79,14 @@ fn delegation_lifecycle() {
         kind: ActorKind::Human,
         display_name: "Alice".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let delegate = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Assistant,
         display_name: "Claude".into(),
         external_refs: vec![],
+        agent_session: None,
     };
 
     store.create_actor(&principal).unwrap();
@@ -127,6 +131,7 @@ fn approval_workflow() {
         kind: ActorKind::Human,
         display_name: "Bob".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&approver).unwrap();
 
@@ -168,12 +173,14 @@ fn audit_event_filtering() {
         kind: ActorKind::Human,
         display_name: "Alice".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     let actor_b = Actor {
         actor_id: ActorId::new(),
         kind: ActorKind::Assistant,
         display_name: "Claude".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&actor_a).unwrap();
     store.create_actor(&actor_b).unwrap();
@@ -238,6 +245,7 @@ fn review_surfaces_unreviewed_agent_changes() {
         kind: ActorKind::Assistant,
         display_name: "Copilot".into(),
         external_refs: vec![],
+        agent_session: None,
     };
     store.create_actor(&assistant).unwrap();
 

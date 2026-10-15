@@ -246,7 +246,7 @@ pub(crate) fn retain_removed_bindings(
         if selected.is_empty() {
             continue;
         }
-        let graph = InMemoryGraph::from_snapshot(GraphSnapshot {
+        let graph = InMemoryGraph::from_snapshot_without_text_index(GraphSnapshot {
             entities: prior.entities.clone(),
             relations: prior.relations.clone(),
             resolved_tree: prior.tree.clone(),

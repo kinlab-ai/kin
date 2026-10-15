@@ -136,6 +136,15 @@ pub(crate) fn native_remote_bearer_token(base_url: &str) -> Option<String> {
     })
 }
 
+/// The bearer token the environment names for `base_url`, without reading any
+/// saved credential. A server answering a page reads this and nothing that
+/// could stop to ask a person.
+pub(crate) fn native_remote_bearer_token_from_environment(base_url: &str) -> Option<String> {
+    credential_for_endpoint(base_url, || {
+        resolve_native_remote_bearer_token_with(|key| std::env::var(key).ok())
+    })
+}
+
 fn credential_for_endpoint(
     base_url: &str,
     load: impl FnOnce() -> Option<String>,

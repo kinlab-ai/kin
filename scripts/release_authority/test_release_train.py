@@ -395,6 +395,55 @@ def assert_release_branch_allowlist_covers_generator(release_train: str) -> None
         )
 
 
+def declared_generated_git_paths(release_train: str, command: str) -> set[str]:
+    """Read a literal restore/stage list from the protected branch step."""
+
+    step = workflow_step_source(
+        "release train", release_train, "      - name: Create or coalesce the release branch\n"
+    )
+    lines = step.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.strip() == f"{command} \\"), None)
+    if start is None:
+        raise AssertionError(f"release train is missing its generated-path {command} list")
+    paths: set[str] = set()
+    for line in lines[start + 1:]:
+        literal = line.strip()
+        continues = literal.endswith("\\")
+        candidate = literal[:-1].strip() if continues else literal
+        if not GENERATED_PATH_LITERAL.fullmatch(candidate):
+            raise AssertionError(f"release train {command} list contains a non-literal generated path")
+        paths.add(candidate)
+        if not continues:
+            return paths
+    raise AssertionError(f"release train {command} list never ends")
+
+
+def assert_generated_branch_paths_restored_and_staged(release_train: str) -> None:
+    generated = prepared_release_paths(PREPARE_RELEASE.read_text(encoding="utf-8"))
+    for command in ("git restore --source refs/remotes/origin/main --", "git add"):
+        declared = declared_generated_git_paths(release_train, command)
+        missing = sorted(generated - declared)
+        extra = sorted(declared - generated)
+        if missing:
+            raise AssertionError(f"{command} omits generated release paths: {', '.join(missing)}")
+        if extra:
+            raise AssertionError(f"{command} admits non-generated release paths: {', '.join(extra)}")
+
+
+def assert_compatibility_lock_allowlist_is_exact(release_train: str) -> None:
+    allowed = re.compile(release_branch_allowlist(release_train))
+    for path in (
+        "packages/kin/package-lock.json",
+        "packages/boundary-contracts/package-lock.json",
+        "packages/kin-mcp/npm-shrinkwrap.json",
+        "packages/kin-mcp/.npmrc",
+        "packages/kin-mcp/src/index.js",
+        "packages/kin-mcp/package-lock.json.extra",
+    ):
+        if allowed.match(path):
+            raise AssertionError(f"release branch lock allowlist admits non-generated path: {path}")
+
+
 def assert_release_hold_marker_contract(
     release_train: str,
     hold_alarm: str,
@@ -706,6 +755,32 @@ def check_release_train_authority(release_train: str) -> None:
         ),
     )
     assert_release_branch_allowlist_covers_generator(release_train)
+    assert_generated_branch_paths_restored_and_staged(release_train)
+    assert_compatibility_lock_allowlist_is_exact(release_train)
+    expect_assertion(
+        "the compatibility lock is removed from release branch admission",
+        "the release branch guard refuses paths the release generator writes",
+        lambda: assert_release_branch_allowlist_covers_generator(
+            release_train.replace(r"|packages/kin-mcp/package-lock\.json", "", 1)
+        ),
+    )
+    lock_line = "            packages/kin-mcp/package-lock.json \\\n"
+    for command, altered in (
+        ("git restore --source refs/remotes/origin/main --", release_train.replace(lock_line, "", 1)),
+        ("git add", "".join(release_train.rsplit(lock_line, 1))),
+    ):
+        expect_assertion(
+            f"the compatibility lock is omitted from {command}",
+            f"{command} omits generated release paths: packages/kin-mcp/package-lock.json",
+            lambda altered=altered: assert_generated_branch_paths_restored_and_staged(altered),
+        )
+    expect_assertion(
+        "compatibility lock admission expands to unrelated package locks",
+        "release branch lock allowlist admits non-generated path",
+        lambda: assert_compatibility_lock_allowlist_is_exact(
+            release_train.replace(r"packages/kin-mcp/package-lock\.json", r"packages/(kin-mcp|kin|boundary-contracts)/package-lock\.json", 1)
+        ),
+    )
 
 
 

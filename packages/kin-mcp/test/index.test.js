@@ -170,6 +170,14 @@ const fakeKinPreload = [
   "const fs = require('node:fs');",
   "const path = require('node:path');",
   "const command = path.basename(process.argv[1] || '');",
+  "if (command === 'runtime') {",
+  "  const suffix = process.platform === 'win32' ? '.exe' : '';",
+  "  const binary = process.execPath;",
+  "  const daemon = path.join(path.dirname(binary), 'kin-daemon' + suffix);",
+  "  const component = file => ({ path: file, version: '99.0.0', commit_sha: 'a'.repeat(40), source_dirty: true, target: 'fixture', build_profile: 'debug', sha256: require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex') });",
+  "  process.stdout.write(JSON.stringify({ schema: 'kin.runtime-status.v1', ready: true, mode: 'development', kin_home: path.join(process.env.HOME, '.kin-development-fixture'), pair_matches: true, cli: component(binary), daemon: component(daemon) }));",
+  "  process.exit(0);",
+  "}",
   "if (command === 'store') {",
   "  if (process.env.KIN_MCP_FAKE_STORE_REPLY) { process.stdout.write(process.env.KIN_MCP_FAKE_STORE_REPLY); process.exit(0); }",
   "  let dir = process.cwd();",
@@ -218,12 +226,29 @@ const fakeKinPreload = [
 ].join('\n');
 
 async function fakeKinEnvironment(tmpDir, overrides = {}) {
-  const preloadName = 'fake-kin-preload.cjs';
-  await fs.writeFile(path.join(tmpDir, preloadName), fakeKinPreload);
+  const preloadPath = path.join(tmpDir, 'fake-kin-preload.cjs');
+  await fs.writeFile(preloadPath, fakeKinPreload);
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  const binary = path.join(tmpDir, 'kin' + suffix);
+  if (!await exists(binary)) await fs.copyFile(process.execPath, binary);
+  const daemon = path.join(tmpDir, 'kin-daemon' + suffix);
+  if (!await exists(daemon)) await fs.copyFile(process.execPath, daemon);
+  if (process.platform === 'darwin') {
+    // Homebrew's shared Node executable resolves this actual host library
+    // relative to itself. Keep the copied protocol fixture runnable too.
+    const libraryName = `libnode.${process.versions.modules}.dylib`;
+    try {
+      const actualLibrary = await fs.realpath(path.join(path.dirname(process.execPath), '..', 'lib', libraryName));
+      const fixtureLibrary = path.join(tmpDir, libraryName);
+      if (!await exists(fixtureLibrary)) await fs.symlink(actualLibrary, fixtureLibrary);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
   const env = {
     ...process.env,
-    NODE_OPTIONS: `--require=./${preloadName}`,
-    KIN_MCP_KIN_BINARY: process.execPath,
+    NODE_OPTIONS: `--require=${JSON.stringify(preloadPath)}`,
+    KIN_MCP_KIN_BINARY: binary,
     KIN_MCP_FAKE_REPO: tmpDir,
     ...overrides
   };
@@ -410,7 +435,7 @@ test(
         .trim();
       assert.match(head, /^[0-9a-f]{40,64}$/);
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
     }
   }
 );
@@ -524,7 +549,7 @@ async function buildReleaseArchive(
   } else {
     cp.execFileSync('tar', ['-czf', archiveName, assetName], { cwd: tmpDir });
   }
-  await fs.rm(packageDir, { recursive: true, force: true });
+  await fs.rm(packageDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
 
   const archiveBytes = await fs.readFile(archivePath);
   if (platform === 'win32') {
@@ -549,7 +574,7 @@ function mockReleaseFetch(t, version, archiveName, archiveBytes, checksum) {
   return baseUrl;
 }
 
-test('ensureKinBinary downloads kin and its daemon from a release asset', async t => {
+test('a development archive is extracted but cannot serve without runtime identity', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-download-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
@@ -562,12 +587,14 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
   };
 
   try {
-    const binaryPath = await ensureKinBinary({
+    const options = {
       env,
       platform: 'linux',
       arch: 'x64',
       version
-    });
+    };
+    await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+    const binaryPath = resolveCachedBinaryPath(options);
 
     assert.equal(
       binaryPath,
@@ -584,11 +611,11 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
     assert.equal(await exists(daemonPath), true);
     assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
-test('ensureKinBinary installs the flat native Windows zip and .exe pair', async t => {
+test('ensureKinBinary installs the flat native Windows zip and .exe pair but refuses unsupported identity', async t => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-windows-download-'));
   const assetName = 'kin-windows-x86_64';
   const version = '9.9.9-test';
@@ -601,12 +628,14 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
   });
 
   try {
-    const binaryPath = await ensureKinBinary({
+    const options = {
       env,
       platform: 'win32',
       arch: 'x64',
       version
-    });
+    };
+    await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+    const binaryPath = resolveCachedBinaryPath(options);
 
     assert.equal(path.basename(binaryPath), 'kin.exe');
     assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
@@ -615,7 +644,7 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
     assert.equal(path.basename(daemonPath), 'kin-daemon.exe');
     assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -640,18 +669,20 @@ test(
     });
 
     try {
-      const binaryPath = await ensureKinBinary({
+      const options = {
         env,
         platform: 'linux',
         arch: 'x64',
         version
-      });
+      };
+      await assert.rejects(ensureKinBinary(options), /runtime-isolation contract/);
+      const binaryPath = resolveCachedBinaryPath(options);
 
       assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
       const daemonPath = resolveDaemonBinaryPath(binaryPath);
       assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
     } finally {
-        await fs.rm(tmpDir, { recursive: true, force: true });
+        await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
     }
   }
 );
@@ -677,7 +708,7 @@ test('ensureKinBinary fails with a precise message when the archive omits kin-da
       /kin-daemon/
     );
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -690,7 +721,7 @@ test('ensureKinBinary rejects a failed archive response', async t => {
       env: { KIN_MCP_CACHE_DIR: tmpDir }, platform: 'linux', arch: 'x64', version: '9.9.9-test'
     }), /failed to download .*404 Not Found/);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -708,7 +739,7 @@ test('ensureKinBinary rejects archive bytes that disagree with the checksum', as
       env: { KIN_MCP_CACHE_DIR: tmpDir }, platform: 'linux', arch: 'x64', version
     })), false);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -732,7 +763,7 @@ test('runKinMcp invokes kin mcp start', async () => {
     assert.equal(exitCode, 0);
     assert.equal(await fs.readFile(argsPath, 'utf8'), 'mcp\nstart\n');
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -781,7 +812,7 @@ test('runKinMcp starts the server when the launch directory is no Kin repository
       'starting unbound must not initialize a repository behind the user'
     );
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -834,7 +865,7 @@ test('initialize is served through the wrapper in an empty directory', async () 
     assert.match(result.stderr, /npx -y @kinlab\/kin@\S+ init \./);
     assert.equal(await exists(path.join(tmpDir, '.kin')), false);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -958,7 +989,7 @@ test('a central store or unreadable discovery does not trigger wrapper auto-init
       assert.doesNotMatch(stderr, /running kin init|neither is any folder above it/);
     }
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -993,7 +1024,7 @@ test('runKinMcp names the enclosing repository instead of saying none is bound',
     assert.equal(await fs.readFile(logPath, 'utf8'), 'mcp\nstart\n', 'no kin init over an enclosing repository');
     assert.equal(await exists(path.join(nested, '.kin')), false);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1082,7 +1113,7 @@ test('--stop stops idle daemons through the cached kin and names what stays on d
       assert.ok(stdout.includes(`rm -rf -- '${model.replaceAll("'", "'\\''")}'`), stdout);
     }
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1110,7 +1141,7 @@ test('--stop never downloads a Kin just to stop daemons', async () => {
     assert.match(stdout, /no Kin binary is cached here/);
     assert.equal(await exists(path.join(tmpDir, 'empty-cache')), false, 'nothing was fetched');
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1135,7 +1166,7 @@ test('runKinMcp forwards the agent-default profile to kin mcp start', async () =
     assert.equal(exitCode, 0);
     assert.equal(await fs.readFile(profilePath, 'utf8'), 'agent-default');
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1160,7 +1191,7 @@ test('runKinMcp emits a guided fix when no binary can be provisioned', async () 
     assert.match(stderr, /could not provision a runnable Kin/);
     assert.match(stderr, /kin setup/);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1187,7 +1218,7 @@ test('runKinMcp auto-inits when explicitly allowed', async () => {
     assert.ok(mcpPos >= 0, 'expected kin mcp start call');
     assert.ok(initPos < mcpPos, 'init should run before mcp start');
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1226,7 +1257,7 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
     assert.match(result.stderr, /init stdout must leave the protocol channel/);
     assert.match(result.stderr, /init stderr remains diagnostic/);
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0 });
   }
 });
 
@@ -1849,6 +1880,12 @@ const fakeKinSource = [
   "const path = require('node:path');",
   'const env = process.env;',
   "const log = line => fs.appendFileSync(env.KIN_MCP_FAKE_SERVER_LOG, JSON.stringify(line) + '\\n');",
+  "if (process.argv[2] === 'runtime') {",
+  "  const binary = process.env.KIN_MCP_FAKE_INSTALLED_BINARY;",
+  "  const daemon = path.join(path.dirname(binary), 'kin-daemon');",
+  "  process.stdout.write(JSON.stringify({ schema: 'kin.runtime-status.v1', ready: true, mode: 'development', kin_home: path.join(process.env.HOME, '.kin-development-fixture'), pair_matches: true, cli: { path: binary }, daemon: { path: daemon } }));",
+  "  process.exit(0);",
+  "}",
   'log({ argv: process.argv.slice(2), pid: process.pid });',
   'const waitFor = (marker, then) => {',
   '  if (!marker || fs.existsSync(marker)) return then();',
@@ -1909,7 +1946,7 @@ async function buildFakeKinArchive(tmpDir, asset) {
   await fs.mkdir(packageDir, { recursive: true });
   await fs.writeFile(
     path.join(packageDir, 'kin'),
-    `#!/bin/sh\nexec "${process.execPath}" "${fakeKin}" "$@"\n`,
+    `#!/bin/sh\nKIN_MCP_FAKE_INSTALLED_BINARY="$0"; export KIN_MCP_FAKE_INSTALLED_BINARY\nexec "${process.execPath}" "${fakeKin}" "$@"\n`,
     { mode: 0o755 }
   );
   await fs.writeFile(path.join(packageDir, 'kin-daemon'), '#!/bin/sh\nexit 0\n', {

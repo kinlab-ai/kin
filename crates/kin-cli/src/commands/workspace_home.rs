@@ -25,9 +25,9 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,6 +56,34 @@ const OPERATIONS_KEPT: usize = 50;
 const LOCATION_MAX_BYTES: usize = 4096;
 const SOURCE_MAX_BYTES: usize = 2048;
 
+/// How long one look for projects around a home directory may take.
+const LOOK_BUDGET: Duration = Duration::from_millis(900);
+/// How long what a look found is kept before a request looks again.
+const LOOK_KEPT: Duration = Duration::from_secs(30);
+/// The directories one look lists, over every place it looks through.
+const LOOK_LISTINGS: usize = 400;
+/// The directories examined in any one place, most recently changed first.
+const LOOK_PER_PLACE: usize = 200;
+/// The projects one look keeps, most recently changed first.
+const LOOK_FOUND: usize = 200;
+const CANDIDATES_DEFAULT: usize = 30;
+const CANDIDATES_MAX: usize = 100;
+/// How long a request waits for commit counts Git has not given yet. A count
+/// that is later than this is in the next answer.
+const COUNT_WAIT: Duration = Duration::from_millis(600);
+/// How long Git is given to count one project's commits once no request is
+/// waiting on it.
+const GIT_PATIENCE: Duration = Duration::from_secs(20);
+/// The projects Git counts commits for at once.
+const GIT_AT_ONCE: usize = 4;
+/// The projects whose commit counts are remembered.
+const COUNTS_KEPT: usize = 512;
+/// The coding agent sessions remembered. The oldest ended one goes first.
+const SESSIONS_KEPT: usize = 256;
+/// The newest changes read from a running repository for the coding agents
+/// that made them.
+const SESSION_CHANGES_READ: usize = 50;
+
 /// What the listing page's server remembers while it runs.
 #[derive(Default)]
 pub(super) struct Home {
@@ -66,6 +94,16 @@ pub(super) struct Home {
     /// has moved, so a page that polls costs each daemon one comparison and
     /// not one diff.
     readings: Mutex<HashMap<String, Arc<Slot>>>,
+    /// The projects the last look around the home directory found, and when
+    /// it looked.
+    look: Mutex<Option<(std::time::Instant, Arc<Look>)>>,
+    /// The directory looked around in place of the home directory. Only a
+    /// test names one.
+    looks_in: Mutex<Option<PathBuf>>,
+    counts: Counts,
+    /// The coding agent sessions the repositories on this machine have
+    /// shown this server, by session.
+    sessions: Mutex<HashMap<String, SessionSeen>>,
 }
 
 pub(super) fn routes() -> Router<Arc<Hub>> {
@@ -73,6 +111,7 @@ pub(super) fn routes() -> Router<Arc<Hub>> {
         .route("/api/home/session", get(session))
         .route("/api/home", get(home))
         .route("/api/home/inspect", post(inspect))
+        .route("/api/home/candidates", get(candidates))
         .route("/api/home/repositories", post(add))
         .route("/api/home/clients", get(clients).post(connect))
         .route("/api/home/operations", get(operations))
@@ -353,21 +392,10 @@ struct InspectBody {
     path: String,
 }
 
-async fn inspect(State(hub): State<Arc<Hub>>, Json(body): Json<InspectBody>) -> Response {
-    let reading = {
-        let hub = hub.clone();
-        tokio::task::spawn_blocking(move || {
-            let place = look_at(&body.path)?;
-            let registered = hub.catalog.registered_at(&place.path);
-            Ok::<_, String>((place, registered))
-        })
-        .await
-    };
-    let (place, registered) = match reading {
-        Ok(Ok(reading)) => reading,
-        Ok(Err(sentence)) => return refused(StatusCode::BAD_REQUEST, sentence),
-        Err(error) => return refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
+/// What the add flow says of one location: what is there, what adding it
+/// would do, and what this page may be asked to do with it. Everything but
+/// what Git has to be asked for.
+fn described(hub: &Hub, place: &Place, registered: bool) -> Value {
     // A repository answers at its URL once the registry names it or this
     // server already serves it. Before that the URL would lead nowhere.
     let key = place
@@ -384,7 +412,7 @@ async fn inspect(State(hub): State<Arc<Hub>>, Json(body): Json<InspectBody>) -> 
         "kind": place.kind.word(),
         "name": place.path.file_name().map(|name| name.to_string_lossy().into_owned()),
         "registered": registered,
-        "note": note(&place, reachable.is_some()),
+        "note": note(place, reachable.is_some()),
     });
     if let Some(key) = reachable {
         answer["repository"] = json!({
@@ -400,22 +428,10 @@ async fn inspect(State(hub): State<Arc<Hub>>, Json(body): Json<InspectBody>) -> 
     answer["actions"] = json!(
         [Action::Convert, Action::Create, Action::Open, Action::Clone]
             .into_iter()
-            .filter(|action| precondition(*action, &place).is_none())
+            .filter(|action| precondition(*action, place).is_none())
             .map(Action::word)
             .collect::<Vec<_>>()
     );
-    if place.kind == Kind::Git {
-        let mut git = serde_json::Map::new();
-        if let Some(commits) = git_commits(&place.path).await {
-            git.insert("commits".into(), json!(commits));
-        }
-        if let Some(branch) = &place.branch {
-            git.insert("branch".into(), json!(branch));
-        }
-        if !git.is_empty() {
-            answer["git"] = Value::Object(git);
-        }
-    }
     if let Some(outer) = &place.inside {
         let entry = super::workspace_ui::entry(outer);
         answer["inside"] = json!({
@@ -425,7 +441,501 @@ async fn inspect(State(hub): State<Arc<Hub>>, Json(body): Json<InspectBody>) -> 
             "location": location(outer.working_dir()),
         });
     }
+    answer
+}
+
+/// What is known of a Git project before it is added: the branch it has
+/// checked out and how many commits it holds, each when known.
+fn git_block(branch: Option<&str>, commits: Option<u64>) -> Option<Value> {
+    let mut git = serde_json::Map::new();
+    if let Some(commits) = commits {
+        git.insert("commits".into(), json!(commits));
+    }
+    if let Some(branch) = branch {
+        git.insert("branch".into(), json!(branch));
+    }
+    (!git.is_empty()).then_some(Value::Object(git))
+}
+
+async fn inspect(State(hub): State<Arc<Hub>>, Json(body): Json<InspectBody>) -> Response {
+    let reading = {
+        let hub = hub.clone();
+        tokio::task::spawn_blocking(move || {
+            let place = look_at(&body.path)?;
+            let registered = hub.catalog.registered_at(&place.path);
+            Ok::<_, String>((place, registered))
+        })
+        .await
+    };
+    let (place, registered) = match reading {
+        Ok(Ok(reading)) => reading,
+        Ok(Err(sentence)) => return refused(StatusCode::BAD_REQUEST, sentence),
+        Err(error) => return refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let mut answer = described(&hub, &place, registered);
+    if place.kind == Kind::Git {
+        let commits = git_commits(&place.path, GIT_BUDGET).await;
+        if let Some(git) = git_block(place.branch.as_deref(), commits) {
+            answer["git"] = git;
+        }
+    }
     Json(answer).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Projects a person is likely to add
+// ---------------------------------------------------------------------------
+//
+// So that adding a repository starts from a list and not from a typed
+// location, this page looks for projects where people keep them. It is the
+// same boundary `inspect` sits on, reached without a location being typed,
+// and it is kept as narrow: directory names and change times are read,
+// nothing a project holds is, and what is found is only ever offered to the
+// reader to add.
+
+/// Directories directly inside a home directory that people keep projects
+/// in, in lowercase. Each is looked through two levels deep, so a project
+/// kept under its owner's name is found as well.
+const CODE_ROOTS: [&str; 15] = [
+    "code",
+    "dev",
+    "developer",
+    "development",
+    "git",
+    "github",
+    "gitlab",
+    "projects",
+    "repos",
+    "repositories",
+    "source",
+    "src",
+    "work",
+    "workspace",
+    "workspaces",
+];
+
+/// Directories never looked into, in lowercase: what tools install or build
+/// into, and the folders an operating system keeps a person's documents,
+/// media and synced storage in. Those are not where projects are looked for,
+/// and macOS asks a person before any program may read some of them.
+const NEVER_LOOKED_IN: [&str; 38] = [
+    "__pycache__",
+    "_build",
+    "applications",
+    "bin",
+    "bower_components",
+    "build",
+    "coverage",
+    "creative cloud files",
+    "deps",
+    "deriveddata",
+    "desktop",
+    "dist",
+    "documents",
+    "downloads",
+    "dropbox",
+    "env",
+    "google drive",
+    "icloud drive",
+    "library",
+    "movies",
+    "music",
+    "node_modules",
+    "obj",
+    "onedrive",
+    "out",
+    "parallels",
+    "pictures",
+    "pods",
+    "public",
+    "site-packages",
+    "snap",
+    "target",
+    "temp",
+    "templates",
+    "tmp",
+    "vendor",
+    "venv",
+    "videos",
+];
+
+/// Names at the top of a directory that say it is a project. Only the name
+/// is looked at.
+const PROJECT_MARKERS: [&str; 26] = [
+    "build.bazel",
+    "build.gradle",
+    "build.gradle.kts",
+    "build.sbt",
+    "cargo.toml",
+    "cmakelists.txt",
+    "composer.json",
+    "deno.json",
+    "dune-project",
+    "flake.nix",
+    "gemfile",
+    "go.mod",
+    "makefile",
+    "meson.build",
+    "mix.exs",
+    "package.json",
+    "package.swift",
+    "pipfile",
+    "pom.xml",
+    "pubspec.yaml",
+    "pyproject.toml",
+    "requirements.txt",
+    "settings.gradle",
+    "setup.py",
+    "stack.yaml",
+    "tsconfig.json",
+];
+const PROJECT_MARKER_ENDINGS: [&str; 5] = [".sln", ".xcodeproj", ".csproj", ".cabal", ".gemspec"];
+
+/// A project a look found: where it is and when it last changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Spotted {
+    path: PathBuf,
+    /// The later of when its own directory and its Git directory changed.
+    changed: Option<SystemTime>,
+}
+
+/// What one look around a home directory found.
+#[derive(Debug, Default)]
+struct Look {
+    /// Most recently changed first.
+    spotted: Vec<Spotted>,
+    /// Whether every place was looked through inside the look's bounds.
+    complete: bool,
+}
+
+fn lowercase_name(name: &OsStr) -> String {
+    name.to_string_lossy().to_lowercase()
+}
+
+/// Whether a directory of this name is looked at at all.
+fn looked_into(name: &OsStr) -> bool {
+    let name = lowercase_name(name);
+    !name.starts_with('.') && !NEVER_LOOKED_IN.contains(&name.as_str())
+}
+
+fn marks_a_project(name: &OsStr) -> bool {
+    let name = lowercase_name(name);
+    PROJECT_MARKERS.contains(&name.as_str())
+        || PROJECT_MARKER_ENDINGS
+            .iter()
+            .any(|ending| name.ends_with(ending))
+}
+
+/// Look for projects where people keep them: the directories directly
+/// inside `home`, and one and two levels inside those named like a code
+/// root. Blocking, and read-only.
+///
+/// It reads directory names and change times and nothing a project holds. A
+/// project is known by the `.git` or `.kin` directory at its top or by the
+/// name of a build manifest there, and a directory that is one is never
+/// looked inside. A second working copy of a project is not a second project.
+/// It follows no link and enters no directory a tool installs or builds
+/// into. It stops at `until`, or once it has listed [`LOOK_LISTINGS`]
+/// directories, and in each place it examines the most recently changed
+/// directories first, so that what a bound cuts off is the oldest.
+fn look_around(home: &Path, until: std::time::Instant) -> Look {
+    let mut look = Look {
+        spotted: Vec::new(),
+        complete: true,
+    };
+    let Ok(tree) = kin_io::WorktreeSource::open(home, &kin_io::Grant::ambient()) else {
+        return look;
+    };
+    let mut listings = 0;
+    // Each place still to look through: where it is under `home`, the names
+    // it holds when they were already read, whether a directory in it that
+    // is no project is itself looked through, and how many levels further.
+    let mut places: VecDeque<(PathBuf, Option<Vec<OsString>>, usize)> =
+        VecDeque::from([(PathBuf::new(), None, 0)]);
+    'places: while let Some((place, names, deeper)) = places.pop_front() {
+        let at_home = place.as_os_str().is_empty();
+        let names = match names {
+            Some(names) => names,
+            None => {
+                if listings >= LOOK_LISTINGS || std::time::Instant::now() >= until {
+                    look.complete = false;
+                    break;
+                }
+                listings += 1;
+                tree.names(&place).unwrap_or_default()
+            }
+        };
+        // The directories here, most recently changed first.
+        let mut directories: Vec<(Option<SystemTime>, PathBuf, OsString)> = Vec::new();
+        for name in names {
+            if !looked_into(&name) {
+                continue;
+            }
+            let inner = place.join(&name);
+            if tree.kind(&inner).ok().flatten() != Some(kin_io::EntryKind::Directory) {
+                continue;
+            }
+            directories.push((tree.modified(&inner).ok().flatten(), inner, name));
+        }
+        directories.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        if directories.len() > LOOK_PER_PLACE {
+            directories.truncate(LOOK_PER_PLACE);
+            look.complete = false;
+        }
+        for (changed, inner, name) in directories {
+            if std::time::Instant::now() >= until {
+                look.complete = false;
+                break 'places;
+            }
+            let is_directory = |name: &str| {
+                tree.kind(inner.join(name)).ok().flatten() == Some(kin_io::EntryKind::Directory)
+            };
+            if is_directory(".git") || is_directory(".kin") {
+                let git = tree.modified(inner.join(".git")).ok().flatten();
+                look.spotted.push(Spotted {
+                    path: home.join(&inner),
+                    changed: changed.max(git),
+                });
+                continue;
+            }
+            // A `.git` that is not a directory marks one more working copy
+            // of a project kept somewhere else, or a project held inside
+            // another. That project is found where it is kept, so this is
+            // neither offered beside it nor looked inside.
+            if tree.kind(inner.join(".git")).ok().flatten().is_some() {
+                continue;
+            }
+            // Neither Git nor Kin holds it, so its top names say whether it
+            // is a project, and they are what is looked through if it is not.
+            if listings >= LOOK_LISTINGS {
+                look.complete = false;
+                break 'places;
+            }
+            listings += 1;
+            let inside = tree.names(&inner).unwrap_or_default();
+            if inside.iter().any(|name| marks_a_project(name)) {
+                look.spotted.push(Spotted {
+                    path: home.join(&inner),
+                    changed,
+                });
+            } else if at_home && CODE_ROOTS.contains(&lowercase_name(&name).as_str()) {
+                places.push_back((inner, Some(inside), 1));
+            } else if deeper > 0 {
+                places.push_back((inner, Some(inside), deeper - 1));
+            }
+        }
+    }
+    look.spotted.sort_by(|left, right| {
+        right
+            .changed
+            .cmp(&left.changed)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    if look.spotted.len() > LOOK_FOUND {
+        look.spotted.truncate(LOOK_FOUND);
+        look.complete = false;
+    }
+    look
+}
+
+/// What Git said of one project's commits.
+#[derive(Default)]
+struct Counted {
+    /// The project's change time the count was taken at. A project that has
+    /// changed since is counted again.
+    taken_at: Option<Option<SystemTime>>,
+    commits: Option<u64>,
+    in_flight: bool,
+}
+
+/// Commit counts for the projects this page offers, kept between requests so
+/// a list that is read again starts no process for a project that has not
+/// changed.
+struct Counts {
+    known: Mutex<HashMap<PathBuf, Counted>>,
+    gate: tokio::sync::Semaphore,
+    /// Bumped whenever a count arrives, for a request waiting on one.
+    moved: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for Counts {
+    fn default() -> Self {
+        Self {
+            known: Mutex::default(),
+            gate: tokio::sync::Semaphore::new(GIT_AT_ONCE),
+            moved: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+impl Counts {
+    /// The count held for a project, and whether a newer one is on its way.
+    fn held(&self, path: &Path) -> (Option<u64>, bool) {
+        locked(&self.known)
+            .get(path)
+            .map_or((None, false), |counted| {
+                (counted.commits, counted.in_flight)
+            })
+    }
+}
+
+/// Have Git count the commits of the project at `path`, unless a count is
+/// held for it as it was at `changed` or one is already being taken. The
+/// count is taken by a task of its own, so it outlasts the request that
+/// asked and is there for the next one.
+fn count_commits(hub: &Arc<Hub>, path: &Path, changed: Option<SystemTime>) {
+    {
+        let mut known = locked(&hub.home.counts.known);
+        if known.len() >= COUNTS_KEPT && !known.contains_key(path) {
+            known.retain(|_, counted| counted.in_flight);
+        }
+        let counted = known.entry(path.to_path_buf()).or_default();
+        if counted.in_flight || counted.taken_at == Some(changed) {
+            return;
+        }
+        counted.in_flight = true;
+    }
+    let (hub, path) = (hub.clone(), path.to_path_buf());
+    tokio::spawn(async move {
+        let counts = &hub.home.counts;
+        let commits = match counts.gate.acquire().await {
+            Ok(_one_at_a_time) => git_commits(&path, GIT_PATIENCE).await,
+            Err(_) => None,
+        };
+        if let Some(counted) = locked(&counts.known).get_mut(&path) {
+            *counted = Counted {
+                taken_at: Some(changed),
+                commits,
+                in_flight: false,
+            };
+        }
+        counts.moved.send_modify(|version| *version += 1);
+    });
+}
+
+impl Home {
+    /// What a look around the home directory finds, from the last look when
+    /// that was within [`LOOK_KEPT`]. Blocking.
+    fn looked_around(&self) -> Arc<Look> {
+        if let Some((looked, look)) = locked(&self.look).as_ref() {
+            if looked.elapsed() < LOOK_KEPT {
+                return look.clone();
+            }
+        }
+        // The resolved form of the home directory, so that what is found is
+        // named the way the registry and `inspect` name it.
+        let home = locked(&self.looks_in)
+            .clone()
+            .or_else(|| homes().last().cloned());
+        let look = Arc::new(match home {
+            Some(home) => look_around(&home, std::time::Instant::now() + LOOK_BUDGET),
+            None => Look::default(),
+        });
+        *locked(&self.look) = Some((std::time::Instant::now(), look.clone()));
+        look
+    }
+
+    /// Look around `home` in place of the home directory.
+    #[cfg(test)]
+    fn look_in(&self, home: &Path) {
+        *locked(&self.looks_in) = Some(home.to_path_buf());
+        *locked(&self.look) = None;
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidatesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// The projects on this machine a person is likely to want in Kin, most
+/// recently changed first, each described as `inspect` describes it.
+///
+/// Looking is bounded and its result is kept for a while, so a large disk
+/// costs a request no more than a small one. What each project is, and what
+/// may be done with it, is read again for every answer, so a project added
+/// a moment ago says so. Commit counts come from Git at its own pace: the
+/// ones not known yet are left out, and `counting` says how many are coming.
+async fn candidates(State(hub): State<Arc<Hub>>, Query(query): Query<CandidatesQuery>) -> Response {
+    let limit = query
+        .limit
+        .unwrap_or(CANDIDATES_DEFAULT)
+        .clamp(1, CANDIDATES_MAX);
+    let reading = {
+        let hub = hub.clone();
+        tokio::task::spawn_blocking(move || {
+            let look = hub.home.looked_around();
+            let registered = hub.catalog.registered_keys();
+            let shown: Vec<(Spotted, Place, bool)> = look
+                .spotted
+                .iter()
+                .take(limit)
+                .filter_map(|spotted| {
+                    // Read as `inspect` reads a location a person typed. A
+                    // project that has gone since the look is left out.
+                    let place = look_at(&spotted.path.to_string_lossy()).ok()?;
+                    let known = registered.contains(&repository_key(&place.path));
+                    matches!(place.kind, Kind::Kin | Kind::Git | Kind::Plain)
+                        .then(|| (spotted.clone(), place, known))
+                })
+                .collect();
+            (look.spotted.len(), look.complete, shown)
+        })
+        .await
+    };
+    let (found, complete, shown) = match reading {
+        Ok(reading) => reading,
+        Err(error) => return refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    let counted: Vec<&Path> = shown
+        .iter()
+        .filter(|(_, place, _)| place.kind == Kind::Git)
+        .map(|(spotted, place, _)| {
+            count_commits(&hub, &place.path, spotted.changed);
+            place.path.as_path()
+        })
+        .collect();
+    let counts = &hub.home.counts;
+    let mut moved = counts.moved.subscribe();
+    let deadline = tokio::time::Instant::now() + COUNT_WAIT;
+    let counting = loop {
+        let counting = counted.iter().filter(|path| counts.held(path).1).count();
+        if counting == 0
+            || tokio::time::timeout_at(deadline, moved.changed())
+                .await
+                .is_err()
+        {
+            break counting;
+        }
+    };
+    let rows: Vec<Value> = shown
+        .iter()
+        .map(|(spotted, place, registered)| {
+            let mut row = described(&hub, place, *registered);
+            if let Some(changed) = spotted.changed {
+                row["modified_at"] = json!(chrono::DateTime::<chrono::Utc>::from(changed)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            }
+            if place.kind == Kind::Git {
+                let commits = counts.held(&place.path).0;
+                if let Some(git) = git_block(place.branch.as_deref(), commits) {
+                    row["git"] = git;
+                }
+            }
+            row
+        })
+        .collect();
+    Json(json!({
+        "schema": "kin.workspace.home-candidates.v1",
+        "read_at": now(),
+        "candidates": rows,
+        "found": found,
+        "complete": complete,
+        "counting": counting,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -510,15 +1020,18 @@ async fn relay<R: AsyncRead + Unpin>(
 /// Run `program` to its end and answer its exit status, handing `said` each
 /// line it prints and whether the line came on its error stream.
 ///
-/// This is the one place this page starts a process, and it starts two: this
-/// same Kin binary, to add a repository exactly as a terminal would, and Git,
-/// to count a project's commits before it is added. Neither answers a
-/// question about a repository's code.
-async fn run_child(
+/// This is the one place the local app starts a process, and it starts two:
+/// this same Kin binary, to add a repository or write a Git projection
+/// exactly as a terminal would, and Git, to count a project's commits before
+/// it is added and to carry a published branch to a Git remote. Neither
+/// answers a question about a repository's code. `environment` is set on the
+/// child over what it inherits.
+pub(super) async fn run_child(
     program: &OsStr,
     arguments: &[OsString],
     directory: Option<&Path>,
     outlives_request: bool,
+    environment: &[(&str, &str)],
     said: &(dyn Fn(bool, &str) + Send + Sync),
 ) -> std::io::Result<Option<i32>> {
     let spawner = kin_io::Spawner::new(&kin_io::Grant::ambient());
@@ -526,6 +1039,7 @@ async fn run_child(
     command
         .args(arguments)
         .env("NO_COLOR", "1")
+        .envs(environment.iter().copied())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -547,9 +1061,9 @@ async fn run_child(
 }
 
 /// How many commits Git reaches from every ref of the project at
-/// `directory`, when it can say within [`GIT_BUDGET`]. The same count `kin
-/// init` opens with, asked only to word the add flow.
-async fn git_commits(directory: &Path) -> Option<u64> {
+/// `directory`, when it can say within `budget`. The same count `kin init`
+/// opens with, asked only to word the add flow.
+async fn git_commits(directory: &Path, budget: Duration) -> Option<u64> {
     let printed = Mutex::new(String::new());
     let keep = |errors: bool, line: &str| {
         if !errors {
@@ -558,8 +1072,15 @@ async fn git_commits(directory: &Path) -> Option<u64> {
     };
     let arguments = ["rev-list", "--count", "--all"].map(OsString::from);
     let ended = tokio::time::timeout(
-        GIT_BUDGET,
-        run_child(OsStr::new("git"), &arguments, Some(directory), false, &keep),
+        budget,
+        run_child(
+            OsStr::new("git"),
+            &arguments,
+            Some(directory),
+            false,
+            &[],
+            &keep,
+        ),
     )
     .await
     .ok()?
@@ -953,7 +1474,7 @@ fn serve(hub: &Hub, layout: kin_core::KinLayout) -> RepositoryEntry {
 async fn run_kin(hub: Arc<Hub>, operation: Arc<Operation>, arguments: Vec<OsString>) {
     let said = |errors: bool, line: &str| operation.say(errors, line);
     let ended = match std::env::current_exe() {
-        Ok(kin) => run_child(kin.as_os_str(), &arguments, None, true, &said).await,
+        Ok(kin) => run_child(kin.as_os_str(), &arguments, None, true, &[], &said).await,
         Err(error) => Err(error),
     };
     let failed = |detail: String| Outcome::Failed {
@@ -1183,13 +1704,236 @@ async fn add(
 /// The most coding agents one request may name. Kin knows fewer.
 const CLIENTS_PER_REQUEST: usize = 16;
 
-/// Every coding agent Kin can connect, as `kin setup clients --json` prints
-/// it, from the same function. Reads only.
-async fn clients() -> Response {
-    match tokio::task::spawn_blocking(super::setup::clients_report).await {
-        Ok(report) => Json(report).into_response(),
-        Err(error) => refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+/// One coding agent session a repository showed this server: its daemon
+/// listed it as connected, or its history records a change the session made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionSeen {
+    /// The coding agent, by the id `kin setup clients` lists it by.
+    client: &'static str,
+    /// The repository it worked in, by key and by name.
+    key: String,
+    name: String,
+    /// When it was last known to do anything.
+    at: chrono::DateTime<chrono::Utc>,
+    /// `active` or `idle` while the repository's daemon lists it, and
+    /// nothing once it does not.
+    listed: Option<&'static str>,
+}
+
+impl SessionSeen {
+    fn state(&self) -> &'static str {
+        self.listed.unwrap_or("ended")
     }
+}
+
+/// Keep what is remembered inside its bound, dropping the session that
+/// ended longest ago.
+fn bound_sessions(sessions: &mut HashMap<String, SessionSeen>) {
+    while sessions.len() > SESSIONS_KEPT {
+        let Some(oldest) = sessions
+            .iter()
+            .filter(|(_, seen)| seen.listed.is_none())
+            .min_by_key(|(_, seen)| seen.at)
+            .map(|(session, _)| session.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+}
+
+/// Take in what one repository's daemon lists as connected. `None` says no
+/// daemon is running for the repository, so no session of it is still
+/// connected. An answer that is not a list says nothing either way.
+fn sessions_listed(
+    sessions: &mut HashMap<String, SessionSeen>,
+    key: &str,
+    name: &str,
+    answer: Option<&Value>,
+) {
+    let agents: &[Value] = match answer {
+        Some(answer) => match answer["agents"].as_array() {
+            Some(agents) => agents,
+            None => return,
+        },
+        None => &[],
+    };
+    let mut listed = Vec::new();
+    for agent in agents {
+        let Some(session) = agent["session_id"].as_str().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        listed.push(session.clone());
+        let Some(client) = super::workspace_agents::agent_client_id(
+            agent["vendor"].as_str().unwrap_or_default(),
+            agent["client"].as_str().unwrap_or_default(),
+        ) else {
+            continue;
+        };
+        let at = ["last_activity_at", "started_at"]
+            .iter()
+            .find_map(|field| recorded_time(agent[*field].as_str()?))
+            .unwrap_or_else(chrono::Utc::now);
+        let state = if agent["state"] == "active" {
+            "active"
+        } else {
+            "idle"
+        };
+        let seen = sessions.entry(session).or_insert_with(|| SessionSeen {
+            client,
+            key: key.to_string(),
+            name: name.to_string(),
+            at,
+            listed: None,
+        });
+        seen.client = client;
+        seen.key = key.to_string();
+        seen.name = name.to_string();
+        seen.at = seen.at.max(at);
+        seen.listed = Some(state);
+    }
+    for (session, seen) in sessions.iter_mut() {
+        if seen.key == key && !listed.contains(session) {
+            seen.listed = None;
+        }
+    }
+    bound_sessions(sessions);
+}
+
+/// Take in one recorded change of a repository: when a coding agent made
+/// it, its session was at work in that repository then.
+fn session_committed(
+    sessions: &mut HashMap<String, SessionSeen>,
+    key: &str,
+    name: &str,
+    author: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(author) = super::workspace_agents::agent_author(author) else {
+        return;
+    };
+    let Some(client) = author.client else {
+        return;
+    };
+    let seen = sessions
+        .entry(author.session)
+        .or_insert_with(|| SessionSeen {
+            client,
+            key: key.to_string(),
+            name: name.to_string(),
+            at,
+            listed: None,
+        });
+    seen.at = seen.at.max(at);
+    bound_sessions(sessions);
+}
+
+/// The newest session of each coding agent, as the page is told of it. A
+/// session still connected leads one that ended at the same moment.
+fn last_sessions(sessions: &HashMap<String, SessionSeen>) -> HashMap<&'static str, Value> {
+    let mut newest: HashMap<&'static str, &SessionSeen> = HashMap::new();
+    for seen in sessions.values() {
+        let rank = |seen: &SessionSeen| (seen.at, seen.listed.is_some());
+        let kept = newest.entry(seen.client).or_insert(seen);
+        if rank(seen) > rank(kept) {
+            *kept = seen;
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(client, seen)| {
+            let last = json!({
+                "repository": {
+                    "key": seen.key,
+                    "name": seen.name,
+                    "url": format!("/repositories/{}/workspace/", seen.key),
+                },
+                "at": seen.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "state": seen.state(),
+            });
+            (client, last)
+        })
+        .collect()
+}
+
+/// Read which coding agents one repository has seen, when its daemon is
+/// already running: the sessions it lists now, and the agents behind its
+/// newest changes. A repository that is not running is not started. It is
+/// only noted that nothing is connected to it.
+async fn read_sessions(hub: &Hub, listed: &Listed) {
+    let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
+    let (key, name) = (&listed.entry.key, &listed.entry.name);
+    let client = match tokio::time::timeout_at(deadline, running_daemon(&listed.layout)).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            sessions_listed(&mut locked(&hub.home.sessions), key, name, None);
+            return;
+        }
+        // Not known in time, which says nothing about what is connected.
+        Err(_) => return,
+    };
+    let newest = super::log::LogRequest {
+        count: SESSION_CHANGES_READ,
+        skip: 0,
+    };
+    let (agents, changes) = tokio::join!(
+        tokio::time::timeout_at(deadline, client.agents()),
+        tokio::time::timeout_at(deadline, client.log(&newest)),
+    );
+    let mut sessions = locked(&hub.home.sessions);
+    if let Ok(Ok(agents)) = &agents {
+        sessions_listed(&mut sessions, key, name, Some(agents));
+    }
+    for entry in changes
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|answer| answer.report)
+        .into_iter()
+        .flat_map(|report| report.entries)
+    {
+        session_committed(
+            &mut sessions,
+            key,
+            name,
+            &entry.author.to_string(),
+            entry.timestamp.0,
+        );
+    }
+}
+
+/// Every coding agent Kin can connect, as `kin setup clients --json` prints
+/// it, from the same function, and for each the last session Kin has a
+/// record of on this machine: which repository it worked in, when, and
+/// whether it is still connected. `null` when Kin has no record of one.
+///
+/// The record is what the repositories that are running say now, the agents
+/// behind their newest changes, and what this server has seen since it
+/// started. Reads only, and no repository is started to answer.
+async fn clients(State(hub): State<Arc<Hub>>) -> Response {
+    let catalog = hub.catalog.clone();
+    let reading =
+        tokio::task::spawn_blocking(move || (super::setup::clients_report(), catalog.read())).await;
+    let (mut report, listing) = match reading {
+        Ok(reading) => reading,
+        Err(error) => return refused(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    futures_util::future::join_all(
+        listing
+            .repositories
+            .iter()
+            .map(|listed| read_sessions(&hub, listed)),
+    )
+    .await;
+    let last = last_sessions(&locked(&hub.home.sessions));
+    for client in report["clients"].as_array_mut().into_iter().flatten() {
+        let session = client["id"]
+            .as_str()
+            .and_then(|id| last.get(id))
+            .cloned()
+            .unwrap_or(Value::Null);
+        client["last_session"] = session;
+    }
+    Json(report).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1411,14 +2155,48 @@ struct Reading {
     head_change: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     /// The generation `head_change` was read at.
     head_generation: Option<Generation>,
+    /// The last count this server read, at any generation: whether the
+    /// working copy held work, how many entities it touched, and when. Kept
+    /// so a row whose daemon stops answering says what was last known.
+    counted: Option<(bool, usize, chrono::DateTime<chrono::Utc>)>,
     in_flight: bool,
     /// A read that failed is not started again before this.
     retry_after: Option<tokio::time::Instant>,
 }
 
+/// What a repository's daemon last told this server about its repository,
+/// and when. A daemon that is busy, wedged or stopped leaves this as it
+/// was, so the row says what Kin last knew instead of dropping to saying
+/// that nothing is in motion.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Known {
+    /// When the daemon last answered this server.
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The generations its branch listing was last read at.
+    generation: Option<Generation>,
+    branch: Option<String>,
+    agents: Option<Value>,
+    merge_in_progress: Option<bool>,
+    activity: Option<super::daemon_activity::DaemonActivity>,
+}
+
+/// The reading of a daemon that runs in the background of the requests that
+/// want it.
+#[derive(Default)]
+struct Asking {
+    in_flight: bool,
+    /// When the running reading started.
+    started: Option<tokio::time::Instant>,
+    /// When the last reading finished, and whether the daemon answered it.
+    finished: Option<(tokio::time::Instant, bool)>,
+}
+
 struct Slot {
     reading: Mutex<Reading>,
-    /// Bumped whenever `reading` gains something, for a request waiting on it.
+    known: Mutex<Known>,
+    asking: Mutex<Asking>,
+    /// Bumped whenever `reading`, `known` or `asking` gains something, for a
+    /// request waiting on it.
     moved: tokio::sync::watch::Sender<u64>,
 }
 
@@ -1426,6 +2204,8 @@ impl Default for Slot {
     fn default() -> Self {
         Self {
             reading: Mutex::default(),
+            known: Mutex::default(),
+            asking: Mutex::default(),
             moved: tokio::sync::watch::channel(0).0,
         }
     }
@@ -1523,6 +2303,9 @@ async fn read_repository(client: DaemonClient, slot: Arc<Slot>) {
                 reading.differs = reading
                     .differs
                     .map(|dirty| differs_after_count(dirty, changed));
+                reading.counted = reading
+                    .differs
+                    .map(|differs| (differs, changed, chrono::Utc::now()));
             }
             if let Ok(Some(made)) = head {
                 reading.head_generation = Some(generation);
@@ -1606,10 +2389,37 @@ fn last_change(
     }
 }
 
-/// What a running daemon said about its repository. A reading that did not
-/// arrive in time is left out or said to be unknown, never guessed.
+/// Whether a repository's daemon answered for one reading of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// It answered, for this request or a moment before it.
+    Answering,
+    /// It is running and has not answered for a while.
+    NotAnswering,
+    /// No daemon is running for the repository.
+    Stopped,
+}
+
+impl Reach {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Answering => "answering",
+            Self::NotAnswering => "not_answering",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// What a row says about a repository's daemon. A reading that did not
+/// arrive in time is what the daemon last told this server, with when it
+/// told it, or is left out; it is never guessed and never dropped to
+/// "nothing in motion".
 struct Observed {
     running: bool,
+    reach: Reach,
+    /// When the branch, working copy, agents and merge the row carries were
+    /// last read, when that was not for this request.
+    known_at: Option<chrono::DateTime<chrono::Utc>>,
     branch: Option<String>,
     working: Option<Working>,
     agents: Option<Value>,
@@ -1619,14 +2429,21 @@ struct Observed {
 }
 
 /// The daemon already serving `layout`, when its recorded endpoint answers
-/// and proves it is that repository's. Reads recorded endpoint metadata and
-/// verifies health without discovery, cleanup, startup or process control.
+/// and proves it is that repository's and this release's. Reads recorded
+/// endpoint metadata and verifies health without discovery, cleanup, startup
+/// or process control, except to replace a daemon of an older release, which
+/// the page never reads through.
 async fn running_daemon(layout: &kin_core::KinLayout) -> Option<DaemonClient> {
     let (pid, port) = crate::daemon_client::repo_daemon_recorded_endpoint(layout.root());
     let port = pid.and(port).filter(|port| *port != 0)?;
-    DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), layout)
-        .await
-        .ok()
+    DaemonClient::for_workspace_page(
+        "local UI",
+        format!("http://127.0.0.1:{port}"),
+        layout,
+        Duration::from_secs(10),
+    )
+    .await
+    .ok()
 }
 
 /// Who the daemon lists as connected, by the names a reader knows them by.
@@ -1658,12 +2475,217 @@ impl Home {
     }
 }
 
+/// How long a reading of a daemon, once started, waits on it after no
+/// request is waiting on the answer any more.
+const ASK_PATIENCE: Duration = Duration::from_secs(20);
+/// A reading that finished this shortly before a request began is current
+/// enough for it, so several pages polling at once ask a daemon once.
+const ASKED_RECENTLY: Duration = Duration::from_secs(2);
+/// How long what a daemon said still counts as current when it is slow to
+/// answer again. Past this the row says what it shows was last known.
+const STILL_CURRENT: Duration = Duration::from_secs(60);
+
+/// What a row carries for a repository whose daemon did not answer this
+/// request: what the daemon last told this server, and when.
+#[derive(Debug, PartialEq)]
+struct Carried {
+    reach: Reach,
+    known_at: Option<chrono::DateTime<chrono::Utc>>,
+    branch: Option<String>,
+    working: Option<Working>,
+    agents: Option<Value>,
+    merge_in_progress: Option<bool>,
+}
+
+/// What a row says for a repository whose daemon did not answer this
+/// request. `running` is whether a daemon process is alive for it. What the
+/// daemon told this server before is said with when it was told: a busy or
+/// wedged daemon is still working in a repository that holds the same work,
+/// branch and agents, and a stopped one still leaves its work, branch and
+/// merge as they were. A stopped daemon holds no agent session, so no agent
+/// is carried for it. An answer within [`STILL_CURRENT`] is current, so the
+/// daemon still counts as answering.
+fn unanswered(
+    known: &Known,
+    counted: Option<(bool, usize, chrono::DateTime<chrono::Utc>)>,
+    running: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Carried {
+    let recent = known.at.is_some_and(|at| {
+        (now - at)
+            .to_std()
+            .ok()
+            .is_none_or(|age| age <= STILL_CURRENT)
+    });
+    let reach = if !running {
+        Reach::Stopped
+    } else if recent {
+        Reach::Answering
+    } else {
+        Reach::NotAnswering
+    };
+    let Some(at) = known.at else {
+        return Carried {
+            reach,
+            known_at: None,
+            branch: None,
+            working: None,
+            agents: None,
+            merge_in_progress: None,
+        };
+    };
+    let working = counted.map(|(differs, changed, _)| Working::Read {
+        differs,
+        changed: Some(changed),
+    });
+    // The oldest of what is carried says when the row was last known.
+    let known_at = counted.map_or(at, |(_, _, read)| read.min(at));
+    Carried {
+        reach,
+        known_at: Some(known_at),
+        branch: known.branch.clone(),
+        working,
+        agents: if reach == Reach::Stopped {
+            None
+        } else {
+            known.agents.clone()
+        },
+        merge_in_progress: known.merge_in_progress,
+    }
+}
+
+/// The active branch a listing names, without its `refs/heads/` prefix.
+fn active_branch(report: &super::branch::BranchListReport) -> Option<String> {
+    report
+        .branches
+        .iter()
+        .find(|branch| branch.active)
+        .map(|branch| {
+            let full = branch.name.to_string();
+            full.strip_prefix("refs/heads/")
+                .unwrap_or(&full)
+                .to_string()
+        })
+}
+
+/// Start counting a repository's working copy unless what it would read is
+/// already held for `wanted`, or a count is running or waiting to retry.
+fn start_reading(
+    client: &DaemonClient,
+    slot: &Arc<Slot>,
+    wanted: Option<Generation>,
+    since: tokio::time::Instant,
+) {
+    let mut reading = locked(&slot.reading);
+    let settled = matches!(
+        working_from(&reading, wanted, since),
+        Working::Read {
+            changed: Some(_),
+            ..
+        }
+    ) && wanted.is_some_and(|wanted| reading.head_generation == Some(wanted));
+    let may_start = reading
+        .retry_after
+        .is_none_or(|after| tokio::time::Instant::now() >= after);
+    if !settled && !reading.in_flight && may_start {
+        reading.in_flight = true;
+        tokio::spawn(read_repository(client.clone(), slot.clone()));
+    }
+}
+
+/// Ask a repository's running daemon what it says of its branch, its merge,
+/// its agents and what it is doing, keep each answer in `slot` as it is
+/// given, and start counting its working copy. Runs on its own, so an answer
+/// that arrives after every request stopped waiting is kept for the next.
+async fn ask_daemon(
+    hub: Arc<Hub>,
+    key: String,
+    name: String,
+    layout: kin_core::KinLayout,
+    slot: Arc<Slot>,
+) {
+    use super::daemon_activity::{read_activity, Reachability};
+
+    let started = tokio::time::Instant::now();
+    let answered = match tokio::time::timeout(ASK_PATIENCE, running_daemon(&layout)).await {
+        Ok(Some(client)) => {
+            locked(&slot.known).at = Some(chrono::Utc::now());
+            slot.announce();
+            let list = super::branch::BranchRequest::List;
+            let listing = super::conflicts::ConflictsRequest { bodies: false };
+            let root = layout.working_dir().display().to_string();
+            let (branches, conflicts, agents, activity) = tokio::join!(
+                tokio::time::timeout(ASK_PATIENCE, client.branch(&list)),
+                tokio::time::timeout(ASK_PATIENCE, client.conflicts(&listing)),
+                tokio::time::timeout(ASK_PATIENCE, client.agents()),
+                tokio::time::timeout(
+                    ASK_PATIENCE,
+                    read_activity(client.base_url().to_string(), root, Reachability::Answering),
+                ),
+            );
+            // What the list reads anyway is also what says which coding
+            // agents work here, so it is remembered for the page that asks
+            // about them.
+            if let Ok(Ok(answer)) = &agents {
+                sessions_listed(&mut locked(&hub.home.sessions), &key, &name, Some(answer));
+            }
+            let branches = branches
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|answer| answer.report);
+            let generation = branches
+                .as_ref()
+                .map(|report| (report.authority_generation, report.workspace_generation));
+            {
+                let mut known = locked(&slot.known);
+                known.at = Some(chrono::Utc::now());
+                if let Some(report) = &branches {
+                    known.generation = generation;
+                    known.branch = active_branch(report);
+                }
+                if let Some(seen) = agents
+                    .ok()
+                    .and_then(Result::ok)
+                    .as_ref()
+                    .and_then(agents_seen)
+                {
+                    known.agents = Some(seen);
+                }
+                if let Some(merging) = conflicts
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|answer| answer.report)
+                    .map(|report| {
+                        report.record.is_some_and(|record| {
+                            matches!(record.state, kin_model::MergeTransactionState::InProgress)
+                        })
+                    })
+                {
+                    known.merge_in_progress = Some(merging);
+                }
+                if let Ok(activity) = activity {
+                    known.activity = Some(activity);
+                }
+            }
+            start_reading(&client, &slot, generation, started);
+            true
+        }
+        _ => false,
+    };
+    {
+        let mut asking = locked(&slot.asking);
+        asking.in_flight = false;
+        asking.finished = Some((tokio::time::Instant::now(), answered));
+    }
+    slot.announce();
+}
+
 async fn observe(
-    hub: &Hub,
+    hub: &Arc<Hub>,
     listed: &Listed,
     standing: &kin_core::history_state::HistoryStanding,
 ) -> Observed {
-    use super::daemon_activity::{activity_without_health, read_activity, Reachability};
+    use super::daemon_activity::{activity_without_health, Reachability};
 
     let since = tokio::time::Instant::now();
     let deadline = since + OBSERVE_BUDGET;
@@ -1673,65 +2695,101 @@ async fn observe(
         .and_then(|record| recorded_time(&record.at));
     let slot = hub.home.slot(&listed.entry.key);
     let history = super::daemon_activity::running_history(standing);
-    let Ok(Some(client)) = tokio::time::timeout_at(deadline, running_daemon(&listed.layout)).await
-    else {
-        // No daemon answers. A history derivation runs in a worker of its
-        // own, so it can still be what this repository is doing.
-        let head = locked(&slot.reading).head_change;
+    let (pid, _) = crate::daemon_client::repo_daemon_recorded_endpoint(listed.layout.root());
+    let alive = pid.is_some_and(crate::daemon_client::is_process_alive);
+    if !alive {
+        // No daemon is running. A history derivation runs in a worker of
+        // its own, so it can still be what this repository is doing.
+        let known = locked(&slot.known).clone();
+        let (counted, head) = {
+            let reading = locked(&slot.reading);
+            (reading.counted, reading.head_change)
+        };
+        let carried = unanswered(&known, counted, false, chrono::Utc::now());
         return Observed {
             running: false,
-            branch: None,
-            working: None,
-            agents: None,
-            merge_in_progress: None,
+            reach: carried.reach,
+            known_at: carried.known_at,
+            branch: carried.branch,
+            working: carried.working,
+            agents: carried.agents,
+            merge_in_progress: carried.merge_in_progress,
             activity: activity_without_health(Reachability::Gone, history.as_ref()),
             changed_at: last_change(recorded, head, false),
         };
-    };
-    let list = super::branch::BranchRequest::List;
-    let listing = super::conflicts::ConflictsRequest { bodies: false };
-    let root = listed.layout.working_dir().display().to_string();
-    let (branches, conflicts, agents, activity) = tokio::join!(
-        tokio::time::timeout_at(deadline, client.branch(&list)),
-        tokio::time::timeout_at(deadline, client.conflicts(&listing)),
-        tokio::time::timeout_at(deadline, client.agents()),
-        tokio::time::timeout_at(
-            deadline,
-            read_activity(client.base_url().to_string(), root, Reachability::Answering),
-        ),
-    );
-    let branches = branches
-        .ok()
-        .and_then(Result::ok)
-        .and_then(|answer| answer.report);
-    let wanted = branches
-        .as_ref()
-        .map(|report| (report.authority_generation, report.workspace_generation));
+    }
 
-    // Start the reader unless what it would read is already held for this
-    // generation, then wait for it only as long as this request has.
+    // Ask the daemon in the background unless a reading is under way or one
+    // just finished, then wait for it only as long as this request has.
     let mut moved = slot.moved.subscribe();
     {
-        let mut reading = locked(&slot.reading);
-        let settled = matches!(
-            working_from(&reading, wanted, since),
-            Working::Read {
-                changed: Some(_),
-                ..
-            }
-        ) && wanted.is_some_and(|wanted| reading.head_generation == Some(wanted));
-        let may_start = reading
-            .retry_after
-            .is_none_or(|after| tokio::time::Instant::now() >= after);
-        if !settled && !reading.in_flight && may_start {
-            reading.in_flight = true;
-            tokio::spawn(read_repository(client.clone(), slot.clone()));
+        let mut asking = locked(&slot.asking);
+        let recent = asking.finished.is_some_and(|(at, answered)| {
+            answered && since.saturating_duration_since(at) <= ASKED_RECENTLY
+        });
+        if !asking.in_flight && !recent {
+            asking.in_flight = true;
+            asking.started = Some(since);
+            tokio::spawn(ask_daemon(
+                hub.clone(),
+                listed.entry.key.clone(),
+                listed.entry.name.clone(),
+                listed.layout.clone(),
+                slot.clone(),
+            ));
         }
     }
+    let fresh = loop {
+        {
+            let asking = locked(&slot.asking);
+            match asking.finished {
+                Some((at, answered)) if since.saturating_duration_since(at) <= ASKED_RECENTLY => {
+                    break answered;
+                }
+                _ if !asking.in_flight => break false,
+                _ => {}
+            }
+        }
+        if tokio::time::timeout_at(deadline, moved.changed())
+            .await
+            .is_err()
+        {
+            break false;
+        }
+    };
+    if !fresh {
+        let known = locked(&slot.known).clone();
+        let (counted, head) = {
+            let reading = locked(&slot.reading);
+            (reading.counted, reading.head_change)
+        };
+        let carried = unanswered(&known, counted, true, chrono::Utc::now());
+        let activity = match (&carried.reach, &known.activity) {
+            (Reach::Answering, Some(activity)) => activity.clone(),
+            _ => activity_without_health(Reachability::NotAnswering, history.as_ref()),
+        };
+        return Observed {
+            running: true,
+            reach: carried.reach,
+            known_at: carried.known_at,
+            branch: carried.branch,
+            working: Some(carried.working.unwrap_or(Working::Unknown)),
+            agents: carried.agents,
+            merge_in_progress: carried.merge_in_progress,
+            activity,
+            changed_at: last_change(recorded, head, false),
+        };
+    }
+
+    // The daemon answered. Wait for the count of its working copy at the
+    // generation it answered at, as long as this request has.
+    let known = locked(&slot.known).clone();
+    let wanted = known.generation;
+    let counting_since = locked(&slot.asking).started.unwrap_or(since);
     let (working, head, head_is_current) = loop {
         {
             let reading = locked(&slot.reading);
-            let working = working_from(&reading, wanted, since);
+            let working = working_from(&reading, wanted, counting_since);
             let counted = matches!(
                 working,
                 Working::Read {
@@ -1751,7 +2809,7 @@ async fn observe(
             let reading = locked(&slot.reading);
             let current = wanted.is_some_and(|wanted| reading.head_generation == Some(wanted));
             break (
-                working_from(&reading, wanted, since),
+                working_from(&reading, wanted, counting_since),
                 reading.head_change,
                 current,
             );
@@ -1759,34 +2817,13 @@ async fn observe(
     };
     Observed {
         running: true,
-        branch: branches.as_ref().and_then(|report| {
-            report
-                .branches
-                .iter()
-                .find(|branch| branch.active)
-                .map(|branch| {
-                    let full = branch.name.to_string();
-                    full.strip_prefix("refs/heads/")
-                        .unwrap_or(&full)
-                        .to_string()
-                })
-        }),
+        reach: Reach::Answering,
+        known_at: None,
+        branch: known.branch,
         working: Some(working),
-        agents: agents
-            .ok()
-            .and_then(Result::ok)
-            .as_ref()
-            .and_then(agents_seen),
-        merge_in_progress: conflicts
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|answer| answer.report)
-            .map(|report| {
-                report.record.is_some_and(|record| {
-                    matches!(record.state, kin_model::MergeTransactionState::InProgress)
-                })
-            }),
-        activity: activity.unwrap_or_else(|_| {
+        agents: known.agents,
+        merge_in_progress: known.merge_in_progress,
+        activity: known.activity.unwrap_or_else(|| {
             activity_without_health(Reachability::NotAnswering, history.as_ref())
         }),
         changed_at: last_change(recorded, head, head_is_current),
@@ -1844,6 +2881,7 @@ async fn home(State(hub): State<Arc<Hub>>) -> Response {
                     .changed_at
                     .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
                 "runtime": if observed.running { "running" } else { "idle" },
+                "reach": observed.reach.word(),
                 "activity": observed.activity,
                 "history": super::workspace_ui::history_json(standing),
             });
@@ -1852,6 +2890,9 @@ async fn home(State(hub): State<Arc<Hub>>) -> Response {
             }
             if let Some(host) = &entry.host {
                 row["host"] = json!(host);
+            }
+            if let Some(at) = observed.known_at {
+                row["known_at"] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
             }
             if let Some(branch) = observed.branch {
                 row["branch"] = json!(branch);
@@ -2229,6 +3270,80 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_that_does_not_answer_leaves_what_it_last_said_with_when_it_said_it() {
+        let at = |text: &str| recorded_time(text).unwrap();
+        let answered = at("2026-10-14T09:12:00Z");
+        let counted = at("2026-10-14T09:11:30Z");
+        let agents = json!({ "active": 1, "connected": 1, "names": ["Claude Code"] });
+        let known = Known {
+            at: Some(answered),
+            generation: Some((7, 9)),
+            branch: Some("main".to_string()),
+            agents: Some(agents.clone()),
+            merge_in_progress: Some(false),
+            activity: None,
+        };
+        let work = Some((true, 4, counted));
+        let later = at("2026-10-14T09:40:00Z");
+
+        // Busy or wedged: still running, so everything it said is carried,
+        // said to be as of the oldest reading carried, and never dropped to
+        // "nothing in motion".
+        let busy = unanswered(&known, work, true, later);
+        assert_eq!(
+            busy,
+            Carried {
+                reach: Reach::NotAnswering,
+                known_at: Some(counted),
+                branch: Some("main".to_string()),
+                working: Some(Working::Read {
+                    differs: true,
+                    changed: Some(4)
+                }),
+                agents: Some(agents.clone()),
+                merge_in_progress: Some(false),
+            }
+        );
+        assert_eq!(
+            busy.working.unwrap().json(),
+            json!({ "differs": true, "changed": 4 })
+        );
+
+        // Stopped: the work, branch and merge stay as they were, but no
+        // agent session can outlive the daemon that held it.
+        let stopped = unanswered(&known, work, false, later);
+        assert_eq!(stopped.reach, Reach::Stopped);
+        assert_eq!(stopped.agents, None);
+        assert_eq!(stopped.branch.as_deref(), Some("main"));
+        assert_eq!(stopped.known_at, Some(counted));
+
+        // Slow to answer again a moment after it last did: still current.
+        let moment = at("2026-10-14T09:12:40Z");
+        let slow = unanswered(&known, None, true, moment);
+        assert_eq!(slow.reach, Reach::Answering);
+        assert_eq!(slow.known_at, Some(answered));
+        assert_eq!(
+            slow.working, None,
+            "a working copy never counted is not guessed"
+        );
+
+        // Never heard from: nothing is carried and nothing is claimed.
+        let never = unanswered(&Known::default(), None, true, later);
+        assert_eq!(never.reach, Reach::NotAnswering);
+        assert_eq!(never.known_at, None);
+        assert_eq!(never.branch, None);
+        assert_eq!(never.agents, None);
+        assert_eq!(
+            unanswered(&Known::default(), None, false, later).reach,
+            Reach::Stopped
+        );
+        assert_eq!(
+            [Reach::Answering, Reach::NotAnswering, Reach::Stopped].map(Reach::word),
+            ["answering", "not_answering", "stopped"]
+        );
+    }
+
+    #[test]
     fn a_stage_is_read_from_what_a_conversion_reports_and_never_from_its_result() {
         // Every step Kin's conversion announces has a stage here, so a new
         // step cannot arrive unstaged.
@@ -2431,7 +3546,7 @@ mod tests {
         let keep = |errors: bool, line: &str| locked(&heard).push((errors, line.to_string()));
         let script = "printf 'one\\rtwo\\n'; printf 'refused\\n' >&2; exit 7";
         let arguments = ["-c", script].map(OsString::from);
-        let ended = run_child(OsStr::new("sh"), &arguments, None, false, &keep)
+        let ended = run_child(OsStr::new("sh"), &arguments, None, false, &[], &keep)
             .await
             .unwrap();
         assert_eq!(ended, Some(7));
@@ -2444,5 +3559,373 @@ mod tests {
         assert_eq!(printed, ["one", "two"]);
         assert!(heard.contains(&(true, "refused".to_string())));
         assert!(exit_note(7).is_some() && exit_note(8).is_some() && exit_note(1).is_none());
+    }
+
+    /// A home directory with projects kept the ways people keep them, and
+    /// with the places a look must leave alone.
+    fn a_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let make = |path: &str| std::fs::create_dir_all(home.path().join(path)).unwrap();
+        let write = |path: &str, text: &str| std::fs::write(home.path().join(path), text).unwrap();
+        // A Git project in a code root, with a dependency tree of its own.
+        make("GitHub/alpha/.git");
+        write("GitHub/alpha/.git/HEAD", "ref: refs/heads/trunk\n");
+        make("GitHub/alpha/node_modules/dep/.git");
+        // A project Git does not hold, kept under its owner's name.
+        make("GitHub/owner/beta");
+        write("GitHub/owner/beta/Cargo.toml", "");
+        // Three levels down is further than a look goes.
+        make("GitHub/owner/group/deep/.git");
+        // What tools install, and a directory that is no project.
+        make("GitHub/node_modules/pkg/.git");
+        make("GitHub/notes");
+        write("GitHub/notes/todo.txt", "");
+        write("GitHub/readme.txt", "");
+        // One more working copy of a project that is kept elsewhere.
+        make("GitHub/alpha-second");
+        write(
+            "GitHub/alpha-second/.git",
+            "gitdir: ../alpha/.git/worktrees/second\n",
+        );
+        write("GitHub/alpha-second/Cargo.toml", "");
+        // A project directly in the home directory, and one inside a
+        // directory there that is not named like a code root.
+        make("loose/.git");
+        make("stuff/inner/.git");
+        // Where a person's documents are, and a hidden directory.
+        make("Documents/report/.git");
+        make(".cache/tool/.git");
+        home
+    }
+
+    fn found_in(home: &Path, look: &Look) -> Vec<String> {
+        look.spotted
+            .iter()
+            .map(|spotted| {
+                spotted
+                    .path
+                    .strip_prefix(home)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_look_finds_projects_where_people_keep_them_and_nowhere_else() {
+        let home = a_home();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            home.path().join("GitHub/alpha"),
+            home.path().join("GitHub/linked"),
+        )
+        .unwrap();
+        let far = std::time::Instant::now() + Duration::from_secs(60);
+        let look = look_around(home.path(), far);
+        let mut found = found_in(home.path(), &look);
+        found.sort();
+        assert_eq!(found, ["GitHub/alpha", "GitHub/owner/beta", "loose"]);
+        assert!(look.complete);
+
+        // The most recently changed project leads, whichever place holds it.
+        let day = Duration::from_secs(24 * 60 * 60);
+        let age = |path: &str, days: u32| {
+            let time = filetime::FileTime::from_system_time(SystemTime::now() - day * days);
+            filetime::set_file_mtime(home.path().join(path), time).unwrap();
+        };
+        for (path, days) in [
+            ("GitHub/alpha", 9),
+            ("GitHub/alpha/.git", 2),
+            ("GitHub/owner/beta", 5),
+            ("loose", 7),
+            ("loose/.git", 8),
+        ] {
+            age(path, days);
+        }
+        let look = look_around(home.path(), far);
+        assert_eq!(
+            found_in(home.path(), &look),
+            ["GitHub/alpha", "GitHub/owner/beta", "loose"]
+        );
+
+        // A look that is out of time says it did not finish, and guesses
+        // nothing.
+        let late = look_around(home.path(), std::time::Instant::now());
+        assert!(late.spotted.is_empty() && !late.complete);
+        // A home directory that cannot be read holds no project.
+        assert!(look_around(&home.path().join("absent"), far)
+            .spotted
+            .is_empty());
+    }
+
+    #[test]
+    fn a_directory_is_a_project_by_the_name_of_what_is_at_its_top() {
+        for name in [
+            "package.json",
+            "Cargo.toml",
+            "go.mod",
+            "Makefile",
+            "App.xcodeproj",
+        ] {
+            assert!(marks_a_project(OsStr::new(name)), "{name}");
+        }
+        for name in ["notes.txt", "src", "README.md", "cargo.toml.bak"] {
+            assert!(!marks_a_project(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "node_modules",
+            "target",
+            "Library",
+            "Documents",
+            ".git",
+            ".venv",
+        ] {
+            assert!(!looked_into(OsStr::new(name)), "{name}");
+        }
+        assert!(looked_into(OsStr::new("GitHub")) && looked_into(OsStr::new("kin")));
+    }
+
+    /// The projects a person is likely to add are listed without a location
+    /// being typed, each described as `inspect` describes it.
+    #[tokio::test]
+    async fn candidates_are_listed_newest_first_with_what_may_be_done_with_each() {
+        let home = a_home();
+        let day = Duration::from_secs(24 * 60 * 60);
+        for (path, days) in [
+            ("GitHub/alpha", 1),
+            ("GitHub/alpha/.git", 1),
+            ("GitHub/owner/beta", 2),
+            ("loose", 3),
+            ("loose/.git", 3),
+        ] {
+            let time = filetime::FileTime::from_system_time(SystemTime::now() - day * days);
+            filetime::set_file_mtime(home.path().join(path), time).unwrap();
+        }
+        let listener = review_ui::bind(Some(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hub = Hub::new(port, super::super::workspace_ui::empty_catalog(), None);
+        hub.home.look_in(home.path());
+        let router = super::super::workspace_ui::hub_router(hub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let origin = format!("http://127.0.0.1:{port}");
+
+        let listed: Value = client
+            .get(format!("{origin}/api/home/candidates"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["schema"], "kin.workspace.home-candidates.v1");
+        assert_eq!(listed["found"], 3);
+        assert_eq!(listed["complete"], true);
+        let rows = listed["candidates"].as_array().unwrap();
+        let names: Vec<&str> = rows.iter().filter_map(|row| row["name"].as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "loose"]);
+        let alpha = &rows[0];
+        assert_eq!(alpha["kind"], "git");
+        assert_eq!(alpha["git"]["branch"], "trunk");
+        assert_eq!(alpha["actions"], json!(["convert"]));
+        assert_eq!(alpha["registered"], false);
+        assert!(alpha["modified_at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z')));
+        assert!(alpha["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("Kin reads this project"));
+        // A project is added by the location this answer gives for it.
+        let resolved = home.path().canonicalize().unwrap();
+        assert_eq!(
+            alpha["path"],
+            resolved.join("GitHub/alpha").display().to_string()
+        );
+        let beta = &rows[1];
+        assert_eq!(beta["kind"], "plain");
+        assert_eq!(beta["actions"], json!(["convert"]));
+        assert!(beta.get("git").is_none());
+        // A caller may ask for fewer, and is still told how many were found.
+        let settled: Value = client
+            .get(format!("{origin}/api/home/candidates?limit=1"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(settled["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(settled["found"], 3);
+        assert!(settled["counting"].is_u64());
+
+        let refused = client
+            .get(format!("{origin}/api/home/candidates?path=/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    fn listed_agent(session: &str, vendor: &str, state: &str, at: &str) -> Value {
+        json!({
+            "session_id": session, "vendor": vendor, "client": vendor, "state": state,
+            "started_at": "2026-10-13T08:00:00Z", "last_activity_at": at,
+        })
+    }
+
+    #[test]
+    fn the_last_session_of_a_coding_agent_is_the_newest_any_repository_showed() {
+        let mut sessions = HashMap::new();
+        // Two repositories are running. Claude Code is at work in one, and
+        // sits idle in the other beside Codex.
+        let atlas = json!({"agents": [
+            listed_agent("S-ONE", "claude-code", "active", "2026-10-13T10:00:00Z"),
+            listed_agent("s-two", "my-helper", "active", "2026-10-13T11:00:00Z"),
+        ]});
+        let harbor = json!({"agents": [
+            listed_agent("s-three", "codex-mcp-client", "idle", "2026-10-13T09:00:00Z"),
+            listed_agent("s-four", "claude-code", "idle", "2026-10-13T09:30:00Z"),
+        ]});
+        sessions_listed(&mut sessions, "k1", "atlas", Some(&atlas));
+        sessions_listed(&mut sessions, "k2", "harbor", Some(&harbor));
+        let last = last_sessions(&sessions);
+        assert_eq!(
+            last["claude-code"],
+            json!({
+                "repository": {"key": "k1", "name": "atlas", "url": "/repositories/k1/workspace/"},
+                "at": "2026-10-13T10:00:00Z",
+                "state": "active",
+            })
+        );
+        assert_eq!(last["codex"]["state"], "idle");
+        assert_eq!(last["codex"]["repository"]["name"], "harbor");
+        // An agent Kin does not connect is no coding agent's session, and
+        // no session is named by what identifies it.
+        assert_eq!(last.len(), 2);
+        assert!(!json!(last).to_string().to_lowercase().contains("s-one"));
+
+        // A session its repository no longer lists has ended, and is still
+        // the last one known when nothing newer is.
+        sessions_listed(&mut sessions, "k1", "atlas", Some(&json!({"agents": []})));
+        let last = last_sessions(&sessions);
+        assert_eq!(last["claude-code"]["state"], "ended");
+        assert_eq!(last["claude-code"]["repository"]["name"], "atlas");
+        assert_eq!(last["claude-code"]["at"], "2026-10-13T10:00:00Z");
+
+        // An answer that is not a list says nothing either way. A repository
+        // that is no longer running has nothing connected.
+        sessions_listed(
+            &mut sessions,
+            "k2",
+            "harbor",
+            Some(&json!({"error": "starting"})),
+        );
+        assert_eq!(last_sessions(&sessions)["codex"]["state"], "idle");
+        sessions_listed(&mut sessions, "k2", "harbor", None);
+        assert_eq!(last_sessions(&sessions)["codex"]["state"], "ended");
+        assert_eq!(last_sessions(&sessions)["claude-code"]["state"], "ended");
+    }
+
+    #[test]
+    fn a_change_a_coding_agent_made_is_a_record_of_its_session() {
+        let mut sessions = HashMap::new();
+        let noon = recorded_time("2026-10-13T12:00:00Z").unwrap();
+        let author = "gemini-cli-mcp-client/Gemini <mcp-agent:s-five>";
+        session_committed(&mut sessions, "k2", "harbor", author, noon);
+        // A person's change, and an agent's that Kin does not connect.
+        session_committed(
+            &mut sessions,
+            "k2",
+            "harbor",
+            "Ada <ada@example.invalid>",
+            noon,
+        );
+        session_committed(
+            &mut sessions,
+            "k2",
+            "harbor",
+            "my-helper/x <mcp-agent:s-six>",
+            noon,
+        );
+        let last = last_sessions(&sessions);
+        assert_eq!(last.len(), 1);
+        assert_eq!(last["gemini-cli"]["state"], "ended");
+        assert_eq!(last["gemini-cli"]["at"], "2026-10-13T12:00:00Z");
+
+        // The session is still connected: its change moves when it was last
+        // at work and ends nothing.
+        let listed = json!({"agents": [
+            listed_agent("s-five", "gemini-cli-mcp-client", "idle", "2026-10-13T11:00:00Z"),
+        ]});
+        sessions_listed(&mut sessions, "k2", "harbor", Some(&listed));
+        let last = last_sessions(&sessions);
+        assert_eq!(last["gemini-cli"]["state"], "idle");
+        assert_eq!(last["gemini-cli"]["at"], "2026-10-13T12:00:00Z");
+    }
+
+    #[test]
+    fn remembered_sessions_stay_bounded_and_keep_the_connected_ones() {
+        let mut sessions = HashMap::new();
+        let connected = json!({"agents": [
+            listed_agent("still-here", "codex", "idle", "2020-01-01T00:00:00Z"),
+        ]});
+        sessions_listed(&mut sessions, "k1", "atlas", Some(&connected));
+        let start = recorded_time("2026-10-13T00:00:00Z").unwrap();
+        for index in 0..SESSIONS_KEPT + 20 {
+            let author = format!("claude-code/Claude Code <mcp-agent:ended-{index}>");
+            let at = start + chrono::Duration::seconds(index as i64);
+            session_committed(&mut sessions, "k2", "harbor", &author, at);
+        }
+        assert_eq!(sessions.len(), SESSIONS_KEPT);
+        assert!(sessions.contains_key("still-here"));
+        assert!(!sessions.contains_key("ended-0"));
+        assert!(sessions.contains_key(&format!("ended-{}", SESSIONS_KEPT + 19)));
+    }
+
+    /// The coding agents page is told, for each agent, the last session Kin
+    /// has a record of, or that it has none.
+    #[tokio::test]
+    async fn every_coding_agent_says_its_last_session_or_that_kin_has_none() {
+        let listener = review_ui::bind(Some(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hub = Hub::new(port, super::super::workspace_ui::empty_catalog(), None);
+        let working = json!({"agents": [
+            listed_agent("s-one", "claude-code", "active", "2026-10-13T10:00:00Z"),
+        ]});
+        sessions_listed(
+            &mut locked(&hub.home.sessions),
+            "k1",
+            "atlas",
+            Some(&working),
+        );
+        let router = super::super::workspace_ui::hub_router(hub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let answer: Value = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/home/clients"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(answer["schema"], "kin.setup-clients.v1");
+        let clients = answer["clients"].as_array().unwrap();
+        assert!(clients.len() >= 8);
+        for client in clients {
+            let last = client.get("last_session").expect("every agent says");
+            if client["id"] == "claude-code" {
+                assert_eq!(last["state"], "active");
+                assert_eq!(last["repository"]["name"], "atlas");
+                assert_eq!(last["at"], "2026-10-13T10:00:00Z");
+            } else {
+                assert!(last.is_null(), "{client}");
+            }
+            // What the list already said of each agent is still said.
+            assert!(client["detected"].is_boolean() && client["connected"].is_boolean());
+        }
+        server.abort();
     }
 }

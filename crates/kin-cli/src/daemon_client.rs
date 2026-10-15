@@ -33,7 +33,9 @@ use uuid::Uuid;
 mod attach_env;
 pub(crate) mod probe_process;
 pub(crate) mod process_executable;
+pub mod replacement;
 mod starting_owner;
+pub mod succession;
 #[cfg(all(test, unix))]
 pub(crate) use starting_owner::stand_in_as_starting_daemon_for_test;
 pub use starting_owner::{
@@ -78,6 +80,11 @@ pub enum AutoStartError {
     StartupTimeout(String),
     #[error("invalid .kin layout: {0}")]
     InvalidLayout(String),
+    /// An older release's daemon serves this repository. The caller replaces
+    /// it under the startup lock and starts this release's; it reaches a
+    /// caller of the crate only if that replacement could not be made.
+    #[error("an older Kin daemon (pid {pid}) serves this repository and must be replaced first")]
+    Superseded { pid: u32 },
 }
 
 impl AutoStartError {
@@ -282,6 +289,10 @@ struct SupervisorRouteResponse {
 #[derive(Debug, Deserialize)]
 struct DaemonCompatResponse {
     #[serde(default)]
+    runtime_identity: Option<kin_core::runtime_identity::RuntimeIdentity>,
+    #[serde(default)]
+    runtime_mode: Option<kin_core::runtime_identity::RuntimeMode>,
+    #[serde(default)]
     schema: String,
     graph_snapshot_version: u32,
     #[serde(default)]
@@ -449,13 +460,12 @@ pub struct DaemonClient {
     /// Carries the same endpoint authority as `client`, but never follows an
     /// HTTP redirect that could redispatch a non-idempotent mutation.
     one_dispatch_client: reqwest::Client,
-    /// The store this client's daemon serves, when one was resolvable.
-    ///
-    /// Held so that a request which goes unanswered can ask the store what
-    /// happened to its daemon instead of asserting the ordinary cause. A
-    /// transport error describes a socket; the killer leaves its evidence in
-    /// the repository, and without a root there is nowhere to read it.
-    /// `None` behaves exactly as this client behaved before it had this field.
+    runtime_namespace: kin_core::runtime_identity::RuntimeNamespace,
+    runtime_repository:
+        Option<Result<kin_core::runtime_identity::RuntimeRepositoryBinding, String>>,
+    /// The intended store supplies repository admission and daemon failure
+    /// evidence. Health diagnostics can work without it; semantic requests
+    /// require a captured repository binding.
     kin_root: Option<PathBuf>,
 }
 
@@ -540,6 +550,17 @@ impl fmt::Display for RefusedBeforeWriteError {
 }
 
 impl std::error::Error for RefusedBeforeWriteError {}
+
+/// What came of one push or pull sent once by [`DaemonClient::transfer_once`].
+#[derive(Debug)]
+pub enum TransferDispatch {
+    /// The daemon finished the command and said how it went.
+    Answered(Box<crate::commands::transfer::CommandTransferResponse>),
+    /// The daemon answered with a refusal. The command has ended there.
+    Refused { status: u16, body: String },
+    /// Nothing says how the request ended. The daemon may still be running it.
+    Lost(anyhow::Error),
+}
 
 /// Proof carried by a successful acknowledgement of a non-idempotent command.
 ///
@@ -834,7 +855,7 @@ impl DaemonClient {
     ) -> Result<Self> {
         let mut client =
             Self::from_base_url_with_token(base_url, resolve_daemon_auth_token_for_layout(layout))?;
-        client.kin_root = Some(layout.root().to_path_buf());
+        client.bind_repository(layout.root());
         Ok(client)
     }
 
@@ -864,7 +885,18 @@ impl DaemonClient {
         if let Some(token) = auth_token.as_deref() {
             refuse_local_token_leaving_loopback(&base_url, token)?;
         }
-        let headers = daemon_client_headers(auth_token, session_id)?;
+        let mut headers = daemon_client_headers(auth_token, session_id)?;
+        let mode =
+            kin_core::runtime_identity::RuntimeMode::current().map_err(anyhow::Error::msg)?;
+        let runtime_namespace =
+            kin_core::runtime_identity::RuntimeNamespace::current().map_err(anyhow::Error::msg)?;
+        headers.insert(
+            kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+            kin_core::runtime_identity::RuntimeIdentity::current()
+                .fingerprint(mode, runtime_namespace.token())
+                .parse()
+                .expect("runtime fingerprint is ASCII hex"),
+        );
         let request_timeout = std::env::var("KIN_DAEMON_HTTP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -884,16 +916,66 @@ impl DaemonClient {
             .default_headers(headers)
             .build()
             .context("build one-dispatch daemon client")?;
+        let kin_root = crate::daemon_death::kin_root_from_cwd();
+        let runtime_repository = kin_root
+            .as_deref()
+            .map(kin_core::runtime_identity::RuntimeRepositoryBinding::for_store);
         Ok(Self {
             base_url,
             client,
             one_dispatch_client,
-            // Discovery from the working directory is the fallback every
-            // constructor but the layout one gets. A caller standing outside a
-            // repository resolves nothing, which is the same reading as a store
-            // that never lost a daemon and leaves every message unchanged.
-            kin_root: crate::daemon_death::kin_root_from_cwd(),
+            runtime_namespace,
+            runtime_repository,
+            // Layout constructors replace both the discovered root and its
+            // retained binding with the explicitly selected workspace.
+            kin_root,
         })
+    }
+
+    fn bind_repository(&mut self, root: &Path) {
+        self.kin_root = Some(root.to_path_buf());
+        self.runtime_repository =
+            Some(kin_core::runtime_identity::RuntimeRepositoryBinding::for_store(root));
+    }
+
+    async fn request_repository_fingerprint(&self) -> Result<Option<String>> {
+        let identity = read_runtime_endpoint(&self.base_url).await?;
+        let mode = kin_core::runtime_identity::RuntimeMode::current()
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        let fingerprint = identity
+            .admit_daemon_for(
+                &kin_core::runtime_identity::RuntimeIdentity::current(),
+                mode,
+                Some(&self.runtime_namespace),
+            )
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        if fingerprint.is_none() {
+            return Ok(None);
+        }
+        let expected = self.runtime_repository.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RuntimeEndpointRefusal(
+                "repository admission refused: no intended repository is bound".into(),
+            ))
+        })?;
+        let expected = expected.as_ref().map_err(|error| {
+            anyhow::Error::new(RuntimeEndpointRefusal(format!(
+                "repository admission refused: {error}"
+            )))
+        })?;
+        let repository = identity.repository.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RuntimeEndpointRefusal(
+                "repository admission refused: ready service supplied no repository identity"
+                    .into(),
+            ))
+        })?;
+        repository
+            .validate_for(expected)
+            .map(Some)
+            .map_err(|error| {
+                anyhow::Error::new(RuntimeEndpointRefusal(format!(
+                    "repository admission refused: {error}"
+                )))
+            })
     }
 
     /// The store whose records explain a daemon of this endpoint that died.
@@ -901,11 +983,93 @@ impl DaemonClient {
         self.kin_root.as_deref()
     }
 
+    fn request_runtime_fingerprint(&self) -> Result<String> {
+        self.runtime_namespace
+            .revalidate()
+            .map_err(anyhow::Error::msg)?;
+        let selected =
+            kin_core::runtime_identity::RuntimeNamespace::current().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            selected.token() == self.runtime_namespace.token(),
+            "selected Kin home changed after this daemon client was created; reconnect using the current runtime profile"
+        );
+        let mode =
+            kin_core::runtime_identity::RuntimeMode::current().map_err(anyhow::Error::msg)?;
+        Ok(kin_core::runtime_identity::RuntimeIdentity::current()
+            .fingerprint(mode, selected.token()))
+    }
+
+    /// Attach the admission a local daemon checks before any handler runs.
+    ///
+    /// A managed daemon refuses a request that does not carry this process's
+    /// runtime identity and, for anything but a health probe, the repository
+    /// it means. Everything this client sends passes through here. A command
+    /// that builds its own request, for a deadline or a redirect policy this
+    /// client does not carry, passes it through [`admit_daemon_request`]
+    /// rather than sending it bare.
+    ///
+    /// Reading the repository the endpoint serves is itself a request to it.
+    /// When that read never reaches the daemon, the command has lost its
+    /// request exactly as if the request itself had been sent, so it reads the
+    /// same way, with the store's account of why the daemon is gone.
+    pub(crate) async fn admitted_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        leaf: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        Ok(request.headers(self.admission_headers(leaf).await?))
+    }
+
+    /// The headers [`Self::admitted_request`] attaches, for a caller that
+    /// sends the same request more than once.
+    pub(crate) async fn admission_headers(&self, leaf: &str) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER,
+            reqwest::header::HeaderValue::from_str(&self.request_runtime_fingerprint()?)
+                .context("runtime fingerprint is not a header value")?,
+        );
+        let repository = if matches!(leaf, "health" | "readiness") {
+            validate_runtime_endpoint(&self.base_url, "daemon")
+                .await
+                .map(|()| None)
+        } else {
+            self.request_repository_fingerprint().await
+        }
+        .map_err(|error| self.lost_admission_probe(error, leaf))?;
+        if let Some(repository) = repository {
+            headers.insert(
+                kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER,
+                reqwest::header::HeaderValue::from_str(&repository)
+                    .context("repository fingerprint is not a header value")?,
+            );
+        }
+        Ok(headers)
+    }
+
+    /// Explain an admission probe the endpoint never answered as the lost
+    /// request it is. A refusal the endpoint did answer stays its own error.
+    fn lost_admission_probe(&self, error: anyhow::Error, leaf: &str) -> anyhow::Error {
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
+        {
+            error.context(daemon_send_failure_message(
+                &self.base_url,
+                leaf,
+                self.kin_root(),
+            ))
+        } else {
+            error
+        }
+    }
+
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
         leaf: &str,
     ) -> Result<reqwest::Response> {
+        let request = self.admitted_request(request, leaf).await?;
         let resp = request.send().await;
         // The daemon answered, or the request failed. Either way the line that
         // said it was ready has done its job, and what prints next is the
@@ -915,6 +1079,24 @@ impl DaemonClient {
             .with_context(|| daemon_send_failure_message(&self.base_url, leaf, self.kin_root()))?;
         check_response_build_match(resp.headers())?;
         Ok(resp)
+    }
+
+    /// Send a request this client has no typed method for, with the bearer
+    /// token and runtime admission every request of this client carries.
+    pub async fn send_untyped(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        leaf: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let request = self.client.request(method, url);
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        self.send(request, leaf).await
     }
 
     /// Turn a non-success daemon response into the error the user reads.
@@ -973,6 +1155,63 @@ impl DaemonClient {
         Self::from_running_workspace(discovered.base_url, layout).await
     }
 
+    /// A known workspace endpoint for a page of `kin ui`, which never works
+    /// beside a daemon of another release.
+    ///
+    /// Like [`Self::from_running_workspace`], except that the endpoint must
+    /// admit this client's release first. A daemon of an older release this
+    /// client supersedes is not used: the page goes through
+    /// [`Self::connect_for_workspace`], which replaces it and starts this
+    /// release's, within `budget`. A newer release, a development build, and a
+    /// client an update has replaced are refused in their own words.
+    pub async fn for_workspace_page(
+        command: &str,
+        base_url: impl Into<String>,
+        layout: &KinLayout,
+        budget: Duration,
+    ) -> Result<Self> {
+        let base_url = base_url.into();
+        if let Err(error) = validate_runtime_endpoint(&base_url, "daemon").await {
+            if error.downcast_ref::<RuntimeEndpointRefusal>().is_none() {
+                return Err(error);
+            }
+            let (pid, port) = repo_daemon_recorded_endpoint(layout.root());
+            let recorded = pid.filter(|_| {
+                port.is_some_and(|port| {
+                    base_url.trim_end_matches('/') == format!("http://127.0.0.1:{port}")
+                })
+            });
+            let judged = match recorded {
+                Some(pid) => {
+                    judge_daemon_of_another_release(
+                        &base_url,
+                        pid,
+                        budget.min(Duration::from_secs(5)),
+                    )
+                    .await
+                }
+                None => None,
+            };
+            return match judged {
+                Some(kin_core::runtime_identity::Succession::Replace) => {
+                    let replacing = "Kin is replacing an older daemon for this repository; \
+                                     reload in a moment";
+                    tokio::time::timeout(budget, Self::connect_for_workspace(command, layout))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(replacing)))
+                }
+                Some(refused) => Err(anyhow::anyhow!(
+                    "{}",
+                    refused
+                        .refusal()
+                        .unwrap_or("the workspace daemon was refused")
+                )),
+                None => Err(error),
+            };
+        }
+        Self::from_running_workspace(base_url, layout).await
+    }
+
     /// Verify a known endpoint without starting a daemon or adopting ambient scope.
     pub async fn from_running_workspace(
         base_url: impl Into<String>,
@@ -983,7 +1222,7 @@ impl DaemonClient {
             resolve_daemon_auth_token_for_layout(layout),
             None,
         )?;
-        client.kin_root = Some(layout.root().to_path_buf());
+        client.bind_repository(layout.root());
         let health = client.health().await?;
         match classify_health_repo(&health, layout.root(), layout.working_dir()) {
             RepoIdentity::Matches => Ok(client),
@@ -1001,10 +1240,36 @@ impl DaemonClient {
         limit: usize,
         offset: usize,
     ) -> Result<serde_json::Value> {
+        self.workspace_entities_and_untested(repo_id, query, limit, offset, None)
+            .await
+    }
+
+    /// [`Self::workspace_entities`], and with `untested` the most relied-on
+    /// entities no test reaches, that many of them, under the answer's
+    /// `untested`. Both come from the daemon's one ranking pass. A daemon that
+    /// predates the list answers without the field.
+    pub async fn workspace_entities_and_untested(
+        &self,
+        repo_id: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        untested: Option<usize>,
+    ) -> Result<serde_json::Value> {
         anyhow::ensure!(
             (1..=100).contains(&limit),
             "entity page limit must be 1..100"
         );
+        let mut asked = vec![
+            ("query", query.to_string()),
+            ("order", "importance".to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+            ("include", "ranking,signature,summary".to_string()),
+        ];
+        if let Some(rows) = untested {
+            asked.push(("untested", rows.to_string()));
+        }
         let response = self
             .send(
                 self.client
@@ -1013,13 +1278,7 @@ impl DaemonClient {
                         self.base_url,
                         urlencoding::encode(repo_id)
                     ))
-                    .query(&[
-                        ("query", query.to_string()),
-                        ("order", "importance".to_string()),
-                        ("limit", limit.to_string()),
-                        ("offset", offset.to_string()),
-                        ("include", "ranking,signature,summary".to_string()),
-                    ]),
+                    .query(&asked),
                 "workspace entity inventory",
             )
             .await?;
@@ -1078,7 +1337,19 @@ impl DaemonClient {
         .await
     }
 
-    // Only the two named, read-only wrappers above reach this transport.
+    /// What contains one entity, read without its text.
+    pub async fn workspace_entity_owners(&self, entity_id: &str) -> Result<serde_json::Value> {
+        uuid::Uuid::parse_str(entity_id).context("invalid entity id")?;
+        self.workspace_graph_read(
+            "get_entity_source",
+            serde_json::json!({
+                "entity_id": entity_id, "full_body": false,
+            }),
+        )
+        .await
+    }
+
+    // Only the three named, read-only wrappers above reach this transport.
     async fn workspace_graph_read(
         &self,
         name: &str,
@@ -1664,6 +1935,34 @@ impl DaemonClient {
             .context("parse daemon verify run response")
     }
 
+    /// Ask about the tests that reach a piece of work, or run them.
+    ///
+    /// Sent once and never retried: a run executes the repository's tests
+    /// and records what they did, so a replay would run them again. A run
+    /// takes as long as the repository's tests do, so it is given far longer
+    /// than an ordinary request.
+    pub async fn verify_work(
+        &self,
+        request: &crate::commands::verify::WorkVerifyRequest,
+    ) -> Result<crate::commands::verify::WorkVerifyResponse> {
+        const RUN_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
+        let resp = self
+            .send(
+                self.one_dispatch_client
+                    .post(format!("{}/verify/work", self.base_url))
+                    .timeout(RUN_BUDGET)
+                    .json(request),
+                "verify work",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("verify work", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon verify work response")
+    }
+
     pub async fn verify_command(
         &self,
         request: &crate::commands::verify::VerifyCommandRequest,
@@ -1807,6 +2106,73 @@ impl DaemonClient {
             .context("parse daemon command status response")
     }
 
+    pub async fn git_update_status(&self) -> Result<crate::git_update::GitUpdateStatus> {
+        let response = self
+            .send(
+                self.client
+                    .get(format!("{}/commands/git-update/status", self.base_url)),
+                "Git update status",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("Git update status", response).await);
+        }
+        response
+            .json()
+            .await
+            .context("parse daemon Git update status")
+    }
+
+    /// Dispatch an update once. A lost acknowledgement never triggers another
+    /// request, since the original command may already have admitted history.
+    pub async fn git_update_once(
+        &self,
+        request: &crate::git_update::GitUpdateRequest,
+    ) -> crate::git_update::GitUpdateDispatch {
+        use crate::git_update::GitUpdateDispatch;
+        let response = match self
+            .send(
+                self.one_dispatch_client
+                    .post(format!(
+                        "{}/commands/git-update",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .json(request),
+                "Git update",
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return GitUpdateDispatch::Lost(error),
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                return GitUpdateDispatch::Lost(
+                    anyhow!(error).context("read the daemon's Git update answer"),
+                )
+            }
+        };
+        if !status.is_success() {
+            return GitUpdateDispatch::Refused {
+                status: status.as_u16(),
+                body,
+            };
+        }
+        match serde_json::from_str::<crate::git_update::GitUpdateResponse>(&body) {
+            Ok(response) if response.operation_id == request.operation_id => {
+                GitUpdateDispatch::Answered(Box::new(response))
+            }
+            Ok(_) => GitUpdateDispatch::Lost(anyhow!(
+                "Git update acknowledgement names another operation"
+            )),
+            Err(error) => GitUpdateDispatch::Lost(
+                anyhow!(error).context("parse the daemon's Git update answer"),
+            ),
+        }
+    }
+
     pub async fn command_push(
         &self,
         request: &crate::commands::transfer::CommandTransferRequest,
@@ -1826,6 +2192,121 @@ impl DaemonClient {
         request: &crate::commands::transfer::CommandTransferRequest,
     ) -> Result<crate::commands::transfer::CommandTransferPlanResponse> {
         self.transfer_command("transfer-plan", request).await
+    }
+
+    /// Send one push or pull exactly once, and say what came of it.
+    ///
+    /// The local app must never repeat a transfer behind the page when its
+    /// answer is lost, so this goes out on the client that never retries and
+    /// keeps a refusal apart from a lost answer instead of folding both into
+    /// one error. A refusal is the daemon's own answer: the command has ended
+    /// on the daemon, although a transfer that needed several packs may have
+    /// published some before it refused, which only a fresh reading can tell.
+    pub async fn transfer_once(
+        &self,
+        direction: kin_remote::repository_transfer_negotiation::RepositoryTransferDirection,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> TransferDispatch {
+        use kin_remote::repository_transfer_negotiation::RepositoryTransferDirection;
+        let leaf = match direction {
+            RepositoryTransferDirection::Push => "push",
+            RepositoryTransferDirection::Pull => "pull",
+        };
+        let sent = self
+            .send(
+                self.one_dispatch_client
+                    .post(format!(
+                        "{}/commands/{leaf}",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .json(request),
+                leaf,
+            )
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => return TransferDispatch::Lost(error),
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                return TransferDispatch::Lost(
+                    anyhow!(error).context(format!("read the daemon's {leaf} answer")),
+                )
+            }
+        };
+        if !status.is_success() {
+            return TransferDispatch::Refused {
+                status: status.as_u16(),
+                body,
+            };
+        }
+        match serde_json::from_str(&body) {
+            Ok(response) => TransferDispatch::Answered(Box::new(response)),
+            Err(error) => TransferDispatch::Lost(
+                anyhow!(error).context(format!("parse the daemon's {leaf} answer")),
+            ),
+        }
+    }
+
+    /// Negotiate a push plan, keeping the daemon's status apart from a
+    /// transport failure. The outer error is a daemon that did not answer; the
+    /// inner one is the daemon's refusal with its status and its words.
+    pub async fn command_transfer_plan_reading(
+        &self,
+        request: &crate::commands::transfer::CommandTransferRequest,
+    ) -> Result<
+        std::result::Result<crate::commands::transfer::CommandTransferPlanResponse, (u16, String)>,
+    > {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/transfer-plan", self.base_url))
+                    .json(request),
+                "transfer-plan",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Ok(Err((status.as_u16(), body)));
+        }
+        Ok(Ok(response
+            .json()
+            .await
+            .context("parse daemon transfer plan response")?))
+    }
+
+    /// What changed between two read points of this daemon's repository,
+    /// entity by entity, from `GET /repos/{repo_id}/semantic-diff`.
+    pub async fn repository_semantic_diff(
+        &self,
+        repo_id: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<std::result::Result<serde_json::Value, (u16, String)>> {
+        let response = self
+            .send(
+                self.client
+                    .get(format!(
+                        "{}/repos/{}/semantic-diff",
+                        self.base_url.trim_end_matches('/'),
+                        urlencoding::encode(repo_id)
+                    ))
+                    .query(&[("base", base), ("head", head)]),
+                "semantic diff",
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Ok(Err((status.as_u16(), body)));
+        }
+        Ok(Ok(response
+            .json()
+            .await
+            .context("parse daemon semantic diff response")?))
     }
 
     /// Drive one repository-v6 transfer command in the daemon.
@@ -2398,22 +2879,26 @@ impl DaemonClient {
             Err(error) => {
                 return AdmitDispatch::Refused(
                     anyhow::Error::new(error).context("encode the admission request"),
-                )
+                );
             }
         };
-        let response = match self
+        let request = self
             .one_dispatch_client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload)
-            .send()
-            .await
-        {
+            .body(payload);
+        // Nothing was dispatched when admission itself fails, so that is a
+        // refusal rather than an unanswered request.
+        let request = match self.admitted_request(request, "admit").await {
+            Ok(request) => request,
+            Err(error) => return AdmitDispatch::Refused(error),
+        };
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 return AdmitDispatch::Unanswered(anyhow::Error::new(error).context(
                     daemon_send_failure_message(&self.base_url, "admit", self.kin_root()),
-                ))
+                ));
             }
         };
         if let Err(error) = check_response_build_match(response.headers()) {
@@ -2434,7 +2919,7 @@ impl DaemonClient {
             Err(error) => {
                 return AdmitDispatch::Unanswered(
                     anyhow::Error::new(error).context("read the admission response body"),
-                )
+                );
             }
         };
         match serde_json::from_slice(&body) {
@@ -2583,8 +3068,51 @@ impl DaemonClient {
         resp.json().await.context("parse daemon agents response")
     }
 
-    /// `GET /session/{session_id}/calls`: one live session's call log, newest
-    /// first, at most `limit` entries.
+    /// `POST /agents/edits`: report an edit an agent made with its client's
+    /// own tools. With `wait` the answer says what became of the report;
+    /// without it the daemon answers at once and resolves it behind the answer.
+    pub async fn record_agent_edit(
+        &self,
+        claim: &serde_json::Value,
+        wait: bool,
+    ) -> Result<serde_json::Value> {
+        let url = if wait {
+            format!("{}/agents/edits?wait=true", self.base_url)
+        } else {
+            format!("{}/agents/edits", self.base_url)
+        };
+        let resp = self
+            .send(self.client.post(url).json(claim), "agents/edits")
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("agents/edits", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon edit report response")
+    }
+
+    /// `GET /agents/ended`: the agents that worked in this repository and are
+    /// gone, with at most `calls` of each one's newest calls. `None` from a
+    /// daemon that does not keep sessions past their end.
+    pub async fn ended_agents(&self, calls: usize) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/agents/ended?calls={calls}", self.base_url);
+        let resp = self.send(self.client.get(url), "agents/ended").await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("agents/ended", resp).await);
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .context("parse daemon ended agents response")
+    }
+
+    /// `GET /session/{session_id}/calls`: one session's call log, newest
+    /// first, at most `limit` entries. A session that ended answers from what
+    /// the daemon kept of it.
     pub async fn session_calls(
         &self,
         session_id: &str,
@@ -2652,6 +3180,27 @@ impl DaemonClient {
             return Err(self.http_refusal("note", resp).await);
         }
         resp.json().await.context("parse daemon note response")
+    }
+
+    /// Set, close or list review flags in the repository daemon.
+    pub async fn review_flags(
+        &self,
+        request: &crate::commands::review_flags::ReviewFlagRequest,
+    ) -> Result<crate::commands::review_flags::ReviewFlagResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/review/flags", self.base_url))
+                    .json(request),
+                "review flags",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("review flags", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon review flags response")
     }
 
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
@@ -3858,7 +4407,7 @@ pub fn probe_daemon_port(port: u16) -> DaemonPortProbe {
     let mut stream = match std::net::TcpStream::connect_timeout(&addr, PORT_PROBE_CONNECT_TIMEOUT) {
         Ok(stream) => stream,
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            return DaemonPortProbe::OpenNotAccepting
+            return DaemonPortProbe::OpenNotAccepting;
         }
         Err(_) => return DaemonPortProbe::Closed,
     };
@@ -4893,6 +5442,19 @@ pub fn read_supervisor_owner_record() -> Option<EndpointOwnerRecord> {
     read_supervisor_owner_record_in_dir(&supervisor_dir())
 }
 
+/// The supervisor endpoint recorded in `dir`: its pid, port and owner record,
+/// with no liveness probe.
+///
+/// A supervisor from 0.8.6 or older recorded its endpoint in `.kin` under the
+/// real home, or beside an explicit `KIN_REGISTRY_PATH`, rather than in the
+/// managed services directory, and the updater reads it there to retire it.
+pub fn supervisor_endpoint_in_dir(
+    dir: &Path,
+) -> (Option<u32>, Option<u16>, Option<EndpointOwnerRecord>) {
+    let recorded = supervisor_endpoint_snapshot(dir);
+    (recorded.pid, recorded.port, recorded.owner)
+}
+
 fn read_supervisor_owner_record_in_dir(dir: &Path) -> Option<EndpointOwnerRecord> {
     let raw = std::fs::read_to_string(dir.join(SUPERVISOR_OWNER_FILE)).ok()?;
     let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
@@ -5637,6 +6199,15 @@ fn validate_daemon_compat_response(compat: &DaemonCompatResponse) -> Result<(), 
             SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY
         ));
     }
+    let identity = compat.runtime_identity.as_ref().ok_or_else(|| "daemon does not report exact runtime identity; install CLI and daemon from the same current bundle".to_string())?;
+    let mode = compat.runtime_mode.ok_or_else(|| {
+        "daemon does not acknowledge managed or development runtime mode".to_string()
+    })?;
+    kin_core::runtime_identity::RuntimeIdentity::current().validate_service(
+        identity,
+        kin_core::runtime_identity::RuntimeMode::current()?,
+        mode,
+    )?;
     Ok(())
 }
 
@@ -5819,7 +6390,55 @@ async fn attach_to_existing_daemon(
     kin_root: &Path,
     base_url: &str,
 ) -> std::result::Result<(), AutoStartError> {
+    if let Err(error) = validate_runtime_endpoint(base_url, "daemon").await {
+        if error.downcast_ref::<RuntimeEndpointRefusal>().is_some() {
+            // Only the repository's own recorded daemon can be replaced from
+            // here: its incarnation is what the replacement is bound to.
+            let recorded = daemon_endpoint_snapshot(kin_root);
+            if let (Some(pid), Some(port)) = (recorded.pid, recorded.port) {
+                if base_url.trim_end_matches('/') == format!("http://127.0.0.1:{port}") {
+                    match judge_daemon_of_another_release(base_url, pid, Duration::from_secs(5))
+                        .await
+                    {
+                        Some(kin_core::runtime_identity::Succession::Replace) => {
+                            return Err(AutoStartError::Superseded { pid })
+                        }
+                        Some(refused) => {
+                            if let Some(message) = refused.refusal() {
+                                return Err(AutoStartError::SpawnFailed(message.to_string()));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        return Err(AutoStartError::spawn(error));
+    }
     report_behavior_env_ignored_by_existing_daemon(kin_root, base_url).await
+}
+
+/// What a managed client does about the daemon at `base_url`, which refused
+/// it as another release, or `None` for a development client, which keeps the
+/// refusal it always had.
+///
+/// Only the refusals that say something new are worth their words here: a
+/// newer release, a development build, and a client an update has replaced.
+/// The rest keep the admission's own refusal.
+async fn judge_daemon_of_another_release(
+    base_url: &str,
+    pid: u32,
+    budget: Duration,
+) -> Option<kin_core::runtime_identity::Succession> {
+    use kin_core::runtime_identity::Succession;
+    let client = succession::current_succession_client().ok()?;
+    if client.mode != kin_core::runtime_identity::RuntimeMode::Managed {
+        return None;
+    }
+    match succession::judge_running_daemon(base_url, pid, budget).await {
+        Succession::Attach | Succession::Refuse(_) => None,
+        judged => Some(judged),
+    }
 }
 
 /// Say so when this command sets behavior levers the attached daemon cannot
@@ -7337,28 +7956,39 @@ pub enum InstalledStartupProtocol {
 
 /// Installed kin binaries on this host that are not the running one.
 ///
-/// Candidates are whatever `PATH` resolves for `kin`, plus the Kin home's
-/// `bin`. That is deliberately the set an operator actually invokes rather than
-/// a filtered notion of an install: `PATH` is what decides which binary runs, so
-/// a build tree reachable through it is probed like any other install and
-/// diagnosed on the same evidence. Paths are canonicalized so one binary
-/// reachable by two names is probed once, and so the running binary is excluded
-/// even when it was invoked through a symlink.
+/// The candidates are every native `kin` the full copy enumeration finds:
+/// each one on `PATH`, Cargo's and Homebrew's, `/usr/local/bin`, the managed
+/// pair, and anything the managed home links to. npm launchers are left out,
+/// because they run the managed pair and carry no daemon of their own, and so
+/// are copies that cannot be identified. Paths are canonicalized so one binary
+/// reachable by two names is probed once, and so the running binary is
+/// excluded even when it was invoked through a symlink.
 fn other_installed_kin_binaries() -> Vec<PathBuf> {
+    use crate::commands::kin_copies::{scan, CopyKind, ScanRoots};
+
     let running = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    let mut candidates = Vec::new();
-    if let Some(path) = crate::commands::setup::check_binary_in_path("kin") {
-        candidates.push(path);
-    }
-    if let Ok(home) = crate::commands::setup::kin_dir() {
-        candidates.push(home.join("bin").join("kin"));
-    }
-
+    let Ok(roots) = ScanRoots::from_environment() else {
+        return Vec::new();
+    };
+    // Only the startup protocol probe below runs anything; identifying a copy
+    // never does here.
+    let roots = ScanRoots {
+        probe_versions: false,
+        ..roots
+    };
     let mut found: Vec<PathBuf> = Vec::new();
-    for candidate in candidates {
-        let Ok(resolved) = candidate.canonicalize() else {
+    for copy in scan(&roots).copies {
+        if copy.program != "kin"
+            || matches!(
+                copy.kind,
+                CopyKind::NpmLauncher { .. } | CopyKind::Unknown(_)
+            )
+        {
+            continue;
+        }
+        let Ok(resolved) = copy.path.canonicalize() else {
             continue;
         };
         if running.as_ref() == Some(&resolved) || found.contains(&resolved) {
@@ -7421,7 +8051,7 @@ pub fn probe_installed_startup_protocol(kin_binary: &Path) -> InstalledStartupPr
             Err(error) => {
                 return InstalledStartupProtocol::Undetermined(format!(
                     "compat probe failed to execute: {error}"
-                ))
+                ));
             }
         };
     let compat: DaemonCompatResponse = match serde_json::from_slice(&output.stdout) {
@@ -7429,7 +8059,7 @@ pub fn probe_installed_startup_protocol(kin_binary: &Path) -> InstalledStartupPr
         Err(error) => {
             return InstalledStartupProtocol::Undetermined(format!(
                 "compat probe returned invalid JSON: {error}"
-            ))
+            ));
         }
     };
     match compat.supervisor_startup_protocol {
@@ -8260,6 +8890,20 @@ enum ExistingDaemon {
     /// one would lose the singleton flock, so the caller must report this
     /// instead.
     LiveNotReady(String),
+    /// A live daemon of an older release owns this repo. The caller replaces
+    /// it under the startup lock, then starts this release's.
+    Superseded(u32),
+}
+
+/// How the administrative identity handshake with a recorded daemon ended.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityHandshake {
+    /// It runs this client's release.
+    Admitted,
+    /// The recorded endpoint changed or its owner exited while waiting.
+    EndpointChanged,
+    /// It runs an older release this client replaces.
+    Superseded,
 }
 
 /// Resolve the endpoint recorded for this repo, escalating patience — never
@@ -8302,6 +8946,87 @@ async fn wait_for_existing_daemon_within(
             }
             resolved => return resolved,
         }
+    }
+}
+
+/// Wait only for the administrative identity handshake. Health and repository
+/// requests cannot begin until the endpoint proves the selected runtime.
+async fn wait_for_existing_daemon_identity(
+    kin_root: &Path,
+    endpoint: LiveDaemonEndpoint,
+    deadline: Instant,
+    patience: Duration,
+    silence_bound: Option<Duration>,
+) -> std::result::Result<IdentityHandshake, String> {
+    let started = Instant::now();
+    let base_url = format!("http://127.0.0.1:{}", endpoint.port);
+    let mut detail = "the runtime identity endpoint has not answered".to_string();
+    loop {
+        let recorded = daemon_endpoint_snapshot(kin_root);
+        if recorded.pid != Some(endpoint.pid)
+            || recorded.port != Some(endpoint.port)
+            || process_liveness(endpoint.pid).authorizes_cleanup()
+        {
+            return Ok(IdentityHandshake::EndpointChanged);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let silence_remaining = silence_bound.map(|bound| bound.saturating_sub(started.elapsed()));
+        if silence_remaining.is_some_and(|remaining| remaining.is_zero()) {
+            return Err(live_daemon_wedged_message(
+                endpoint.pid,
+                endpoint.port,
+                &detail,
+                started.elapsed(),
+            ));
+        }
+        if remaining.is_zero() {
+            return Err(live_daemon_not_ready_message(
+                endpoint.pid,
+                endpoint.port,
+                &detail,
+                false,
+                patience.as_secs(),
+            ));
+        }
+        let budget = silence_remaining.map_or(remaining, |silence| remaining.min(silence));
+        let handshake =
+            tokio::time::timeout(budget, validate_runtime_endpoint(&base_url, "daemon")).await;
+        let recorded = daemon_endpoint_snapshot(kin_root);
+        if recorded.pid != Some(endpoint.pid)
+            || recorded.port != Some(endpoint.port)
+            || process_liveness(endpoint.pid).authorizes_cleanup()
+        {
+            return Ok(IdentityHandshake::EndpointChanged);
+        }
+        match handshake {
+            Ok(Ok(())) => return Ok(IdentityHandshake::Admitted),
+            Ok(Err(error)) if error.downcast_ref::<RuntimeEndpointRefusal>().is_some() => {
+                let budget = deadline.saturating_duration_since(Instant::now());
+                return match judge_daemon_of_another_release(&base_url, endpoint.pid, budget)
+                    .await
+                {
+                    Some(kin_core::runtime_identity::Succession::Replace) => {
+                        Ok(IdentityHandshake::Superseded)
+                    }
+                    Some(refused) if refused.refusal().is_some() => {
+                        Err(refused.refusal().unwrap_or_default().to_string())
+                    }
+                    _ => Err(format!("{error:#}; existing daemon pid {} was left running and its endpoint files were preserved", endpoint.pid)),
+                };
+            }
+            Ok(Err(error)) => detail = format!("{error:#}"),
+            Err(_) => {
+                detail =
+                    "the runtime identity probe did not answer within the caller's readiness budget"
+                        .to_string()
+            }
+        }
+        let mut retry_delay =
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()));
+        if let Some(bound) = silence_bound {
+            retry_delay = retry_delay.min(bound.saturating_sub(started.elapsed()));
+        }
+        tokio::time::sleep(retry_delay).await;
     }
 }
 
@@ -8391,6 +9116,18 @@ async fn inspect_existing_daemon_once(
     };
     let existing = LiveDaemonEndpoint { pid, port };
 
+    match wait_for_existing_daemon_identity(kin_root, existing, deadline, patience, silence_bound)
+        .await
+    {
+        Ok(IdentityHandshake::Admitted) => {}
+        Ok(IdentityHandshake::EndpointChanged) => {
+            return ExistingDaemon::Starting(
+                "the daemon endpoint changed while its runtime identity was pending".to_string(),
+            )
+        }
+        Ok(IdentityHandshake::Superseded) => return ExistingDaemon::Superseded(pid),
+        Err(message) => return ExistingDaemon::LiveNotReady(message),
+    }
     let short_deadline = (Instant::now() + short).min(deadline);
     // No silence bound on the short probe. It is the fast path for a healthy
     // daemon and is shorter than the bound anyway, so applying it there would
@@ -8616,6 +9353,7 @@ fn live_daemon_not_ready_message(
 
 async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<String> {
     let base_url = format!("http://127.0.0.1:{}", endpoint.port);
+    validate_runtime_endpoint(&base_url, "supervisor").await?;
     let client = daemon_health_client();
     let health: SupervisorHealthResponse = client
         .get(format!("{base_url}/health"))
@@ -8636,6 +9374,93 @@ async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<St
         bail!("supervisor health status is {}", health.status);
     }
     Ok(base_url)
+}
+
+/// A metadata-only handshake preceding repository health, routing and commands.
+#[derive(Debug)]
+pub struct RuntimeEndpointRefusal(String);
+
+impl std::fmt::Display for RuntimeEndpointRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RuntimeEndpointRefusal {}
+
+/// Attach the admission a local daemon requires to a request built outside
+/// [`DaemonClient`].
+///
+/// Some commands send to the daemon on an HTTP client of their own, for a
+/// deadline or a retry policy the shared client does not carry. A managed
+/// daemon refuses every such request that lacks this process's runtime
+/// identity and the repository it means, before the handler runs, so each one
+/// passes through here with the layout it addresses.
+pub async fn admit_daemon_request(
+    request: reqwest::RequestBuilder,
+    base_url: &str,
+    layout: &KinLayout,
+    leaf: &str,
+) -> Result<reqwest::RequestBuilder> {
+    Ok(request.headers(daemon_admission_headers(base_url, layout, leaf).await?))
+}
+
+/// The headers [`admit_daemon_request`] attaches, for a caller that sends the
+/// same request more than once.
+pub async fn daemon_admission_headers(
+    base_url: &str,
+    layout: &KinLayout,
+    leaf: &str,
+) -> Result<reqwest::header::HeaderMap> {
+    DaemonClient::from_base_url_for_layout(base_url.to_string(), layout)?
+        .admission_headers(leaf)
+        .await
+}
+
+pub async fn validate_runtime_endpoint(base_url: &str, component: &str) -> Result<()> {
+    let identity = read_runtime_endpoint(base_url).await?;
+    if component == "daemon" {
+        let mode = kin_core::runtime_identity::RuntimeMode::current()
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))?;
+        let namespace = kin_core::runtime_identity::RuntimeNamespace::current();
+        return identity
+            .admit_daemon_for(
+                &kin_core::runtime_identity::RuntimeIdentity::current(),
+                mode,
+                namespace.as_ref().ok(),
+            )
+            .map(|_| ())
+            .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)));
+    }
+    identity
+        .validate_for_current(component)
+        .map_err(|error| anyhow::Error::new(RuntimeEndpointRefusal(error)))
+}
+
+pub async fn read_runtime_endpoint(
+    base_url: &str,
+) -> Result<kin_core::runtime_identity::RuntimeServiceIdentity> {
+    let response = daemon_health_client()
+        .get(format!(
+            "{}/runtime/identity",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .context("probe service runtime identity")?;
+    if !response.status().is_success() {
+        return Err(anyhow::Error::new(RuntimeEndpointRefusal(format!(
+            "service does not acknowledge exact runtime identity (HTTP {})",
+            response.status()
+        ))));
+    }
+    let identity: kin_core::runtime_identity::RuntimeServiceIdentity =
+        response.json().await.map_err(|error| {
+            anyhow::Error::new(RuntimeEndpointRefusal(format!(
+                "invalid runtime identity: {error}"
+            )))
+        })?;
+    Ok(identity)
 }
 
 #[derive(Debug)]
@@ -8806,6 +9631,11 @@ where
     let existing = LiveDaemonEndpoint { pid, port };
     match validate_supervisor_endpoint(existing).await {
         Ok(base_url) => ExistingSupervisor::Connected(base_url),
+        Err(err) if err.downcast_ref::<RuntimeEndpointRefusal>().is_some() => {
+            ExistingSupervisor::LiveNotReady(format!(
+                "{err}; existing supervisor pid {pid} and its endpoint were preserved"
+            ))
+        }
         Err(err) => {
             warn!(
                 pid = existing.pid,
@@ -9501,6 +10331,74 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
             .await
         })
     }
+
+    fn reading_at(
+        &self,
+        kin_root: PathBuf,
+        endpoint: String,
+        budget: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kin_daemon_spawn::RunningDaemonRouteReading> + Send>,
+    > {
+        Box::pin(async move { probe_running_route_within(&kin_root, &endpoint, budget).await })
+    }
+
+    fn replace_superseded(
+        &self,
+        kin_root: PathBuf,
+        endpoint: String,
+        budget: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kin_daemon_spawn::SupersededReplacement> + Send>,
+    > {
+        Box::pin(async move { replace_superseded_endpoint(&kin_root, &endpoint, budget).await })
+    }
+}
+
+/// Replace the daemon recorded for `kin_root` at `endpoint`, which refused
+/// this client as another release, when it is an older one this client
+/// supersedes. Holds the repository's startup lock while it does, and starts
+/// nothing.
+async fn replace_superseded_endpoint(
+    kin_root: &Path,
+    endpoint: &str,
+    budget: Duration,
+) -> kin_daemon_spawn::SupersededReplacement {
+    use kin_daemon_spawn::SupersededReplacement;
+    let deadline = Instant::now() + budget;
+    let recorded = daemon_endpoint_snapshot(kin_root);
+    let Some(pid) = recorded.pid.filter(|_| {
+        recorded.port.is_some_and(|port| {
+            endpoint.trim_end_matches('/') == format!("http://127.0.0.1:{port}")
+        })
+    }) else {
+        return SupersededReplacement::Refused(format!(
+            "{endpoint} is not the daemon recorded for this repository, so it was left running"
+        ));
+    };
+    match judge_daemon_of_another_release(endpoint, pid, budget.min(Duration::from_secs(5))).await {
+        Some(kin_core::runtime_identity::Succession::Replace) => {}
+        Some(refused) => {
+            return SupersededReplacement::Refused(
+                refused.refusal().unwrap_or_default().to_string(),
+            )
+        }
+        None => {
+            return SupersededReplacement::Refused(format!(
+                "Kin daemon pid {pid} runs another Kin, and this client does not replace it; it \
+                 was left running"
+            ))
+        }
+    }
+    let _startup_lock = match acquire_startup_lock(kin_root).await {
+        Ok(lock) => lock,
+        Err(error) => return SupersededReplacement::Refused(format!("{error:#}")),
+    };
+    let mut replaced = None;
+    match replace_superseded_daemon_once_until(kin_root, pid, &mut replaced, deadline).await {
+        Ok(()) => SupersededReplacement::Replaced,
+        Err(error) => SupersededReplacement::Refused(error.to_string()),
+    }
 }
 
 /// Publish this crate's supervisor access to every daemon spawn in this
@@ -9540,8 +10438,12 @@ async fn ensure_daemon_running_inner(
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(kin_root, &base_url).await?;
-        return Ok(base_url);
+        match attach_to_existing_daemon(kin_root, &base_url).await {
+            Ok(()) => return Ok(base_url),
+            // Replaced under the startup lock below.
+            Err(AutoStartError::Superseded { .. }) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     match wait_for_existing_daemon(kin_root).await {
@@ -9549,34 +10451,59 @@ async fn ensure_daemon_running_inner(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(kin_root, &base_url).await?;
-            return Ok(base_url);
+            match attach_to_existing_daemon(kin_root, &base_url).await {
+                Ok(()) => return Ok(base_url),
+                Err(AutoStartError::Superseded { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
             return Err(AutoStartError::SpawnFailed(message));
         }
-        ExistingDaemon::None => {}
+        // Replaced under the startup lock below, where no other command of
+        // this release can start a daemon in the meantime.
+        ExistingDaemon::Superseded(_) | ExistingDaemon::None => {}
     }
 
     let _startup_lock = acquire_startup_lock(kin_root)
         .await
         .map_err(AutoStartError::spawn)?;
-    if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(kin_root, &base_url).await?;
-        return Ok(base_url);
-    }
-    match wait_for_existing_daemon(kin_root).await {
-        ExistingDaemon::Connected(base_url) => {
-            register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
-                .await
-                .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(kin_root, &base_url).await?;
-            return Ok(base_url);
+    // One replacement per call. A second older daemon after it means
+    // something keeps starting one, and replacing it again would only race
+    // that.
+    let mut replaced: Option<u32> = None;
+    loop {
+        if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+            match attach_to_existing_daemon(kin_root, &base_url).await {
+                Ok(()) => return Ok(base_url),
+                Err(AutoStartError::Superseded { pid }) => {
+                    replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
-            return Err(AutoStartError::SpawnFailed(message));
+        match wait_for_existing_daemon(kin_root).await {
+            ExistingDaemon::Connected(base_url) => {
+                register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
+                    .await
+                    .map_err(AutoStartError::spawn)?;
+                match attach_to_existing_daemon(kin_root, &base_url).await {
+                    Ok(()) => return Ok(base_url),
+                    Err(AutoStartError::Superseded { pid }) => {
+                        replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
+                return Err(AutoStartError::SpawnFailed(message));
+            }
+            ExistingDaemon::Superseded(pid) => {
+                replace_superseded_daemon_once(kin_root, pid, &mut replaced).await?;
+            }
+            ExistingDaemon::None => break,
         }
-        ExistingDaemon::None => {}
     }
 
     // Everything above this line either attached to a live daemon or proved
@@ -9659,10 +10586,10 @@ async fn ensure_daemon_running_inner(
             base_url
         }
         Err(DaemonReadinessError::Failed(error)) => {
-            return Err(AutoStartError::spawn(format!("{error:#}")))
+            return Err(AutoStartError::spawn(format!("{error:#}")));
         }
         Err(DaemonReadinessError::Timeout(detail)) => {
-            return Err(AutoStartError::StartupTimeout(detail))
+            return Err(AutoStartError::StartupTimeout(detail));
         }
     };
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, true)
@@ -9680,6 +10607,76 @@ async fn ensure_daemon_running_inner(
     Ok(base_url)
 }
 
+/// Replace the older daemon at `pid` that serves `kin_root`, once per call.
+///
+/// The caller holds the repository's startup lock. Waits as long as a daemon
+/// start may take for it to finish its writes and go. A daemon still working
+/// at the end, or one that is not this client's to replace, is refused in its
+/// own words, and nothing is started or attached. A second older daemon after
+/// the first is refused by the process that started it.
+async fn replace_superseded_daemon_once(
+    kin_root: &Path,
+    pid: u32,
+    replaced: &mut Option<u32>,
+) -> std::result::Result<(), AutoStartError> {
+    let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
+    replace_superseded_daemon_once_until(kin_root, pid, replaced, deadline).await
+}
+
+/// [`replace_superseded_daemon_once`] within the caller's `deadline`.
+async fn replace_superseded_daemon_once_until(
+    kin_root: &Path,
+    pid: u32,
+    replaced: &mut Option<u32>,
+    deadline: Instant,
+) -> std::result::Result<(), AutoStartError> {
+    use crate::commands::daemon::ReplacementOutcome;
+    if let Some(previous) = *replaced {
+        return Err(AutoStartError::SpawnFailed(format!(
+            "Kin replaced the older daemon pid {previous} for this repository, and another older              daemon, pid {pid}, took its place, started by {}. Kin will not replace it again in              one command; stop whatever keeps starting it",
+            describe_parent_process(pid)
+        )));
+    }
+    let successor =
+        crate::commands::daemon::ReplacementSuccessor::current().map_err(AutoStartError::spawn)?;
+    let outcome =
+        crate::commands::daemon::retire_for_replacement(kin_root, pid, &successor, deadline)
+            .await
+            .map_err(AutoStartError::spawn)?;
+    *replaced = Some(pid);
+    match outcome {
+        ReplacementOutcome::Replaced { .. }
+        | ReplacementOutcome::NotRunning
+        | ReplacementOutcome::AlreadySuccessor => {
+            info!(pid, successor = %successor.label(), "replaced an older Kin daemon");
+            Ok(())
+        }
+        ReplacementOutcome::Waiting(holding) => Err(AutoStartError::SpawnFailed(format!(
+            "Kin is replacing the older daemon pid {pid} with {}, and it is still finishing: {}.              Nothing was started or attached; run the command again once it has finished",
+            successor.label(),
+            holding.join("; ")
+        ))),
+        ReplacementOutcome::Refused(reason) => Err(AutoStartError::SpawnFailed(reason)),
+    }
+}
+
+/// The process that started `pid`, for a refusal to name: its pid and
+/// executable, or that it could not be read.
+fn describe_parent_process(pid: u32) -> String {
+    let mut system = sysinfo::System::new();
+    let target = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    match system.process(target).and_then(|process| process.parent()) {
+        Some(parent) => format!(
+            "pid {} ({})",
+            parent.as_u32(),
+            process_executable_path(parent.as_u32())
+                .unwrap_or_else(|| "executable unknown".to_string())
+        ),
+        None => "a process that could not be read".to_string(),
+    }
+}
+
 /// Refuse a `.kin/` store this build cannot serve before anything is spawned.
 ///
 /// The daemon holds the same gate, but reaching it costs a supervisor, a binary
@@ -9691,7 +10688,15 @@ async fn ensure_daemon_running_inner(
 /// Only the version gap is answered here. Any other failure to read the marker
 /// is recorded and left to the daemon, whose gate sees the same file.
 fn refuse_incompatible_store(kin_root: &Path) -> std::result::Result<(), AutoStartError> {
-    match kin_core::KinLayout::new(kin_root.to_path_buf()).check_version() {
+    let layout = kin_core::KinLayout::new(kin_root.to_path_buf());
+    // A store whose history attach a crash interrupted may hold no version
+    // marker at all until the attach is finished, and a missing marker reads
+    // as the oldest layout. The daemon this start is about to spawn finishes
+    // the attach before it reads the store, so the refusal is left to it.
+    if kin_core::history_attach::attach_is_interrupted(&layout) {
+        return Ok(());
+    }
+    match layout.check_version() {
         Ok(()) => Ok(()),
         Err(error @ kin_core::KinError::IncompatibleVersion { .. }) => {
             Err(AutoStartError::IncompatibleStore(
@@ -9811,7 +10816,7 @@ async fn running_daemon_route_reading_within(
                 && !recorded.port_exists
                 && !repo_daemon_owner_path(layout.root()).exists() =>
         {
-            return Reading::Absent
+            return Reading::Absent;
         }
         _ => return Reading::Unresolved {
             detail:
@@ -9839,14 +10844,23 @@ async fn running_daemon_route_reading_within(
     )
     .await;
     match verdict {
-        Ok(EndpointVerdict::Serving(url)) => probe_running_route_within(
-            layout.root(), &url,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        ).await,
+        Ok(EndpointVerdict::Serving(url)) => {
+            probe_running_route_within(
+                layout.root(),
+                &url,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+        }
         Ok(EndpointVerdict::Invalid(detail)) => Reading::Unresolved { detail },
-        Ok(EndpointVerdict::LiveNotReady { detail, warming, .. }) => Reading::NotReady { detail, warming },
+        Ok(EndpointVerdict::LiveNotReady {
+            detail, warming, ..
+        }) => Reading::NotReady { detail, warming },
         Err(_) => Reading::NotReady {
-            detail: format!("recorded daemon pid {} at loopback port {} has not established readiness for this repository within the probe budget", endpoint.pid, endpoint.port),
+            detail: format!(
+                "recorded daemon pid {} at loopback port {} has not established readiness for this repository within the probe budget",
+                endpoint.pid, endpoint.port
+            ),
             warming: warming.load(Ordering::Relaxed),
         },
     }
@@ -10485,7 +11499,864 @@ mod tests {
         );
     }
 
+    fn runtime_identity_body(component: &str) -> String {
+        serde_json::to_string(
+            &kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
+                .expect("the fixture uses the selected isolated runtime home"),
+        )
+        .unwrap()
+    }
+
+    struct RequestRepositoryFixture {
+        layout: kin_core::layout::KinLayout,
+        _environment: kin_core::test_env::EnvVarGuard,
+        _root: tempfile::TempDir,
+    }
+
+    impl RequestRepositoryFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("isolated protected-request repository");
+            let home = root.path().join("home");
+            let kin_home = root.path().join("kin-home");
+            let working_dir = root.path().join("repo");
+            for directory in [&home, &kin_home, &working_dir] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            let environment = kin_core::test_env::EnvVarGuard::set("HOME", &home)
+                .with("USERPROFILE", &home)
+                .with("KIN_HOME", &kin_home)
+                .with("KIN_RUNTIME_MODE", "development")
+                .with("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
+                .with("KIN_NO_DAEMON", "1")
+                .without("KIN_DIR")
+                .without("KIN_STORE")
+                .without("KIN_STORE_LAYOUT")
+                .without("KIN_DAEMON_URL")
+                .without("KIN_MCP_REPO")
+                .without("KIN_SESSION_ID");
+            let layout = kin_core::init(&working_dir)
+                .expect("initialize the actual protected-request repository")
+                .layout;
+            kin_core::runtime_identity::RuntimeNamespace::initialize_local_service()
+                .expect("initialize the fixture's actual runtime namespace");
+            Self {
+                layout,
+                _environment: environment,
+                _root: root,
+            }
+        }
+
+        fn client(
+            &self,
+            base_url: String,
+            checkout_token: Option<String>,
+            session_id: Option<&str>,
+        ) -> DaemonClient {
+            let mut client = DaemonClient::from_base_url_with_explicit_authority(
+                base_url,
+                checkout_token,
+                session_id,
+            )
+            .unwrap();
+            client.bind_repository(self.layout.root());
+            client
+        }
+    }
+
+    fn repository_runtime_identity(
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> kin_core::runtime_identity::RuntimeServiceIdentity {
+        let mut identity = kin_core::runtime_identity::RuntimeServiceIdentity::current(component)
+            .expect("the fixture uses its actual isolated runtime namespace");
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(layout)
+                .expect("the fixture's actual repository binding")
+                .identity()
+                .clone(),
+        );
+        identity
+    }
+
+    fn repository_runtime_identity_body(
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> String {
+        serde_json::to_string(&repository_runtime_identity(component, layout)).unwrap()
+    }
+
+    fn with_repository_runtime_identity(
+        app: axum::Router,
+        component: &str,
+        layout: &kin_core::layout::KinLayout,
+    ) -> axum::Router {
+        let body = repository_runtime_identity_body(component, layout);
+        app.route(
+            "/runtime/identity",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }),
+        )
+    }
+
+    async fn spawn_repository_admission_server(
+        identity: kin_core::runtime_identity::RuntimeServiceIdentity,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            routing::{get, post},
+            Router,
+        };
+
+        identity
+            .validate_for_current("daemon")
+            .expect("the peer must share the caller's real source and runtime namespace");
+        let identity_body = serde_json::to_string(&identity).unwrap();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new()
+            .route(
+                "/runtime/identity",
+                get(move || {
+                    let body = identity_body.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/commands/test",
+                post(move || {
+                    let requests = handler_requests.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"accepted": true}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    type HostedControlRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, bool, serde_json::Value)>>>;
+
+    fn independent_hosted_identity() -> kin_core::runtime_identity::RuntimeServiceIdentity {
+        let mut peer = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+            .expect("the caller's real isolated runtime identity");
+        peer.component = "hosted-daemon".into();
+        peer.namespace = None;
+        peer.repository = None;
+        peer.identity.commit_sha = if peer.identity.commit_sha == "1".repeat(40) {
+            "2".repeat(40)
+        } else {
+            "1".repeat(40)
+        };
+        peer
+    }
+
+    async fn spawn_hosted_control_server(
+        peer: kin_core::runtime_identity::RuntimeServiceIdentity,
+    ) -> (String, HostedControlRequests, tokio::task::JoinHandle<()>) {
+        let identity = serde_json::to_string(&peer).unwrap();
+        let requests: HostedControlRequests = Default::default();
+        let captured = requests.clone();
+        let operation =
+            move |uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push((
+                        uri.path().to_string(),
+                        headers.contains_key(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER),
+                        body,
+                    ));
+                    axum::Json(if uri.path() == "/commands/admit" {
+                        serde_json::json!({"lines": ["hosted admission control"], "mutated": false})
+                    } else {
+                        serde_json::json!({"accepted": true})
+                    })
+                }
+            };
+        let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            identity,
+                        )
+                    }
+                }),
+            )
+            .route("/commands/test", axum::routing::post(operation.clone()))
+            .route("/commands/admit", axum::routing::post(operation));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), requests, server)
+    }
+
+    fn unbound_hosted_client(
+        repository: &RequestRepositoryFixture,
+        base_url: String,
+    ) -> DaemonClient {
+        let mut client = repository.client(base_url, None, None);
+        client.kin_root = None;
+        client.runtime_repository = None;
+        client
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_send_uses_independent_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = independent_hosted_identity();
+        assert_ne!(
+            peer.identity.commit_sha,
+            kin_core::runtime_identity::RuntimeIdentity::current().commit_sha
+        );
+        let (base_url, requests, server) = spawn_hosted_control_server(peer).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let body = serde_json::json!({"control": "independent hosted send"});
+        let response = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&body),
+                "hosted send control",
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"accepted": true})
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![("/commands/test".into(), false, body)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_admit_uses_independent_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) =
+            spawn_hosted_control_server(independent_hosted_identity()).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let request = crate::commands::admit::AdmitRequest::default();
+        let AdmitDispatch::Answered(answer) = client.admit(&request).await else {
+            panic!("eligible independent Hosted authority must answer deliberate admission");
+        };
+        assert_eq!(answer.lines, vec!["hosted admission control"]);
+        assert!(!answer.mutated);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![(
+                "/commands/admit".into(),
+                false,
+                serde_json::to_value(&request).unwrap()
+            )]
+        );
+        server.abort();
+    }
+
+    async fn assert_hosted_client_eligibility_refusal(wrong_mode: bool) {
+        let repository = RequestRepositoryFixture::new();
+        let mut peer = independent_hosted_identity();
+        let reason = if wrong_mode {
+            peer.mode = kin_core::runtime_identity::RuntimeMode::Managed;
+            "mode"
+        } else {
+            peer.identity.source_known = false;
+            "source"
+        };
+        let (base_url, requests, server) = spawn_hosted_control_server(peer).await;
+        let client = unbound_hosted_client(&repository, base_url);
+        let error = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&serde_json::json!({"control": "hosted refusal"})),
+                "hosted refusal control",
+            )
+            .await
+            .expect_err("ineligible Hosted authority must refuse ordinary dispatch");
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        let AdmitDispatch::Refused(error) = client
+            .admit(&crate::commands::admit::AdmitRequest::default())
+            .await
+        else {
+            panic!("ineligible Hosted authority must refuse deliberate admission");
+        };
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "ineligible Hosted authority must receive no semantic request"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_wrong_mode_refuses_both_dispatches() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        assert_hosted_client_eligibility_refusal(true).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_hosted_unknown_source_refuses_both_dispatches() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        assert_hosted_client_eligibility_refusal(false).await;
+    }
+
+    async fn assert_repository_client_refusal(
+        client: &DaemonClient,
+        requests: &std::sync::atomic::AtomicUsize,
+        reason: &str,
+    ) {
+        let error = client
+            .send(
+                client
+                    .client
+                    .post(format!("{}/commands/test", client.base_url))
+                    .json(&serde_json::json!({"control": "repository admission"})),
+                "repository admission control",
+            )
+            .await
+            .expect_err("repository admission must refuse before semantic dispatch");
+        assert!(
+            error.downcast_ref::<RuntimeEndpointRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused repository must receive no semantic request"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_unbound_caller_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = repository_runtime_identity("daemon", &repository.layout);
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let mut client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        client.kin_root = None;
+        client.runtime_repository = None;
+        assert_repository_client_refusal(&client, &requests, "no intended repository is bound")
+            .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_missing_peer_repository_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        peer.repository = None;
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "ready service supplied no repository identity",
+        )
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_wrong_repository_id_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let other_dir = repository._root.path().join("other-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = kin_core::init(&other_dir)
+            .expect("initialize the other real repository")
+            .layout;
+        let other_binding =
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&other)
+                .expect("capture the other real repository binding");
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        let claim = peer.repository.as_mut().unwrap();
+        assert_ne!(claim.repository_id, other_binding.identity().repository_id);
+        claim.repository_id = other_binding.identity().repository_id.clone();
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "repository identity differs from the selected repository",
+        )
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_wrong_store_namespace_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let other_dir = repository._root.path().join("other-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = kin_core::init(&other_dir)
+            .expect("initialize the other real repository")
+            .layout;
+        let other_binding =
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&other)
+                .expect("capture the other real repository binding");
+        let mut peer = repository_runtime_identity("daemon", &repository.layout);
+        let claim = peer.repository.as_mut().unwrap();
+        assert_ne!(
+            claim.store_namespace,
+            other_binding.identity().store_namespace
+        );
+        claim.store_namespace = other_binding.identity().store_namespace.clone();
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        assert_repository_client_refusal(
+            &client,
+            &requests,
+            "repository identity differs from the selected repository",
+        )
+        .await;
+        server.abort();
+    }
+
+    // Unix permits renaming a retained directory; Windows directory handles deny delete sharing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_repository_client_refuses_replaced_retained_store_without_dispatch() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let peer = repository_runtime_identity("daemon", &repository.layout);
+        let (base_url, requests, server) = spawn_repository_admission_server(peer).await;
+        let client = repository.client(base_url, None, None);
+        let store = repository.layout.root();
+        let retained = store.with_extension("retained-store");
+        std::fs::rename(store, &retained)
+            .expect("rename the fixture's own store while its admitted capability is retained");
+        std::fs::create_dir(store).expect("create a distinct store object at the original path");
+        assert!(
+            client
+                .runtime_repository
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .revalidate()
+                .is_err(),
+            "the retained capability must detect the replaced object"
+        );
+        assert_repository_client_refusal(&client, &requests, "repository admission refused").await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_client_refuses_same_source_other_home_before_health_dispatch() {
+        let other_home = tempfile::tempdir().unwrap();
+        let other =
+            kin_core::runtime_identity::RuntimeNamespace::capture(other_home.path()).unwrap();
+        let mut service =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        service.namespace = Some(other.token().to_owned());
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let marker = reached.clone();
+        let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let service = service.clone();
+                    async move { axum::Json(service) }
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let marker = marker.clone();
+                    async move {
+                        marker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "repository health accessed"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        struct FixtureServer(tokio::task::JoinHandle<()>);
+        impl Drop for FixtureServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = FixtureServer(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let client = DaemonClient::from_base_url(base_url).unwrap();
+        let error = client.health().await.unwrap_err();
+        assert!(error.to_string().contains("namespace differs"), "{error:#}");
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_waiter_refuses_different_source_without_readiness_dispatch_or_retirement(
+    ) {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_HOME", home.path())
+            .with("KIN_RUNTIME_MODE", "development");
+        kin_core::runtime_identity::RuntimeNamespace::initialize_local_service().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let mut service =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        service.identity.commit_sha = if service.identity.commit_sha == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let marker = reached.clone();
+        let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let service = service.clone();
+                    async move { axum::Json(service) }
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let marker = marker.clone();
+                    async move {
+                        marker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "repository health accessed"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        struct FixtureServer(tokio::task::JoinHandle<()>);
+        impl Drop for FixtureServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = FixtureServer(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let pid_text = std::process::id().to_string();
+        let port_text = port.to_string();
+        std::fs::write(fixture.path().join("daemon.pid"), &pid_text).unwrap();
+        std::fs::write(fixture.path().join("daemon.port"), &port_text).unwrap();
+        let reading = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_existing_daemon_within(
+                fixture.path(),
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+                None,
+            ),
+        )
+        .await
+        .expect("an explicit identity refusal must not wait out startup patience");
+        match reading {
+            ExistingDaemon::LiveNotReady(message) => {
+                assert!(message.contains("runtime identity mismatch"), "{message}")
+            }
+            other => panic!("a different source generation must remain refused: {other:?}"),
+        }
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("daemon.pid")).unwrap(),
+            pid_text
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("daemon.port")).unwrap(),
+            port_text
+        );
+    }
+
+    /// A managed Kin 0.8.7 client, for the replacement tests. Test builds are
+    /// development clients, which never replace anything.
+    #[cfg(unix)]
+    fn managed_client_0_8_7() -> impl Drop {
+        succession::stand_in_client_for_test(
+            kin_core::runtime_identity::SuccessionClient {
+                identity: kin_core::runtime_identity::RuntimeIdentity {
+                    version: "0.8.7".into(),
+                    commit_sha: "a".repeat(40),
+                    source_dirty: false,
+                    source_known: true,
+                    target: "aarch64-apple-darwin".into(),
+                    build_profile: "release".into(),
+                },
+                mode: kin_core::runtime_identity::RuntimeMode::Managed,
+                namespace: None,
+            },
+            None,
+        )
+    }
+
+    /// A live stand-in daemon from before runtime identity, published for a
+    /// repository, whose endpoint reports `health` and ends the stand-in when
+    /// it is asked to stop. Counts every request that is not a read.
+    #[cfg(unix)]
+    struct LegacyDaemonFixture {
+        root: tempfile::TempDir,
+        pid: u32,
+        identity: ProcessIdentity,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _server: tokio::task::JoinHandle<()>,
+        child: std::process::Child,
+    }
+
+    #[cfg(unix)]
+    impl LegacyDaemonFixture {
+        async fn start(version: &str, dirty: bool) -> Self {
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let identity = process_identity(pid).unwrap().unwrap();
+            let input = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));
+            let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let health = serde_json::json!({
+                "version": version,
+                "pid": pid,
+                "build": {"sha": "b".repeat(40), "dirty": dirty, "source_known": true, "built_at": "then"},
+            });
+            let retire_writes = writes.clone();
+            let shutdown_writes = writes.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/health",
+                    axum::routing::get(move || {
+                        let health = health.clone();
+                        async move { axum::Json(health) }
+                    }),
+                )
+                .route(
+                    "/retire",
+                    axum::routing::post(move |body: String| {
+                        let writes = retire_writes.clone();
+                        async move {
+                            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if body.contains("\"replacement\"") {
+                                (axum::http::StatusCode::UNPROCESSABLE_ENTITY, String::new())
+                            } else {
+                                (
+                                    axum::http::StatusCode::ACCEPTED,
+                                    r#"{"retiring":true,"blocked_by":["a client session is attached"]}"#
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/shutdown",
+                    axum::routing::post(move || {
+                        let writes = shutdown_writes.clone();
+                        let input = input.clone();
+                        async move {
+                            writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            drop(input.lock().unwrap().take());
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                repo_daemon_owner_path(root.path()),
+                serde_json::to_vec(&EndpointOwnerRecord::for_identity(identity.clone())).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.path().join("daemon.pid"), pid.to_string()).unwrap();
+            std::fs::write(root.path().join("daemon.port"), port.to_string()).unwrap();
+            Self {
+                root,
+                pid,
+                identity,
+                writes,
+                _server: server,
+                child,
+            }
+        }
+
+        async fn existing(&self) -> ExistingDaemon {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_existing_daemon_within(
+                    self.root.path(),
+                    Duration::from_millis(20),
+                    Duration::from_secs(60),
+                    None,
+                ),
+            )
+            .await
+            .expect("a release decision must not wait out startup patience")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LegacyDaemonFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// An older release's daemon is named superseded rather than refused,
+    /// replaced through its incarnation, and then the repository has no
+    /// daemon, which is where the spawn path starts this release's. A second
+    /// older daemon in the same command is refused by who started it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_daemon_is_replaced_and_then_the_spawn_path_runs() {
+        let _client = managed_client_0_8_7();
+        let daemon = LegacyDaemonFixture::start("0.8.6", false).await;
+        let ExistingDaemon::Superseded(pid) = daemon.existing().await else {
+            panic!("an older release must be named superseded");
+        };
+        assert_eq!(pid, daemon.pid);
+
+        let mut replaced = None;
+        replace_superseded_daemon_once(daemon.root.path(), pid, &mut replaced)
+            .await
+            .expect("the older daemon must be replaced");
+        assert_eq!(replaced, Some(pid));
+        assert!(
+            !process_identity_is_current(&daemon.identity).unwrap(),
+            "the older daemon must be gone"
+        );
+        assert!(
+            matches!(daemon.existing().await, ExistingDaemon::None),
+            "with the older daemon replaced, nothing serves the repository and the spawn path runs"
+        );
+
+        let AutoStartError::SpawnFailed(message) =
+            replace_superseded_daemon_once(daemon.root.path(), 424_242, &mut replaced)
+                .await
+                .unwrap_err()
+        else {
+            panic!("a second older daemon must be refused");
+        };
+        assert!(
+            message.contains(&format!("pid {pid}")) && message.contains("started by"),
+            "{message}"
+        );
+    }
+
+    /// A newer release and a development build are refused by pid and path,
+    /// and never asked to retire or stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_newer_or_development_daemon_is_refused_and_never_asked_to_go() {
+        let _client = managed_client_0_8_7();
+        for (version, dirty, named) in [
+            ("0.9.0", false, "Kin 0.9.0"),
+            ("0.8.6", true, "uncommitted source changes"),
+        ] {
+            let daemon = LegacyDaemonFixture::start(version, dirty).await;
+            let ExistingDaemon::LiveNotReady(message) = daemon.existing().await else {
+                panic!("{version}: the daemon must be refused");
+            };
+            assert!(
+                message.contains(&format!("pid {}", daemon.pid)) && message.contains("/bin/cat"),
+                "{message}"
+            );
+            assert!(message.contains(named), "{message}");
+            assert_eq!(
+                daemon.writes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{version}: nothing may be asked of a daemon that is not replaced"
+            );
+            assert!(process_identity_is_current(&daemon.identity).unwrap());
+        }
+    }
+
+    async fn write_fixture_json_response(
+        stream: &mut tokio::net::TcpStream,
+        body: &str,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+    }
+
     async fn spawn_fixed_response_server_at(
+        layout: &kin_core::layout::KinLayout,
         route: &'static str,
         status: axum::http::StatusCode,
         body: impl Into<String>,
@@ -10510,6 +12381,7 @@ mod tests {
                 }
             }),
         );
+        let app = with_repository_runtime_identity(app, "daemon", layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -10519,6 +12391,7 @@ mod tests {
     }
 
     async fn spawn_fixed_response_server(
+        layout: &kin_core::layout::KinLayout,
         status: axum::http::StatusCode,
         body: &'static str,
     ) -> (
@@ -10526,10 +12399,12 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
-        spawn_fixed_response_server_at("/commands/test", status, body).await
+        spawn_fixed_response_server_at(layout, "/commands/test", status, body).await
     }
 
-    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    async fn read_complete_http_request(
+        stream: &mut tokio::net::TcpStream,
+    ) -> std::io::Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
 
         let mut request = Vec::new();
@@ -10561,16 +12436,19 @@ mod tests {
                 })
                 .unwrap_or(0);
             if request.len() >= header_end + content_length {
-                return Ok(());
+                return Ok(request);
             }
         }
     }
 
-    async fn spawn_dropped_ack_server() -> (
+    async fn spawn_dropped_ack_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
+        let runtime_identity = repository_runtime_identity_body("daemon", layout);
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_requests = requests.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10580,8 +12458,12 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                if read_complete_http_request(&mut stream).await.is_ok() {
-                    server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(request) = read_complete_http_request(&mut stream).await {
+                    if request.starts_with(b"GET /runtime/identity ") {
+                        let _ = write_fixture_json_response(&mut stream, &runtime_identity).await;
+                    } else {
+                        server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 drop(stream);
             }
@@ -10589,13 +12471,16 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
-    async fn spawn_truncated_ack_server() -> (
+    async fn spawn_truncated_ack_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
         use tokio::io::AsyncWriteExt;
 
+        let runtime_identity = repository_runtime_identity_body("daemon", layout);
         let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_requests = requests.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10605,7 +12490,11 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                if read_complete_http_request(&mut stream).await.is_ok() {
+                if let Ok(request) = read_complete_http_request(&mut stream).await {
+                    if request.starts_with(b"GET /runtime/identity ") {
+                        let _ = write_fixture_json_response(&mut stream, &runtime_identity).await;
+                        continue;
+                    }
                     server_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = stream
                         .write_all(
@@ -10620,7 +12509,9 @@ mod tests {
         (format!("http://{address}"), requests, server)
     }
 
-    async fn spawn_redirect_server() -> (
+    async fn spawn_redirect_server(
+        layout: &kin_core::layout::KinLayout,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
@@ -10654,6 +12545,7 @@ mod tests {
                     }
                 }),
             );
+        let app = with_repository_runtime_identity(app, "daemon", layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -10692,6 +12584,10 @@ mod tests {
 
     #[tokio::test]
     async fn merge_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let operation_id = stable_test_operation_id();
         let other_operation_id =
             OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
@@ -10714,11 +12610,14 @@ mod tests {
         ];
 
         for (case, body, detail) in cases {
-            let (base_url, requests, server) =
-                spawn_fixed_response_server_at("/commands/merge", axum::http::StatusCode::OK, body)
-                    .await;
-            let client =
-                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let (base_url, requests, server) = spawn_fixed_response_server_at(
+                &repository.layout,
+                "/commands/merge",
+                axum::http::StatusCode::OK,
+                body,
+            )
+            .await;
+            let client = repository.client(base_url, None, None);
             let request = crate::commands::merge::MergeRequest {
                 source: kin_model::RefName::branch(b"source").unwrap(),
                 operation_id,
@@ -10746,6 +12645,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_requires_a_corroborated_acknowledgement_and_dispatches_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let operation_id = stable_test_operation_id();
         let other_operation_id =
             OperationId::from_uuid(Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321));
@@ -10769,13 +12672,13 @@ mod tests {
 
         for (case, body, detail) in cases {
             let (base_url, requests, server) = spawn_fixed_response_server_at(
+                &repository.layout,
                 "/commands/resolve",
                 axum::http::StatusCode::OK,
                 body,
             )
             .await;
-            let client =
-                DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            let client = repository.client(base_url, None, None);
             let request = crate::commands::resolve::ResolveRequest {
                 operation_id,
                 actor: kin_model::AuthorId::new("ack-test"),
@@ -10804,10 +12707,13 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_serialization_failure_is_direct_and_never_dispatched() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::OK, "{}").await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            spawn_fixed_response_server(&repository.layout, axum::http::StatusCode::OK, "{}").await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10833,9 +12739,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_dropped_ack_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) = spawn_dropped_ack_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_dropped_ack_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10855,9 +12764,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_truncated_body_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) = spawn_truncated_ack_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_truncated_ack_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10878,11 +12790,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_server_error_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::SERVICE_UNAVAILABLE, "try later")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "try later",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10903,10 +12821,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_malformed_success_is_indeterminate_and_dispatched_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::OK, "not-json").await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+            spawn_fixed_response_server(&repository.layout, axum::http::StatusCode::OK, "not-json")
+                .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10927,11 +12849,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_client_error_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::CONFLICT, "stale merge record")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::CONFLICT,
+            "stale merge record",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -10977,18 +12905,22 @@ mod tests {
     /// it is, once, with the daemon's reason carried through.
     #[tokio::test]
     async fn a_marked_client_error_is_a_refusal_that_wrote_nothing_and_dispatched_once() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let body = crate::daemon_error::DaemonErrorBody::before_write(
             "merging refs/heads/pretty into refs/heads/main still has 27 unresolved conflict(s)",
         )
         .to_wire();
         let (base_url, requests, server) = spawn_fixed_response_server_at(
+            &repository.layout,
             "/commands/test",
             axum::http::StatusCode::CONFLICT,
             body,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11018,16 +12950,20 @@ mod tests {
     /// one real safety property.
     #[tokio::test]
     async fn a_marked_server_error_is_still_indeterminate() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let body =
             crate::daemon_error::DaemonErrorBody::before_write("nothing was committed").to_wire();
         let (base_url, requests, server) = spawn_fixed_response_server_at(
+            &repository.layout,
             "/commands/test",
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             body,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11051,13 +12987,17 @@ mod tests {
     /// a new CLI must not read silence as a promise.
     #[tokio::test]
     async fn an_unmarked_client_error_body_is_still_indeterminate() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
             axum::http::StatusCode::CONFLICT,
             "repository projection conflict: tracked working-copy path differs",
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11082,13 +13022,16 @@ mod tests {
     /// green while breaking the other.
     #[tokio::test]
     async fn a_client_error_marked_false_is_still_indeterminate() {
-        let (base_url, _requests, server) = spawn_fixed_response_server(
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, _requests, server) = spawn_fixed_response_server(&repository.layout,
             axum::http::StatusCode::BAD_REQUEST,
             r#"{"message":"no recorded merge conflict matches summarize","refused_before_write":false}"#,
         )
         .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11107,11 +13050,17 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_bad_request_is_indeterminate_and_dispatched_once() {
-        let (base_url, requests, server) =
-            spawn_fixed_response_server(axum::http::StatusCode::BAD_REQUEST, "finalization failed")
-                .await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            &repository.layout,
+            axum::http::StatusCode::BAD_REQUEST,
+            "finalization failed",
+        )
+        .await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11132,9 +13081,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_idempotent_post_does_not_redispatch_through_redirects() {
-        let (base_url, requests, server) = spawn_redirect_server().await;
-        let client =
-            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
+        let (base_url, requests, server) = spawn_redirect_server(&repository.layout).await;
+        let client = repository.client(base_url, None, None);
         let operation_id = stable_test_operation_id();
 
         let error = client
@@ -11173,6 +13125,10 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_post_retries_exact_body_with_same_session_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let repository = RequestRepositoryFixture::new();
         use axum::{body::Bytes, http::StatusCode, routing::post, Router};
 
         #[derive(Default)]
@@ -11205,17 +13161,17 @@ mod tests {
                 }
             }),
         );
+        let app = with_repository_runtime_identity(app, "daemon", &repository.layout);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = DaemonClient::from_base_url_with_explicit_authority(
+        let client = repository.client(
             format!("http://{address}"),
             Some("checkout-token".to_string()),
             Some("session-checkout"),
-        )
-        .unwrap();
+        );
         let request = serde_json::json!({
             "operation_id": "stable-operation",
             "path_hex": "7372632f6c69622e7273"
@@ -11826,6 +13782,7 @@ mod tests {
     ) -> (u16, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let runtime_identity = runtime_identity_body("daemon");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -11838,7 +13795,9 @@ mod tests {
                     continue;
                 };
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                if request.contains("/readiness") {
+                if request.starts_with("GET /runtime/identity ") {
+                    let _ = write_fixture_json_response(&mut socket, &runtime_identity).await;
+                } else if request.contains("/readiness") {
                     let body = format!(r#"{{"ready":true,"warming":{warming}}}"#);
                     let _ = socket
                         .write_all(
@@ -12267,6 +14226,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_route_observer_uses_the_chosen_route_and_preserves_repository_identity() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mine = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = mine.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let own_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own_url = format!("http://{}", own_listener.local_addr().unwrap());
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_url = format!("http://{}", other_listener.local_addr().unwrap());
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_HOME", home.path())
+            .with("KIN_RUNTIME_MODE", "development")
+            .with("KIN_DAEMON_URL", &other_url);
+        kin_core::runtime_identity::RuntimeNamespace::initialize_local_service().unwrap();
+        let own_server = serve_repo_daemon_health(own_listener, mine.path());
+        let other_server = serve_repo_daemon_health(other_listener, other.path());
+
+        let own_reading = kin_daemon_spawn::DaemonSpawnRegistrar::reading_at(
+            &CliSpawnRegistrar,
+            root.clone(),
+            own_url.clone(),
+            Duration::from_millis(500),
+        )
+        .await;
+        let other_reading = kin_daemon_spawn::DaemonSpawnRegistrar::reading_at(
+            &CliSpawnRegistrar,
+            root,
+            other_url,
+            Duration::from_millis(500),
+        )
+        .await;
+        own_server.abort();
+        other_server.abort();
+        let _ = own_server.await;
+        let _ = other_server.await;
+
+        assert_eq!(
+            own_reading,
+            Reading::Serving(own_url),
+            "the chosen endpoint must win over a stale configured route"
+        );
+        assert!(
+            matches!(other_reading, Reading::Unresolved { .. }),
+            "an endpoint serving another repository must stay refused: {other_reading:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn typed_route_reading_does_not_certify_untrusted_or_wrong_repository_urls() {
         use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
         let mine = tempfile::tempdir().unwrap();
@@ -12317,6 +14328,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let repo_root = strict_canonical_path(repo_root).unwrap();
+        let runtime_identity = runtime_identity_body("daemon");
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -12327,7 +14339,9 @@ mod tests {
                     continue;
                 };
                 let request = String::from_utf8_lossy(&buffer[..read]);
-                let body = if request.contains("/readiness") {
+                let body = if request.starts_with("GET /runtime/identity ") {
+                    runtime_identity.clone()
+                } else if request.contains("/readiness") {
                     r#"{"ready":true,"warming":false}"#.to_string()
                 } else if request.contains("/health") {
                     serde_json::json!({
@@ -13082,6 +15096,8 @@ mod tests {
         );
 
         let current: DaemonCompatResponse = serde_json::from_value(serde_json::json!({
+            "runtime_identity": kin_core::runtime_identity::RuntimeIdentity::current(),
+            "runtime_mode": kin_core::runtime_identity::RuntimeMode::current().unwrap(),
             "schema": "kin.daemon.compat.v2",
             "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
             "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
@@ -13224,6 +15240,7 @@ mod tests {
     fn serve_supervisor_health(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        let runtime_identity = runtime_identity_body("supervisor");
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -13233,10 +15250,14 @@ mod tests {
                 let Ok(read) = socket.read(&mut buffer).await else {
                     continue;
                 };
-                if !String::from_utf8_lossy(&buffer[..read]).contains("/health") {
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body = if request.starts_with("GET /runtime/identity ") {
+                    runtime_identity.as_str()
+                } else if request.contains("/health") {
+                    r#"{"status":"ok"}"#
+                } else {
                     continue;
-                }
-                let body = r#"{"status":"ok"}"#;
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                      connection: close\r\ncontent-length: {}\r\n\r\n{body}",

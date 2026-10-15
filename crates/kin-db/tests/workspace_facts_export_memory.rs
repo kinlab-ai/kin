@@ -218,6 +218,7 @@ fn fixture() -> GraphSnapshot {
                 authored_by: IdentityRef::human("fixture-author"),
                 created_at: fixed_timestamp(),
                 staleness: StalenessState::default(),
+                review: None,
             },
         );
     }

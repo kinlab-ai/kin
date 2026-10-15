@@ -380,6 +380,26 @@ fn with_daemon_auth(
     }
 }
 
+/// Authorize and admit one request to the repo-scoped daemon.
+///
+/// A managed daemon refuses a request that lacks this process's runtime
+/// identity and the repository it means, before any handler runs, so a bare
+/// request from this module carries both beside the bearer token.
+async fn admitted_daemon_request(
+    request: reqwest::RequestBuilder,
+    daemon_url: &str,
+    layout: &kin_core::KinLayout,
+    leaf: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
+    crate::daemon_client::admit_daemon_request(
+        with_daemon_auth(request, layout),
+        daemon_url,
+        layout,
+        leaf,
+    )
+    .await
+}
+
 async fn fetch_daemon_graph(
     daemon_url: &str,
     layout: &kin_core::KinLayout,
@@ -396,13 +416,17 @@ async fn fetch_daemon_graph(
         .build()
         .map_err(|error| format!("build daemon bootstrap client: {error}"))?;
 
-    let resp = with_daemon_auth(
+    let resp = admitted_daemon_request(
         client.get(format!(
             "{}/graph/bootstrap",
             daemon_url.trim_end_matches('/')
         )),
+        daemon_url,
         layout,
+        "graph bootstrap",
     )
+    .await
+    .map_err(|error| format!("admit graph bootstrap request: {error:#}"))?
     .send()
     .await
     .map_err(|error| format!("send graph bootstrap request: {error}"))?;
@@ -445,14 +469,17 @@ pub async fn require_daemon_update_head(
         "expected_head": expected_head_id,
     });
 
-    let resp = with_daemon_auth(
+    let resp = admitted_daemon_request(
         client.put(format!(
             "{}/v2/graph/branches/{}/head",
             daemon_url.trim_end_matches('/'),
             branch_name
         )),
+        &daemon_url,
         layout,
+        "branch head update",
     )
+    .await?
     .json(&payload)
     .send()
     .await?;
@@ -488,13 +515,16 @@ pub async fn require_daemon_commit(
         "branch_name": branch_name,
     });
 
-    let resp = with_daemon_auth(
+    let resp = admitted_daemon_request(
         client.post(format!(
             "{}/v1/graph/commit",
             daemon_url.trim_end_matches('/')
         )),
+        &daemon_url,
         layout,
+        "graph commit",
     )
+    .await?
     .json(&payload)
     .send()
     .await?;
@@ -565,6 +595,19 @@ async fn send_serialized_release_request(
             message: format!("build daemon release client: {error}"),
         })?;
     let endpoint = format!("{}/v1/graph/commit", daemon_url.trim_end_matches('/'));
+    // Admitted once: every attempt resends these exact bytes to this endpoint.
+    // A refused admission dispatched nothing, and the request stays pending.
+    let admission =
+        crate::daemon_client::daemon_admission_headers(daemon_url, layout, "release commit")
+            .await
+            .map_err(|error| DaemonReleaseCommitError {
+                kind: DaemonReleaseFailureKind::Uncertain,
+                safe_to_abandon: false,
+                message: format!(
+                    "the daemon did not admit the semantic release request for branch \
+                     {branch_name}; it remains pending: {error:#}"
+                ),
+            })?;
     let attempts = max_attempts.max(1);
     let mut backoff = initial_backoff;
     let mut last_uncertain = String::new();
@@ -574,6 +617,7 @@ async fn send_serialized_release_request(
         let response = with_daemon_auth(
             client
                 .post(&endpoint)
+                .headers(admission.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 // Clone the already-serialized bytes. Retries must never
                 // regenerate the change, timestamp, ID, or JSON request.
@@ -754,13 +798,16 @@ pub async fn require_daemon_graph_mutations(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let resp = with_daemon_auth(
+    let resp = admitted_daemon_request(
         client.post(format!(
             "{}/v1/graph/mutations",
             daemon_url.trim_end_matches('/')
         )),
+        &daemon_url,
         layout,
+        "graph mutations",
     )
+    .await?
     .json(&batch)
     .send()
     .await?;
@@ -796,17 +843,27 @@ pub async fn get_spine_impact(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = with_daemon_auth(
+    // A daemon that would not admit the request answered nothing about the
+    // spine, which is the unavailable case, never an empty answer.
+    let request = match admitted_daemon_request(
         client.get(format!("{}/spine/impact", daemon_url.trim_end_matches('/'))),
+        &daemon_url,
         layout,
+        "spine impact",
     )
-    .query(&[
-        ("repo", repo_id),
-        ("entity", &entity_id.to_string()),
-        ("depth", &depth.to_string()),
-    ])
-    .send()
-    .await;
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => return Ok(SpineQuery::Unavailable(format!("{error:#}"))),
+    };
+    let resp = request
+        .query(&[
+            ("repo", repo_id),
+            ("entity", &entity_id.to_string()),
+            ("depth", &depth.to_string()),
+        ])
+        .send()
+        .await;
     let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
     match classify_spine_probe(true, status) {
@@ -842,13 +899,23 @@ pub async fn get_spine_xref(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = with_daemon_auth(
+    // A daemon that would not admit the request answered nothing about the
+    // spine, which is the unavailable case, never an empty answer.
+    let request = match admitted_daemon_request(
         client.get(format!("{}/spine/xref", daemon_url.trim_end_matches('/'))),
+        &daemon_url,
         layout,
+        "spine xref",
     )
-    .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
-    .send()
-    .await;
+    .await
+    {
+        Ok(request) => request,
+        Err(error) => return Ok(SpineQuery::Unavailable(format!("{error:#}"))),
+    };
+    let resp = request
+        .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
+        .send()
+        .await;
     let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
     match classify_spine_probe(true, status) {
@@ -893,12 +960,20 @@ mod tests {
         first_response: Arc<Mutex<Option<StatusCode>>>,
         attempt_delays: Arc<Mutex<Vec<Duration>>>,
         later_response: Arc<Mutex<Option<StatusCode>>>,
+        /// Whether each received attempt carried both runtime admission
+        /// headers a managed daemon checks before this handler would run.
+        admitted: Arc<Mutex<Vec<bool>>>,
     }
 
     async fn release_retry_handler(
         State(state): State<ReleaseRetryServerState>,
+        headers: axum::http::HeaderMap,
         body: Bytes,
     ) -> StatusCode {
+        state.admitted.lock().unwrap().push(
+            headers.contains_key(kin_core::runtime_identity::RUNTIME_IDENTITY_HEADER)
+                && headers.contains_key(kin_core::runtime_identity::RUNTIME_REPOSITORY_HEADER),
+        );
         state.received.lock().unwrap().push(body.to_vec());
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let change_id = request["change"]["id"].as_str().unwrap().to_string();
@@ -924,12 +999,32 @@ mod tests {
             .unwrap_or(StatusCode::OK)
     }
 
+    /// A stand-in daemon serving `layout`'s repository: it names the caller's
+    /// own runtime and that repository on `/runtime/identity`, as a real one
+    /// does, so the caller's admission of each attempt is the real one.
     async fn release_retry_server(
         state: ReleaseRetryServerState,
+        layout: &kin_core::KinLayout,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let mut identity = kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon")
+            .expect("the fixture uses its actual runtime namespace");
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(layout)
+                .expect("the fixture's actual repository binding")
+                .identity()
+                .clone(),
+        );
+        let identity = serde_json::to_value(identity).unwrap();
         let app = Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(identity) }
+                }),
+            )
             .route("/v1/graph/commit", post(release_retry_handler))
             .with_state(state);
         let task = tokio::spawn(async move {
@@ -1012,7 +1107,7 @@ mod tests {
         let layout = kin_core::init(repo.path()).unwrap().layout;
         let state = ReleaseRetryServerState::default();
         *state.first_response.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
-        let (url, server) = release_retry_server(state.clone()).await;
+        let (url, server) = release_retry_server(state.clone(), &layout).await;
         let payload = serialized_release_fixture();
 
         send_serialized_release_request(
@@ -1031,6 +1126,11 @@ mod tests {
         let received = state.received.lock().unwrap();
         assert_eq!(received.len(), 2);
         assert!(received.iter().all(|request| request == &payload));
+        assert_eq!(
+            *state.admitted.lock().unwrap(),
+            vec![true, true],
+            "every attempt must carry the runtime admission a managed daemon checks first"
+        );
     }
 
     #[tokio::test]
@@ -1041,7 +1141,7 @@ mod tests {
         let max_attempts = 4;
         let state = ReleaseRetryServerState::default();
         *state.attempt_delays.lock().unwrap() = vec![attempt_timeout * 120];
-        let (url, server) = release_retry_server(state.clone()).await;
+        let (url, server) = release_retry_server(state.clone(), &layout).await;
         let payload = serialized_release_fixture();
 
         send_serialized_release_request(
@@ -1087,7 +1187,7 @@ mod tests {
         let max_attempts = 4;
         let state = ReleaseRetryServerState::default();
         *state.attempt_delays.lock().unwrap() = vec![attempt_timeout * 120, attempt_timeout * 120];
-        let (url, server) = release_retry_server(state.clone()).await;
+        let (url, server) = release_retry_server(state.clone(), &layout).await;
         let payload = serialized_release_fixture();
 
         send_serialized_release_request(
@@ -1132,7 +1232,7 @@ mod tests {
         let state = ReleaseRetryServerState::default();
         *state.first_response.lock().unwrap() = Some(StatusCode::REQUEST_TIMEOUT);
         *state.later_response.lock().unwrap() = Some(StatusCode::CONFLICT);
-        let (url, server) = release_retry_server(state.clone()).await;
+        let (url, server) = release_retry_server(state.clone(), &layout).await;
         let payload = serialized_release_fixture();
 
         let error = send_serialized_release_request(

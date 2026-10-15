@@ -83,20 +83,8 @@ SETUP = r'''      - name: Require the workflow context candidate before checkout
           SOURCE_PATH: ${{ inputs.source_path }}
         run: |
           $ErrorActionPreference = "Stop"
-          & "rehearsal-source/$env:SOURCE_PATH/scripts/test-windows-install-mirror.ps1" -InstallerPath "rehearsal-source/$env:SOURCE_PATH/scripts/install.ps1" -OutputRoot "$env:RUNNER_TEMP/rehearsal/mirror-boundary"
-      - name: Install the baseline with the candidate Windows installer
-        if: inputs.proof_mode == 'compatibility-baseline'
-        shell: pwsh
-        env:
-          SOURCE_PATH: ${{ inputs.source_path }}
-          KIN_VERSION: ${{ inputs.release_tag }}
-          KIN_NO_SETUP: '1'
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:KIN_VERSION = $env:KIN_VERSION.TrimStart('v')
-          & "rehearsal-source/$env:SOURCE_PATH/scripts/install.ps1"
-          "$HOME\.kin\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Rehearse stable baseline setup and Git author identity
+          & "rehearsal-source/$env:SOURCE_PATH/scripts/test-windows-install-mirror.ps1" -InstallerPath "rehearsal-source/$env:SOURCE_PATH/scripts/install.ps1" -OutputRoot "$env:RUNNER_TEMP/rehearsal/mirror-boundary" -RetainBaselineArchive
+      - name: Prepare verified legacy baseline and rehearse its setup
         if: inputs.proof_mode == 'compatibility-baseline'
         shell: bash
         env:
@@ -104,6 +92,7 @@ SETUP = r'''      - name: Require the workflow context candidate before checkout
         run: |
           set -euo pipefail
           python "rehearsal-source/$SOURCE_PATH/scripts/release-rehearsal-compat.py" \
+            --baseline-archive "$RUNNER_TEMP/rehearsal/mirror-boundary/kin-windows-x86_64.zip" \
             --output "$RUNNER_TEMP/rehearsal/compatibility"
 '''
 PREPARE = r'''      - name: Prepare candidate Windows installer and exact metadata

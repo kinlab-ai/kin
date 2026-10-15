@@ -165,6 +165,7 @@ fn build_annotation(
         authored_by: IdentityRef::human("cli-user"),
         created_at: Timestamp::now(),
         staleness: StalenessState::Fresh,
+        review: None,
     };
 
     let link = WorkLink::AttachedTo {

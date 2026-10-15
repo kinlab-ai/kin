@@ -97,6 +97,8 @@ HOSTS: tuple[tuple[str, str, str], ...] = (
     ("windows x86_64 (MSYS)", "MSYS_NT-10.0-22631", "x86_64"),
     ("windows x86_64 (Cygwin)", "CYGWIN_NT-10.0-22631", "amd64"),
 )
+WINDOWS_UNAME_PREFIXES = ("MINGW", "MSYS", "CYGWIN")
+OFFICIAL_POWERSHELL_COMMAND = "irm https://get.kinlab.dev/install.ps1 | iex"
 
 
 class GuardError(RuntimeError):
@@ -285,7 +287,7 @@ def installer_env(root: Path, fake_bin: Path, releases: Path, home: Path) -> dic
     return env
 
 
-def requested_asset(uname_s: str, uname_m: str) -> str:
+def requested_asset(uname_s: str, uname_m: str) -> str | None:
     """Ask install.sh which artifact this host is served.
 
     The release directory is empty on purpose: the installer prints the name it
@@ -306,6 +308,14 @@ def requested_asset(uname_s: str, uname_m: str) -> str:
             capture_output=True,
             text=True,
         )
+        managed_home_created = (home / ".kin").exists() or (home / ".kin").is_symlink()
+    output = ANSI.sub("", result.stdout + result.stderr)
+    if uname_s.startswith(WINDOWS_UNAME_PREFIXES):
+        if result.returncode == 0 or DOWNLOAD_LINE.search(output) or managed_home_created or OFFICIAL_POWERSHELL_COMMAND not in output:
+            raise GuardError(
+                "install.sh must provide the official PowerShell redirect before any Windows download or managed write"
+            )
+        return None
     for line in ANSI.sub("", result.stdout).splitlines():
         match = DOWNLOAD_LINE.search(line)
         if match:
@@ -353,6 +363,8 @@ def build_archive(directory: Path, leg: Leg) -> Path:
 
 def check_host(label: str, uname_s: str, uname_m: str, resolved: dict[str, Leg]) -> str:
     artifact = requested_asset(uname_s, uname_m)
+    if artifact is None:
+        return f"{label}: refused before download or managed write with official PowerShell redirect"
     leg = resolved.get(artifact)
     if leg is None:
         raise GuardError(

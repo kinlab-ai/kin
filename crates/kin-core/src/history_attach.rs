@@ -20,11 +20,16 @@
 //!
 //! **Nothing the partial store holds is lost.** The swap refuses a partial
 //! store that has anything the staged store cannot stand for: a change other
-//! than its snapshot, a ref that moved off the snapshot, a stash or an open
-//! merge. What the partial store accumulated on top of the snapshot without
-//! committing, its workspace state and the cross-file enrichment a sweep
-//! published into it, is re-derived by the next daemon from the working tree
-//! and the language servers, exactly as for a newly converted store.
+//! than its snapshot, or a ref that moved off the snapshot. It waits, moving
+//! nothing, while the partial store holds work that is still open
+//! ([`OpenWork`]): a merge, a stash, an agent's transaction, an unapplied
+//! entity draft or a release being recorded. That check is made here, under
+//! the runtime authority and with no daemon serving, so it is exact whoever
+//! asks for the attach and whatever a daemon believed a moment earlier. What
+//! the partial store accumulated on top of the snapshot without committing,
+//! its workspace state and the cross-file enrichment a sweep published into
+//! it, is re-derived by the next daemon from the working tree and the
+//! language servers, exactly as for a newly converted store.
 //!
 //! **A crash never strands the store.** A journal written before the first move
 //! and removed after the last one names the stage, and every attach, including
@@ -98,6 +103,132 @@ pub enum AttachOutcome {
     Attached,
     /// The store is already complete; nothing was done.
     AlreadyComplete,
+    /// Nothing was moved, because the partial store holds work that is still
+    /// open and the swap would drop it. The stage stays staged, and the attach
+    /// goes ahead once that work is finished.
+    Deferred(OpenWork),
+}
+
+/// Work a partial store holds open, which an attach waits for.
+///
+/// Each of these lives in the store's own records and nowhere else, so the
+/// swap would drop it, and each is finished by whoever opened it. A refusal is
+/// different: a change committed after the snapshot never goes away, so an
+/// attach that meets one fails rather than waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenWork {
+    /// A merge is open.
+    Merge,
+    /// The store holds stashed work.
+    Stash,
+    /// An agent's transaction is open, or one is being recovered.
+    Transaction,
+    /// An entity draft has not been applied.
+    Draft,
+    /// A release request is recorded and not settled yet.
+    Release,
+}
+
+impl OpenWork {
+    /// What is open, as a clause every surface can put after "waiting for".
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Merge => "an open merge to be finished",
+            Self::Stash => "stashed work to be restored or dropped",
+            Self::Transaction => "an agent's open transaction to be committed or abandoned",
+            Self::Draft => "an unapplied entity draft to be applied or discarded",
+            Self::Release => "a release being recorded to finish",
+        }
+    }
+}
+
+impl std::fmt::Display for OpenWork {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.describe())
+    }
+}
+
+/// Whether an attach of the store staged at `stage_parent` would go ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachReadiness {
+    /// Nothing stands in the way.
+    Ready,
+    /// The store is already complete.
+    AlreadyComplete,
+    /// The partial store holds open work the attach waits for.
+    Waiting(OpenWork),
+}
+
+/// The daemon's durable mirror of its agents' transactions, and the record it
+/// leaves while one of their lifecycle writes is being recovered. The daemon
+/// writes both and takes their names from here, because the attach has to
+/// find them from every process that can run it.
+pub const AGENT_TRANSACTIONS_RECORD: &str = "mcp_transactions.json";
+pub const AGENT_TRANSACTIONS_RECOVERY_RECORD: &str = "mcp_transactions.lifecycle.json";
+/// The directory the daemon keeps entity drafts in, and the lock inside it,
+/// which is not a draft. Named here for the same reason.
+pub const ENTITY_DRAFTS_DIR: &str = "entity-drafts-v1";
+pub const ENTITY_DRAFTS_LOCK: &str = "store.lock";
+
+/// The open work the store at `layout` holds, if it holds any.
+///
+/// Reads the store's own records, so it answers the same from a serving
+/// daemon deciding whether now is a quiet point and from the attach itself.
+/// A record that cannot be read counts as open work: the only safe answer to
+/// "would the swap drop anything" when the answer is unknown is yes.
+pub fn open_work(layout: &KinLayout) -> Option<OpenWork> {
+    let root = layout.root();
+    let present = |path: &Path| !matches!(crate::store_records::read(root, path), Ok(None));
+    if present(&layout.merge_state_path()) {
+        return Some(OpenWork::Merge);
+    }
+    if holds_an_entry(&layout.stashes_dir(), None) {
+        return Some(OpenWork::Stash);
+    }
+    if present(&root.join(AGENT_TRANSACTIONS_RECOVERY_RECORD))
+        || holds_an_open_transaction(root, &root.join(AGENT_TRANSACTIONS_RECORD))
+    {
+        return Some(OpenWork::Transaction);
+    }
+    if holds_an_entry(&root.join(ENTITY_DRAFTS_DIR), Some(ENTITY_DRAFTS_LOCK)) {
+        return Some(OpenWork::Draft);
+    }
+    if present(&layout.pending_release_path()) {
+        return Some(OpenWork::Release);
+    }
+    None
+}
+
+/// Whether `dir` holds any entry other than `ignored`. A directory that is
+/// not there holds none; one that cannot be listed is taken to hold one.
+fn holds_an_entry(dir: &Path, ignored: Option<&str>) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => ignored.is_none_or(|ignored| entry.file_name() != ignored),
+            Err(_) => true,
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether the transaction mirror at `path` holds a transaction that is
+/// neither committed nor abandoned. A mirror that cannot be read as the map it
+/// is counts as holding one.
+fn holds_an_open_transaction(root: &Path, path: &Path) -> bool {
+    let raw = match crate::store_records::read(root, path) {
+        Ok(None) => return false,
+        Ok(Some(raw)) => raw,
+        Err(_) => return true,
+    };
+    let Ok(serde_json::Value::Object(transactions)) = serde_json::from_slice(&raw) else {
+        return true;
+    };
+    transactions.values().any(|transaction| {
+        !matches!(
+            transaction.get("state").and_then(serde_json::Value::as_str),
+            Some("committed" | "aborted")
+        )
+    })
 }
 
 /// Where a stage's complete store lives.
@@ -187,8 +318,32 @@ pub fn attach_staged_history(layout: &KinLayout, stage_parent: &Path) -> Result<
     if recover_interrupted_attach(layout)? {
         return Ok(AttachOutcome::Attached);
     }
+    match attach_readiness(layout, stage_parent)? {
+        AttachReadiness::Ready => {}
+        AttachReadiness::AlreadyComplete => return Ok(AttachOutcome::AlreadyComplete),
+        AttachReadiness::Waiting(work) => return Ok(AttachOutcome::Deferred(work)),
+    }
+
+    let journal = AttachJournal {
+        schema: ATTACH_JOURNAL_SCHEMA.to_string(),
+        phase: AttachPhase::Evacuating,
+        stage_parent: stage_parent.to_path_buf(),
+    };
+    write_journal(layout, &journal)?;
+    roll_forward(layout, journal)?;
+    Ok(AttachOutcome::Attached)
+}
+
+/// Whether attaching the store staged at `stage_parent` would go ahead now,
+/// without moving anything.
+///
+/// The attach asks this itself, with the runtime authority held and no daemon
+/// serving, and that answer is the one that decides. A serving daemon asks it
+/// earlier, only to avoid leaving its clients for an attach that would wait or
+/// be refused anyway. An error is a refusal that waiting does not cure.
+pub fn attach_readiness(layout: &KinLayout, stage_parent: &Path) -> Result<AttachReadiness> {
     let record = match history_state::standing(layout) {
-        HistoryStanding::Complete => return Ok(AttachOutcome::AlreadyComplete),
+        HistoryStanding::Complete => return Ok(AttachReadiness::AlreadyComplete),
         HistoryStanding::Unreadable { reason } => {
             return Err(KinError::Other(format!(
                 "the store's history record cannot be read ({reason}), so its history cannot be \
@@ -199,16 +354,25 @@ pub fn attach_staged_history(layout: &KinLayout, stage_parent: &Path) -> Result<
     };
     let staged = KinLayout::new(staged_store(stage_parent));
     verify_staged_store(layout, &staged)?;
+    if let Some(work) = open_work(layout) {
+        return Ok(AttachReadiness::Waiting(work));
+    }
     verify_nothing_would_be_lost(layout, &record)?;
+    Ok(AttachReadiness::Ready)
+}
 
-    let journal = AttachJournal {
-        schema: ATTACH_JOURNAL_SCHEMA.to_string(),
-        phase: AttachPhase::Evacuating,
-        stage_parent: stage_parent.to_path_buf(),
-    };
-    write_journal(layout, &journal)?;
-    roll_forward(layout, journal)?;
-    Ok(AttachOutcome::Attached)
+/// Whether a swap of the store at `layout` was interrupted and still has to
+/// be finished. A journal that cannot be read counts: something is there.
+///
+/// Until it is finished the store may hold neither its old records nor its
+/// new ones, its manifest included, so a process that would read them has to
+/// ask this first and finish the swap under the runtime authority.
+pub fn attach_is_interrupted(layout: &KinLayout) -> bool {
+    let root = layout.root();
+    !matches!(
+        crate::store_records::read(root, &root.join(ATTACH_JOURNAL_FILE)),
+        Ok(None)
+    )
 }
 
 /// Finish a swap a crash interrupted. Answers whether there was one.
@@ -240,6 +404,46 @@ pub fn recover_interrupted_attach(layout: &KinLayout) -> Result<bool> {
     Ok(true)
 }
 
+/// Stop a swap after a number of its steps, as a crash would, so a test can
+/// prove every step is one recovery resumes from. Compiled for tests only:
+/// this crate's own, and those of a crate that takes its `test-support`
+/// feature from a dev-dependency.
+#[cfg(any(test, feature = "test-support"))]
+pub mod interruption {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEPS_LEFT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let this thread's swaps take `steps` more steps and then stop, or run
+    /// to their end with `None`.
+    pub fn after(steps: Option<usize>) {
+        STEPS_LEFT.with(|left| left.set(steps));
+    }
+
+    pub(super) fn step() -> crate::error::Result<()> {
+        STEPS_LEFT.with(|left| match left.get() {
+            None => Ok(()),
+            Some(0) => Err(crate::error::KinError::Other(
+                "history attach interrupted by its test".to_string(),
+            )),
+            Some(steps) => {
+                left.set(Some(steps - 1));
+                Ok(())
+            }
+        })
+    }
+}
+
+/// One step of a swap is about to change the store. Stops the swap here when a
+/// test asked for an interruption, and is nothing otherwise.
+fn before_step() -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    interruption::step()?;
+    Ok(())
+}
+
 fn roll_forward(layout: &KinLayout, mut journal: AttachJournal) -> Result<()> {
     let root = layout.root();
     let stage_store = staged_store(&journal.stage_parent);
@@ -252,6 +456,7 @@ fn roll_forward(layout: &KinLayout, mut journal: AttachJournal) -> Result<()> {
             }
             let from = root.join(&entry);
             let to = provisional.join(&entry);
+            before_step()?;
             if to.exists() {
                 // Moved by an earlier attempt that died before the journal
                 // advanced, and something recreated the name since. The
@@ -264,6 +469,7 @@ fn roll_forward(layout: &KinLayout, mut journal: AttachJournal) -> Result<()> {
         }
         sync_directory(root)?;
         sync_directory(&provisional)?;
+        before_step()?;
         journal.phase = AttachPhase::Installing;
         write_journal(layout, &journal)?;
     }
@@ -274,10 +480,14 @@ fn roll_forward(layout: &KinLayout, mut journal: AttachJournal) -> Result<()> {
             continue;
         }
         let from = stage_store.join(&entry);
+        before_step()?;
         std::fs::rename(&from, &to).map_err(|error| KinError::io(&from, error))?;
     }
+    // Not a step of its own: it is repeated by every recovery that reaches
+    // it, and writes the same setting each time.
     carry_enrichment_setting(&provisional, root)?;
     sync_directory(root)?;
+    before_step()?;
     let journal_path = root.join(ATTACH_JOURNAL_FILE);
     match std::fs::remove_file(&journal_path) {
         Ok(()) => {}
@@ -340,25 +550,25 @@ fn verify_staged_store(layout: &KinLayout, staged: &KinLayout) -> Result<()> {
             staged.root().display()
         ))
     })?;
+    // Neither refusal names where the stage is kept: both are recorded in the
+    // store's history progress, which people read.
     if ours.repo_id != theirs.repo_id {
         return Err(KinError::Other(format!(
-            "the store staged at {} belongs to repository {}, not {}",
-            staged.root().display(),
-            theirs.repo_id,
-            ours.repo_id
+            "the staged history belongs to repository {}, not {}",
+            theirs.repo_id, ours.repo_id
         )));
     }
     if !history_state::standing(staged).is_complete() {
-        return Err(KinError::Other(format!(
-            "the store staged at {} does not hold complete history",
-            staged.root().display()
-        )));
+        return Err(KinError::Other(
+            "the staged store does not hold complete history".to_string(),
+        ));
     }
     Ok(())
 }
 
-/// Refuse a swap that would drop anything the partial store holds beyond its
-/// snapshot.
+/// Refuse a swap that would drop anything the partial store committed beyond
+/// its snapshot. Work that is still open is [`open_work`]'s to find, and the
+/// attach waits for it instead.
 fn verify_nothing_would_be_lost(
     layout: &KinLayout,
     record: &history_state::HistoryStateRecord,
@@ -369,12 +579,6 @@ fn verify_nothing_would_be_lost(
              it, so this store stays partial; its history keeps answering as partial"
         )))
     };
-    if std::fs::symlink_metadata(layout.merge_state_path()).is_ok() {
-        return refuse("a merge is open in this store".to_string());
-    }
-    if std::fs::read_dir(layout.stashes_dir()).is_ok_and(|mut entries| entries.next().is_some()) {
-        return refuse("this store holds stashes".to_string());
-    }
     let manifest = KinManifest::load(&layout.manifest_path())?;
     let repository_id = kin_model::RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;

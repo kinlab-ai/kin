@@ -377,6 +377,9 @@ pub(crate) struct EncodedChanges {
     /// Records this history already read, checked against the digest its open
     /// recorded, and decoded, so a later read of the same record serves them.
     verified: Mutex<VerifiedRecords>,
+    /// Records too large for `verified`, kept only while a read holds them.
+    /// See [`ChangeMap::hold_large_records`].
+    large: Arc<Mutex<HeldLargeRecords>>,
 }
 
 /// Encoded bytes of verified records one history keeps decoded.
@@ -447,6 +450,51 @@ impl VerifiedRecords {
         }
         self.encoded_bytes += encoded_len;
         self.records.insert(id, Arc::new(change.clone()));
+    }
+}
+
+/// Records over [`VERIFIED_RECORD_KEPT_MAX`] that reads in progress keep
+/// decoded, for as long as any of them runs.
+///
+/// A store whose older history is still being derived holds the repository as
+/// one bootstrap change, and every commit on it after that names thousands of
+/// relations. Neither fits the bound, so each was read, hashed and decoded
+/// again by every replay that crossed it, and a guide of one commit crosses
+/// them in five or six replays: on zod, close to half of a guide's time. A read
+/// that will cross them several times holds them for its own life; nothing is
+/// kept once the last such read ends, so the daemon carries no more between
+/// reads than it did. Sound for the reasons [`VerifiedRecords`] is: a record is
+/// held only after it was verified and decoded from this generation's bytes.
+#[derive(Default)]
+struct HeldLargeRecords {
+    /// Reads that hold large records now.
+    holders: usize,
+    records: HashMap<SemanticChangeId, Arc<SemanticChange>>,
+}
+
+/// One read's hold on the large records of a history; see
+/// [`ChangeMap::hold_large_records`]. The records are let go when the last
+/// hold on them is dropped.
+#[must_use = "large records are kept only while the hold lives"]
+pub struct LargeRecordHold {
+    held: Arc<Mutex<HeldLargeRecords>>,
+}
+
+impl Drop for LargeRecordHold {
+    fn drop(&mut self) {
+        let mut held = self.held.lock();
+        held.holders = held.holders.saturating_sub(1);
+        if held.holders == 0 {
+            held.records = HashMap::new();
+        }
+    }
+}
+
+impl fmt::Debug for LargeRecordHold {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LargeRecordHold")
+            .finish_non_exhaustive()
     }
 }
 
@@ -610,6 +658,7 @@ impl EncodedChanges {
             carries_call_site_ledgers: false,
             carries_context_validations: false,
             verified: Mutex::new(VerifiedRecords::default()),
+            large: Arc::default(),
         }
     }
 
@@ -707,9 +756,26 @@ impl EncodedChanges {
         if let Some(kept) = kept {
             return Ok(Some(SemanticChange::clone(&kept)));
         }
+        let large = record_len > VERIFIED_RECORD_KEPT_MAX;
+        if large {
+            let held = self.large.lock().records.get(id).map(Arc::clone);
+            if let Some(held) = held {
+                return Ok(Some(SemanticChange::clone(&held)));
+            }
+        }
         let change = self.read_change(id)?;
         if let Some(change) = &change {
-            self.verified.lock().keep(*id, change, record_len);
+            if !large {
+                self.verified.lock().keep(*id, change, record_len);
+            } else if self.large.lock().holders > 0 {
+                // Copied outside the lock; a second read that decoded it at
+                // the same time keeps the first copy.
+                let copy = Arc::new(change.clone());
+                let mut held = self.large.lock();
+                if held.holders > 0 {
+                    held.records.entry(*id).or_insert(copy);
+                }
+            }
         }
         Ok(change)
     }
@@ -1062,6 +1128,20 @@ impl ChangeMap {
             Some(encoded) => encoded.read_change_kept(id),
             None => Ok(None),
         }
+    }
+
+    /// Keep the records too large for the verified-record bound decoded for
+    /// as long as the returned hold lives, so a read that replays across them
+    /// several times decodes each once. `None` when this map is not read from
+    /// encoded bytes, where there is nothing to keep. See `HeldLargeRecords`.
+    pub fn hold_large_records(&self) -> Option<LargeRecordHold> {
+        if self.body.decoded.get().is_some() {
+            return None;
+        }
+        let encoded = self.body.encoded.as_ref()?;
+        let held = Arc::clone(&encoded.large);
+        held.lock().holders += 1;
+        Some(LargeRecordHold { held })
     }
 
     /// Project one selected record, borrowing an already decoded body and

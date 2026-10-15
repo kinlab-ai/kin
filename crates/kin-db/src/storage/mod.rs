@@ -52,7 +52,7 @@ pub use backend::{
     VectorRepositoryIdentity, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
     MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
-pub use change_map::{ChangeMap, ChangeMapInner};
+pub use change_map::{ChangeMap, ChangeMapInner, LargeRecordHold};
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };

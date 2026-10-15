@@ -2129,8 +2129,38 @@ pub(crate) struct NameSearchAccount {
     pub(crate) folded_attributes: std::collections::BTreeMap<String, u64>,
     pub(crate) folded_total: u64,
     pub(crate) not_held_total: u64,
+    /// How many declarations `not_held` lists. The reply may later say rows
+    /// that read alike once, with a count, but they are still these many.
+    pub(crate) not_held_listed: u64,
     pub(crate) closure: NameClosure,
     pub(crate) artifacts: u64,
+}
+
+/// Declarations that read alike once projected, the same name, kind, module,
+/// enclosing entity and reason on different lines, are said once with how
+/// many there are. Sixteen tests that each declare `validate` inside a
+/// `constraint` object are one row with a count of sixteen, not sixteen
+/// copies of one sentence. The order of first appearance is kept.
+pub(crate) fn said_once(rows: Vec<Value>) -> Vec<Value> {
+    let mut said: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let key = row.to_string();
+        match at.get(&key) {
+            Some(&index) => {
+                let count = said[index]
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                said[index]["count"] = serde_json::json!(count + 1);
+            }
+            None => {
+                at.insert(key, said.len());
+                said.push(row);
+            }
+        }
+    }
+    said
 }
 
 impl NameSearchAccount {
@@ -2178,11 +2208,12 @@ impl NameSearchAccount {
                     .collect()
             })
             .unwrap_or_default();
+        let not_held_listed = not_held.len() as u64;
         let folded_total: u64 = folded_attributes.values().sum();
         let not_held_total = census
             .get("matching_unadmitted_total")
             .and_then(Value::as_u64)
-            .unwrap_or(not_held.len() as u64 + folded_total)
+            .unwrap_or(not_held_listed + folded_total)
             .saturating_sub(folded_total);
         let closure = NameClosure::read(machine, verdict, &census, rows, total);
 
@@ -2199,6 +2230,7 @@ impl NameSearchAccount {
             folded_attributes,
             folded_total,
             not_held_total,
+            not_held_listed,
             closure,
             artifacts,
         }

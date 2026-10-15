@@ -115,15 +115,26 @@ fn a_daemon_that_cannot_start_still_names_a_remedy() {
 
     let kin_root = runtime.layout().root().to_path_buf();
 
-    // Stop whatever init started, so the next command pays for a start rather
-    // than attaching to a live daemon and never reaching the code under test.
-    runtime
+    // Retire both the worker and supervisor so the next start receives this
+    // command's fault injection instead of a supervisor's earlier environment.
+    let stopped = runtime
         .kin_command()
-        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
-        .args(["daemon", "stop"])
+        .args(["daemon", "stop", "--all"])
         .current_dir(repo.path())
         .output()
-        .expect("stop the daemon init started");
+        .expect("stop the runtime init started");
+    assert!(
+        stopped.status.success(),
+        "fixture runtime did not stop: status={} stdout={} stderr={}",
+        stopped.status,
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    // The admitted native pair remains authoritative. The supported gate holds
+    // its real daemon before readiness, so a bounded query cannot be served.
+    let startup_gate = repo.path().join("daemon-startup.gate");
+    fs::write(&startup_gate, b"held").expect("hold the native daemon in startup");
 
     // A serving record naming a dead pid is what `peek_unwatched_daemon_death`
     // grades, and it is the same shape the init-budget acceptance suite seeds
@@ -137,11 +148,13 @@ fn a_daemon_that_cannot_start_still_names_a_remedy() {
 
     let output = runtime
         .kin_command()
-        .env("KIN_DAEMON_BIN", repo.path().join("no-such-kin-daemon"))
+        .env("KIN_DAEMON_TEST_STARTUP_GATE", &startup_gate)
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "2")
+        .env("KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS", "2")
         .args(["locate", "lexer"])
         .current_dir(repo.path())
         .output()
-        .expect("run a daemon-backed command with no daemon binary");
+        .expect("run a command while its native daemon cannot become ready");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

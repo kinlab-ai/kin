@@ -73,7 +73,8 @@ struct McpSession {
 }
 
 impl McpSession {
-    fn start(repo: &Path, home: &Path, registry: &Path, port: u16) -> Self {
+    fn start(repo: &Path, home: &Path, kin_home: &Path, registry: &Path, port: u16) -> Self {
+        let _ = common::ensure_sibling_daemon_built();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kin"))
             .args(["mcp", "start"])
             .current_dir(repo)
@@ -84,6 +85,8 @@ impl McpSession {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", home)
             .env("USERPROFILE", home)
+            .env("KIN_HOME", kin_home)
+            .env("KIN_RUNTIME_MODE", "development")
             .env("TMPDIR", std::env::temp_dir())
             .env("KIN_VFS_DISABLE", "1")
             .env("KIN_REGISTRY_PATH", registry)
@@ -210,6 +213,13 @@ fn the_default_profile_lists_no_session_and_a_write_needs_none() {
     seed_repository(&repo);
 
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let kin_home = std::path::PathBuf::from(
+        runtime
+            .kin_command()
+            .configured_env_for_test(std::ffi::OsStr::new("KIN_HOME"))
+            .flatten()
+            .expect("owned Kin home"),
+    );
     let init = runtime
         .kin_command()
         .args(["init", ".", "--json"])
@@ -238,7 +248,7 @@ fn the_default_profile_lists_no_session_and_a_write_needs_none() {
         .expect("spawn the daemon");
     let port = wait_until_serving(runtime.layout().root(), &mut daemon);
 
-    let mut mcp = McpSession::start(&repo, &home, runtime.registry_path(), port);
+    let mut mcp = McpSession::start(&repo, &home, &kin_home, runtime.registry_path(), port);
     let initialized = mcp.request(
         1,
         "initialize",

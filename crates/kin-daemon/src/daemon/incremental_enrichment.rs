@@ -1268,8 +1268,26 @@ mod tests {
     /// sweep of that file leaves, and so may record the file's mark: in the
     /// same store, where a sweep changes only the peer's proof context, and
     /// in a store that was only ever swept at the edited text.
-    #[tokio::test]
-    async fn an_incremental_pass_leaves_the_ledgers_a_fresh_sweep_does() {
+    // The pass, the sweep and both ledger reads are one future; an unoptimized
+    // build lays its frames out wider than a test thread's default stack, so it
+    // runs on a thread sized like the CLI's.
+    #[test]
+    fn an_incremental_pass_leaves_the_ledgers_a_fresh_sweep_does() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(an_incremental_pass_leaves_the_ledgers_a_fresh_sweep_does_body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn an_incremental_pass_leaves_the_ledgers_a_fresh_sweep_does_body() {
         async fn validated_ledgers(
             fixture: &Fixture,
         ) -> (

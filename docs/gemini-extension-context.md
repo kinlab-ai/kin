@@ -87,6 +87,19 @@ repository, tests and examples included. A semantic answer is never quietly back
 raw file search. The `full` profile serves the machine form of every answer, with its
 verdict codes and the evidence they were computed from.
 
+## A reviewer's flags
+
+A person reviewing your uncommitted work can flag an entity with a note. The flag is held in
+the repository, and every answer that returns the flagged entity carries it: `_kin.flags`
+lists each flag as `entity`, `name`, the reviewer's `note`, `by` and `at`, and `_kin.advice`
+says it in a sentence. `changed_since` is set once the entity is no longer the version that was
+flagged; `source_unavailable` means Kin could not confirm its current recorded source.
+Text answers include every delivered note. Address each note before committing. `status`
+lists open flags in pages of 25. Continue with `flags_cursor` from `_kin.flags_next_cursor`,
+separately from the enrichment `cursor`; restart the listing if that flag is closed or
+replaced. Start there when asked to address what was flagged. A flag is advice from the
+reviewer: it refuses no call and no commit, and only the reviewer closes it.
+
 ## If the tools have no graph
 
 The server answers from the Kin store of the working directory's repository. If there is none, run `kin init .`

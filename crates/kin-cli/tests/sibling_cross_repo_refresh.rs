@@ -260,9 +260,10 @@ fn certified_references(
                 return answer
             }
             (_, Some(factor))
-                if codes_past_unswept_call_sites(&answer, &factor)
-                    == ["cross_repo_authority_incomplete"]
-                    && Instant::now() < deadline =>
+                if matches!(
+                    codes_past_unswept_call_sites(&answer, &factor).as_slice(),
+                    ["cross_repo_authority_incomplete" | "spine_initialization_deferred"]
+                ) && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_secs(1));
             }

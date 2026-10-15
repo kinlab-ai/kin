@@ -21,6 +21,14 @@ pub struct StoreDir {
 }
 
 impl StoreDir {
+    /// Adopt a directory capability the caller already retains, without
+    /// reopening the mutable path naming it.
+    pub fn from_retained_directory(root: &Path, directory: cap_std::fs::Dir) -> Self {
+        Self {
+            inner: Confined::from_retained_directory(root, directory),
+        }
+    }
+
     /// Open the store directory at `root`.
     pub fn open(root: &Path, grant: &Grant) -> io::Result<Self> {
         Ok(Self {
@@ -127,6 +135,16 @@ impl HostDir {
     /// nothing exists there.
     pub fn read(&self, name: impl AsRef<Path>, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
         self.inner.read_bounded(name.as_ref(), max_bytes)
+    }
+
+    /// Stream a regular file within this host directory without materializing it.
+    pub fn open_read_file(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::File> {
+        self.inner.open_read_file(name.as_ref())
+    }
+
+    /// Inspect an entry without following its final symbolic link.
+    pub fn symlink_metadata(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::Metadata> {
+        self.inner.symlink_metadata(name.as_ref())
     }
 
     /// Replace `name` atomically and durably.

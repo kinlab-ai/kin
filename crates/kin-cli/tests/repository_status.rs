@@ -31,11 +31,14 @@ fn run_git(path: &Path, args: &[&str]) {
 }
 
 fn status_command(home: &Path) -> Command<'static> {
+    let kin_home = home.join("kin-home");
+    std::fs::create_dir_all(&kin_home).expect("create isolated development Kin home");
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
     command
         .env("HOME", home)
-        .env("KIN_HOME", home.join(".kin"))
-        .env("KIN_REGISTRY_PATH", home.join(".kin/registry.toml"))
+        .env("KIN_HOME", &kin_home)
+        .env("KIN_RUNTIME_MODE", "development")
+        .env("KIN_REGISTRY_PATH", kin_home.join("registry.toml"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .env_remove("XDG_CONFIG_HOME")
@@ -247,6 +250,10 @@ fn inspect_canonical_status(repo: &Path, home: &Path) -> kin_cli::commands::stat
 /// copy or the durable marker moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
+    use kin_core::runtime_identity::{
+        RuntimeIdentity, RuntimeMode, RuntimeNamespace, RuntimeRepositoryBinding,
+        RuntimeServiceIdentity,
+    };
     use std::sync::{Arc, Mutex};
     let root = tempdir().unwrap();
     let (repo, home) = seeded_status_repository(root.path());
@@ -272,19 +279,35 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
         "graph_loaded": true, "reconciliation_status": "idle",
         "repo_id": before.repository.repository_id, "repo_root": before.repo_root,
     });
+    let namespace = RuntimeNamespace::capture(&home.join("kin-home"))
+        .expect("capture the fixture command's selected namespace");
+    let repository = RuntimeRepositoryBinding::for_layout(&status_layout(&repo, &home))
+        .expect("capture the fixture command's actual selected repository");
+    let identity = serde_json::to_value(RuntimeServiceIdentity {
+        schema: "kin.runtime-service.v1".into(),
+        identity: RuntimeIdentity::current(),
+        mode: RuntimeMode::Development,
+        component: "daemon".into(),
+        pid: std::process::id(),
+        namespace: Some(namespace.token().to_owned()),
+        repository: Some(repository.identity().clone()),
+    })
+    .unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);
     let app = axum::Router::new().fallback(axum::routing::any(move |method: axum::http::Method, uri: axum::http::Uri| {
         captured.lock().unwrap().push(format!("{method} {}", uri.path()));
         let response = response.clone();
         let health = health.clone();
+        let identity = identity.clone();
         async move {
             match (method.as_str(), uri.path()) {
+                ("GET", "/runtime/identity") => (axum::http::StatusCode::OK, axum::Json(identity)),
                 ("GET", "/readiness") => (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"ready": true, "warming": false}))),
                 ("GET", "/health") => (axum::http::StatusCode::OK, axum::Json(health)),
                 ("POST", "/commands/status") => (axum::http::StatusCode::OK, axum::Json(response)),
                 ("POST", "/commands/admit") => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "this fixture daemon refuses the pass on purpose"}))),
-                _ => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "this fixture daemon answers only readiness, health, admit and status"}))),
+                _ => (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "this fixture daemon answers only runtime identity, readiness, health, admit and status"}))),
             }
         }
     }));
@@ -334,6 +357,10 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
     }
     server.abort();
     let seen = requests.lock().unwrap().clone();
+    let identity_at = seen
+        .iter()
+        .position(|path| path == "GET /runtime/identity")
+        .unwrap_or_else(|| panic!("status never admitted the fixture runtime: {seen:?}"));
     let admitted_at = seen
         .iter()
         .position(|path| path == "POST /commands/admit")
@@ -343,13 +370,21 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
         .position(|path| path == "POST /commands/status")
         .unwrap_or_else(|| panic!("status never read the report: {seen:?}"));
     assert!(
+        identity_at < admitted_at,
+        "status requested admission before validating the fixture runtime: {seen:?}"
+    );
+    assert!(
         admitted_at < read_at,
         "status read the report before it admitted the working copy: {seen:?}"
     );
     assert!(
         seen.iter().all(|path| matches!(
             path.as_str(),
-            "GET /health" | "GET /readiness" | "POST /commands/admit" | "POST /commands/status"
+            "GET /runtime/identity"
+                | "GET /health"
+                | "GET /readiness"
+                | "POST /commands/admit"
+                | "POST /commands/status"
         )),
         "{seen:?}"
     );

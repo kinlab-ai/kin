@@ -91,7 +91,10 @@ jobs:
   build:
     name: RC Build (${{ matrix.artifact }})
     if: ${{ github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main' }}
-    runs-on: ${{ matrix.os }}
+    # An explicit outage switch selects only the reviewed native hosted row.
+    # Unset or false keeps the measured Depot routes. It changes no build or
+    # proof rule; slower candidates can use this workflow's 120-minute dispatch.
+    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && matrix.github_os || matrix.os }}
     # A ceiling on a build that stops making progress, not a queue bound. In a
     # merge group it is 60: the whole run has to finish inside the merge
     # queue's 90-minute check window. The Windows leg measured 31 to 49
@@ -137,18 +140,22 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: kin-linux-x86_64
             cross: false
+            github_os: ubuntu-latest
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
             cross: false
+            github_os: ubuntu-24.04-arm
           - os: depot-macos-26
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             cross: false
+            github_os: macos-15-intel
           - os: depot-macos-26
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             cross: false
+            github_os: macos-latest
           # The Windows archive builds on a 16-core Depot Windows runner, on
           # the same terms as the macOS rows above. On the standard 4-vCPU
           # windows-latest runner its build step took 39 to 49 minutes and set
@@ -166,6 +173,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
             cross: false
+            github_os: windows-latest
 
     steps:
       - name: Preserve tracked bytes on Windows
@@ -899,7 +907,7 @@ jobs:
     # 16 removes the image from the critical path. This pretag producer can
     # wait for its pool without stranding a release tag; release.yml only
     # verifies and publishes the archive it uploads.
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     # A ceiling for a stalled build, with the smokes still inside the merge
     # queue's 90-minute window.
     timeout-minutes: 45

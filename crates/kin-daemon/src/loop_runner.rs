@@ -657,6 +657,52 @@ fn layout_is_held(state: &DaemonState, file_id: &FilePathId) -> bool {
         })
 }
 
+/// Where a host path sits in this repository, for a caller outside the
+/// reconcile loop that was handed one at a boundary. `None` for a path that is
+/// not this repository's to hold.
+pub(crate) fn host_repo_path(state: &DaemonState, host: &Path) -> Option<RepoPath> {
+    repo_path(host, state.layout.working_dir()).ok().flatten()
+}
+
+/// Whether `path` is source Kin parses into entities, by its name alone.
+pub(crate) fn is_entity_source_path(path: &RepoPath) -> bool {
+    path.as_utf8().is_some_and(|file| {
+        matches!(
+            FileClassifier::classify(Path::new(file)),
+            FileClassification::EntitySource
+        )
+    })
+}
+
+/// Whether the daemon's tree holds exactly what the host holds at `path`.
+pub(crate) fn host_unit_is_admitted(state: &DaemonState, host: &Path, path: &RepoPath) -> bool {
+    matches!(host_entry_matches_graph(state, host, path), Ok(true))
+}
+
+/// Whether the entities the graph holds for `path` were derived from the
+/// bytes its tree holds there: a complete parse bound to those bytes, whose
+/// declaration regions are the spans the graph holds, with no earlier parse
+/// retained in its place.
+pub(crate) fn unit_semantics_are_held(
+    state: &DaemonState,
+    tree: &kin_model::ResolvedTree,
+    path: &RepoPath,
+) -> bool {
+    let Some(file) = path.as_utf8() else {
+        return false;
+    };
+    let retained = kin_core::retained_parse::read(&state.layout);
+    if matches!(
+        retained,
+        kin_core::retained_parse::RetainedParseRead::Unreadable(_)
+    ) || retained.errors_for(file).is_some()
+    {
+        return false;
+    }
+    crate::semantic_debt::answering_graph_parsed(state, tree, path)
+        && layout_is_held(state, &FilePathId::new(file))
+}
+
 /// Whether `file_id` carries no shallow, structured or opaque record, which an
 /// entity-source round would clear.
 fn no_facet_of_another_kind(state: &DaemonState, file_id: &FilePathId) -> bool {
@@ -747,12 +793,26 @@ pub(crate) fn publish_exact_workspace_tree(
     // still owe rides the same transaction.
     let owed = crate::semantic_debt::owed_by(&admitted.exact_deltas()?);
     let legacy = crate::semantic_debt::legacy_carry(state);
-    let authority_context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let started = Instant::now();
-    let Some(admission) = crate::repository_commit::publish_workspace_tree(
+    // The authority the daemon already holds for the current publication, as
+    // every other daemon publisher binds it, rather than an open of this
+    // publication's own. See `publish_workspace_tree_through`.
+    let authority =
+        crate::local_repository_authority::ActiveLocalRepositoryAuthority::open_bound(state)
+            .map_err(|refusal| match refusal {
+                crate::local_repository_authority::RepositoryAuthorityBindRefusal::Unbound(
+                    error,
+                ) => error,
+                refusal => DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "{:#}",
+                    refusal.into_error()
+                ))),
+            })?;
+    let published = crate::repository_commit::publish_workspace_tree_through(
         state.blobs.as_ref(),
-        &authority_context,
+        &authority.manager,
+        &authority.repository_id,
+        authority.workspace_id,
         admitted,
         kin_model::OperationId::new(),
         // The daemon's own loop is the actor here, and naming it is a statement
@@ -765,10 +825,14 @@ pub(crate) fn publish_exact_workspace_tree(
         kin_model::AuthorId::new(DAEMON_ADMISSION_ACTOR),
         &owed,
         &legacy,
-    )?
-    else {
+    )?;
+    let Some(admission) = published else {
         return Ok(None);
     };
+    // The held authority now holds the successor it just wrote. While the
+    // durable record is still the one that commit installed, every reader
+    // after this one keeps it rather than reopening the store to load it.
+    crate::api::relabel_held_authority_after_own_commit(state);
     if !legacy.is_empty() {
         crate::semantic_debt::legacy_carried(state);
     }
@@ -1521,21 +1585,32 @@ fn exact_tree_admission_once(
             // captured successor then carries both in the same publication, so
             // a pass carrying a single source does not publish its bytes and
             // leave its parse to the live graph alone.
-            let before = state.graph.semantic_observation();
-            let staged = kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
-            staged.apply_transaction_delta(&live_delta)?;
+            let (before, staged) =
+                crate::mcp_commit::timed_commit_phase("stage_live_graph", || {
+                    let before = state.graph.semantic_observation();
+                    let staged =
+                        kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
+                    staged.apply_transaction_delta(&live_delta)?;
+                    Ok::<_, DaemonError>((before, staged))
+                })?;
             let paths = source_batch::with_owed_paths(state, changed_paths.clone());
-            prepared_sources = source_batch::prepare(
-                state,
-                reconciler,
-                &staged,
-                &paths,
-                source_batch::BatchPredecessor::Observed(Some(&before)),
-                &changed_paths,
-                source_batch::BatchScope::ExactAdmission,
-            )?;
+            prepared_sources =
+                crate::mcp_commit::timed_commit_phase("prepare_changed_sources", || {
+                    source_batch::prepare(
+                        state,
+                        reconciler,
+                        &staged,
+                        &paths,
+                        source_batch::BatchPredecessor::Observed(Some(&before)),
+                        &changed_paths,
+                        source_batch::BatchScope::ExactAdmission,
+                    )
+                })?;
             if let Some(prepared) = &prepared_sources {
-                let mut joined = source_batch::semantic_delta(&before, prepared.snapshot())?;
+                let mut joined =
+                    crate::mcp_commit::timed_commit_phase("join_semantic_delta", || {
+                        source_batch::semantic_delta(&before, prepared.snapshot())
+                    })?;
                 joined.tree_deltas = live_delta.tree_deltas;
                 live_delta = joined;
             }
@@ -1547,13 +1622,15 @@ fn exact_tree_admission_once(
         // has not crossed the repository-v6 compare-and-swap. The scanner's
         // completion proof and the planning base travel with the tree so
         // publication can verify both rather than trust the caller.
-        let admitted = crate::repository_commit::AdmittedWorkspaceTree::from_complete_observation(
-            observed.completion(),
-            expected_roots,
-            previous.clone(),
-            desired_tree,
-        )
-        .with_live_observation(state.graph.as_ref(), &live_delta)?;
+        let admitted = crate::mcp_commit::timed_commit_phase("capture_live_observation", || {
+            crate::repository_commit::AdmittedWorkspaceTree::from_complete_observation(
+                observed.completion(),
+                expected_roots,
+                previous.clone(),
+                desired_tree,
+            )
+            .with_live_observation(state.graph.as_ref(), &live_delta)
+        })?;
         #[cfg(test)]
         after_admission_capture_for_test(state);
         if proposes_root_rule {
@@ -1633,17 +1710,34 @@ fn exact_tree_admission_once(
         // earlier live observation; it must not overwrite the newer witness.
         let batch_derivation = (defer && prepared_sources.is_some())
             .then(|| crate::binding_history::Derivation::begin(state));
-        let applied = state
-            .graph
-            .apply_transaction_delta(&live_delta)
-            .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas));
+        let applied = crate::mcp_commit::timed_commit_phase("apply_live_delta", || {
+            state
+                .graph
+                .apply_transaction_delta(&live_delta)
+                .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))
+        });
         match applied {
             Ok(()) => {
                 finish_removed_path_enrichment(state, &vacated, &live_delta.entity_deltas)?;
                 relocate_file_records_for(state, &relocations)?;
                 if !defer {
-                    crate::binding_history::restore_exact_authority(state);
+                    crate::mcp_commit::timed_commit_phase("restore_binding_authority", || {
+                        crate::binding_history::restore_exact_authority(state)
+                    });
                 }
+                // One step per unit this transition moved, for an agent
+                // client that says the edit was its own: the entities the
+                // transaction changed where it carried the unit's parse, and
+                // what the unit still holds where its parse is yet to come.
+                // See `crate::client_edits`.
+                state.client_edits.tree_moved(
+                    state,
+                    &deltas,
+                    prepared_sources
+                        .as_ref()
+                        .map(source_batch::PreparedLiveBatch::handled),
+                    &live_delta.entity_deltas,
+                );
             }
             // A deferred tree has not crossed authority, so a refusal here
             // splits nothing: the caller's transaction never runs and authority
@@ -15626,24 +15720,31 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // had paid.
     let batch_paths = source_batch::with_owed_paths(state, exact_admission.changed_paths.clone());
     let mut batch_delta = crate::state::PassDelta::default();
-    let batch_result = if let Some(prepared) = exact_admission.prepared_sources.take() {
-        prepared.finish(state, &mut reconciler, &mut batch_delta)
-    } else {
-        source_batch::try_readmit(
-            state,
-            &mut reconciler,
-            &batch_paths,
-            exact_admission.semantic_predecessor.as_ref(),
-            &exact_admission.changed_paths,
-            &mut batch_delta,
-        )
-    };
+    let batch_result = crate::mcp_commit::timed_commit_phase("finish_changed_sources", || {
+        if let Some(prepared) = exact_admission.prepared_sources.take() {
+            prepared.finish(state, &mut reconciler, &mut batch_delta)
+        } else {
+            source_batch::try_readmit(
+                state,
+                &mut reconciler,
+                &batch_paths,
+                exact_admission.semantic_predecessor.as_ref(),
+                &exact_admission.changed_paths,
+                &mut batch_delta,
+            )
+        }
+    });
     drop(reconciler);
     if let Some(event) = batch_delta.into_event() {
         state.emit_event(event);
     }
     let handled = batch_result?;
-    if let Err(error) = drain_semantic_debt_except(state, &handled).await {
+    if let Err(error) = crate::mcp_commit::timed_commit_phase_async(
+        "drain_semantic_debt",
+        drain_semantic_debt_except(state, &handled),
+    )
+    .await
+    {
         drop(binding_derivation);
         drop(graph_mutation);
         return Err(error);

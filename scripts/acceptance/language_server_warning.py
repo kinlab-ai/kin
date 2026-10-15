@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from runtime_fixture import prepare_runtime_fixture
 
 TICKET = "FIR-2777"
 
@@ -238,6 +239,7 @@ def run_arm(kin, tmp, name, path_value):
         "KIN_EMBED_BACKEND": "cpu",
         "TERM": "dumb",
     }
+    kin, _ = prepare_runtime_fixture(kin, None, env, home)
     subprocess.run([kin, "init", "."], cwd=str(work), env=env,
                    capture_output=True, text=True)
     got = subprocess.run([kin, "graph", "status"], cwd=str(work), env=env,

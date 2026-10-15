@@ -175,12 +175,20 @@ impl std::fmt::Display for ApprovalDecision {
 // Core types
 // ---------------------------------------------------------------------------
 
+/// Persisted through positional MessagePack, so a field is only ever
+/// appended. `agent_session` is left out of the encoding when absent, which
+/// keeps every actor that is not an agent session at the bytes, and so the
+/// digest, it always had.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Actor {
     pub actor_id: ActorId,
     pub kind: ActorKind,
     pub display_name: String,
     pub external_refs: Vec<crate::work::ExternalRef>,
+    /// Present when this actor stands for one agent session: what the
+    /// session did in this repository. See [`crate::agent_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<crate::agent_session::AgentSessionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -333,6 +341,7 @@ mod tests {
                 identifier: "alice".into(),
                 url: None,
             }],
+            agent_session: None,
         };
 
         let json = serde_json::to_string(&actor).unwrap();
@@ -341,6 +350,58 @@ mod tests {
         assert_eq!(parsed.kind, actor.kind);
         assert_eq!(parsed.display_name, actor.display_name);
         assert_eq!(parsed.external_refs.len(), 1);
+    }
+
+    /// The actor as it was encoded before an actor could carry an agent
+    /// session's record.
+    #[derive(Serialize)]
+    struct ActorBeforeAgentSessions<'a> {
+        actor_id: ActorId,
+        kind: ActorKind,
+        display_name: &'a str,
+        external_refs: &'a [ExternalRef],
+    }
+
+    /// An actor that is not an agent session keeps the bytes it always had,
+    /// in the positional encoding the store hashes and in JSON, and a store
+    /// written before agent sessions reads back with none. One that is
+    /// reads back whole from both.
+    #[test]
+    fn an_actor_without_an_agent_session_keeps_its_stored_bytes() {
+        let plain = Actor {
+            actor_id: ActorId::new(),
+            kind: ActorKind::Assistant,
+            display_name: "claude-code/claude-code".into(),
+            external_refs: Vec::new(),
+            agent_session: None,
+        };
+        let before = ActorBeforeAgentSessions {
+            actor_id: plain.actor_id,
+            kind: plain.kind,
+            display_name: &plain.display_name,
+            external_refs: &plain.external_refs,
+        };
+        let stored = rmp_serde::to_vec(&before).unwrap();
+        assert_eq!(rmp_serde::to_vec(&plain).unwrap(), stored);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        let read: Actor = rmp_serde::from_slice(&stored).unwrap();
+        assert_eq!(read, plain);
+
+        let mut session = plain.clone();
+        let mut record = crate::agent_session::AgentSessionRecord::new(
+            "dbecbbcd-c382-4559-93ba-9f08bbf28ab6",
+            crate::agent_session::AgentSessionSource::Kin,
+        );
+        record.calls_total = 4;
+        record.ended_at = Some(Timestamp::now());
+        session.agent_session = Some(record);
+        let read: Actor = rmp_serde::from_slice(&rmp_serde::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(read, session);
+        let read: Actor = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(read, session);
     }
 
     #[test]

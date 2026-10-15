@@ -1996,6 +1996,38 @@ fn name_lookup(query: &str, rows: &[&str], not_held: &[&str]) -> Map<String, Val
     reply
 }
 
+/// Declarations that read alike once projected, here sixteen nested
+/// `validate` callbacks inside `outer` on different lines, are one not_held
+/// row with their count, and the sentence still counts sixteen.
+#[test]
+fn identical_not_held_declarations_are_said_once_with_their_count() {
+    let names = ["validate"; 16];
+    let reply = plain_answer_with_details(
+        name_lookup("validate", &[], &names),
+        "semantic_search",
+        false,
+    );
+    assert_plain(&reply);
+    // Details lists every declaration as it is.
+    let detailed = plain_answer(name_lookup("validate", &[], &names), "semantic_search");
+    assert_eq!(detailed["not_held"].as_array().unwrap().len(), 16);
+    let rows = reply["not_held"].as_array().expect("not_held rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["name"], "validate");
+    assert_eq!(rows[0]["inside"], "outer");
+    assert_eq!(rows[0]["count"], 16);
+    assert!(
+        meaning_of(&reply).contains("16 declarations"),
+        "{}",
+        meaning_of(&reply)
+    );
+    assert!(
+        !meaning_of(&reply).contains("1 of them"),
+        "{}",
+        meaning_of(&reply)
+    );
+}
+
 /// The claim that a reply holds every declaration of a name is about the
 /// declarations named exactly so. A reply of nothing else leads with it; one
 /// that also holds longer names says which of its rows the claim counts; one

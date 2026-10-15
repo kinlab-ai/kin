@@ -208,7 +208,7 @@ import path from "node:path";
 // no assertion moved.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "b7ec0ce75f717d238463a3385c5efadf541e072f25ecd21d86e6c3da03386eac",
+  sha256: "162b6ce38ad685b359ae0fe798eb14087fb94cc7f886582141d4855f6040645a",
 };
 
 class Unreadable extends Error {}

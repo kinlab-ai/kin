@@ -7,7 +7,9 @@
 //! commit and answers at once. Its history is derived afterwards by a worker
 //! process that runs the complete admission ladder into a stage beside the
 //! repository, at low priority and with a bounded share of the machine, and
-//! then attaches the staged store once no daemon is serving the partial one.
+//! then attaches the staged store when no daemon is serving the partial one.
+//! A daemon that is serving it finds the stage within seconds and hands the
+//! store over at its next quiet point (see `kin_daemon::history_schedule`).
 //! `kin init --history full` over a partial store does the same work in the
 //! foreground and attaches at once.
 //!
@@ -179,12 +181,8 @@ fn report(layout: &KinLayout, progress: &HistoryDerivationProgress) {
 }
 
 /// A stage a previous attempt finished, still on disk.
-fn finished_stage(progress: Option<&HistoryDerivationProgress>) -> Option<PathBuf> {
-    let progress = progress?;
-    if progress.state != DerivationState::Staged {
-        return None;
-    }
-    let stage = PathBuf::from(progress.detail.as_deref()?);
+pub fn finished_stage(progress: Option<&HistoryDerivationProgress>) -> Option<PathBuf> {
+    let stage = progress?.staged_at()?;
     history_attach::staged_store(&stage)
         .join("manifest.json")
         .is_file()
@@ -202,6 +200,18 @@ pub(crate) enum DerivationOutcome {
     NotAsked(String),
     /// Derived and staged; attached when no daemon serves the store.
     Staged { stage: PathBuf },
+}
+
+/// What asking for a staged store to be attached came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    /// The store now holds its complete history.
+    Attached,
+    /// A daemon is serving the partial store, and hands it over at its next
+    /// quiet point.
+    Served,
+    /// The partial store holds open work, which the attach waits for.
+    Waiting(history_attach::OpenWork),
 }
 
 /// Derive the store's complete history into a stage, reusing a stage an
@@ -329,7 +339,14 @@ fn first_line(text: &str) -> String {
 
 /// Attach a staged store, stopping the daemon first when `stop_daemon`, and
 /// otherwise only when no daemon serves the store.
-async fn attach(layout: &KinLayout, stage: &Path, stop_daemon: bool) -> Result<bool> {
+///
+/// Open work is looked for before a daemon is stopped for it: stopping the
+/// daemon would not finish that work, and the attach would then wait anyway.
+async fn attach(layout: &KinLayout, stage: &Path, stop_daemon: bool) -> Result<Attachment> {
+    if let Some(work) = history_attach::open_work(layout) {
+        note_wait(layout, Some(work));
+        return Ok(Attachment::Waiting(work));
+    }
     if stop_daemon {
         super::daemon::stop_current_repo_quiet(layout.root())
             .await
@@ -338,7 +355,7 @@ async fn attach(layout: &KinLayout, stage: &Path, stop_daemon: bool) -> Result<b
         .await
         .is_some()
     {
-        return Ok(false);
+        return Ok(Attachment::Served);
     }
     let budget = if stop_daemon {
         kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET
@@ -362,12 +379,56 @@ async fn attach(layout: &KinLayout, stage: &Path, stop_daemon: bool) -> Result<b
                 layout.root().display()
             );
         }
-        return Ok(false);
+        return Ok(Attachment::Served);
     };
     let outcome = history_attach::attach_staged_history(layout, stage);
     drop(runtime);
     match outcome? {
-        AttachOutcome::Attached | AttachOutcome::AlreadyComplete => Ok(true),
+        AttachOutcome::Attached | AttachOutcome::AlreadyComplete => Ok(Attachment::Attached),
+        AttachOutcome::Deferred(work) => {
+            note_wait(layout, Some(work));
+            Ok(Attachment::Waiting(work))
+        }
+    }
+}
+
+/// Finish a history attach a crash interrupted, for a command that is about
+/// to read the store.
+///
+/// Whichever process next holds the repository's runtime authority finishes
+/// the swap. A daemon does as it starts. A command that finds the journal
+/// does it here, because the half-moved store has no manifest and no layout
+/// version to read, and the command would otherwise refuse the store before
+/// it ever started the daemon that finishes it. When a daemon holds the
+/// authority, that daemon is finishing the swap, and nothing is done here.
+pub(crate) fn finish_interrupted_attach(layout: &KinLayout) {
+    if !history_attach::attach_is_interrupted(layout) {
+        return;
+    }
+    match crate::daemon_client::acquire_repository_runtime_authority_within(
+        layout.root(),
+        kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+    ) {
+        Ok(Some(authority)) => {
+            if let Err(error) = history_attach::recover_interrupted_attach(layout) {
+                tracing::warn!(%error, "an interrupted history attach could not be finished");
+            }
+            drop(authority);
+        }
+        Ok(None) => tracing::debug!(
+            "an interrupted history attach is being finished by the daemon on this store"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not take this repository's runtime authority to finish an interrupted history attach")
+        }
+    }
+}
+
+/// Record what a staged history's attach waits for, never failing the
+/// derivation for it.
+fn note_wait(layout: &KinLayout, work: Option<history_attach::OpenWork>) {
+    if let Err(error) = history_state::note_staged_wait(layout, work.map(|work| work.describe())) {
+        tracing::warn!(%error, "could not record what the staged history is waiting for");
     }
 }
 
@@ -396,17 +457,27 @@ pub async fn run_worker(path: Option<String>, background: bool) -> Result<i32> {
     .map_err(|error| anyhow!("history derivation stopped: {error}"))??;
     match outcome {
         DerivationOutcome::Staged { stage } => {
-            if attach(&layout, &stage, !background).await? {
-                let _ = history_state::clear_progress(&layout);
-                drop(lock);
-                say("Attached the full Git history; this store's history is complete");
-                prepare_attached_store(&layout);
-            } else {
-                drop(lock);
-                say(
-                    "Derived the full Git history; it replaces this store when its daemon is \
-                     next idle",
-                );
+            match attach(&layout, &stage, !background).await? {
+                Attachment::Attached => {
+                    let _ = history_state::clear_progress(&layout);
+                    drop(lock);
+                    say("Attached the full Git history; this store's history is complete");
+                    prepare_attached_store(&layout);
+                }
+                Attachment::Served => {
+                    drop(lock);
+                    say(
+                        "Derived the full Git history; this repository switches to it at its \
+                         daemon's next quiet point",
+                    );
+                }
+                Attachment::Waiting(work) => {
+                    drop(lock);
+                    say(&format!(
+                        "Derived the full Git history; this repository switches to it once it is \
+                         quiet (waiting for {work})"
+                    ));
+                }
             }
             Ok(0)
         }
@@ -450,8 +521,20 @@ pub(crate) async fn derive_now(layout: &KinLayout, quiet: bool) -> Result<Foregr
         DerivationOutcome::Staged { stage } => {
             let attached = attach(layout, &stage, true).await?;
             drop(lock);
-            if !attached {
-                bail!("the full history was derived but could not be attached");
+            match attached {
+                Attachment::Attached => {}
+                Attachment::Served => {
+                    bail!("the full history was derived but could not be attached")
+                }
+                Attachment::Waiting(work) => {
+                    return Ok(ForegroundDerivation {
+                        history: "staged",
+                        detail: format!(
+                            "Derived the full Git history. This repository switches to it once \
+                             it is quiet: Kin is waiting for {work}"
+                        ),
+                    })
+                }
             }
             let _ = history_state::clear_progress(layout);
             prepare_attached_store(layout);
@@ -484,5 +567,60 @@ pub(crate) async fn derive_now(layout: &KinLayout, quiet: bool) -> Result<Foregr
 fn prepare_attached_store(layout: &KinLayout) {
     if let Err(error) = super::repository_authority::materialize_workspace_base_offline(layout) {
         tracing::warn!(%error, "could not prepare the attached store's first graph reopen");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command that finds a store half way through an interrupted attach
+    /// finishes the attach before it reads the store, so the store it reads
+    /// has its manifest and layout version again.
+    #[test]
+    fn a_command_finishes_an_interrupted_attach_before_it_reads_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo/.kin");
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("daemon.lock"), b"").unwrap();
+        let stage = dir.path().join(".kin-history-stage");
+        let staged = history_attach::staged_store(&stage);
+        std::fs::create_dir_all(staged.join("kindb")).unwrap();
+        std::fs::write(staged.join("manifest.json"), b"complete").unwrap();
+        std::fs::write(staged.join("version"), b"2").unwrap();
+        // Everything of the partial store has been moved out and nothing of
+        // the complete one has been moved in: the store a kill leaves behind.
+        std::fs::create_dir_all(stage.join("provisional/kindb")).unwrap();
+        std::fs::write(stage.join("provisional/manifest.json"), b"partial").unwrap();
+        std::fs::write(
+            root.join("history-attach.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "kin.history-attach.v1",
+                "phase": "evacuating",
+                "stage_parent": stage,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let layout = KinLayout::new(root.clone());
+        assert!(history_attach::attach_is_interrupted(&layout));
+        assert!(layout.check_version().is_err());
+
+        finish_interrupted_attach(&layout);
+
+        assert!(!history_attach::attach_is_interrupted(&layout));
+        assert_eq!(
+            std::fs::read(root.join("manifest.json")).unwrap(),
+            b"complete"
+        );
+        layout.check_version().unwrap();
+        assert!(root.join("daemon.lock").exists());
+        assert!(!stage.exists());
+        // Nothing left to finish, and asking again changes nothing.
+        finish_interrupted_attach(&layout);
+        assert_eq!(
+            std::fs::read(root.join("manifest.json")).unwrap(),
+            b"complete"
+        );
     }
 }

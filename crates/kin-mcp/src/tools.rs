@@ -1717,6 +1717,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "dependencies": {"type":"array","maxItems":1024,"items":{"type":"string"},"description":"Exact projection paths whose admitted source and recorded call-site proof must be accounted for. No source bodies are returned."},
                         "cursor": {"type":"string","maxLength":512,"description":"Continue the same selected-source observation with the same dependencies."},
+                        "flags_cursor": {"type":"string","maxLength":64,"description":"Continue open review flags from _kin.flags_next_cursor, independently of the enrichment cursor."},
                         "max_chars": {
                             "type": "integer",
                             "default": crate::budget::RESPONSE_DEFAULT_MAX_CHARS,
@@ -1935,7 +1936,11 @@ pub fn agent_routed_tool_names() -> &'static [&'static str] {
 /// 6,362 once it listed `ask`, the front door that routes a plain question to
 /// these verbs and composes one reply, served with its question alone: 334
 /// bytes for the definition and its annotations, about 85 tokens a turn.
-pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 6_362;
+/// 6,368 once `status` said it lists review flags, so an agent asked to
+/// address what a reviewer flagged knows where to start: 7 bytes on the one
+/// description, 6 where it already had a byte to spare.
+/// 6,401 once `status` served its separate review-flag continuation.
+pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 6_401;
 
 /// The most bytes `agent-default`'s served `tools/list` may cost: what a bare
 /// `kin mcp start` hands every client, and what `kin setup` writes for every
@@ -1988,7 +1993,8 @@ pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 6_362;
 /// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
 /// most relevant rows by proven callers or hops from a root, with its measured
 /// cost in one clause: 147 bytes for the two properties.
-pub const AGENT_DEFAULT_LIST_CEILING_BYTES: usize = 9_203;
+/// 9,243 with the review-flag description and its separate status cursor.
+pub const AGENT_DEFAULT_LIST_CEILING_BYTES: usize = 9_243;
 
 /// The most bytes `agent-default`'s tool definitions may cost, summed one
 /// definition at a time as a client hands each to its model: name,
@@ -2062,7 +2068,8 @@ pub const AGENT_DEFAULT_LIST_CEILING_BYTES: usize = 9_203;
 /// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
 /// most relevant rows by proven callers or hops from a root, with its measured
 /// cost in one clause: 147 bytes for the two properties.
-pub const AGENT_DEFAULT_DEFINITION_CEILING_BYTES: usize = 7_760;
+/// 7,800 with the review-flag description and its separate status cursor.
+pub const AGENT_DEFAULT_DEFINITION_CEILING_BYTES: usize = 7_800;
 
 /// The most bytes the tool-search profile's `tools/list` may cost, measured on
 /// the profile AS SERVED.
@@ -2098,7 +2105,11 @@ pub const AGENT_DEFAULT_DEFINITION_CEILING_BYTES: usize = 7_760;
 /// cost in one clause: 149 bytes for the two properties.
 /// 4,714 once it listed `ask` in its always-on set, served with its question
 /// alone, the same 334 bytes `agent-query` pays for it.
-pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 4_714;
+/// 4,721 once `status` said it lists review flags, so an agent asked to
+/// address what a reviewer flagged knows where to start: 7 bytes on the one
+/// description.
+/// 4,754 once `status` served its separate review-flag continuation.
+pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 4_754;
 
 /// Tool names for the always-on set the tool-search profile serves.
 ///

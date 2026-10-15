@@ -1633,6 +1633,8 @@ mod tests {
             duration_ms: Some(25),
             evidence_blob: None,
             exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: None,
         };
         store.create_verification_run(&run).unwrap();
         store

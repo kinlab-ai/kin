@@ -69,6 +69,16 @@ impl WorktreeSource {
         self.inner.names(relative.as_ref())
     }
 
+    /// When the entry at `relative` last changed, without following a link
+    /// and without reading it. An empty path asks about the root. `Ok(None)`
+    /// when nothing exists there.
+    pub fn modified(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> io::Result<Option<std::time::SystemTime>> {
+        self.inner.modified(relative.as_ref())
+    }
+
     /// The target the link at `relative` names, exactly as stored and without
     /// following it. `Ok(None)` when nothing exists there.
     pub fn link_target(&self, relative: impl AsRef<Path>) -> io::Result<Option<PathBuf>> {
@@ -144,6 +154,16 @@ mod tests {
         assert_eq!(source.names("").unwrap(), vec![OsString::from("pkg")]);
         assert_eq!(source.kind("pkg").unwrap(), Some(EntryKind::Directory));
         assert_eq!(source.kind("pkg/mod.py").unwrap(), Some(EntryKind::Regular));
+        // A change time is read for the root and for an entry, and an entry
+        // that is not there has none.
+        let written = std::fs::metadata(tree.join("pkg/mod.py"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(source.modified("pkg/mod.py").unwrap(), Some(written));
+        assert!(source.modified("").unwrap().is_some());
+        assert_eq!(source.modified("pkg/absent.py").unwrap(), None);
+        assert!(source.modified("../outside").is_err());
         assert_eq!(source.kind("pkg/absent.py").unwrap(), None);
         assert_eq!(
             source.read("pkg/mod.py", 64).unwrap().as_deref(),

@@ -511,6 +511,8 @@ mod tests {
             duration_ms: None,
             evidence_blob: None,
             exit_code: None,
+            ran_against: Vec::new(),
+            proof: None,
         };
         store
             .create_verification_run(&run)
@@ -700,6 +702,7 @@ mod tests {
                 kind,
                 display_name: "reviewer".into(),
                 external_refs: vec![],
+                agent_session: None,
             })
             .unwrap();
     }
@@ -867,6 +870,8 @@ mod tests {
             duration_ms: Some(1),
             evidence_blob: None,
             exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: None,
         };
         store.create_verification_run(&run).unwrap();
         store

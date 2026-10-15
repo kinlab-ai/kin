@@ -78,6 +78,12 @@ pub struct SemanticDiff {
     /// found one edit.
     #[serde(default)]
     pub provenance_only_entity_changes: usize,
+    /// Of those, the entities whose recorded documentation was read again in a
+    /// different form while their code and the comment above it stayed as they
+    /// were ([`is_documentation_reread`]). A reader is told about them in one
+    /// quiet line and never asked to review them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documentation_rereads: Vec<EntityId>,
 }
 
 /// Whether a recorded modification changed what the entity IS, rather than only
@@ -96,12 +102,68 @@ pub struct SemanticDiff {
 /// added to `Entity` later is therefore treated as semantic until someone
 /// decides otherwise, which fails toward reporting a change rather than hiding
 /// one.
+///
+/// The documentation summary is the one content field compared by what it
+/// says rather than byte for byte ([`documentation_agrees`]). It is read from
+/// the comment above a declaration, outside the entity's own text and outside
+/// its fingerprints, and a newer reading of an unchanged comment records it in
+/// a different form: a store built before the JavaScript and TypeScript adapters
+/// read a doc block as its prose holds `* Options: ... * @default ... */` where
+/// a re-read now holds `Options: ...`. Editing one declaration re-reads every
+/// declaration beside it, so without this every documented neighbour of an
+/// edit was reported as modified when nothing about it moved.
 pub fn is_semantic_modification(old: &Entity, new: &Entity) -> bool {
     let mut normalized = new.clone();
     normalized.span.clone_from(&old.span);
     normalized.metadata.clone_from(&old.metadata);
     normalized.created_in = old.created_in;
+    if documentation_agrees(old.doc_summary.as_deref(), new.doc_summary.as_deref()) {
+        normalized.doc_summary.clone_from(&old.doc_summary);
+    }
     normalized != *old
+}
+
+/// Whether a recorded modification only re-read the entity's documentation:
+/// nothing about the entity changed ([`is_semantic_modification`]), yet the
+/// two records hold its documentation in different forms.
+pub fn is_documentation_reread(old: &Entity, new: &Entity) -> bool {
+    old.doc_summary != new.doc_summary && !is_semantic_modification(old, new)
+}
+
+/// Whether two recorded documentation summaries say the same thing.
+///
+/// Compared word by word, without the comment punctuation an older reading
+/// left in (`*` line leaders, a closing `*/`), so the prose decides. A doc
+/// block's tags are not its prose either: the current reading stops at the
+/// first `@` tag and an older one ran on through them, so a summary that
+/// equals the other's words followed by a tag is the same summary read two
+/// ways. Any change to the words themselves is still a change.
+pub fn documentation_agrees(old: Option<&str>, new: Option<&str>) -> bool {
+    if old == new {
+        return true;
+    }
+    let old = documentation_words(old);
+    let new = documentation_words(new);
+    if old == new {
+        return true;
+    }
+    let (short, long) = if old.len() < new.len() {
+        (&old, &new)
+    } else {
+        (&new, &old)
+    };
+    long.len() > short.len() && long.starts_with(short) && long[short.len()].starts_with('@')
+}
+
+/// A summary's words, with comment punctuation trimmed from each and words
+/// that were nothing but punctuation dropped.
+fn documentation_words(summary: Option<&str>) -> Vec<&str> {
+    summary
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(|word| word.trim_matches(|character| matches!(character, '*' | '/')))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 impl SemanticDiff {
@@ -161,17 +223,26 @@ impl SemanticDiff {
 
 /// Drop the modifications that only advanced provenance, returning how many
 /// were dropped so the caller can publish the count.
-fn split_provenance_only(changes: Vec<EntityChange>) -> (Vec<EntityChange>, usize) {
+fn split_provenance_only(changes: Vec<EntityChange>) -> (Vec<EntityChange>, usize, Vec<EntityId>) {
     let before = changes.len();
+    let mut rereads = Vec::new();
     let kept: Vec<EntityChange> = changes
         .into_iter()
         .filter(|change| match &change.kind {
-            EntityChangeKind::Modified { old, new } => is_semantic_modification(old, new),
+            EntityChangeKind::Modified { old, new } => {
+                if is_semantic_modification(old, new) {
+                    return true;
+                }
+                if is_documentation_reread(old, new) {
+                    rereads.push(change.entity_id);
+                }
+                false
+            }
             EntityChangeKind::Added(_) | EntityChangeKind::Removed { .. } => true,
         })
         .collect();
     let suppressed = before - kept.len();
-    (kept, suppressed)
+    (kept, suppressed, rereads)
 }
 
 /// Fold one `Modified` delta into the accumulated state for its entity.
@@ -326,9 +397,10 @@ pub fn compute_diff_scoped<G: GraphStore>(
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
-    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
+    let (entity_changes, provenance_only, rereads) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
     diff.provenance_only_entity_changes = provenance_only;
+    diff.documentation_rereads = rereads;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -416,9 +488,10 @@ pub fn diff_from_change(change: &SemanticChange) -> SemanticDiff {
         };
         entity_changes.push(EntityChange { entity_id, kind });
     }
-    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
+    let (entity_changes, provenance_only, rereads) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
     diff.provenance_only_entity_changes = provenance_only;
+    diff.documentation_rereads = rereads;
 
     for delta in &change.relation_deltas {
         let kind = match delta {
@@ -488,9 +561,10 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
     entity_changes.sort_by_key(|change| change.entity_id);
-    let (entity_changes, provenance_only) = split_provenance_only(entity_changes);
+    let (entity_changes, provenance_only, rereads) = split_provenance_only(entity_changes);
     diff.entity_changes = entity_changes;
     diff.provenance_only_entity_changes = provenance_only;
+    diff.documentation_rereads = rereads;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -1415,5 +1489,109 @@ mod tests {
             is_semantic_modification(&base, &relocated),
             "a declaration that changed file is a move a reviewer must see"
         );
+    }
+
+    /// The summary a store built by the earlier TypeScript reading holds for
+    /// zod's `$ZodStringBoolParams.case`, and what a re-read of the same,
+    /// untouched comment holds now.
+    const EARLIER_READING: &str =
+        "* Options: `\"sensitive\"`, `\"insensitive\"` * * @default `\"insensitive\"` */";
+    const CURRENT_READING: &str = "Options: `\"sensitive\"`, `\"insensitive\"`";
+
+    /// Editing one declaration re-reads every declaration beside it. One whose
+    /// comment and code did not move is not modified, however differently its
+    /// documentation was read the first time.
+    #[test]
+    fn a_documentation_reread_is_not_a_modification() {
+        let mut base = test_entity("$ZodStringBoolParams.case");
+        base.doc_summary = Some(EARLIER_READING.to_string());
+        let mut reread = base.clone();
+        reread.doc_summary = Some(CURRENT_READING.to_string());
+        reread.span = Some(SourceSpan {
+            file: FilePathId::new("src/api.ts"),
+            start_byte: 70,
+            end_byte: 120,
+            start_line: 1709,
+            start_col: 2,
+            end_line: 1709,
+            end_col: 52,
+        });
+        assert!(!is_semantic_modification(&base, &reread));
+        assert!(is_documentation_reread(&base, &reread));
+
+        // A directive the earlier reading kept as a summary and the current
+        // one reads as none.
+        let mut directive = test_entity("_email");
+        directive.doc_summary = Some("@__NO_SIDE_EFFECTS__".to_string());
+        let mut none = directive.clone();
+        none.doc_summary = None;
+        assert!(!is_semantic_modification(&directive, &none));
+        assert!(is_documentation_reread(&directive, &none));
+
+        // Prose that says something else is a change, in either reading.
+        let mut edited = base.clone();
+        edited.doc_summary = Some("Options: `\"sensitive\"` only".to_string());
+        assert!(is_semantic_modification(&base, &edited));
+        assert!(is_semantic_modification(&reread, &edited));
+        assert!(!is_documentation_reread(&base, &edited));
+        let undocumented = test_entity("undocumented");
+        let mut added = undocumented.clone();
+        added.doc_summary = Some("Now documented.".to_string());
+        assert!(is_semantic_modification(&undocumented, &added));
+        let mut removed = reread.clone();
+        removed.doc_summary = None;
+        assert!(is_semantic_modification(&reread, &removed));
+
+        // A mention of a tag inside the prose is still prose.
+        assert!(!documentation_agrees(
+            Some("Use @Foo for this"),
+            Some("Use @Foo for that")
+        ));
+        // The re-read leaves a code change exactly as visible as before.
+        let mut rewritten = reread.clone();
+        rewritten.fingerprint.behavior_hash = Hash256::from_bytes([4; 32]);
+        assert!(is_semantic_modification(&base, &rewritten));
+        assert!(!is_documentation_reread(&base, &rewritten));
+    }
+
+    /// A change, a range and a commit's entity list all read through the same
+    /// split, so the re-read entity is counted apart and named, never walked.
+    #[test]
+    fn a_change_counts_its_documentation_rereads_apart() {
+        let edited = test_entity("_toLowerCase");
+        let mut edited_new = edited.clone();
+        edited_new.fingerprint.behavior_hash = Hash256::from_bytes([5; 32]);
+        let mut documented = test_entity("$ZodStringBoolParams.case");
+        documented.doc_summary = Some(EARLIER_READING.to_string());
+        let mut documented_new = documented.clone();
+        documented_new.doc_summary = Some(CURRENT_READING.to_string());
+        let change = SemanticChange {
+            id: test_change_id(7),
+            entity_deltas: vec![
+                EntityDelta::Modified {
+                    old: edited.clone(),
+                    new: edited_new,
+                },
+                EntityDelta::Modified {
+                    old: documented.clone(),
+                    new: documented_new,
+                },
+            ],
+            ..reemitted_file_change(0, 0)
+        };
+
+        for diff in [
+            diff_from_change(&change),
+            diff_from_changes(std::slice::from_ref(&change)),
+        ] {
+            let modified: Vec<&str> = diff
+                .modified_entities()
+                .into_iter()
+                .map(|(_, new)| new.name.as_str())
+                .collect();
+            assert_eq!(modified, vec!["_toLowerCase"]);
+            assert_eq!(diff.provenance_only_entity_changes, 1);
+            assert_eq!(diff.documentation_rereads, vec![documented.id]);
+        }
     }
 }

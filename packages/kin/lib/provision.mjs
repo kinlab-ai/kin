@@ -23,8 +23,6 @@ import {
   compareVersions,
   kinHome,
   managedBinaryPath,
-  readLauncherStamp,
-  resolveManagedBinary,
   targetKinVersion,
   writeLauncherStamp,
 } from './resolve.mjs';
@@ -65,6 +63,76 @@ export function artifactName(platform = process.platform, arch = process.arch) {
 /** Download URL of a file attached to the v<version> GitHub release. */
 export function releaseDownloadUrl(version, file) {
   return `https://github.com/kinlab-ai/kin/releases/download/v${version}/${file}`;
+}
+
+export function releaseRustTarget(platform = process.platform, arch = process.arch) {
+  const targets = {
+    'darwin:arm64': 'aarch64-apple-darwin', 'darwin:x64': 'x86_64-apple-darwin',
+    'linux:arm64': 'aarch64-unknown-linux-musl', 'linux:x64': 'x86_64-unknown-linux-musl',
+    'win32:x64': 'x86_64-pc-windows-msvc',
+  };
+  artifactName(platform, arch); // Preserve the supported-platform refusal.
+  return targets[`${platform}:${arch}`];
+}
+
+/** Resolve a published tag independently of the executable we will run. */
+export async function resolvePublishedRelease(version, {
+  platform = process.platform, arch = process.arch, fetchImpl = fetch, releaseMetadata = null,
+} = {}) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error('published bootstrap requires an exact release version');
+  }
+  const archiveName = artifactName(platform, arch);
+  const base = 'https://api.github.com/repos/kinlab-ai/kin';
+  const [releaseBytes, tagBytes] = await Promise.all([
+    releaseMetadata ? Buffer.from(JSON.stringify(releaseMetadata)) : fetchBuffer(`${base}/releases/tags/v${version}`, fetchImpl),
+    fetchBuffer(`${base}/git/ref/tags/v${version}`, fetchImpl),
+  ]);
+  let release, tag;
+  try { release = JSON.parse(releaseBytes); tag = JSON.parse(tagBytes); } catch {
+    throw new Error('official release/tag metadata is malformed; no managed component was replaced');
+  }
+  if (tag.ref !== `refs/tags/v${version}`) throw new Error('official release metadata did not resolve the exact tag ref');
+  let object = tag.object;
+  for (let depth = 0; object?.type === 'tag' && depth < 5; depth++) {
+    if (!/^[0-9a-f]{40}$/i.test(object.sha || '')) throw new Error('official annotated tag has no exact source identity');
+    let annotated;
+    try { annotated = JSON.parse(await fetchBuffer(`${base}/git/tags/${object.sha}`, fetchImpl)); } catch {
+      throw new Error('official annotated tag metadata is unavailable or malformed');
+    }
+    if (annotated.sha !== object.sha) throw new Error('official annotated tag object changed while resolving its source');
+    object = annotated.object;
+  }
+  const channel = version.includes('-') ? 'alpha' : 'stable';
+  const url = releaseDownloadUrl(version, archiveName);
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const archive = assets.filter(asset => asset.name === archiveName);
+  const checksum = assets.filter(asset => asset.name === `${archiveName}.sha256`);
+  if (release.tag_name !== `v${version}` || release.draft !== false ||
+      release.prerelease !== (channel === 'alpha') || object?.type !== 'commit' || !/^[0-9a-f]{40}$/i.test(object.sha || '') ||
+      archive.length !== 1 || archive[0].browser_download_url !== url ||
+      checksum.length !== 1 || checksum[0].browser_download_url !== `${url}.sha256`) {
+    throw new Error('official published release metadata does not bind the requested tag and archive');
+  }
+  return { version, channel, commitSha: object.sha.toLowerCase(), target: releaseRustTarget(platform, arch), archiveName, url };
+}
+
+/** Legacy callers converge on stable latest while retaining their supported minimum. */
+export async function resolveLatestPublishedRelease(minimumVersion, {
+  platform = process.platform, arch = process.arch, fetchImpl = fetch,
+} = {}) {
+  let release;
+  try { release = JSON.parse(await fetchBuffer('https://api.github.com/repos/kinlab-ai/kin/releases/latest', fetchImpl)); } catch (error) {
+    throw new Error(`official latest stable metadata is unavailable or malformed: ${error.message}`, { cause: error });
+  }
+  const version = /^v(\d+\.\d+\.\d+)$/.exec(release.tag_name || '')?.[1];
+  if (!version || release.draft !== false || release.prerelease !== false) {
+    throw new Error('official latest release is not a published stable version');
+  }
+  if (compareVersions(version, minimumVersion) < 0) {
+    throw new Error(`official latest stable Kin ${version} is below this package's supported minimum ${minimumVersion}; no managed component was replaced`);
+  }
+  return resolvePublishedRelease(version, { platform, arch, fetchImpl, releaseMetadata: release });
 }
 
 /**
@@ -241,6 +309,20 @@ function mkdirKinDir(dir) {
 }
 
 /** `value` as one POSIX shell word, quoted only when it needs to be. */
+function assertFreshManagedDirectories(env) {
+  const root = kinHome(env);
+  for (const directory of [root, path.join(root, 'bin'), path.join(root, 'lib')]) {
+    let metadata;
+    try { metadata = fs.lstatSync(directory); } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error(`managed install directory must be a real non-symlink directory: ${directory}`);
+    }
+  }
+}
+
 function shellWord(value) {
   return /^[A-Za-z0-9/._\-+,:@%=]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 }
@@ -588,6 +670,18 @@ export async function provision(version, opts = {}) {
     setupFollows = false,
   } = opts;
 
+  if ((env.KIN_MANAGED_BIN && env.KIN_MANAGED_BIN.trim()) || env.KIN_RUNTIME_MODE === 'development') {
+    throw new Error('explicit development selections cannot run managed provisioning or repair');
+  }
+  const existingBinary = managedBinaryPath('kin', env, platform);
+  const existingDaemon = path.join(kinHome(env), 'bin', binaryName('kin-daemon', platform));
+  if (isInstalledComponent(existingBinary) || isInstalledComponent(existingDaemon)) {
+    if (!probeManagedRuntime(existingBinary, { env, spawnImpl: opts.spawnImpl })) {
+      return bootstrapPublishedInstall(version, opts);
+    }
+    return updateManagedInstall({ env, platform, spawnImpl: opts.spawnImpl, minimumVersion: version, log });
+  }
+  assertFreshManagedDirectories(env);
   const file = artifactName(platform, arch);
   const url = releaseDownloadUrl(version, file);
   // When `kin setup` runs next, the download line is the only one printed
@@ -660,6 +754,13 @@ export async function provision(version, opts = {}) {
     // live notifier from the previous release.
     const notifierSrc = preflightNotifierBundle(root, platform);
 
+    assertFreshManagedDirectories(env);
+    if (isInstalledComponent(existingBinary) || isInstalledComponent(existingDaemon)) {
+      if (!probeManagedRuntime(existingBinary, { env, spawnImpl: opts.spawnImpl })) {
+        return bootstrapPublishedInstall(version, opts);
+      }
+      return updateManagedInstall({ env, platform, spawnImpl: opts.spawnImpl, minimumVersion: version, log });
+    }
     const binDir = path.join(kinHome(env), 'bin');
     const libDir = path.join(kinHome(env), 'lib');
     mkdirKinDir(binDir);
@@ -710,22 +811,323 @@ export function probeBinaryVersion(binary, spawnImpl = spawnSync) {
     : null;
 }
 
-/**
- * The notice a launcher prints the first time it runs a managed install that
- * is newer than its own pin.
- *
- * It names the version that runs, the pin it outranks, what usually put it
- * there, and both ways to change the outcome: bring the launcher forward, or
- * install the pinned release over the newer one on purpose. The forward move
- * comes first because it is the one almost everybody wants.
- */
-export function newerInstallNotice(installed, target, installedPath) {
-  return (
-    `kin: running managed kin ${installed} at ${installedPath}, which is newer than the ${target} ` +
-    'this @kinlab/kin launcher pins (`kin update` and the shell installer move the managed install ' +
-    'forward without touching the npm package). `npm install -g @kinlab/kin@latest` brings the ' +
-    `launcher forward too; KIN_LAUNCHER_ADOPT=1 installs ${target} over it instead.`
-  );
+/** Read the native authority's complete CLI/daemon identity, never a version stamp. */
+export function probeManagedRuntime(binary, { env = process.env, spawnImpl = spawnSync, development = false } = {}) {
+  const args = ['runtime', 'status', '--json', ...(development ? ['--development'] : [])];
+  const probeEnv = mergeEnvironment(process.env, env);
+  if (development) {
+    if (!Object.hasOwn(env, 'KIN_HOME')) delete probeEnv.KIN_HOME;
+    if (!Object.hasOwn(env, 'KIN_DIR')) delete probeEnv.KIN_DIR;
+  }
+  const result = spawnImpl(binary, args, {
+    encoding: 'utf8', env: probeEnv, timeout: 20000,
+    killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+  });
+  let report;
+  try { report = JSON.parse(String(result.stdout)); } catch { return null; }
+  if (result.error || typeof result.status !== 'number' || report.schema !== 'kin.runtime-status.v1') return null;
+  if (result.status !== 0 && report.ready !== false) return null;
+  return report;
+}
+
+function isInstalledComponent(candidate) {
+  try { fs.lstatSync(candidate); return true; } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function runtimePathIdentity(value, platform) {
+  let resolved = value;
+  try { resolved = fs.realpathSync.native(value); } catch {}
+  if (platform === 'win32') {
+    resolved = resolved.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '');
+    return path.win32.resolve(resolved).toLowerCase();
+  }
+  return path.resolve(resolved);
+}
+
+function sameRuntimePath(left, right, platform) {
+  return runtimePathIdentity(left, platform) === runtimePathIdentity(right, platform);
+}
+
+/** Normal entry points must refuse an incomplete or differing native pair. */
+export function resolveReadyManagedBinary({
+  env = process.env, platform = process.platform, minimumVersion = '0.0.0',
+  spawnImpl = spawnSync, expectedRelease = null, statusReport = undefined,
+} = {}) {
+  const binary = managedBinaryPath('kin', env, platform);
+  const daemon = path.join(kinHome(env), 'bin', binaryName('kin-daemon', platform));
+  if (!isInstalledComponent(binary) && !isInstalledComponent(daemon)) return null;
+  const report = statusReport === undefined ? probeManagedRuntime(binary, { env, spawnImpl }) : statusReport;
+  const component = value => value && typeof value.path === 'string' &&
+    typeof value.version === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(value.version) &&
+    typeof value.target === 'string' && value.target.length > 0 &&
+    typeof value.build_profile === 'string' && value.build_profile.length > 0 &&
+    /^[0-9a-f]{40}$/i.test(value.commit_sha || '') &&
+    /^[0-9a-f]{64}$/i.test(value.sha256 || '') && value.source_dirty === false;
+  const matches = report && report.ready === true && report.mode === 'managed' &&
+    report.pair_matches === true && component(report.cli) && component(report.daemon) &&
+    typeof report.kin_home === 'string' && report.restart_needed === false &&
+    sameRuntimePath(report.kin_home, kinHome(env), platform) &&
+    sameRuntimePath(report.cli.path, binary, platform) &&
+    sameRuntimePath(report.daemon.path, daemon, platform) &&
+    report.cli.version === report.daemon.version &&
+    report.cli.commit_sha === report.daemon.commit_sha &&
+    report.cli.target === report.daemon.target &&
+    report.cli.build_profile === report.daemon.build_profile &&
+    compareVersions(report.cli.version, minimumVersion) >= 0 &&
+    (!expectedRelease || (report.cli.version === expectedRelease.version &&
+      report.cli.commit_sha.toLowerCase() === expectedRelease.commitSha &&
+      report.cli.target === expectedRelease.target));
+  if (!matches) {
+    throw new Error(
+      `managed Kin runtime is not certified at ${binary}: ${report?.reason || 'identity unavailable'}. ` +
+      'Kin requires a clean CLI and daemon from the same source. Run the managed ' +
+      '`kin update --apply` or inspect `kin runtime status --json`; no cached or PATH binary was substituted.',
+    );
+  }
+  return binary;
+}
+
+/** Only an already explicit development environment may supply its own home. */
+function developmentProbeEnvironment(env) {
+  const isolated = { ...env, KIN_RUNTIME_MODE: 'development' };
+  if (env.KIN_RUNTIME_MODE !== 'development') {
+    delete isolated.KIN_HOME;
+    delete isolated.KIN_DIR;
+  }
+  return isolated;
+}
+
+function inspectDevelopmentSelection(binary, { env, spawnImpl, platform }) {
+  if (!isInstalledComponent(binary)) return null;
+  const isolatedEnv = developmentProbeEnvironment(env);
+  const report = probeManagedRuntime(binary, { env: isolatedEnv, spawnImpl, development: true });
+  let realBinary = binary;
+  try { realBinary = fs.realpathSync.native(binary); } catch {}
+  const daemon = path.join(path.dirname(realBinary), binaryName('kin-daemon', platform));
+  if (!report || report.ready !== true || report.mode !== 'development' || report.pair_matches !== true ||
+      !report.cli || !report.daemon || typeof report.kin_home !== 'string' || !path.isAbsolute(report.kin_home) ||
+      !sameRuntimePath(report.cli.path || '', binary, platform) || !sameRuntimePath(report.daemon.path || '', daemon, platform)) {
+    throw new Error(
+      `selected development build at ${binary} lacks the runtime-isolation contract ` +
+      `(${report?.reason || 'identity unavailable'}). Rebuild its matching CLI and daemon; ` +
+      'no managed runtime or configuration was repaired.',
+    );
+  }
+  return { binary, env: { ...isolatedEnv, KIN_HOME: report.kin_home, KIN_DIR: report.kin_home } };
+}
+
+/** Explicit development selections use the isolated native contract too. */
+export function resolveDevelopmentBinary(binary, {
+  env = process.env, spawnImpl = spawnSync, platform = process.platform,
+} = {}) {
+  return inspectDevelopmentSelection(binary, { env, spawnImpl, platform })?.binary || null;
+}
+
+/** Build real child environment from the home the admitted native status chose. */
+export function developmentLaunchEnvironment(binary, {
+  env = process.env, spawnImpl = spawnSync, platform = process.platform,
+} = {}) {
+  const selected = inspectDevelopmentSelection(binary, { env, spawnImpl, platform });
+  if (!selected) throw new Error(`selected development binary is missing at ${binary}`);
+  return selected.env;
+}
+
+function hashNativeFile(file) {
+  const handle = fs.openSync(file, 'r');
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.alloc(64 * 1024);
+  try {
+    let count;
+    while ((count = fs.readSync(handle, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count));
+  } finally { fs.closeSync(handle); }
+  return hash.digest('hex');
+}
+
+function validateWindowsWorkerStage(handoff, env) {
+  const directory = path.dirname(handoff.worker_executable);
+  const expectedNames = ['handoff.json', 'kin-update-worker.exe'];
+  if (!/^\.update-worker-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(path.basename(directory)) ||
+      !sameRuntimePath(path.dirname(directory), kinHome(env), 'win32') ||
+      !sameRuntimePath(path.dirname(handoff.handoff_record), directory, 'win32') ||
+      path.basename(handoff.worker_executable) !== 'kin-update-worker.exe' || path.basename(handoff.handoff_record) !== 'handoff.json' ||
+      JSON.stringify(fs.readdirSync(directory).sort()) !== JSON.stringify(expectedNames)) {
+    throw new Error('prepared Windows update worker identity changed; scratch is not an unclaimed owned directory');
+  }
+  const metadata = fs.lstatSync(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('prepared Windows worker directory is not a real private directory');
+  return { directory, record: handoff.handoff_record, recordSha256: hashNativeFile(handoff.handoff_record) };
+}
+
+/** Native authority owns deletion and authenticates the exited incarnation. */
+function requestWindowsWorkerCleanup(binary, worker, result, { env, spawnImpl, log }) {
+  if (result?.error || typeof result?.status !== 'number' || !Number.isInteger(result.pid) || result.pid <= 0) return;
+  try {
+    const claimed = path.join(worker.directory, 'claimed');
+    const marker = fs.lstatSync(claimed);
+    if (!marker.isFile() || marker.isSymbolicLink() || marker.size <= 0 || marker.size > 64 * 1024) return;
+    const consumed = JSON.parse(fs.readFileSync(claimed, 'utf8'));
+    if (consumed.schema !== 'kin.windows-update-worker-consumed.v1' ||
+        consumed.worker_process?.pid !== result.pid || consumed.handoff_sha256 !== worker.recordSha256) return;
+    const cleanup = spawnImpl(binary, ['update', '--cleanup-windows-worker', worker.record], {
+      cwd: path.dirname(binary), stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8',
+      env: mergeEnvironment(process.env, env), maxBuffer: 64 * 1024,
+    });
+    if (cleanup.stdout) log(String(cleanup.stdout).trimEnd());
+    if (cleanup.stderr) log(String(cleanup.stderr).trimEnd());
+    if (cleanup.error || cleanup.status !== 0) {
+      log(`kin: native Windows worker cleanup deferred (${cleanup.error?.message || cleanup.status}); the update result is unchanged`);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') log(`kin: native Windows worker cleanup deferred (${error.message}); the update result is unchanged`);
+  }
+}
+
+function nativeUpdateCommand(binary, env, platform, spawnImpl) {
+  if (platform !== 'win32') return { executable: binary, args: ['update', '--apply'] };
+  const prepared = spawnImpl(binary, ['update', '--prepare-windows-worker'], {
+    encoding: 'utf8', env: mergeEnvironment(process.env, env), maxBuffer: 1024 * 1024,
+  });
+  let handoff;
+  try { handoff = JSON.parse(String(prepared.stdout)); } catch {}
+  if (prepared.error || prepared.status !== 0 || handoff?.schema !== 'kin.windows-update-worker.v1' ||
+      typeof handoff.worker_executable !== 'string' || !path.isAbsolute(handoff.worker_executable) ||
+      typeof handoff.handoff_record !== 'string' || !path.isAbsolute(handoff.handoff_record) ||
+      !/^[0-9a-f]{40}$/i.test(handoff.source_commit_sha || '') || !/^[0-9a-f]{64}$/i.test(handoff.worker_sha256 || '') ||
+      !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(handoff.version || '')) {
+    throw new Error('the managed Windows runtime could not prepare its native update worker; no wrapper replaced any installed component');
+  }
+  const workerMetadata = fs.lstatSync(handoff.worker_executable);
+  const recordMetadata = fs.lstatSync(handoff.handoff_record);
+  if (!workerMetadata.isFile() || workerMetadata.isSymbolicLink() ||
+      !recordMetadata.isFile() || recordMetadata.isSymbolicLink() ||
+      hashNativeFile(handoff.worker_executable) !== handoff.worker_sha256.toLowerCase()) {
+    throw new Error('prepared Windows update worker identity changed; refusing to launch it');
+  }
+  const workerHandoff = validateWindowsWorkerStage(handoff, env);
+  return {
+    executable: handoff.worker_executable,
+    args: ['update', '--windows-worker', handoff.handoff_record, '--apply'],
+    cwd: path.dirname(handoff.worker_executable),
+    workerHandoff,
+  };
+}
+
+/** Existing installs have one writer: the native transactional updater. */
+export function updateManagedInstall({
+  env = process.env, platform = process.platform, spawnImpl = spawnSync,
+  minimumVersion = targetKinVersion(), log = () => {},
+} = {}) {
+  const binary = managedBinaryPath('kin', env, platform);
+  if (!isInstalledComponent(binary)) {
+    throw new Error('an incomplete managed install exists; refusing to replace its native components independently');
+  }
+  log(`kin: updating the managed runtime through its native transaction at ${binary}`);
+  const command = nativeUpdateCommand(binary, env, platform, spawnImpl);
+  let result;
+  try {
+    result = spawnImpl(command.executable, command.args, {
+      cwd: command.cwd, stdio: ['inherit', 'pipe', 'pipe'], encoding: 'utf8',
+      env: mergeEnvironment(process.env, env), maxBuffer: 8 * 1024 * 1024,
+    });
+  } finally {
+    if (command.workerHandoff) requestWindowsWorkerCleanup(binary, command.workerHandoff, result, { env, spawnImpl, log });
+  }
+  if (result.stdout) log(String(result.stdout).trimEnd());
+  if (result.stderr) log(String(result.stderr).trimEnd());
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `native transactional update failed (${result.error?.message || result.status}); ` +
+      "no launcher installer replaced the existing CLI or daemon. Follow the native updater recovery instructions.",
+    );
+  }
+  return resolveReadyManagedBinary({ env, platform, spawnImpl, minimumVersion });
+}
+
+/** Stage an incoming published helper outside the installation it will migrate. */
+export async function bootstrapPublishedInstall(version, {
+  env = process.env, platform = process.platform, arch = process.arch,
+  fetchImpl = fetch, spawnImpl = spawnSync, log = line => process.stderr.write(`${line}\n`),
+} = {}) {
+  if ((env.KIN_MANAGED_BIN && env.KIN_MANAGED_BIN.trim()) || env.KIN_RUNTIME_MODE === 'development') {
+    throw new Error('explicit development selections cannot migrate a managed installation');
+  }
+  const managedHome = kinHome(env);
+  const release = await resolveLatestPublishedRelease(version, { platform, arch, fetchImpl });
+  let originalHome = managedHome;
+  try { originalHome = fs.realpathSync.native(originalHome); } catch {}
+  const stageParent = fs.realpathSync.native(os.tmpdir());
+  const relative = path.relative(originalHome, stageParent);
+  if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) {
+    throw new Error('published bootstrap staging must be outside the managed Kin home');
+  }
+  const stage = fs.mkdtempSync(path.join(stageParent, 'kin-published-bootstrap-'));
+  let invoked = false;
+  let completed = false;
+  try {
+    const archivePath = path.join(stage, release.archiveName);
+    const [archiveResult, checksumResult] = await Promise.allSettled([
+      downloadToFile(release.url, archivePath, fetchImpl),
+      fetchBuffer(`${release.url}.sha256`, fetchImpl),
+    ]);
+    if (archiveResult.status === 'rejected') throw archiveResult.reason;
+    if (checksumResult.status === 'rejected') throw checksumResult.reason;
+    const checksum = checksumResult.value.toString('utf8');
+    const match = checksum.match(/^([0-9a-f]{64})  ([^\r\n]+)\n?$/i);
+    if (!match || match[2] !== release.archiveName || match[1].toLowerCase() !== archiveResult.value.sha256) {
+      throw new Error('published bootstrap archive checksum does not match its exact release asset');
+    }
+    release.archiveSha256 = archiveResult.value.sha256;
+    fs.writeFileSync(path.join(stage, 'bootstrap-release.json'), `${JSON.stringify(release, null, 2)}\n`, { mode: 0o600 });
+    const toolEnv = mergeEnvironment(process.env, env);
+    const extraction = archiveExtraction(platform, toolEnv, release.archiveName);
+    const extracted = spawnSync(extraction.executable, extraction.args, {
+      cwd: stage, encoding: 'utf8', env: extractorEnvironment(toolEnv),
+    });
+    if (extracted.status !== 0) throw new Error(`published bootstrap extraction failed: ${extracted.stderr || extracted.error?.message || extracted.status}`);
+    const root = extractionRoot(stage);
+    validateTree(root);
+    const cli = path.join(root, binaryName('kin', platform));
+    const daemon = path.join(root, binaryName('kin-daemon', platform));
+    for (const component of [cli, daemon]) {
+      if (!fs.existsSync(component) || !fs.lstatSync(component).isFile() || fs.statSync(component).size === 0) {
+        throw new Error(`published bootstrap archive lacks a regular paired component: ${component}`);
+      }
+    }
+    preflightNotifierBundle(root, platform);
+    if (platform !== 'win32') fs.chmodSync(cli, 0o755);
+    const childEnv = mergeEnvironment(process.env, env);
+    for (const name of ['KIN_DIR', 'KIN_DAEMON_BIN', 'KIN_MANAGED_BIN', 'KIN_BINARY_PATH', 'KIN_MCP_KIN_BINARY', 'KIN_DAEMON_URL']) {
+      delete childEnv[name];
+    }
+    childEnv.KIN_HOME = managedHome;
+    childEnv.KIN_RUNTIME_MODE = 'managed';
+    const args = ['update', '--bootstrap-published', '--channel', release.channel,
+      '--expect-version', release.version, '--expect-sha', release.commitSha,
+      '--expect-archive-sha256', release.archiveSha256, '--expect-target', release.target,
+      '--expect-archive-name', release.archiveName, '--apply'];
+    log(`kin: migrating the legacy installation through verified published runtime ${release.version}`);
+    invoked = true;
+    const result = spawnImpl(cli, args, {
+      cwd: root, stdio: ['inherit', 'pipe', 'pipe'], encoding: 'utf8', env: childEnv, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (result.stdout) log(String(result.stdout).trimEnd());
+    if (result.stderr) log(String(result.stderr).trimEnd());
+    if (result.error || result.status !== 0) {
+      throw new Error(`native published bootstrap did not complete (${result.error?.message || result.status}); installation may require recovery or restart`);
+    }
+    const binary = resolveReadyManagedBinary({ env: childEnv, platform, spawnImpl, minimumVersion: version, expectedRelease: release });
+    writeLauncherStamp(release.version, childEnv);
+    completed = true;
+    return binary;
+  } catch (error) {
+    if (invoked) throw new Error(`${error.message}. Bootstrap stage retained at ${stage}; inspect the managed runtime before retrying.`, { cause: error });
+    throw error;
+  } finally {
+    if (!invoked || completed) fs.rmSync(stage, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -746,109 +1148,50 @@ export function storeUpgradeNotice(target) {
 }
 
 /**
- * Ensure a managed `kin` binary at least as new as this launcher's pinned
- * release is present, provisioning (or re-provisioning) when needed. Returns
- * the binary path, or null when nothing usable exists and provisioning is
- * unavailable. Never downgrades unless the caller opts in with
- * $KIN_LAUNCHER_ADOPT=1, and never runs a version other than the pin without
- * saying so.
- *
- * Policy, in order:
- *   - $KIN_MANAGED_BIN is an explicit user pin: use it as-is, never provision.
- *   - $KIN_NO_PROVISION=1: resolve-only, no network.
- *   - $KIN_LAUNCHER_ADOPT=1: always (re-)provision the pinned release,
- *     regardless of what is already installed.
- *   - nothing installed yet: provision the pinned release.
- *   - installed version is known from a bounded `--version` probe. An old
- *     launcher stamp cannot describe bytes replaced by `kin update`, the
- *     shell installer, or a restored backup:
- *       - installed == pinned: reuse it and refresh a missing or stale stamp.
- *       - installed < pinned: the pin is an upgrade — provision it
- *         automatically with a one-line notice. Never a silent no-op.
- *       - installed > pinned: `kin update` or the shell installer moved the
- *         install past this launcher. Run the newer binary, which serves
- *         every command the pin would have. The first run says so and
- *         records the confirmed version in the stamp, so later runs are
- *         quiet until the installed version changes again.
- *   - installed version unparseable (foreign binary that will not report a
- *     version): can't prove direction, so respect it — notice and reuse.
+ * Resolve one normal managed runtime. Package versions set a minimum, while
+ * native pair identity decides whether anything can serve. Explicit binary
+ * overrides are development selections and never trigger provisioning.
  */
 export async function ensureProvisioned(opts = {}) {
   const {
-    env = process.env,
-    platform = process.platform,
-    arch = process.arch,
-    fetchImpl = fetch,
-    log = (line) => process.stderr.write(`${line}\n`),
-    spawnImpl = spawnSync,
-    setupFollows = false,
+    env = process.env, platform = process.platform, arch = process.arch,
+    fetchImpl = fetch, log = line => process.stderr.write(`${line}\n`),
+    spawnImpl = spawnSync, setupFollows = false, minimumVersion = targetKinVersion(),
   } = opts;
-
-  const target = targetKinVersion();
-
   if (env.KIN_MANAGED_BIN && env.KIN_MANAGED_BIN.trim()) {
-    return resolveManagedBinary('kin', env, platform);
+    return resolveDevelopmentBinary(path.resolve(env.KIN_MANAGED_BIN), { env, platform, spawnImpl });
   }
-  const existing = resolveManagedBinary('kin', env, platform);
+  if (env.KIN_RUNTIME_MODE === 'development') {
+    throw new Error('development package launches require an explicit KIN_MANAGED_BIN; no normal runtime was provisioned');
+  }
+  const binary = managedBinaryPath('kin', env, platform);
+  const daemon = path.join(kinHome(env), 'bin', binaryName('kin-daemon', platform));
+  const hasInstall = isInstalledComponent(binary) || isInstalledComponent(daemon);
   if (isTruthyEnv(env.KIN_NO_PROVISION)) {
-    return existing;
+    return resolveReadyManagedBinary({ env, platform, minimumVersion, spawnImpl });
   }
-
-  const doProvision = () =>
-    provision(target, { env, platform, arch, fetchImpl, log, setupFollows });
-
   if (isTruthyEnv(env.KIN_LAUNCHER_ADOPT)) {
-    return doProvision();
-  }
-  if (!existing) {
-    return doProvision();
-  }
-
-  const installedPath = managedBinaryPath('kin', env, platform);
-  const stamp = readLauncherStamp(env);
-  const installed = probeBinaryVersion(existing, spawnImpl);
-
-  if (installed === null) {
-    log(
-      `kin: using existing managed kin (version unknown) at ${installedPath} ` +
-        `(this @kinlab/kin pins ${target}; set KIN_LAUNCHER_ADOPT=1 to re-provision).`,
+    throw new Error(
+      'KIN_LAUNCHER_ADOPT cannot replace a managed pair independently. Use the native ' +
+      '`kin update --apply` for normal updates or KIN_MANAGED_BIN for an explicit development build.',
     );
-    return existing;
   }
-
-  const cmp = compareVersions(target, installed);
-  if (cmp === 0) {
-    if (stamp !== target) {
-      try {
-        writeLauncherStamp(target, env);
-      } catch (error) {
-        log(`kin: could not refresh the launcher receipt (${error.code ?? 'write failed'}); using verified kin ${installed}.`);
-      }
+  if (hasInstall) {
+    const installed = probeBinaryVersion(binary, spawnImpl);
+    const current = probeManagedRuntime(binary, { env, spawnImpl });
+    if (!current) {
+      return bootstrapPublishedInstall(minimumVersion, { env, platform, arch, fetchImpl, spawnImpl, log });
     }
-    return existing;
-  }
-  if (cmp > 0) {
-    log(`kin: managed kin ${installed} is older than the pinned ${target}; upgrading automatically.`);
-    const upgraded = await doProvision();
-    if (upgraded) {
-      log(storeUpgradeNotice(target));
+    const currentVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(current.cli?.version || '')
+      ? current.cli.version : installed;
+    if (currentVersion && compareVersions(currentVersion, minimumVersion) < 0) {
+      log(`kin: managed kin ${currentVersion} is older than ${minimumVersion}; using its transactional updater.`);
+      const upgraded = updateManagedInstall({ env, platform, spawnImpl, minimumVersion, log });
+      log(storeUpgradeNotice(minimumVersion));
+      return upgraded;
     }
-    return upgraded;
+    return resolveReadyManagedBinary({ env, platform, minimumVersion, spawnImpl, statusReport: current });
   }
-  // The install is newer than the pin. This used to refuse, and because
-  // `kin update` and the shell installer both move $KIN_HOME forward without
-  // touching the npm package, every launcher hit that refusal the first time
-  // its owner updated: every command exited 1, and the only way out it named
-  // was a downgrade. The newer binary answers every command the pinned one
-  // would, so the launcher runs it. The stamp is written only after the notice
-  // has been printed, which is what keeps the notice to one run per version.
-  if (stamp !== installed) {
-    log(newerInstallNotice(installed, target, installedPath));
-    try {
-      writeLauncherStamp(installed, env);
-    } catch (error) {
-      log(`kin: could not record the launcher receipt (${error.code ?? 'write failed'}), so this notice repeats next run.`);
-    }
-  }
-  return existing;
+  await provision(minimumVersion, { env, platform, arch, fetchImpl, log, spawnImpl, setupFollows, onProgress: opts.onProgress });
+  return resolveReadyManagedBinary({ env, platform, minimumVersion, spawnImpl });
 }

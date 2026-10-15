@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `kin doctor` names every other copy of Kin this machine can run: each `kin`, `kin-daemon`
+  and `kin-mcp` on `PATH`, in Cargo's and Homebrew's directories, in npm global prefixes and
+  in `/usr/local/bin`, with what it is (the managed pair, a link to it, an npm launcher and its
+  version, a release that hands its commands to the managed pair, a separate older copy, a
+  development build) and the uninstall that removes it. A second row names every running
+  `kin-daemon` by the release it runs.
+- `kin setup` asks about each copy it can remove, defaulting to keep it, and a run with no
+  terminal only names them. `kin setup doctor --fix --remove-other-copies` removes them all
+  with each channel's own uninstall. Neither ever touches a development build or the managed
+  Kin home, and `--fix` alone removes nothing, because `kin update` runs it unattended.
+
+### Fixed
+
+- `kin update` writes the installed release into the npm launcher's version stamp inside the
+  same transaction as the binaries, and a rollback puts the old stamp back byte for byte.
+  Every update used to leave the stamp naming the release it replaced, and launchers older
+  than September 2026 read the stamp as the installed version and could reinstall their own
+  older release over a newer one. Recovery and `kin doctor --fix` rewrite a stamp an older
+  updater left behind. An install without a stamp still gets none.
+- The npm launcher replaces its version stamp by rename, so a reader never sees it empty or
+  half-written.
+
+## [0.8.7] - 2026-10-14
+
 ### Changed
 
 - The local workspace (`kin ui`) is rebuilt so that each page does one job
@@ -61,6 +87,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository, opens one Kin already holds, or clones one, and shows the
   conversion's progress.
 - Coding agents found on this machine are connected to Kin from the app.
+- A guided review of a change or a range names, on each entity an agent wrote
+  through Kin, the agent session that wrote it (`authored_by` on the step,
+  `authors` in the summary), so a review can go back to the agent that made
+  the change. Only the entity the agent's own operation named or created is
+  attributed: an edit that came along in the same change reads as made outside
+  Kin. The record is kept in the store and survives a daemon restart.
+- A guided review also names an agent on the entities it edited with its own
+  tools, which is how most agents edit. `kin setup` now writes an edit hook
+  for Claude Code when it connects it: before and after each `Edit`, `Write` or
+  `MultiEdit` the paired hooks tell the repository's daemon which session made the
+  edit, and the daemon names that session on the entities whose content the
+  edit changed (`through: "client"` in `authored_by`). It names nobody unless
+  the reported edit is exactly what changed, so an edit that arrived mixed
+  with someone else's is left unattributed. The hook is recorded in the
+  install ledger and removed by `kin setup uninstall`.
+
+### Fixed
+
+- An agent whose MCP server is killed outright, without closing its
+  connection, no longer shows as connected. A server that has only read now
+  names its process for the daemon to watch, and the daemon stops listing the
+  agent as soon as that process is gone and ends its session at the next
+  sweep. A live connection that only reads still ends on the idle window.
+- Add `kin runtime status --json` with paired executable identities, readiness refusals and restart acknowledgement.
+- Route installers and npm launchers through one admitted managed CLI and daemon pair, with isolated homes and service namespaces for development runtimes.
+- Bootstrap legacy runtimes through the official installer when their executable cannot report the runtime protocol, preserving update transactions and restart acknowledgement.
+- Include the reviewed workspace, runtime, installer and release-proof changes since 0.8.6.
 
 ## [0.8.6] - 2026-10-13
 

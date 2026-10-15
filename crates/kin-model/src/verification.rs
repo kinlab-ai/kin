@@ -9,7 +9,7 @@
 
 use crate::ids::{ContractId, EntityId, FilePathId, Hash256};
 use crate::timestamp::Timestamp;
-use crate::work::WorkScope;
+use crate::work::{WorkId, WorkScope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -201,6 +201,13 @@ pub struct Assertion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum VerificationStatus {
     Missing,
+    /// No outcome yet. A recorded run is pending when its test command could
+    /// not run: Kin could not start it, or the shell could not find or execute
+    /// the runner it names. Such a run attests nothing about its tests, and
+    /// its exit code and evidence say why it did not run.
+    ///
+    /// Recorded as this existing variant rather than a new one, so a store
+    /// holding such a run still opens in a Kin that predates the reading.
     Pending,
     Passing,
     Failing,
@@ -269,7 +276,7 @@ impl std::fmt::Display for MockStrategy {
 // ---------------------------------------------------------------------------
 
 /// A single execution of one or more tests with captured evidence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct VerificationRun {
     pub run_id: VerificationRunId,
     pub test_ids: Vec<TestId>,
@@ -280,6 +287,78 @@ pub struct VerificationRun {
     pub duration_ms: Option<u64>,
     pub evidence_blob: Option<Hash256>,
     pub exit_code: Option<i32>,
+    /// The entities the run was tied to, each with the fingerprint of its
+    /// source when the run started. A result is current only while each of
+    /// them still has that fingerprint. A run recorded before this was kept
+    /// carries none, and is never current.
+    ///
+    /// Omitted only when empty and no proof targets follow it, so every run
+    /// written before these fields existed keeps its exact bytes. The
+    /// hand-written `Serialize` below decides the omission, because a
+    /// field-level skip would drop this slot even when `proof` follows it.
+    #[serde(default)]
+    pub ran_against: Vec<RunFingerprint>,
+    /// The proof links admitted with this run. The graph derives its links
+    /// from these durable targets when a workspace is reopened.
+    #[serde(default)]
+    pub proof: Option<VerificationProof>,
+}
+
+impl VerificationRun {
+    /// Whether this run's command could not run, so it attests no outcome for
+    /// any test in it. See [`VerificationStatus::Pending`].
+    pub fn could_not_run(&self) -> bool {
+        self.status == VerificationStatus::Pending
+    }
+}
+
+impl Serialize for VerificationRun {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // MessagePack persists this as an array. A skipped interior field
+        // would decode proof targets as fingerprints, so keep the tenth slot
+        // whenever the eleventh is present.
+        let fingerprints = !self.ran_against.is_empty() || self.proof.is_some();
+        let mut out = serializer.serialize_struct(
+            "VerificationRun",
+            9 + usize::from(fingerprints) + usize::from(self.proof.is_some()),
+        )?;
+        out.serialize_field("run_id", &self.run_id)?;
+        out.serialize_field("test_ids", &self.test_ids)?;
+        out.serialize_field("status", &self.status)?;
+        out.serialize_field("runner", &self.runner)?;
+        out.serialize_field("started_at", &self.started_at)?;
+        out.serialize_field("finished_at", &self.finished_at)?;
+        out.serialize_field("duration_ms", &self.duration_ms)?;
+        out.serialize_field("evidence_blob", &self.evidence_blob)?;
+        out.serialize_field("exit_code", &self.exit_code)?;
+        if fingerprints {
+            out.serialize_field("ran_against", &self.ran_against)?;
+        }
+        if let Some(proof) = &self.proof {
+            out.serialize_field("proof", proof)?;
+        }
+        out.end()
+    }
+}
+
+/// The entities and work items a recorded run provides proof for. These
+/// targets are distinct from its fingerprints, which also include tests and
+/// dependencies that the run did not claim to prove.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VerificationProof {
+    pub entities: Vec<EntityId>,
+    pub work_items: Vec<WorkId>,
+}
+
+/// One entity a verification run was tied to, and the fingerprint of its
+/// source when the run started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct RunFingerprint {
+    pub entity: EntityId,
+    /// The entity's [`crate::SemanticFingerprint::behavior_hash`], which
+    /// moves on any edit of its source.
+    pub behavior_hash: Hash256,
 }
 
 /// Advisory hint that a dependency was mocked during a test run.
@@ -506,6 +585,8 @@ mod tests {
             duration_ms: Some(1234),
             evidence_blob: Some(Hash256::from_bytes([0xee; 32])),
             exit_code: Some(0),
+            ran_against: Vec::new(),
+            proof: None,
         };
 
         let json = serde_json::to_string(&run).unwrap();
@@ -515,6 +596,161 @@ mod tests {
         assert_eq!(parsed.status, VerificationStatus::Passing);
         assert_eq!(parsed.duration_ms, Some(1234));
         assert_eq!(parsed.exit_code, Some(0));
+    }
+
+    /// A run persists as a positional MessagePack array. One recorded before
+    /// it carried fingerprints keeps its exact bytes and still decodes, and
+    /// one that carries them keeps them.
+    #[test]
+    fn a_run_keeps_its_bytes_without_fingerprints_and_its_fingerprints_with_them() {
+        use crate::timestamp::Timestamp;
+
+        let without = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![TestId::new()],
+            status: VerificationStatus::Failing,
+            runner: TestRunner::Custom("npm test".into()),
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: Some(1),
+            ran_against: Vec::new(),
+            proof: None,
+        };
+        let bytes = rmp_serde::to_vec(&without).unwrap();
+        // Nine fields, as every run written before `ran_against` existed.
+        assert_eq!(
+            bytes[0], 0x99,
+            "a run without fingerprints is nine elements"
+        );
+        let legacy = (
+            without.run_id,
+            &without.test_ids,
+            without.status,
+            &without.runner,
+            &without.started_at,
+            &without.finished_at,
+            without.duration_ms,
+            without.evidence_blob,
+            without.exit_code,
+        );
+        assert_eq!(bytes, rmp_serde::to_vec(&legacy).unwrap());
+        let decoded: VerificationRun = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, without);
+
+        let with = VerificationRun {
+            ran_against: vec![RunFingerprint {
+                entity: EntityId::new(),
+                behavior_hash: Hash256::from_bytes([0x5a; 32]),
+            }],
+            ..without.clone()
+        };
+        let bytes = rmp_serde::to_vec(&with).unwrap();
+        assert_eq!(bytes[0], 0x9a, "fingerprints are the tenth element");
+        let decoded: VerificationRun = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, with);
+
+        let fingerprint_only = (
+            with.run_id,
+            &with.test_ids,
+            with.status,
+            &with.runner,
+            &with.started_at,
+            &with.finished_at,
+            with.duration_ms,
+            with.evidence_blob,
+            with.exit_code,
+            &with.ran_against,
+        );
+        assert_eq!(bytes, rmp_serde::to_vec(&fingerprint_only).unwrap());
+
+        let targets = VerificationProof {
+            entities: vec![EntityId::new()],
+            work_items: vec![WorkId::new()],
+        };
+        for source in [without, with] {
+            let proved = VerificationRun {
+                proof: Some(targets.clone()),
+                ..source
+            };
+            let bytes = rmp_serde::to_vec(&proved).unwrap();
+            assert_eq!(bytes[0], 0x9b, "proof keeps the fingerprint slot");
+            let decoded: VerificationRun = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, proved);
+            let json = serde_json::to_string(&proved).unwrap();
+            assert_eq!(
+                serde_json::from_str::<VerificationRun>(&json).unwrap(),
+                proved
+            );
+        }
+    }
+
+    /// A run whose command could not run is recorded with a status every
+    /// released Kin already decodes, in the same positional layout as any
+    /// other run, so a store that holds one still opens in an older Kin.
+    #[test]
+    fn a_run_that_could_not_run_keeps_the_released_encoding() {
+        use crate::timestamp::Timestamp;
+
+        let run = VerificationRun {
+            run_id: VerificationRunId::new(),
+            test_ids: vec![TestId::new(), TestId::new()],
+            status: VerificationStatus::Pending,
+            runner: TestRunner::Custom("npm test".into()),
+            started_at: Timestamp::now(),
+            finished_at: Some(Timestamp::now()),
+            duration_ms: Some(395),
+            evidence_blob: Some(Hash256::from_bytes([0x27; 32])),
+            exit_code: Some(127),
+            ran_against: vec![RunFingerprint {
+                entity: EntityId::new(),
+                behavior_hash: Hash256::from_bytes([0x5a; 32]),
+            }],
+            proof: Some(VerificationProof {
+                entities: vec![EntityId::new()],
+                work_items: Vec::new(),
+            }),
+        };
+        assert!(run.could_not_run());
+        for status in [
+            VerificationStatus::Missing,
+            VerificationStatus::Passing,
+            VerificationStatus::Failing,
+        ] {
+            assert!(!VerificationRun {
+                status,
+                ..run.clone()
+            }
+            .could_not_run());
+        }
+
+        let bytes = rmp_serde::to_vec(&run).unwrap();
+        assert_eq!(
+            bytes[0], 0x9b,
+            "eleven positional elements, as any run with proof"
+        );
+        let positional = (
+            run.run_id,
+            &run.test_ids,
+            "Pending",
+            &run.runner,
+            &run.started_at,
+            &run.finished_at,
+            run.duration_ms,
+            run.evidence_blob,
+            run.exit_code,
+            &run.ran_against,
+            &run.proof,
+        );
+        assert_eq!(
+            bytes,
+            rmp_serde::to_vec(&positional).unwrap(),
+            "the status is the released variant name, in the released slot"
+        );
+        let decoded: VerificationRun = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, run);
+        assert!(decoded.could_not_run());
     }
 
     #[test]

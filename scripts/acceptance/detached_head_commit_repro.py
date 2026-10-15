@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -356,6 +357,8 @@ class Suite(object):
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repos = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, os.path.join(workdir, "kin-home"))
 
     def kin_run(self, repo, args, timeout=900):
         rc, out, err = run([self.kin] + args, cwd=repo, env=self.env, timeout=timeout)

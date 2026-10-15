@@ -85,9 +85,10 @@ test('binaryName adds .exe only on Windows', () => {
 });
 
 test('kinHome honors $KIN_HOME then falls back to ~/.kin', () => {
-  assert.equal(kinHome({ KIN_HOME: '/custom/kin' }, '/home/u'), '/custom/kin');
+  assert.equal(kinHome({ KIN_HOME: '/custom/kin' }, '/home/u'), path.resolve('/custom/kin'));
   assert.equal(kinHome({}, '/home/u'), path.join('/home/u', '.kin'));
-  assert.equal(kinHome({ KIN_HOME: '   ' }, '/home/u'), path.join('/home/u', '.kin'));
+  assert.equal(kinHome({ KIN_HOME: '' }, '/home/u'), path.join('/home/u', '.kin'));
+  assert.equal(kinHome({ KIN_HOME: '   ' }, '/home/u'), path.resolve('   '), 'nonempty path spelling matches the shell and native resolver');
 });
 
 test('managedBinaryPath defaults under kinHome and is overridable', () => {
@@ -123,9 +124,55 @@ test('launcher stamp round-trips under kinHome and reads null when absent', () =
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test('launcher stamp is replaced by rename and leaves no temporary file behind', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamp-atomic-'));
+  try {
+    const env = { KIN_HOME: home };
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(launcherStampPath(env), '0.6.6\n');
+    const before = fs.statSync(launcherStampPath(env));
+
+    writeLauncherStamp('0.8.7', env);
+
+    // An in-place write keeps the inode; a rename installs a new one, which is
+    // what lets a concurrent reader see only the whole old or the whole new
+    // stamp.
+    const after = fs.statSync(launcherStampPath(env));
+    assert.notEqual(after.ino, before.ino);
+    assert.equal(fs.readFileSync(launcherStampPath(env), 'utf8'), '0.8.7\n');
+    assert.deepEqual(fs.readdirSync(bin), ['.kinlab-kin-version']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a launcher stamp write that cannot rename removes its temporary file', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamp-refused-'));
+  try {
+    const env = { KIN_HOME: home };
+    const bin = path.join(home, 'bin');
+    // A directory where the stamp belongs refuses the rename.
+    fs.mkdirSync(path.join(launcherStampPath(env), 'occupied'), { recursive: true });
+
+    assert.throws(() => writeLauncherStamp('0.8.7', env));
+
+    assert.deepEqual(fs.readdirSync(bin), ['.kinlab-kin-version']);
+    assert.ok(fs.statSync(launcherStampPath(env)).isDirectory());
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('notProvisionedMessage names the expected path and stays honest', () => {
   const msg = notProvisionedMessage('kin', { KIN_MANAGED_BIN: '/opt/kin/bin/kin' }, 'linux');
   assert.match(msg, /managed "kin" binary not found/);
   assert.match(msg, /\/opt\/kin\/bin\/kin/);
   assert.match(msg, /provisioning failed or was disabled/);
+});
+
+test('KIN_DIR is the install-root alias and KIN_HOME takes precedence', () => {
+  assert.equal(kinHome({ KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/legacy-root'));
+  assert.equal(kinHome({ KIN_HOME: '/preferred', KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/preferred'));
+  assert.equal(kinHome({ KIN_HOME: '', KIN_DIR: '/legacy-root' }, '/home/fixture'), path.resolve('/legacy-root'));
 });

@@ -89,6 +89,12 @@ CONFIRMED = {"schema": "kin.daemon-stop.v1", "scope": "current-repo",
              "stopped": [], "all_stopped": True}
 
 
+def prepare_cleanup_stub(kin, daemon, env, kin_home):
+    """Keep fixture isolation without probing the cleanup-only CLI stub."""
+    env["KIN_HOME"] = str(kin_home)
+    return kin, daemon
+
+
 class StopConfirmed(unittest.TestCase):
     """Every suite's own stop_confirmed reads the product's report the same way."""
 
@@ -219,7 +225,8 @@ class TraceSpineCleanup(RunRootCase):
             checks.append((ident, check))
         argv = ["--kin", str(self.kin), "--daemon", str(self.kin),
                 "--json", str(self.report)] + (["--keep"] if keep else [])
-        with mock.patch.object(trace, "CHECKS", checks):
+        with mock.patch.object(trace, "CHECKS", checks), \
+                mock.patch.object(trace, "prepare_runtime_fixture", prepare_cleanup_stub):
             with contextlib.redirect_stdout(io.StringIO()):
                 code = trace.main(argv)
         return code, self.read_report()
@@ -281,7 +288,8 @@ class TraceSpineCleanup(RunRootCase):
 
     def test_trace_spine_a_failed_init_is_still_owned(self):
         self.init_fails()
-        suite = trace.Suite(str(self.kin), str(self.scratch))
+        with mock.patch.object(trace, "prepare_runtime_fixture", prepare_cleanup_stub):
+            suite = trace.Suite(str(self.kin), str(self.scratch))
         with self.assertRaises(RuntimeError):
             suite.repo()
         self.assertIn(os.path.join(str(self.scratch), "sessions"), suite.owned_repos)
@@ -409,6 +417,7 @@ class GraphVizCleanup(RunRootCase):
                 "--json", str(self.report)] + (["--keep"] if keep else [])
         with contextlib.ExitStack() as stack:
             for name, stub in (("build_store", build_store),
+                               ("prepare_runtime_fixture", prepare_cleanup_stub),
                                ("fetch_payload", fetch_payload),
                                ("namespace_of", namespace_of),
                                ("run_refusal", run_refusal)):
@@ -515,6 +524,7 @@ class ResponseBudgetCleanup(RunRootCase):
         argv += ["--keep"] if keep else []
         argv += ["--workdir", str(workdir)] if workdir else []
         with mock.patch.object(budget, "CHECKS", checks), \
+                mock.patch.object(budget, "prepare_runtime_fixture", prepare_cleanup_stub), \
                 mock.patch.object(budget.Suite, "fixture", fixture), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -576,7 +586,8 @@ class ResponseBudgetCleanup(RunRootCase):
 
     def test_response_budget_a_failed_init_is_still_owned(self):
         self.init_fails()
-        suite = budget.Suite(str(self.kin), str(self.scratch), False)
+        with mock.patch.object(budget, "prepare_runtime_fixture", prepare_cleanup_stub):
+            suite = budget.Suite(str(self.kin), str(self.scratch), False)
         with self.assertRaises(budget.SetupError):
             suite.fixture()
         self.assertIn(os.path.join(str(self.scratch), "fixture-" + suite.run_id),

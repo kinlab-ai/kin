@@ -62,6 +62,10 @@ FILES = (
     "crates/kin-daemon/src/history_schedule.rs",
     "crates/kin-daemon/src/bin/kin-daemon.rs",
     "crates/kin-daemon-spawn/src/runtime_authority.rs",
+    "crates/kin-cli/src/commands/runtime.rs",
+    "crates/kin-io/src/confined.rs",
+    "crates/kin-io/src/store.rs",
+    "crates/kin-core/src/runtime_identity.rs",
 )
 UNPINNED_FILES = (
     "crates/kin-agent/src/belt.rs",

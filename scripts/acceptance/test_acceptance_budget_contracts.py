@@ -26,6 +26,21 @@ class AcceptanceBudgetContracts(unittest.TestCase):
                          'per-entity verdicts at {"generation":2}; current inputs')
         self.assertEqual(answer['negative']['advice'],
                          '{negative.subject} at {_kin.graph_as_of}; {negative.trust_reason}')
+        clause_answer = {
+            '_kin': {'source_derivation': {'identity': 'current'},
+                     'graph_as_of': {'generation': 2}},
+            'negative': {
+                'subject': 'all direct call and non-call references to Target',
+                'trust_reason': 'local_binding_unproven: prior-local binding evidence could not be validated; reference_completion_unmeasured: non-call completion is unmeasured',
+                'advice': '{negative.subject} at {_kin.graph_as_of}; local_binding_unproven; reference_completion_unmeasured ({negative.trust_reason})',
+            },
+        }
+        clause_restored = restore_compacted(copy.deepcopy(clause_answer), compacted)
+        self.assertEqual(
+            clause_restored['negative']['advice'],
+            'all direct call and non-call references to Target at {"generation":2}; '
+            + clause_answer['negative']['trust_reason'],
+        )
         for changed in (
             dict(answer, negative={'advice': '{negative.subject}'}),
             dict(answer, negative=dict(answer['negative'], advice='unadvertised content')),

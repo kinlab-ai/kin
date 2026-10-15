@@ -395,6 +395,12 @@ impl RowScope {
         self.place(entity) != Placement::Outside
     }
 
+    /// [`Self::lists`] for a row that names only the dotted module it sits
+    /// in. A row with no module is kept, since where it sits is unknown.
+    pub fn lists_module(&self, module: Option<&str>) -> bool {
+        module.is_none_or(|module| under(&module.to_lowercase(), &self.folded))
+    }
+
     /// [`Self::lists`] for the entity a row names by `id`. A row whose
     /// entity the graph does not hold is kept.
     pub fn lists_id<G: GraphStore + ?Sized>(&self, store: &G, id: &str) -> bool {

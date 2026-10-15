@@ -148,6 +148,23 @@ impl Catalog {
             })
     }
 
+    /// The key of every location the registry names, for a caller that asks
+    /// about many locations at once. Blocking.
+    pub(super) fn registered_keys(&self) -> std::collections::HashSet<String> {
+        if !self.reads_registry {
+            return Default::default();
+        }
+        kin_core::registry::KinRegistry::load()
+            .map(|registry| {
+                registry
+                    .repos
+                    .iter()
+                    .map(|row| repository_key(&row.path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Read the registry and name what it holds. Blocking: it reads the
     /// registry and each repository's own records.
     pub(super) fn read(&self) -> Listing {
@@ -330,6 +347,7 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
         .route("/workspace/", get(index))
         .merge(page_assets())
         .route("/api/workspace/session", get(session))
+        .route("/api/workspace/session/pull", get(session_pull))
         .route("/api/workspace/branches", get(branches))
         .route("/api/workspace/branch/preview", post(branch_preview))
         .route("/api/workspace/branch/confirm", post(branch_confirm))
@@ -345,8 +363,12 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
         .route("/api/workspace/branch/create", post(branch_create))
         .route("/api/workspace/merge/confirm", post(merge_confirm))
         .route("/api/workspace/commit", post(commit))
+        .route("/api/workspace/entity/restore", post(entity_restore))
         .merge(super::workspace_explore::routes())
         .merge(super::workspace_agents::routes())
+        .merge(super::workspace_remotes::routes())
+        .merge(super::workspace_verify::routes())
+        .merge(super::workspace_flags::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
 }
 
@@ -404,7 +426,7 @@ async fn branch_preview(
         let (_, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         let port = port.filter(|port| *port != 0)
             .context("No daemon endpoint is recorded. Open repository content before requesting a branch preview.")?;
-        DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), &state.layout)
+        DaemonClient::for_workspace_page("branch preview", format!("http://127.0.0.1:{port}"), &state.layout, Duration::from_secs(30))
             .await?.branch_switch_preview(&request).await
     }.await;
     match answer {
@@ -611,10 +633,12 @@ async fn merge_preview(
     };
     let answer = async {
         // Preview observes a running, verified runtime. It must not start a
-        // daemon or open repository recovery as a side effect of previewing.
+        // daemon or open repository recovery as a side effect of previewing,
+        // except to replace a daemon of an older release, which this release
+        // never previews through.
         let (_, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         let port = port.filter(|port| *port != 0).context("No daemon endpoint is recorded. Open repository content before requesting a merge preview.")?;
-        DaemonClient::from_running_workspace(format!("http://127.0.0.1:{port}"), &state.layout)
+        DaemonClient::for_workspace_page("merge preview", format!("http://127.0.0.1:{port}"), &state.layout, Duration::from_secs(30))
             .await?
             .merge_preview(&super::merge::MergePreviewRequest { source })
             .await
@@ -697,7 +721,14 @@ async fn merge_confirm(
 struct CommitBody {
     message: String,
     operation_id: kin_model::OperationId,
+    /// Commit only these entities' changes, as the uncommitted-work guide
+    /// names them, and leave every other change uncommitted.
+    #[serde(default)]
+    entities: Option<Vec<String>>,
 }
+
+/// The most entities one commit from the page may choose.
+const COMMIT_ENTITIES_MAX: usize = 10_000;
 
 /// This attempt recorded nothing: it stopped before the daemon was asked, or
 /// the daemon refused before publication.
@@ -713,7 +744,8 @@ fn commit_refused(operation_id: kin_model::OperationId, error: &anyhow::Error) -
         .into_response()
 }
 
-/// Commit the whole working copy, as `kin commit -m` does.
+/// Commit the whole working copy, as `kin commit -m` does, or only the
+/// entities the body names, as `kin commit -m --entity` does.
 async fn commit(
     State(state): State<Arc<UiState>>,
     headers: HeaderMap,
@@ -724,6 +756,8 @@ async fn commit(
     }
     let operation_id = body.operation_id;
     let message = body.message.trim().to_string();
+    let entities = body.entities.unwrap_or_default();
+    let chose = !entities.is_empty();
     let checked = (|| {
         anyhow::ensure!(
             !operation_id.0.is_nil(),
@@ -733,6 +767,14 @@ async fn commit(
         anyhow::ensure!(
             message.chars().count() <= COMMIT_MESSAGE_MAX_CHARS,
             "a commit message is at most {COMMIT_MESSAGE_MAX_CHARS} characters"
+        );
+        anyhow::ensure!(
+            entities.len() <= COMMIT_ENTITIES_MAX,
+            "one commit chooses at most {COMMIT_ENTITIES_MAX} entities"
+        );
+        anyhow::ensure!(
+            entities.iter().all(|entity| !entity.trim().is_empty()),
+            "every chosen entity needs its id"
         );
         Ok(())
     })();
@@ -748,18 +790,24 @@ async fn commit(
     // Run to its end whatever becomes of this request. A page that closes
     // mid-commit must not leave the daemon's answer unread, and attribution
     // resolves against this URL's repository, never a caller-supplied actor.
+    let chosen = entities.clone();
     let committing = tokio::spawn(async move {
-        super::commit::commit_for_app(&state.layout, &message, operation_id).await
+        super::commit::commit_for_app(&state.layout, &message, operation_id, &chosen).await
     });
     let outcome = committing.await.unwrap_or_else(|error| {
         super::commit::AppCommit::Unknown(anyhow::anyhow!("the commit did not finish: {error}"))
     });
     match outcome {
-        super::commit::AppCommit::Committed { change_id } => Json(serde_json::json!({
-            "operation_id":operation_id, "outcome":"committed",
-            "change_id":change_id, "title":title,
-        }))
-        .into_response(),
+        super::commit::AppCommit::Committed { change_id } => {
+            let mut answer = serde_json::json!({
+                "operation_id":operation_id, "outcome":"committed",
+                "change_id":change_id, "title":title,
+            });
+            if chose {
+                answer["entities"] = serde_json::json!(entities);
+            }
+            Json(answer).into_response()
+        }
         super::commit::AppCommit::NothingToCommit => Json(serde_json::json!({
             "operation_id":operation_id, "outcome":"nothing_to_commit",
         }))
@@ -775,30 +823,136 @@ async fn commit(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityRestoreBody {
+    entity: String,
+    #[serde(default)]
+    to: Option<String>,
+    operation_id: kin_model::OperationId,
+    #[serde(default)]
+    expected: Option<String>,
+}
+
+/// This restore wrote nothing: it stopped before the daemon was asked, or the
+/// daemon refused before writing.
+fn restore_refused(operation_id: kin_model::OperationId, error: &anyhow::Error) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error":format!("{error:#}"), "outcome":"refused",
+            "operation_id":operation_id,
+            "remedy":"Nothing was changed. Resolve what is reported, then restore it again.",
+        })),
+    )
+        .into_response()
+}
+
+/// Put one entity back as it was at the head, or at an earlier change, as an
+/// uncommitted edit, as `kin checkout --entity` does.
+async fn entity_restore(
+    State(state): State<Arc<UiState>>,
+    headers: HeaderMap,
+    Json(body): Json<EntityRestoreBody>,
+) -> Response {
+    if !review_ui::may_write(&headers, &state) {
+        return review_ui::write_refused();
+    }
+    let operation_id = body.operation_id;
+    let entity = body.entity.trim().to_string();
+    let checked = (|| {
+        anyhow::ensure!(
+            !operation_id.0.is_nil(),
+            "a nonempty operation ID is required"
+        );
+        anyhow::ensure!(!entity.is_empty(), "a restore names the entity it restores");
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        return restore_refused(operation_id, &error);
+    }
+    // Run to its end whatever becomes of this request, like a commit: a page
+    // that closes mid-restore must not leave the daemon's answer unread.
+    let (to, expected) = (body.to, body.expected);
+    let restoring = tokio::spawn(async move {
+        super::entity_work::restore_for_app(&state.layout, entity, to, expected, operation_id).await
+    });
+    let outcome = restoring.await.unwrap_or_else(|error| {
+        super::entity_work::AppRestore::Unknown(anyhow::anyhow!(
+            "the restore did not finish: {error}"
+        ))
+    });
+    match outcome {
+        super::entity_work::AppRestore::Restored(restored) => Json(serde_json::json!({
+            "operation_id":operation_id, "outcome":"restored",
+            "entity":restored.entity, "name":restored.name,
+            "to":restored.restored_to, "replayed":restored.replayed,
+        }))
+        .into_response(),
+        super::entity_work::AppRestore::Refused(error) => restore_refused(operation_id, &error),
+        // A lost answer can follow a restore that landed. Return its identity
+        // for reconciliation and never replay it behind the page.
+        super::entity_work::AppRestore::Unknown(error) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error":format!("{error:#}"), "outcome":"unknown",
+            "operation_id":operation_id,
+            "remedy":"The entity may have been restored. Refresh the uncommitted work before restoring it again. This request was not retried.",
+        }))).into_response(),
+    }
+}
+
 /// How much of a repository's history its store holds, from the store's own
 /// record of it. `complete` is a store with its whole history, which a
 /// repository that began in Kin always is. `partial` is a converted project
 /// whose one admitted commit is being followed by the rest in the background.
 /// `none` is a store that holds that one commit and derives no more: it was
 /// asked not to, or the project it came from has no more to give.
+///
+/// A partial store also says where the rest of its history stands. `deriving`
+/// is true while it is being read, and `step` and `steps` then say how far
+/// the reading has come, when the worker has said. `staged` is true once all
+/// of it has been read and the repository has only to switch to it, which it
+/// does at its next quiet point; `admitted` stays at what the repository shows
+/// until then. `waiting_for` is there while that switch is held back, and
+/// says what for, as a clause that follows "waiting for".
 pub(super) fn history_json(
     standing: &kin_core::history_state::HistoryStanding,
 ) -> serde_json::Value {
-    use kin_core::history_state::{HistoryMode, HistoryStanding};
+    use kin_core::history_state::{DerivationState, HistoryMode, HistoryStanding};
     match standing {
         HistoryStanding::Complete => serde_json::json!({"state":"complete"}),
         // A record that cannot be read is treated as incomplete, as every
         // other surface treats it, and no count is claimed for it.
         HistoryStanding::Unreadable { .. } => serde_json::json!({"state":"partial"}),
-        HistoryStanding::Partial { record, .. } => {
-            let filling = record.mode == HistoryMode::Background && record.underivable.is_none();
+        HistoryStanding::Partial { record, progress } => {
+            let staged = progress
+                .as_ref()
+                .is_some_and(|progress| progress.state == DerivationState::Staged);
+            // A history that has been read is on its way in whatever mode the
+            // store records, so it is never shown as one that will not come.
+            let filling =
+                staged || (record.mode == HistoryMode::Background && record.underivable.is_none());
+            let running = super::daemon_activity::running_history(standing);
             let mut history = serde_json::json!({
                 "state": if filling { "partial" } else { "none" },
                 "admitted": record.admitted_commits,
-                "deriving": super::daemon_activity::running_history(standing).is_some(),
+                "deriving": running.is_some(),
+                "staged": staged,
             });
+            if let Some((step, steps)) = running
+                .as_ref()
+                .and_then(|running| running.step.zip(running.steps))
+            {
+                history["step"] = serde_json::json!(step);
+                history["steps"] = serde_json::json!(steps);
+            }
             if let Some(total) = record.reachable_commits {
                 history["total"] = serde_json::json!(total);
+            }
+            if let Some(waiting_for) = progress
+                .as_ref()
+                .and_then(|progress| progress.staged_waiting_for())
+            {
+                history["waiting_for"] = serde_json::json!(waiting_for);
             }
             history
         }
@@ -827,31 +981,53 @@ async fn session(State(state): State<Arc<UiState>>) -> Response {
     // Read recorded endpoint metadata and verify health without discovery,
     // endpoint cleanup, startup or process control. Other resource
     // reads use the ordinary command resolver when the user opens that resource.
-    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+    let observe = tokio::time::timeout(Duration::from_secs(5), async {
         let (pid, port) = crate::daemon_client::repo_daemon_recorded_endpoint(state.layout.root());
         match (pid, port) {
             (Some(_), Some(port)) if port != 0 => {
-                let client = DaemonClient::from_running_workspace(
-                    format!("http://127.0.0.1:{port}"), &state.layout,
-                ).await?;
+                let client = DaemonClient::for_workspace_page(
+                    "local UI",
+                    format!("http://127.0.0.1:{port}"),
+                    &state.layout,
+                    Duration::from_secs(5),
+                )
+                .await?;
                 let health = client.health().await?;
+                // Whether the repository declares a test command Kin can run,
+                // read from its manifests by the same daemon a run would use,
+                // as it last said: a daemon that is writing can take most of
+                // a minute to say, and nothing on the page waits for it. One
+                // that cannot say leaves it unknown.
+                let tests = super::workspace_verify::test_command_known(&state, client).flatten();
                 Ok::<_, anyhow::Error>((
                     serde_json::json!({"state":"running","detail":health.status,
                         "graph_loaded":health.graph_loaded,
                         "reconciliation":health.reconciliation_status}),
-                    health.repo_id, health.workspace_id,
+                    health.repo_id,
+                    health.workspace_id,
+                    tests,
                 ))
             }
             _ => Ok((
                 serde_json::json!({"state":"unknown", "detail":"No complete local daemon endpoint is recorded. Opening repository content uses Kin's normal startup path."}),
-                None, None,
+                None,
+                None,
+                None,
             )),
         }
-    }).await;
-    let (runtime, repository_id, workspace_id) = match observed {
+    });
+    // Whether Git can carry a branch for this project, asked of Git at most
+    // once in a while, beside the runtime reading rather than after it. A
+    // session never asks a remote anything, and never waits for the daemon
+    // to say whether this branch can update from Git: it says what is known,
+    // and that it is checking when nothing is yet.
+    let (observed, git) = tokio::join!(observe, super::workspace_git_remote::ready(&state));
+    let git_pull = super::workspace_git_remote::update_ready_known(&state, &git);
+    let (runtime, repository_id, workspace_id, verify_unavailable) = match observed {
         Ok(Ok(reading)) => reading,
         Ok(Err(error)) => (
             serde_json::json!({"state":"unknown", "detail":format!("{error:#}")}),
+            None,
             None,
             None,
         ),
@@ -859,24 +1035,49 @@ async fn session(State(state): State<Arc<UiState>>) -> Response {
             serde_json::json!({"state":"unknown", "detail":"Runtime observation did not finish within five seconds. Retry to check again."}),
             None,
             None,
+            None,
         ),
     };
     let key = repository_key(state.layout.working_dir());
     // Read for this answer, so a repository added since the server started
     // is in the list the page switches between.
-    let (listing, history) = {
+    let (listing, history, transfer) = {
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
-            (
-                state.catalog.as_ref().map(|catalog| catalog.read()),
-                // The store's own record of its history, so the page can say
-                // when the record of changes is still filling in.
-                history_json(&kin_core::history_state::standing(&state.layout)),
-            )
+            let listing = state.catalog.as_ref().map(|catalog| catalog.read());
+            // The store's own record of its history, so the page can say
+            // when the record of changes is still filling in.
+            let standing = kin_core::history_state::standing(&state.layout);
+            let machine: Vec<_> = listing
+                .iter()
+                .flat_map(|listing| &listing.repositories)
+                .map(|listed| listed.layout.clone())
+                .collect();
+            let transfer =
+                session_transfer(&state.layout, &standing, &machine, &git, git_pull.as_ref());
+            (listing, history_json(&standing), transfer)
         })
         .await
-        .unwrap_or((None, serde_json::Value::Null))
+        .unwrap_or_else(|_| {
+            let unread = || Err("Kin could not read this repository's remotes.".to_string());
+            (
+                None,
+                serde_json::Value::Null,
+                SessionTransfer {
+                    push: unread(),
+                    pull: unread(),
+                    fetch: false,
+                    pull_checking: false,
+                },
+            )
+        })
     };
+    let SessionTransfer {
+        push: remote_push,
+        pull: remote_pull,
+        fetch: remote_fetch,
+        pull_checking,
+    } = transfer;
     let repositories: Vec<_> = listing.iter().flat_map(|listing| &listing.repositories).map(|listed| {
         let item = &listed.entry;
         serde_json::json!({"key":item.key,"name":item.name,"owner":item.owner,"host":item.host,"url":item.url,"selected":item.key == key})
@@ -886,12 +1087,112 @@ async fn session(State(state): State<Arc<UiState>>) -> Response {
         "repositories":repositories,
         "registry_warning":listing.as_ref().and_then(|listing| listing.warning.as_deref()),
         "catalog_basis":"Repositories registered on this machine, read for this answer.",
-        "capabilities":{"graph":true,"review":true,"merge":true,"commit":true,"editor":true,"branch_switch":true,"branch_switch_unavailable_reason":null,"branch_create":true,"conflict_details":true,"conflict_settle":true},
+        "capabilities":{"graph":true,"review":true,"merge":true,"commit":true,"entity_commit":true,"entity_restore":true,"editor":true,"branch_switch":true,"branch_switch_unavailable_reason":null,"branch_create":true,"conflict_details":true,"conflict_settle":true,
+            "remotes":true,
+            "remote_push":remote_push.is_ok(),"remote_pull":remote_pull.is_ok(),"remote_fetch":remote_fetch,
+            "remote_unavailable_reason":remote_push.as_ref().err(),
+            "remote_pull_unavailable_reason":remote_pull.as_ref().err(),
+            "remote_pull_checking":pull_checking,
+            "review_flags":true,"verify_run":verify_unavailable.is_none(),"verify_run_unavailable_reason":verify_unavailable},
         "history":history,
         "runtime":runtime,"version":env!("CARGO_PKG_VERSION"),"actor":state.actor,"token":state.token,
         "review_url":format!("{}/review/",state.base_path),
         "graph_url":format!("{}/workspace/#/entities",state.base_path),
     })).into_response()
+}
+
+/// Whether a push, a pull and a fetch can work here, as a session says it.
+struct SessionTransfer {
+    push: Result<(), String>,
+    pull: Result<(), String>,
+    fetch: bool,
+    /// The pull depends on whether this branch can update from Git, which
+    /// is being asked and is not known yet. `pull` then says nothing either
+    /// way, and the page asks `/api/workspace/session/pull` for it.
+    pull_checking: bool,
+}
+
+/// What a push, a pull and a fetch can do here, from configuration,
+/// credentials, what Git said, and, when it is known, whether this branch
+/// can update from Git. Blocking.
+fn session_transfer(
+    layout: &kin_core::KinLayout,
+    standing: &kin_core::history_state::HistoryStanding,
+    machine: &[kin_core::KinLayout],
+    git: &Result<(), String>,
+    git_pull: Option<&Result<(), String>>,
+) -> SessionTransfer {
+    let capability = |git_pull: &Result<(), String>| {
+        super::workspace_remotes::transfer_capability(layout, standing, machine, git, git_pull)
+    };
+    if let Some(git_pull) = git_pull {
+        let (push, pull, fetch) = capability(git_pull);
+        return SessionTransfer {
+            push,
+            pull,
+            fetch,
+            pull_checking: false,
+        };
+    }
+    // Not known yet. When the answer would not change what a pull can do,
+    // as with no Git remote, or one that cannot pull for another reason,
+    // the session says so; otherwise it says the pull is being checked.
+    let (push, pull_if_ready, fetch) = capability(&Ok(()));
+    let (_, pull_if_not, _) = capability(&Err(String::new()));
+    if pull_if_ready == pull_if_not {
+        return SessionTransfer {
+            push,
+            pull: pull_if_ready,
+            fetch,
+            pull_checking: false,
+        };
+    }
+    SessionTransfer {
+        push,
+        pull: Err(PULL_CHECKING.to_string()),
+        fetch,
+        pull_checking: true,
+    }
+}
+
+/// What a session says of a pull while it checks whether this branch can
+/// update from Git.
+const PULL_CHECKING: &str = "Kin is checking whether this branch can update from Git.";
+
+/// GET /api/workspace/session/pull: whether a pull can work here, once Kin
+/// has asked the repository's daemon whether this branch can update from
+/// Git. A session answers without waiting for that ask and says
+/// `remote_pull_checking`; the page reads the pull from here.
+async fn session_pull(State(state): State<Arc<UiState>>) -> Response {
+    let git = super::workspace_git_remote::ready(&state).await;
+    let git_pull = super::workspace_git_remote::update_ready(&state).await;
+    let transfer = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let listing = state.catalog.as_ref().map(|catalog| catalog.read());
+            let standing = kin_core::history_state::standing(&state.layout);
+            let machine: Vec<_> = listing
+                .iter()
+                .flat_map(|listing| &listing.repositories)
+                .map(|listed| listed.layout.clone())
+                .collect();
+            session_transfer(&state.layout, &standing, &machine, &git, Some(&git_pull))
+        })
+        .await
+    };
+    match transfer {
+        Ok(transfer) => Json(serde_json::json!({
+            "remote_pull": transfer.pull.is_ok(),
+            "remote_pull_unavailable_reason": transfer.pull.as_ref().err(),
+            "remote_pull_checking": false,
+            "remote_fetch": transfer.fetch,
+        }))
+        .into_response(),
+        Err(_) => review_ui::refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &anyhow::anyhow!("Kin could not read this repository's remotes."),
+        ),
+    }
 }
 
 /// Canonicalize the explicitly selected repository at the opening boundary.
@@ -1138,6 +1439,87 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    /// The page is told when the whole history has been read and the
+    /// repository has only to switch to it, and what that switch waits for,
+    /// so it never says a history is still being read when it is not.
+    #[test]
+    fn a_staged_history_is_reported_as_read_and_waiting_to_switch() {
+        use kin_core::history_state::{
+            self, DerivationState, HistoryDerivationProgress, HistoryMode, HistoryStateRecord,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir_all(&root).unwrap();
+        let layout = kin_core::KinLayout::new(root);
+        let stamp = |mode| {
+            history_state::stamp_staged(
+                &layout,
+                &HistoryStateRecord::new(
+                    mode,
+                    "0123456789abcdef0123456789abcdef01234567".into(),
+                    None,
+                    "snapshot".into(),
+                    Vec::new(),
+                    Some(4_673),
+                    None,
+                ),
+            )
+            .unwrap();
+        };
+        stamp(HistoryMode::Background);
+        let read = || history_json(&history_state::standing(&layout));
+
+        // Nothing derived yet: the fields the page already reads, and staged
+        // answered rather than left out.
+        assert_eq!(
+            read(),
+            serde_json::json!({
+                "state": "partial", "admitted": 1, "total": 4_673,
+                "deriving": false, "staged": false,
+            })
+        );
+
+        // Being read: how far the reading has come, when the worker said.
+        let mut running = HistoryDerivationProgress::new(DerivationState::Running);
+        running.step = Some(11);
+        running.steps = Some(16);
+        running.pid = None;
+        history_state::write_progress(&layout, &running).unwrap();
+        assert_eq!(
+            read(),
+            serde_json::json!({
+                "state": "partial", "admitted": 1, "total": 4_673,
+                "deriving": true, "staged": false, "step": 11, "steps": 16,
+            })
+        );
+
+        let mut staged = HistoryDerivationProgress::new(DerivationState::Staged);
+        staged.detail = Some("/stages/one".into());
+        history_state::write_progress(&layout, &staged).unwrap();
+        assert_eq!(
+            read(),
+            serde_json::json!({
+                "state": "partial", "admitted": 1, "total": 4_673,
+                "deriving": false, "staged": true,
+            })
+        );
+
+        history_state::note_staged_wait(&layout, Some("an open merge to be finished")).unwrap();
+        let waiting = read();
+        assert_eq!(waiting["staged"], true);
+        assert_eq!(waiting["waiting_for"], "an open merge to be finished");
+        // Where the staged store is kept is never part of the answer.
+        assert!(!waiting.to_string().contains("stages"), "{waiting}");
+
+        // A store asked to derive nothing whose history was read anyway is on
+        // its way to having it, not a store that will never have it.
+        stamp(HistoryMode::None);
+        assert_eq!(read()["state"], "partial");
+        history_state::clear_progress(&layout).unwrap();
+        assert_eq!(read()["state"], "none");
+        assert_eq!(read()["staged"], false);
     }
 
     /// One server with two repositories mounted, the way `run` composes it,
@@ -1449,6 +1831,409 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        server.abort();
+    }
+
+    /// Push and pull from the page need its authority and an operation, and
+    /// a repository with no Kin remote refuses them with nothing sent. The
+    /// remotes reading and the session say the same without asking anyone.
+    #[tokio::test]
+    async fn push_and_pull_refuse_with_nothing_sent_when_they_cannot_run() {
+        let (origin, tokens, _hub, server) = serve_two().await;
+        let client = reqwest::Client::new();
+        for verb in ["push", "pull", "fetch"] {
+            let url = format!("{origin}/repositories/second/api/workspace/{verb}");
+            let operation_id = kin_model::OperationId::new();
+            for (token, request_origin) in [
+                (tokens[0].as_str(), origin.as_str()),
+                (tokens[1].as_str(), "https://foreign.example"),
+                ("", origin.as_str()),
+            ] {
+                let refused = client
+                    .post(&url)
+                    .header("x-kin-review-token", token)
+                    .header("origin", request_origin)
+                    .json(&serde_json::json!({"operation_id":operation_id}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{verb}");
+            }
+            let send = |body: serde_json::Value| {
+                client
+                    .post(&url)
+                    .header("x-kin-review-token", &tokens[1])
+                    .header("origin", &origin)
+                    .json(&body)
+                    .send()
+            };
+            let nil = send(serde_json::json!({"operation_id":uuid::Uuid::nil()}))
+                .await
+                .unwrap();
+            assert_eq!(nil.status(), StatusCode::CONFLICT);
+            let nil: serde_json::Value = nil.json().await.unwrap();
+            assert_eq!(nil["outcome"], "refused");
+            assert!(nil["error"].as_str().unwrap().contains("operation ID"));
+            // A caller never names the credential or the address.
+            let injected = send(serde_json::json!({
+                "operation_id":operation_id,"url":"http://127.0.0.1:1",
+            }))
+            .await
+            .unwrap();
+            assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            // Refused before anything is sent, so the same operation may be
+            // sent again once what is reported is corrected.
+            for _ in 0..2 {
+                let refused = send(serde_json::json!({
+                    "operation_id":operation_id,"remote":null,"ref":"main",
+                }))
+                .await
+                .unwrap();
+                assert_eq!(refused.status(), StatusCode::CONFLICT, "{verb}");
+                let refused: serde_json::Value = refused.json().await.unwrap();
+                assert_eq!(refused["outcome"], "refused");
+                assert_eq!(refused["operation_id"], serde_json::json!(operation_id));
+                assert_eq!(refused["error"], "No remote is set up for this repository.");
+                assert!(refused["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Nothing was sent."));
+                assert!(refused.get("already_sent").is_none());
+            }
+            let named = send(serde_json::json!({"operation_id":operation_id,"remote":"origin"}))
+                .await
+                .unwrap();
+            let named: serde_json::Value = named.json().await.unwrap();
+            assert_eq!(
+                named["error"],
+                "No remote named origin is set up for this repository."
+            );
+        }
+
+        let remotes: serde_json::Value = client
+            .get(format!(
+                "{origin}/repositories/second/api/workspace/remotes"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            remotes["schema"],
+            super::super::workspace_remotes::REMOTES_SCHEMA
+        );
+        assert_eq!(remotes["remotes"], serde_json::json!([]));
+        assert_eq!(remotes["default_remote"], serde_json::Value::Null);
+        assert_eq!(
+            remotes["default_remote_reason"],
+            "No remote is set up for this repository."
+        );
+
+        let session: serde_json::Value = client
+            .get(format!(
+                "{origin}/repositories/second/api/workspace/session"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let capabilities = &session["capabilities"];
+        assert_eq!(capabilities["remotes"], true);
+        assert_eq!(capabilities["remote_push"], false);
+        assert_eq!(capabilities["remote_pull"], false);
+        assert_eq!(capabilities["remote_fetch"], false);
+        assert_eq!(
+            capabilities["remote_pull_unavailable_reason"],
+            "No remote is set up for this repository."
+        );
+        assert_eq!(
+            capabilities["remote_unavailable_reason"],
+            "No remote is set up for this repository."
+        );
+        server.abort();
+    }
+
+    /// A session answers while the repository's daemon is slow to say
+    /// whether this branch can update from Git. Measured on a busy axum, the
+    /// session waited ten seconds on that question before every page could
+    /// draw, and then said the daemon did not answer. It now says the pull is
+    /// being checked, the page reads the pull on its own route, which joins
+    /// the ask already running, and the next session has the answer.
+    ///
+    /// Breaking it: have the session wait for the ask again, and its answer
+    /// takes the whole held ask.
+    #[tokio::test]
+    async fn a_session_answers_while_the_git_update_check_is_slow() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let layout = kin_core::KinLayout::new(temporary.path().join(".kin"));
+        std::fs::create_dir_all(layout.root()).unwrap();
+        let mut config = kin_core::KinConfig::default();
+        config.git.remotes.push(kin_core::GitRemoteTransportConfig {
+            name: "origin".into(),
+            fetch_urls: vec!["https://github.invalid/example/demo.git".into()],
+            push_urls: Vec::new(),
+            fetch_refspecs: Vec::new(),
+            push_refspecs: Vec::new(),
+        });
+        config.save(&layout.config_path()).unwrap();
+
+        let listener = review_ui::bind(Some(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let catalog = empty_catalog();
+        let hub = Hub::new(port, catalog.clone(), None);
+        let state = Arc::new(UiState::workspace(
+            layout,
+            port,
+            "/repositories/slow".to_string(),
+            catalog,
+        ));
+        // Git itself can carry the branch; only the daemon's answer is slow.
+        state.transfers.remember_git_ready(Ok(()));
+        hub.mount("slow".to_string(), state.clone());
+        let router = hub_router(hub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let held = Duration::from_secs(3);
+        *super::super::workspace_git_remote::UPDATE_STATUS_PAUSE_FOR_TEST
+            .lock()
+            .unwrap() = Some((Arc::as_ptr(&state) as usize, held));
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}/repositories/slow");
+        let read = |path: &'static str| {
+            let client = client.clone();
+            let url = format!("{base}{path}");
+            async move {
+                let asked = std::time::Instant::now();
+                let answer: serde_json::Value =
+                    client.get(url).send().await.unwrap().json().await.unwrap();
+                (answer, asked.elapsed())
+            }
+        };
+        let (session, took) = read("/api/workspace/session").await;
+        assert!(
+            took < Duration::from_millis(1500),
+            "the session waited {took:?} for the Git update check"
+        );
+        let capabilities = &session["capabilities"];
+        assert_eq!(capabilities["remote_push"], true, "{capabilities}");
+        assert_eq!(capabilities["remote_pull"], false);
+        assert_eq!(capabilities["remote_pull_checking"], true);
+
+        let (pull, took) = read("/api/workspace/session/pull").await;
+        assert!(
+            took < held + Duration::from_millis(1500),
+            "the pull read joins the ask the session started: {took:?}"
+        );
+        assert_eq!(pull["remote_pull_checking"], false);
+        assert_eq!(pull["remote_pull"], false);
+        assert_eq!(
+            pull["remote_pull_unavailable_reason"],
+            "Open repository content to read whether this branch can update from Git."
+        );
+
+        let (session, took) = read("/api/workspace/session").await;
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        let capabilities = &session["capabilities"];
+        assert_eq!(capabilities["remote_pull_checking"], false);
+        assert_eq!(
+            capabilities["remote_pull_unavailable_reason"],
+            pull["remote_pull_unavailable_reason"]
+        );
+        *super::super::workspace_git_remote::UPDATE_STATUS_PAUSE_FOR_TEST
+            .lock()
+            .unwrap() = None;
+        server.abort();
+    }
+
+    /// Entity work answers the page's checks before any daemon is asked, and
+    /// the session tells the page this server can do it.
+    #[tokio::test]
+    async fn entity_commit_and_restore_check_authority_and_shape_before_anything_is_asked() {
+        let (origin, tokens, _hub, server) = serve_two().await;
+        let client = reqwest::Client::new();
+        let base = format!("{origin}/repositories/second/api/workspace");
+        let operation_id = kin_model::OperationId::new();
+        let restore = format!("{base}/entity/restore");
+        let foreign = client
+            .post(&restore)
+            .header("x-kin-review-token", &tokens[0])
+            .header("origin", &origin)
+            .json(&serde_json::json!({"entity":"e","operation_id":operation_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        for (body, reason) in [
+            (
+                serde_json::json!({"entity":"  ","operation_id":operation_id}),
+                "names the entity",
+            ),
+            (
+                serde_json::json!({"entity":"e","operation_id":uuid::Uuid::nil()}),
+                "operation ID is required",
+            ),
+        ] {
+            let refused = client
+                .post(&restore)
+                .header("x-kin-review-token", &tokens[1])
+                .header("origin", &origin)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::CONFLICT);
+            let answer: serde_json::Value = refused.json().await.unwrap();
+            assert_eq!(answer["outcome"], "refused");
+            assert!(
+                answer["error"].as_str().unwrap().contains(reason),
+                "{answer}"
+            );
+            assert!(answer["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was changed"));
+        }
+        // A restore names an entity, never where its content is projected.
+        let projected = client
+            .post(&restore)
+            .header("x-kin-review-token", &tokens[1])
+            .header("origin", &origin)
+            .json(&serde_json::json!({
+                "entity":"e","operation_id":operation_id,"path":"src/lib.rs",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(projected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let refused = client
+            .post(format!("{base}/commit"))
+            .header("x-kin-review-token", &tokens[1])
+            .header("origin", &origin)
+            .json(&serde_json::json!({
+                "message":"keep one","operation_id":operation_id,"entities":["a",""],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let answer: serde_json::Value = refused.json().await.unwrap();
+        assert!(
+            answer["error"].as_str().unwrap().contains("needs its id"),
+            "{answer}"
+        );
+
+        let session: serde_json::Value = client
+            .get(format!("{base}/session"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["capabilities"]["entity_commit"], true);
+        assert_eq!(session["capabilities"]["entity_restore"], true);
+        server.abort();
+    }
+
+    /// A flag from the page is refused in words, with nothing asked of the
+    /// repository, when it lacks the page's authority or names no entity, and
+    /// a caller never names who set it.
+    #[tokio::test]
+    async fn a_flag_needs_authority_and_an_entity_before_anything_is_asked() {
+        let (origin, tokens, _hub, server) = serve_two().await;
+        let client = reqwest::Client::new();
+        let session: serde_json::Value = client
+            .get(format!(
+                "{origin}/repositories/second/api/workspace/session"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["capabilities"]["review_flags"], true);
+
+        let operation_id = kin_model::OperationId::new();
+        let entity = uuid::Uuid::new_v4();
+        for (path, body) in [
+            (
+                "flags",
+                serde_json::json!({
+                    "entity":entity,"note":"look again","fingerprint":"ab".repeat(32),
+                    "operation_id":operation_id,
+                }),
+            ),
+            (
+                "flags/resolve",
+                serde_json::json!({"entity":entity,"operation_id":operation_id}),
+            ),
+        ] {
+            let url = format!("{origin}/repositories/second/api/workspace/{path}");
+            for (token, request_origin) in [
+                (tokens[0].as_str(), origin.as_str()),
+                (tokens[1].as_str(), "https://foreign.example"),
+                ("", origin.as_str()),
+            ] {
+                let refused = client
+                    .post(&url)
+                    .header("x-kin-review-token", token)
+                    .header("origin", request_origin)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+            }
+            // An entity is named by its id, never by a name or a place.
+            for unnamed in ["ServerReply.send", "src/reply.ts", ""] {
+                let mut named = body.clone();
+                named["entity"] = serde_json::json!(unnamed);
+                let refused = client
+                    .post(&url)
+                    .header("x-kin-review-token", &tokens[1])
+                    .header("origin", &origin)
+                    .json(&named)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::CONFLICT, "{path}");
+                let said: serde_json::Value = refused.json().await.unwrap();
+                assert_eq!(said["outcome"], "refused");
+                assert_eq!(said["operation_id"], serde_json::json!(operation_id));
+                assert!(
+                    said["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("on an entity, named by its id"),
+                    "{said}"
+                );
+                assert!(said["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Nothing was recorded"));
+            }
+            let mut signed = body.clone();
+            signed["author"] = serde_json::json!("caller");
+            let injected = client
+                .post(&url)
+                .header("x-kin-review-token", &tokens[1])
+                .header("origin", &origin)
+                .json(&signed)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                injected.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
         server.abort();
     }
 

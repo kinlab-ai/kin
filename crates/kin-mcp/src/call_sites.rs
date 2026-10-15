@@ -186,8 +186,9 @@ fn enrichment_switched_off() -> Option<EnrichmentSwitch> {
 /// by the repository's own setting, then its probe of the language's server.
 /// A server the probe found missing, or that could not start, proves nothing
 /// until the host changes, and a language no build of Kin enriches never has
-/// one. Nothing published, or a language the probe did not report on, is
-/// unknown, and reads as owed.
+/// one, whatever was published. For a language Kin enriches, nothing
+/// published, or a probe that did not report on it, is unknown, and reads as
+/// owed.
 pub fn no_resolver_for(
     switch: Option<EnrichmentSwitch>,
     readiness: Option<&kin_core::reference_coverage::LanguageServerReadinessMap>,
@@ -201,6 +202,13 @@ pub fn no_resolver_for(
         }
         Some(EnrichmentSwitch::On) | None => {}
     }
+    // A fact of this build, not of the host, so it holds whether or not a
+    // probe was published. A daemon serving only such languages starts no
+    // server and publishes nothing, and reading that silence as unknown left
+    // every caller in a small Ruby project owed enrichment that never comes.
+    if !ENRICHABLE_LANGUAGES.contains(&language) {
+        return Some(NoResolver::NoLanguageServer);
+    }
     match readiness?.get(&language) {
         Some(LanguageServerReadiness::Absent) => Some(NoResolver::NoLanguageServer),
         Some(LanguageServerReadiness::Unusable { reason }) => Some(NoResolver::ServerCannotStart {
@@ -208,7 +216,6 @@ pub fn no_resolver_for(
         }),
         Some(LanguageServerReadiness::Usable) => None,
         Some(LanguageServerReadiness::Disabled) => Some(NoResolver::EnrichmentOff),
-        None if !ENRICHABLE_LANGUAGES.contains(&language) => Some(NoResolver::NoLanguageServer),
         None => None,
     }
 }
@@ -3355,9 +3362,18 @@ mod tests {
         );
         // Enrichable, and the probe said nothing about it: unknown.
         assert_eq!(read(on, Some(&probed), LanguageId::TypeScript), None);
-        // A language no build of Kin enriches.
+        // A language no build of Kin enriches, whether or not anything was
+        // published.
         assert_eq!(
             read(on, Some(&probed), LanguageId::Java),
+            Some(NoResolver::NoLanguageServer)
+        );
+        assert_eq!(
+            read(None, None, LanguageId::Ruby),
+            Some(NoResolver::NoLanguageServer)
+        );
+        assert_eq!(
+            read(on, None, LanguageId::Java),
             Some(NoResolver::NoLanguageServer)
         );
     }

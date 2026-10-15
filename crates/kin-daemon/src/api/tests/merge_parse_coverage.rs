@@ -218,7 +218,13 @@ async fn body_bound_parse_certificates_do_not_become_authored_merge_conflicts() 
             )),
             "the verified body-bound certificate is derived from the settled body"
         );
-        assert!(entries.iter().all(|entry| !matches!(entry.subject, kin_model::MergeConflictSubject::Relation { .. })), "derived source certificates must not become independently authored conflicts: {entries:#?}");
+        assert!(
+            entries.iter().all(|entry| !matches!(
+                entry.subject,
+                kin_model::MergeConflictSubject::Relation { .. }
+            )),
+            "derived source certificates must not become independently authored conflicts: {entries:#?}"
+        );
         for action in [
             kin_cli::commands::resolve::ResolveAction::Settle {
                 directives: vec![],

@@ -39,12 +39,26 @@ fn refuse(reason: impl std::fmt::Display) -> KinDbError {
     ModelError::InvalidOperation(format!("Git snapshot proof: {reason}")).into()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`validate_metadata`] on this thread, read as the endpoints of
+    /// a span by the tests that pin which transactions re-validate a proof.
+    static METADATA_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn metadata_validations() -> usize {
+    METADATA_VALIDATIONS.with(std::cell::Cell::get)
+}
+
 /// Validate the persisted shape even when raw-body verification can be carried
 /// from a durable validation record for these exact snapshot bytes.
 pub(super) fn validate_metadata(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
 ) -> Result<(), KinDbError> {
+    #[cfg(test)]
+    METADATA_VALIDATIONS.with(|count| count.set(count.get() + 1));
     super::require_sorted_unique(
         &metadata.git_snapshot_proofs,
         |proof| proof.snapshot_change_id,

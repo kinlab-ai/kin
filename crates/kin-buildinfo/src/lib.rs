@@ -12,6 +12,8 @@ pub struct BuildInfo {
     pub dependency_provenance: &'static str,
     pub branch: &'static str,
     pub built_at: &'static str,
+    pub target: &'static str,
+    pub build_profile: &'static str,
 }
 
 /// Versioned, fixed-width build identity embedded exactly once in each
@@ -138,6 +140,8 @@ pub fn get() -> BuildInfo {
         dependency_provenance: env!("KIN_BUILD_DEPENDENCY_PROVENANCE"),
         branch: env!("KIN_BUILD_BRANCH"),
         built_at: env!("KIN_BUILD_TIME"),
+        target: env!("KIN_BUILD_TARGET"),
+        build_profile: env!("KIN_BUILD_PROFILE"),
     }
 }
 
@@ -184,6 +188,8 @@ mod tests {
             dependency_provenance: "lock-sha",
             branch: "main",
             built_at: "2026-06-10T16:00:00Z",
+            target: "x86_64-unknown-linux-gnu",
+            build_profile: "debug",
         };
 
         assert_eq!(
@@ -201,6 +207,8 @@ mod tests {
             dependency_provenance: "lock-sha",
             branch: "main",
             built_at: "2026-06-10T16:00:00Z",
+            target: "x86_64-unknown-linux-gnu",
+            build_profile: "release",
         };
 
         assert_eq!(sha_with_dirty(info), "bd7cd12");

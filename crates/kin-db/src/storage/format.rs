@@ -15,7 +15,8 @@ use crate::storage::change_map::{
 };
 use crate::storage::change_validation::{validate_semantic_change_entries, AdmittedChangeMap};
 use crate::storage::repository::{
-    GitProjectionTreeReplay, HistoryProof, PersistedRepositoryAuthority, RootRecomputation,
+    GitProjectionTreeReplay, HistoryProof, PayloadProof, PersistedRepositoryAuthority,
+    RootRecomputation,
 };
 use crate::types::*;
 
@@ -894,21 +895,23 @@ where
     Option::deserialize(deserializer)
 }
 
-/// The four graph domains a workspace mutation ever compares.
+/// The semantic graph domains a workspace mutation compares.
 ///
 /// Deriving a workspace's cumulative semantic overlay and proving that overlay
-/// reproduces the desired graph read entities, relations, external references
-/// and the resolved tree, and read nothing else. Carrying those two steps on
+/// reproduces the desired graph read entities, semantic relations, external
+/// references, resolution records and the resolved tree. Carrying those two steps on
 /// whole `GraphSnapshot`s meant each of them also held a copy of every change
 /// in the repository with its full entity, relation and tree delta payload,
 /// plus change children, work items, annotations, reviews, verification runs,
 /// provenance and sessions, none of which any comparison consults. On a
 /// full-history conversion the change map IS the repository, so a snapshot
-/// kept for four fields was a whole extra history.
+/// kept for those fields was a whole extra history.
 ///
 /// This is a projection of a `GraphSnapshot`, never a substitute for one:
 /// nothing is validated through it, and every value in it is the value the
-/// snapshot's own field carried.
+/// snapshot's own field carried. Relations retain only semantic endpoints;
+/// verification and work links belong to their records and cannot become
+/// workspace overlay edits when those records are projected here.
 #[derive(Debug)]
 pub struct WorkspaceGraphFacts {
     pub entities: HashMap<EntityId, Entity>,
@@ -923,11 +926,15 @@ impl WorkspaceGraphFacts {
     ///
     /// Consuming rather than borrowing is the point: the domains move out and
     /// everything else is freed at the call, instead of staying alive beside
-    /// the four fields a caller went on to read.
+    /// the compared fields a caller went on to read.
     pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         Self {
             entities: snapshot.entities,
-            relations: snapshot.relations,
+            relations: snapshot
+                .relations
+                .into_iter()
+                .filter(|(_, relation)| crate::engine::is_semantic_relation(relation))
+                .collect(),
             external_references: snapshot.external_references,
             resolved_tree: snapshot.resolved_tree,
             resolution_records: snapshot.resolution_records,
@@ -2075,6 +2082,7 @@ impl GraphSnapshot {
             RootRecomputation::Required,
             AuthorityEnvelope::Validated,
             HistoryProof::Required,
+            PayloadProof::Required,
         )
     }
 
@@ -2092,16 +2100,20 @@ impl GraphSnapshot {
     /// `history` is the successor's [`HistoryProof`], stated by the same caller
     /// for the same reason: it built the successor and knows which of its
     /// inputs the transaction left exactly as the predecessor held them.
+    /// `payload` is the same caller's [`PayloadProof`]: its own replay view
+    /// proved this exact authority-free payload a few statements earlier.
     pub(crate) fn validate_storage_admission_with_proven_roots(
         &self,
         replay: GitProjectionTreeReplay,
         history: HistoryProof,
+        payload: PayloadProof,
     ) -> Result<(), crate::error::KinDbError> {
         self.validate_admission_with_envelope(
             replay,
             RootRecomputation::Proven,
             AuthorityEnvelope::Validated,
             history,
+            payload,
         )
     }
 
@@ -2122,6 +2134,7 @@ impl GraphSnapshot {
             RootRecomputation::Required,
             AuthorityEnvelope::Ignored,
             HistoryProof::Required,
+            PayloadProof::Required,
         )
     }
 
@@ -2131,6 +2144,7 @@ impl GraphSnapshot {
         roots: RootRecomputation,
         envelope: AuthorityEnvelope,
         history: HistoryProof,
+        payload: PayloadProof,
     ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
         // Indexed recovery either verified an exact durable proof or admitted
@@ -2145,7 +2159,7 @@ impl GraphSnapshot {
         };
         let changes_ms = timer.lap_ms();
         self.validate_storage_admission_after_changes(
-            replay, roots, &admitted, envelope, changes_ms, timer, history,
+            replay, roots, &admitted, envelope, changes_ms, timer, history, payload,
         )
     }
 
@@ -2210,6 +2224,7 @@ impl GraphSnapshot {
             0,
             timer,
             HistoryProof::Required,
+            PayloadProof::Required,
         )
     }
 
@@ -2222,6 +2237,7 @@ impl GraphSnapshot {
         changes_ms: u128,
         mut timer: crate::storage::repository::PublicationPhaseTimer,
         history: HistoryProof,
+        payload: PayloadProof,
     ) -> Result<(), crate::error::KinDbError> {
         for (id, reference) in &self.external_references {
             validate_external_reference_entry(id, reference, "snapshot")?;
@@ -2271,7 +2287,8 @@ impl GraphSnapshot {
             AuthorityEnvelope::Ignored => None,
         };
         if let Some(authority) = envelope_to_validate {
-            authority.validate_against_snapshot_with(self, replay, roots, admitted, history)?;
+            authority
+                .validate_against_snapshot_with(self, replay, roots, admitted, history, payload)?;
         }
         let repository_authority_ms = timer.lap_ms();
         tracing::debug!(
@@ -4048,6 +4065,7 @@ mod tests {
             kind: ActorKind::Human,
             display_name: "tester".into(),
             external_refs: vec![],
+            agent_session: None,
         };
         snap.actors.insert(actor.actor_id, actor.clone());
 
@@ -4078,6 +4096,7 @@ mod tests {
                 kind: ActorKind::Human,
                 display_name: "live".into(),
                 external_refs: vec![],
+                agent_session: None,
             },
         );
 
@@ -6900,6 +6919,115 @@ mod tests {
             changes.read_change_for_serving(&target).unwrap().as_ref(),
             original.changes.get(&target),
             "a serving read answers what was verified, never the changed bytes"
+        );
+    }
+
+    /// A record too large to keep between reads is decoded once for as long
+    /// as a read holds the large records, and kept no longer than that.
+    ///
+    /// A store whose older history is still being derived holds the whole
+    /// repository as one bootstrap change, over the bound every other record
+    /// is kept under, and a guide of one commit replayed across it five or six
+    /// times, decoding it each time. Without a hold, each serving read of the
+    /// record still decodes it. With one, the first read does and every other
+    /// read, from the map or a clone that shares its storage, and under a
+    /// second hold, serves what it decoded. Once the last hold is let go
+    /// nothing is kept, and the next read decodes again.
+    #[test]
+    fn a_large_record_is_decoded_once_while_a_read_holds_large_records() {
+        use std::io::Write;
+        let decoded_records = crate::storage::change_map::records_decoded_on_this_thread;
+        let mut original = a_snapshot_with_history(2);
+        let mut bootstrap = a_history_change(9, None);
+        bootstrap.message = "x".repeat(9 * 1024 * 1024);
+        let bootstrap = seal_change(bootstrap);
+        let large = bootstrap.id;
+        original.changes.insert(large, bootstrap);
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (opened, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "large record fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let changes = opened.changes;
+        let serve = |reader: &crate::storage::ChangeMap| {
+            let change = reader.read_change_for_serving(&large).unwrap();
+            assert_eq!(change.as_ref(), original.changes.get(&large));
+        };
+
+        let before = decoded_records();
+        serve(&changes);
+        serve(&changes);
+        assert_eq!(
+            decoded_records() - before,
+            2,
+            "with no read holding them, a large record is decoded on every read"
+        );
+
+        let shared = changes.clone();
+        let hold = changes.hold_large_records().expect("an encoded history");
+        let held_from = decoded_records();
+        serve(&changes);
+        serve(&changes);
+        serve(&shared);
+        let second = shared.hold_large_records().expect("an encoded history");
+        serve(&shared);
+        assert_eq!(
+            decoded_records() - held_from,
+            1,
+            "while a read holds the large records, each is decoded once"
+        );
+        drop(hold);
+        serve(&changes);
+        assert_eq!(
+            decoded_records() - held_from,
+            1,
+            "a second hold keeps them after the first is let go"
+        );
+        drop(second);
+        let released = decoded_records();
+        serve(&changes);
+        assert_eq!(
+            decoded_records() - released,
+            1,
+            "once the last hold is let go nothing is kept"
+        );
+
+        // A graph over the same history says it holds the change from its
+        // index, the check every read that names a ref makes, without reading
+        // the change; and it holds its large records for a read the same way.
+        use kin_model::graph::ChangeStore as _;
+        let (reopened, _) = decode_lazily(&frame, memory_source(&frame));
+        let graph = crate::InMemoryGraph::from_snapshot_without_text_index(reopened).unwrap();
+        let checked = decoded_records();
+        assert!(graph.holds_change(&large).unwrap());
+        assert!(!graph
+            .holds_change(&SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])))
+            .unwrap());
+        assert_eq!(
+            decoded_records(),
+            checked,
+            "whether a graph holds a change is answered without reading it"
+        );
+        let hold = graph
+            .hold_large_change_records()
+            .expect("an encoded history");
+        for _ in 0..3 {
+            assert_eq!(
+                graph.get_change(&large).unwrap().as_ref(),
+                original.changes.get(&large)
+            );
+        }
+        drop(hold);
+        assert_eq!(
+            decoded_records() - checked,
+            1,
+            "a graph read that holds its large records decodes each once"
         );
     }
 

@@ -34,6 +34,13 @@ fn too_long(relative: &Path, root: &Path, max_bytes: u64) -> io::Error {
 }
 
 impl Confined {
+    pub(crate) fn from_retained_directory(root: &Path, dir: Dir) -> Self {
+        Self {
+            dir,
+            root: root.to_path_buf(),
+        }
+    }
+
     pub(crate) fn open(root: &Path, _grant: &Grant) -> io::Result<Self> {
         Self::open_held(root)
     }
@@ -69,6 +76,27 @@ impl Confined {
             dir: self.dir.open_dir(relative)?,
             root: self.root.join(relative),
         })
+    }
+
+    pub(crate) fn open_read_file(&self, relative: &Path) -> io::Result<cap_std::fs::File> {
+        if !self.dir.symlink_metadata(relative)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "entry is not a regular file",
+            ));
+        }
+        let file = self.dir.open(relative)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn symlink_metadata(&self, relative: &Path) -> io::Result<cap_std::fs::Metadata> {
+        self.dir.symlink_metadata(relative)
     }
 
     /// Read `relative` whole, refusing anything longer than `max_bytes`.
@@ -203,6 +231,22 @@ impl Confined {
                     crate::EntryKind::Other
                 }))
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// When the entry at `relative` last changed, without following a link.
+    /// An empty path asks about the directory itself. `Ok(None)` when nothing
+    /// exists there.
+    pub(crate) fn modified(&self, relative: &Path) -> io::Result<Option<std::time::SystemTime>> {
+        let metadata = if relative.as_os_str().is_empty() {
+            self.dir.dir_metadata()
+        } else {
+            self.dir.symlink_metadata(relative)
+        };
+        match metadata {
+            Ok(metadata) => Ok(Some(metadata.modified()?.into_std())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }

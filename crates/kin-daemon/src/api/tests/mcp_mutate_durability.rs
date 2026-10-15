@@ -70,6 +70,7 @@ async fn mcp_mutate_keyed_retry_recovers_original_receipt_through_real_delegate(
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut env = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
     env.apply("KIN_DAEMON_AUTH_TOKEN", Some("mutate-test-token"));
+    let _repository_binding = LocalMcpRepositoryBinding::new(&state.layout);
     let args: HashMap<String, serde_json::Value> = serde_json::from_value(request).unwrap();
     let first = kin_mcp::handlers::sessions::mutate_through_daemon(&args)
         .await
@@ -898,6 +899,7 @@ async fn mcp_mutate_pending_restart_resumes_original_owner_through_real_mcp_dele
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut env = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
     env.apply("KIN_DAEMON_AUTH_TOKEN", Some("mutate-test-token"));
+    let _repository_binding = LocalMcpRepositoryBinding::new(&reopened.layout);
     let args: HashMap<String, serde_json::Value> = serde_json::from_value(args).unwrap();
     let expired = kin_mcp::handlers::sessions::mutate_through_daemon(&args)
         .await

@@ -1960,19 +1960,19 @@ pub(crate) fn resolve_registry_path(
     managed_home().join("registry.toml")
 }
 
-/// Directory of the machine-level daemon supervisor.
-///
-/// Keyed on the real home, or on the parent of an explicit `KIN_REGISTRY_PATH`,
-/// deliberately *not* on `KIN_HOME`. One supervisor holds daemons launched under
-/// several managed homes, so every daemon records [`managed_kin_home`] and the
-/// census partitions on it. Moving the supervisor with `KIN_HOME` would hide
-/// from a pinned session the daemons it shares the box with, which is the
-/// opposite of what that variable is for.
+/// Supervisor authority is scoped to the selected home and runtime mode.
+/// Old global or development supervisors remain outside normal discovery.
 pub fn supervisor_root() -> PathBuf {
-    resolve_supervisor_root(
-        |key| std::env::var_os(key),
-        || directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()),
-    )
+    let home = managed_kin_home();
+    match crate::runtime_identity::RuntimeMode::current() {
+        Ok(crate::runtime_identity::RuntimeMode::Managed) => home.join("services").join("managed"),
+        _ => {
+            let isolated_home = std::env::var_os("KIN_REGISTRY_PATH")
+                .and_then(|path| PathBuf::from(path).parent().map(Path::to_path_buf))
+                .unwrap_or(home);
+            isolated_home.join("services").join("development")
+        }
+    }
 }
 
 /// The policy behind [`supervisor_root`], with the environment and the OS home
@@ -1981,6 +1981,7 @@ pub fn supervisor_root() -> PathBuf {
 /// This reproduces, case for case, what the supervisor directory was before the
 /// registry moved into the managed home: the parent of an explicit
 /// `KIN_REGISTRY_PATH`, or `<real home>/.kin`.
+#[cfg(test)]
 pub(crate) fn resolve_supervisor_root(
     var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
     base_dirs_home: impl FnOnce() -> Option<PathBuf>,

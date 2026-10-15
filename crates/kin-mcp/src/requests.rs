@@ -443,6 +443,7 @@ crate::typed_request! {
     example json!({}),
     rules vec![], {
         cursor: String { doc("`next_cursor` alone."), no_agent_doc(), max_len(512), from_reply() },
+        flags_cursor: String { doc("Continue open review flags from `_kin.flags_next_cursor`; separate from the enrichment cursor."), no_agent_doc(), max_len(64), from_reply() },
         max_output_bytes: u64 { output_budget() },
     }
 }

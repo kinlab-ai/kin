@@ -87,6 +87,7 @@ import time
 os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 from trace_pages import mcp_references
+from runtime_fixture import prepare_runtime_fixture
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -615,6 +616,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self.repo = None
         self.payloads = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def log(self, line):
         if self.verbose:
@@ -716,7 +719,13 @@ class Suite(object):
         payload = None
         for attempt in range(attempts):
             self.kin_run(["graph", "status"], repo)
-            payload = self.mcp(repo, "find_references", args)
+            try:
+                payload = self.mcp(repo, "find_references", args)
+            except (ValueError, RuntimeError):
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(4)
+                continue
             classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
             if (all(classes.get(c) == "present" for c in classes if c != "imports")
                     and not readiness_pending(payload)):

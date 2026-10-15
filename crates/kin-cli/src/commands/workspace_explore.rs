@@ -2,8 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 //! Read-only answers the workspace page explores a repository with: an
-//! overview, one question answered by meaning and by name, one entity in
-//! independently fallible sections, and a map of the whole repository.
+//! overview, one question answered by meaning and by name, with the chain of
+//! calls behind it when it asks how or where something happens, one entity
+//! in independently fallible sections, and a map of the whole repository.
 //!
 //! Every answer speaks of entities. No field carries a place in the checkout,
 //! even where the daemon's own answer holds one, and a graph miss is reported
@@ -51,11 +52,13 @@ const OVERVIEW_RELIED_ON: usize = 10;
 /// How many of the most relied-on rows are read, so the ones with no
 /// definition here can be left out and the list still fills.
 const OVERVIEW_RELIED_ON_READ: usize = 40;
+/// How many of the entities others rely on that no test reaches are shown.
+const OVERVIEW_UNTESTED: usize = 12;
 const OVERVIEW_CHANGES: usize = 5;
 
 const ENTITY_LIST_CAP: usize = 50;
 const NEIGHBORHOOD_LIMIT: usize = 120;
-const IMPACT_DEPTH: u32 = 3;
+const IMPACT_DEPTH: u32 = super::verify::WORK_TEST_REACH_DEPTH;
 const IMPACT_TOP: usize = 8;
 const HISTORY_CAP: usize = 10;
 /// Inventory rows read to find one entity's doc summary by its name.
@@ -157,7 +160,8 @@ fn daemon_unreachable(error: anyhow::Error) -> Response {
 }
 
 /// The graph's spelling of a kind or relation, as the page reads it:
-/// `TraitDef` and `trait_def` are both `trait_def`, `Calls` is `calls`.
+/// `TraitDef`, `trait_def` and `traitdef` are all `trait_def`, `Calls` is
+/// `calls`.
 pub(super) fn kind_label(raw: &str) -> String {
     let mut label = String::with_capacity(raw.len() + 4);
     for character in raw.trim().chars() {
@@ -172,8 +176,40 @@ pub(super) fn kind_label(raw: &str) -> String {
             label.push(character);
         }
     }
-    label
+    // Locate publishes a kind as its variant name lowercased, which runs a
+    // compound kind together: `typealias` is the `type_alias` every other
+    // answer says.
+    match RUN_TOGETHER.iter().find(|(joined, _)| *joined == label) {
+        Some((_, spelled)) => (*spelled).to_string(),
+        None => label,
+    }
 }
+
+/// Each compound kind and relation as a lowercased variant name spells it,
+/// beside the one spelling the page reads.
+const RUN_TOGETHER: [(&str, &str); 21] = [
+    ("traitdef", "trait_def"),
+    ("typealias", "type_alias"),
+    ("apiendpoint", "api_endpoint"),
+    ("eventcontract", "event_contract"),
+    ("documentnode", "document_node"),
+    ("enumdef", "enum_def"),
+    ("enumvariant", "enum_variant"),
+    ("staticvar", "static_var"),
+    ("usesmacro", "uses_macro"),
+    ("usestype", "uses_type"),
+    ("dependson", "depends_on"),
+    ("emitsevent", "emits_event"),
+    ("subscribesto", "subscribes_to"),
+    ("definescontract", "defines_contract"),
+    ("consumescontract", "consumes_contract"),
+    ("sendsmessage", "sends_message"),
+    ("cochanges", "co_changes"),
+    ("derivedfrom", "derived_from"),
+    ("documentedby", "documented_by"),
+    ("ownedby", "owned_by"),
+    ("ownedbyfile", "owned_by_file"),
+];
 
 /// A signature a reader is shown. A module, package or file entity's
 /// recorded signature is the place its text is held, not a declaration, so
@@ -403,9 +439,20 @@ impl<'a> Census<'a> {
         self.node(id).is_some_and(|node| node.file.is_some())
     }
 
+    /// What contains an entity, and under `within` what contains that. Two
+    /// containers can share a name and a kind, and the one a container sits
+    /// in is what tells them apart.
     fn container_of(&self, id: &str) -> Option<Value> {
         let container = self.node(self.parent.get(id)?)?;
-        Some(entity_ref(&container.id, &container.name, &container.kind))
+        let mut named = entity_ref(&container.id, &container.name, &container.kind);
+        let outer = self
+            .parent
+            .get(container.id.as_str())
+            .and_then(|outer| self.node(outer));
+        if let Some(outer) = outer {
+            named["within"] = entity_ref(&outer.id, &outer.name, &outer.kind);
+        }
+        Some(named)
     }
 
     fn top(&self, id: &'a str) -> &'a str {
@@ -537,6 +584,30 @@ fn overview_languages(summary: &Value) -> Result<Map<String, Value>> {
     })))
 }
 
+/// Whether counts of what relies on an entity are exact or lower bounds,
+/// from the daemon's store-wide call-site reading in its summary: `exact`
+/// when every call site the store holds is settled, `at_least` while some
+/// are not, since a call Kin cannot prove may be one more caller.
+///
+/// `None` when the summary was not read or its daemon does not report the
+/// reading, so the page is told no bound at all rather than a guessed one.
+fn relied_on_bound(summary: Option<&Value>) -> Option<&'static str> {
+    let settled = summary?.get("call_sites_settled")?.as_bool()?;
+    Some(if settled { "exact" } else { "at_least" })
+}
+
+/// `section` with `bound` under `key`, or as it was when there is none.
+fn with_bound(
+    mut section: Map<String, Value>,
+    key: &str,
+    bound: Option<&'static str>,
+) -> Map<String, Value> {
+    if let Some(bound) = bound {
+        section.insert(key.into(), Value::String(bound.into()));
+    }
+    section
+}
+
 pub(super) fn overview_containers(census: &Census<'_>, limit: usize) -> Map<String, Value> {
     let containers = census.containers();
     let total = containers.len();
@@ -610,6 +681,81 @@ pub(super) fn overview_relied_on(
     })))
 }
 
+/// The entities many others rely on that no test reaches, most relied-on
+/// first, from the daemon's reading of the whole repository.
+///
+/// The daemon reads coverage in the pass that ranks, with the rule `kin
+/// verify --missing` reads it with, and counts dependents as the ranking
+/// does, so this list cannot disagree with either. It leaves out names with
+/// no definition here, tests and modules. A daemon that does not report the
+/// reading is a gap, said as one: nothing here guesses at coverage.
+pub(super) fn overview_untested(
+    inventory: &Value,
+    census: Option<&Census<'_>>,
+) -> Result<Map<String, Value>> {
+    let untested = inventory
+        .get("untested")
+        .filter(|value| value.is_object())
+        .context(
+            "this repository's daemon does not report it and predates this version of kin ui",
+        )?;
+    let rows = untested["entities"]
+        .as_array()
+        .context("the reading omitted its rows")?;
+    let total = untested["total"]
+        .as_u64()
+        .context("the reading omitted its total")?;
+    let items: Vec<Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row["id"].as_str()?;
+            let mut item = fields(entity_ref(
+                id,
+                row["name"].as_str().unwrap_or_default(),
+                row["kind"].as_str().unwrap_or_default(),
+            ));
+            item.insert(
+                "container".into(),
+                census
+                    .and_then(|census| census.container_of(id))
+                    .unwrap_or(Value::Null),
+            );
+            item.insert("dependents".into(), row["dependents"].clone());
+            Some(Value::Object(item))
+        })
+        .collect();
+    Ok(fields(json!({
+        "items": items,
+        "total": total,
+        "scope": "recorded_graph",
+        "bound": "observed",
+        "basis": "Entities defined here that others rely on and that no recorded test reaches through the supported semantic relationships. Tests and modules are left out. Read across the whole repository, most relied-on first. These are recorded graph gaps, not evidence that complete runtime test coverage is known.",
+    })))
+}
+
+/// The untested section, or its gap in one sentence: what was not read and
+/// why, with no list guessed in its place.
+fn untested_section(answer: Result<Map<String, Value>>) -> Value {
+    match answer {
+        Ok(mut fields) => {
+            fields.insert("ok".into(), Value::Bool(true));
+            Value::Object(fields)
+        }
+        Err(error) => {
+            let mut why = readable(&format!("{error:#}"));
+            while why.ends_with(['.', '!', '?', ' ']) {
+                why.pop();
+            }
+            json!({
+                "ok": false,
+                "reason": plain(&format!(
+                    "Kin could not read which entities no test reaches: {why}."
+                )),
+            })
+        }
+    }
+}
+
 fn recent_changes(report: crate::commands::log::LogReport) -> Map<String, Value> {
     let items: Vec<Value> = report
         .entries
@@ -657,8 +803,16 @@ async fn serve_overview(State(state): State<Arc<UiState>>) -> Response {
                 !repo_id.is_empty(),
                 "the daemon did not identify its repository"
             );
+            // One ranking pass in the daemon answers both the most relied-on
+            // list and what no test reaches, so the overview asks once.
             client
-                .workspace_entities(&repo_id, "", OVERVIEW_RELIED_ON_READ, 0)
+                .workspace_entities_and_untested(
+                    &repo_id,
+                    "",
+                    OVERVIEW_RELIED_ON_READ,
+                    0,
+                    Some(OVERVIEW_UNTESTED),
+                )
                 .await
         }),
         bounded(READ_TIMEOUT, async {
@@ -680,19 +834,30 @@ async fn serve_overview(State(state): State<Arc<UiState>>) -> Response {
         }),
     );
     let census = export.as_ref().ok().map(Census::new);
+    let bound = relied_on_bound(summary.as_ref().ok());
     let counts = match (&export, &summary) {
         (Ok(payload), _) => Ok(overview_counts(payload)),
         (Err(_), Ok(summary)) => overview_counts_from_summary(summary),
         (Err(error), Err(_)) => Err(anyhow::anyhow!("{error:#}")),
-    };
+    }
+    .map(|counts| with_bound(counts, "relationships_bound", bound));
     let containers = match (&census, &export) {
         (Some(census), _) => Ok(overview_containers(census, OVERVIEW_CONTAINERS)),
         (None, Err(error)) => Err(anyhow::anyhow!("{error:#}")),
         (None, Ok(_)) => Err(anyhow::anyhow!("the graph read was empty")),
     };
     let languages = summary.and_then(|summary| overview_languages(&summary));
-    let relied_on = ranking
-        .and_then(|inventory| overview_relied_on(&inventory, census.as_ref(), OVERVIEW_RELIED_ON));
+    let (relied_on, untested) = match ranking {
+        Ok(inventory) => (
+            overview_relied_on(&inventory, census.as_ref(), OVERVIEW_RELIED_ON)
+                .map(|relied_on| with_bound(relied_on, "bound", bound)),
+            overview_untested(&inventory, census.as_ref()),
+        ),
+        Err(error) => {
+            let reason = format!("{error:#}");
+            (Err(error), Err(anyhow::anyhow!(reason)))
+        }
+    };
     let branch = branches.ok().and_then(|report| {
         report
             .branches
@@ -715,6 +880,7 @@ async fn serve_overview(State(state): State<Arc<UiState>>) -> Response {
         "languages": section("Kin could not read this repository's languages.", languages),
         "containers": section("Kin could not read what contains what.", containers),
         "most_relied_on": section("Kin could not rank the most relied-on entities.", relied_on),
+        "untested": untested_section(untested),
         "recent_changes": section("Kin could not read recent changes.", log.map(recent_changes)),
         "read_at": read_at(),
     }))
@@ -947,7 +1113,42 @@ async fn enrich(client: &DaemonClient, ids: Vec<String>) -> HashMap<String, Valu
     found
 }
 
-fn hit_json(hit: &Hit, source: Option<&Value>) -> Value {
+/// What contains each result's container, by the container's id, read from
+/// the container's own answer. Two results can sit in containers of one name
+/// and kind, and this is what tells those apart. A container that sits in
+/// nothing, or whose read fails or is slow, has no entry.
+async fn outer_containers(
+    client: &DaemonClient,
+    sources: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let containers: HashSet<String> = sources
+        .values()
+        .filter_map(|source| owner_ref(&source["semantic_owners"]))
+        .filter_map(|container| parse_entity_id(container["id"].as_str()?))
+        .collect();
+    let gate = Arc::new(tokio::sync::Semaphore::new(ENRICH_CONCURRENCY));
+    let mut reads = tokio::task::JoinSet::new();
+    for id in containers {
+        let client = client.clone();
+        let gate = gate.clone();
+        reads.spawn(async move {
+            let _permit = gate.acquire_owned().await.ok()?;
+            let answer = bounded(ENRICH_TIMEOUT, client.workspace_entity_owners(&id))
+                .await
+                .ok()?;
+            Some((id, owner_ref(&answer["semantic_owners"])?))
+        });
+    }
+    let mut found = HashMap::new();
+    while let Some(read) = reads.join_next().await {
+        if let Ok(Some((id, outer))) = read {
+            found.insert(id, outer);
+        }
+    }
+    found
+}
+
+fn hit_json(hit: &Hit, source: Option<&Value>, outer: &HashMap<String, Value>) -> Value {
     let mut row = fields(json!({
         "id": hit.id, "name": hit.name, "kind": hit.kind,
         "matched": hit.matched(), "why": hit.why(), "defined_here": hit.defined_here,
@@ -965,7 +1166,11 @@ fn hit_json(hit: &Hit, source: Option<&Value>) -> Value {
         row.insert("dependents".into(), json!(dependents));
     }
     if let Some(source) = source {
-        if let Some(container) = owner_ref(&source["semantic_owners"]) {
+        if let Some(mut container) = owner_ref(&source["semantic_owners"]) {
+            let within = container["id"].as_str().and_then(|id| outer.get(id));
+            if let Some(within) = within {
+                container["within"] = within.clone();
+            }
             row.insert("container".into(), container);
         }
         if let Some(module) = text_field(source, "module") {
@@ -973,6 +1178,687 @@ fn hit_json(hit: &Hit, source: Option<&Value>) -> Value {
         }
     }
     Value::Object(row)
+}
+
+// ---------------------------------------------------------------------------
+// Ask: the chain behind a how or where question
+// ---------------------------------------------------------------------------
+//
+// A question that asks how or where something happens is answered with a
+// short chain of entities when the graph holds one Kin can stand behind, and
+// with the ranked list alone when it does not. Every hop of a chain is a call
+// the graph resolved, read from the graph's own record of what calls each
+// entity, and the chain as a whole is confirmed by the route query behind
+// `kin path`. Which chain is the question's is decided by the graph's own
+// names, under one of two rules:
+//
+// - named ends: the chain ends at a ranked result whose name carries some of
+//   the question's words and begins at the nearest caller whose name carries
+//   the rest, so both ends are named by the question;
+// - sole callers: the chain ends at a ranked result whose name carries every
+//   word of the question, and each entity on it is called by the one above
+//   it and by nothing else, so no choice between callers was made.
+//
+// Anything else would be a guess, and a guess is not returned.
+
+/// The ranked results one answer climbs from, best first.
+const ANSWER_SEEDS: usize = 4;
+/// How long the reads behind an answer may take together. Past it the
+/// question is answered with its list alone.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
+const ANSWER_MIN_STEPS: usize = 3;
+const ANSWER_MAX_STEPS: usize = 8;
+/// How many calls above a ranked result its callers are read.
+const ANSWER_HOPS: usize = 6;
+/// The entities whose callers are read above one ranked result.
+const ANSWER_READS: usize = 40;
+/// The fewest words of a question that must name something before a chain is
+/// tied to it. One word names a topic, not a question.
+const ANSWER_MIN_TERMS: usize = 2;
+
+/// Words that ask or connect and name nothing in a repository.
+const ANSWER_STOP_WORDS: &[&str] = &[
+    "a",
+    "about",
+    "actually",
+    "all",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "by",
+    "can",
+    "code",
+    "codebase",
+    "come",
+    "comes",
+    "could",
+    "did",
+    "do",
+    "does",
+    "done",
+    "each",
+    "end",
+    "ends",
+    "every",
+    "exactly",
+    "explain",
+    "flow",
+    "flows",
+    "for",
+    "from",
+    "get",
+    "gets",
+    "getting",
+    "go",
+    "goes",
+    "got",
+    "had",
+    "happen",
+    "happening",
+    "happens",
+    "has",
+    "have",
+    "here",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "kin",
+    "me",
+    "my",
+    "not",
+    "now",
+    "of",
+    "on",
+    "one",
+    "or",
+    "our",
+    "out",
+    "over",
+    "pass",
+    "passes",
+    "place",
+    "please",
+    "reach",
+    "reaches",
+    "repo",
+    "repository",
+    "should",
+    "show",
+    "so",
+    "something",
+    "tell",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "things",
+    "this",
+    "those",
+    "to",
+    "up",
+    "us",
+    "was",
+    "way",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "work",
+    "working",
+    "works",
+    "would",
+    "you",
+    "your",
+];
+
+/// What a question asks for, when it asks how or where something happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asks {
+    How,
+    Where,
+}
+
+impl Asks {
+    fn word(self) -> &'static str {
+        match self {
+            Self::How => "how",
+            Self::Where => "where",
+        }
+    }
+}
+
+/// The words of a question or of one of the graph's names, lowercased:
+/// split wherever a letter or digit run ends and wherever a capital begins a
+/// new word, so `Reply.serializeInput` is `reply`, `serialize` and `input`.
+fn words_of(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in text.split(|character: char| !character.is_alphanumeric()) {
+        let letters: Vec<char> = part.chars().collect();
+        let mut start = 0;
+        for index in 1..=letters.len() {
+            let ends = index == letters.len() || {
+                let (before, here) = (letters[index - 1], letters[index]);
+                (before.is_lowercase() && here.is_uppercase())
+                    || before.is_alphabetic() != here.is_alphabetic()
+                    || (before.is_uppercase()
+                        && here.is_uppercase()
+                        && letters
+                            .get(index + 1)
+                            .is_some_and(|next| next.is_lowercase()))
+            };
+            if ends {
+                words.push(
+                    letters[start..index]
+                        .iter()
+                        .collect::<String>()
+                        .to_lowercase(),
+                );
+                start = index;
+            }
+        }
+    }
+    words
+}
+
+/// Whether a question asks how or where something happens. The asking word
+/// leads, after at most two words such as "show me". "How many" and its kind
+/// ask for an amount, which no chain answers.
+fn asks(question: &str) -> Option<Asks> {
+    let words = words_of(question);
+    for (index, word) in words.iter().enumerate().take(3) {
+        match word.as_str() {
+            "where" => return Some(Asks::Where),
+            "how" => {
+                let amount = matches!(
+                    words.get(index + 1).map(String::as_str),
+                    Some(
+                        "many"
+                            | "much"
+                            | "long"
+                            | "often"
+                            | "big"
+                            | "large"
+                            | "small"
+                            | "old"
+                            | "far"
+                            | "fast"
+                            | "slow"
+                    )
+                );
+                return (!amount).then_some(Asks::How);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One word reduced so its forms meet: `serialized`, `serializer` and
+/// `serialization` all become `serializ`, `routes` and `routing` become
+/// `rout`. It only has to agree with itself, since both the question and the
+/// graph's names pass through it.
+fn stem(word: &str) -> String {
+    let mut text = match word {
+        "sent" => "send",
+        "built" => "build",
+        "ran" => "run",
+        "made" => "make",
+        "wrote" | "written" => "write",
+        "threw" | "thrown" => "throw",
+        "caught" => "catch",
+        "found" => "find",
+        "kept" => "keep",
+        "held" => "hold",
+        "chose" | "chosen" => "choose",
+        other => other,
+    }
+    .to_string();
+    let replaced = [
+        ("ization", "ize"),
+        ("isation", "ize"),
+        ("izing", "ize"),
+        ("ized", "ize"),
+        ("izer", "ize"),
+        ("izes", "ize"),
+        ("ies", "y"),
+        ("sses", "ss"),
+    ]
+    .into_iter()
+    .find(|(suffix, _)| text.ends_with(suffix) && text.len() > suffix.len() + 2);
+    if let Some((suffix, with)) = replaced {
+        text.truncate(text.len() - suffix.len());
+        text.push_str(with);
+    } else if text.ends_with('s') && !text.ends_with("ss") && text.len() > 3 {
+        text.pop();
+    }
+    for (suffix, longer_than) in [("ing", 6), ("ed", 4), ("er", 5), ("or", 5)] {
+        if text.ends_with(suffix) && text.len() > longer_than {
+            text.truncate(text.len() - suffix.len());
+            // `formatted` and `running` double a consonant before the suffix.
+            let mut letters = text.chars().rev();
+            if let (Some(last), Some(before)) = (letters.next(), letters.next()) {
+                if text.len() > 3 && last == before && !"aeiouls".contains(last) {
+                    text.pop();
+                }
+            }
+            break;
+        }
+    }
+    if text.ends_with('e') && text.len() > 4 {
+        text.pop();
+    }
+    if text.ends_with('y') && text.len() > 3 {
+        text.pop();
+        text.push('i');
+    }
+    text
+}
+
+/// The words of a question that could name something in a repository,
+/// reduced, in the order asked and once each.
+fn question_terms(question: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in words_of(question) {
+        if word.chars().count() < 2 || ANSWER_STOP_WORDS.contains(&word.as_str()) {
+            continue;
+        }
+        let term = stem(&word);
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// Whether a word of a name is a word of the question: the same once
+/// reduced, or one beginning with the other when that is at least four
+/// letters, which is how `regist` meets `register`.
+fn term_matches(term: &str, word: &str) -> bool {
+    let (shorter, longer) = if term.len() <= word.len() {
+        (term, word)
+    } else {
+        (word, term)
+    };
+    shorter == longer || (shorter.chars().count() >= 4 && longer.starts_with(shorter))
+}
+
+/// Which of the question's words a name carries, by their place in `terms`.
+fn matched_terms(name: &str, terms: &[String]) -> HashSet<usize> {
+    let words: Vec<String> = words_of(name).iter().map(|word| stem(word)).collect();
+    terms
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| words.iter().any(|word| term_matches(term, word)))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn is_callable(kind: &str) -> bool {
+    matches!(kind, "function" | "method")
+}
+
+/// One entity of an answer's chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Link {
+    id: String,
+    name: String,
+    kind: String,
+}
+
+/// What the graph records as calling one entity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Callers {
+    /// The functions and methods that call it by a call the graph resolved,
+    /// once each and by name, so one question always reads one order.
+    proven: Vec<Link>,
+    /// How many distinct entities call it at all, resolved or not.
+    all: usize,
+    /// Whether the read was cut short, so there may be more.
+    cut: bool,
+}
+
+impl Callers {
+    /// The one entity that calls it, when exactly one does and that call is
+    /// resolved.
+    fn only(&self) -> Option<&Link> {
+        (!self.cut && self.all == 1 && self.proven.len() == 1).then(|| &self.proven[0])
+    }
+}
+
+/// What calls `id`, from the graph's own incoming relations for it.
+fn callers_of(incoming: &Value, id: &str) -> Callers {
+    let entities: HashMap<&str, &Value> = incoming["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row["id"].as_str()?, row)))
+        .collect();
+    let mut all: HashSet<&str> = HashSet::new();
+    let mut proven: Vec<Link> = Vec::new();
+    for relation in incoming["relations"].as_array().into_iter().flatten() {
+        let calls = relation["direction"] == "incoming"
+            && kind_label(relation["kind"].as_str().unwrap_or_default()) == "calls";
+        let Some(caller) = relation["src"]["Entity"].as_str().filter(|_| calls) else {
+            continue;
+        };
+        if caller == id {
+            continue;
+        }
+        all.insert(caller);
+        let Some(row) = entities.get(caller) else {
+            continue;
+        };
+        let kind = kind_label(row["kind"].as_str().unwrap_or_default());
+        let named = (
+            parse_entity_id(caller),
+            text_field(row, "name"),
+            relation["resolution"] == "type_resolved" && is_callable(&kind),
+        );
+        if let (Some(id), Some(name), true) = named {
+            if proven.iter().all(|seen| seen.id != id) {
+                proven.push(Link { id, name, kind });
+            }
+        }
+    }
+    proven.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    Callers {
+        proven,
+        all: all.len(),
+        cut: incoming["truncated"] != false,
+    }
+}
+
+/// What was read above one ranked result: who calls it, who calls those, and
+/// so on, by resolved calls only.
+#[derive(Debug, Default)]
+struct Climb {
+    /// Each caller found, nearest first, with the entity it calls on its
+    /// shortest way down to the result.
+    above: Vec<(Link, String)>,
+    /// What calls each entity whose callers were read, by its id.
+    callers: HashMap<String, Callers>,
+}
+
+/// Read who calls `target`, and who calls those, level by level. Each read
+/// is one entity's incoming relations. It stops [`ANSWER_HOPS`] calls up or
+/// after [`ANSWER_READS`] entities, and a read that fails or is slow only
+/// leaves that entity's callers unknown.
+async fn climb(client: &DaemonClient, target: &Link) -> Climb {
+    let mut climb = Climb::default();
+    let mut seen: HashSet<String> = HashSet::from([target.id.clone()]);
+    let mut level = vec![target.id.clone()];
+    let mut reads = 0;
+    for _ in 0..ANSWER_HOPS {
+        level.truncate(ANSWER_READS - reads);
+        if level.is_empty() {
+            break;
+        }
+        reads += level.len();
+        let answers = futures_util::future::join_all(level.iter().map(|id| async move {
+            bounded(
+                ENRICH_TIMEOUT,
+                client.workspace_entity_neighborhood(id, "in", NEIGHBORHOOD_LIMIT),
+            )
+            .await
+            .ok()
+        }))
+        .await;
+        let mut next = Vec::new();
+        for (id, answer) in level.iter().zip(answers) {
+            let Some(answer) = answer else {
+                continue;
+            };
+            let callers = callers_of(&answer, id);
+            for caller in &callers.proven {
+                if seen.insert(caller.id.clone()) {
+                    climb.above.push((caller.clone(), id.clone()));
+                    next.push(caller.id.clone());
+                }
+            }
+            climb.callers.insert(id.clone(), callers);
+        }
+        level = next;
+    }
+    climb
+}
+
+/// Whether a name reads as test code. The graph's fast reads do not say
+/// which entities are tests, and a test calls into the code it tests, so it
+/// would otherwise stand as the place a chain begins.
+fn names_a_test(name: &str) -> bool {
+    words_of(name).iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "test" | "tests" | "spec" | "specs" | "fixture" | "fixtures" | "mock" | "mocks"
+        )
+    })
+}
+
+/// The shortest chain of resolved calls that ends at `target` and begins at
+/// a caller whose name carries a word of the question `target`'s own name
+/// does not, with every word of the question carried by some name on it.
+fn named_ends_chain(
+    target: &Link,
+    climb: &Climb,
+    terms: &[String],
+    tests_asked: bool,
+) -> Option<Vec<Link>> {
+    let down: HashMap<&str, (&Link, &str)> = climb
+        .above
+        .iter()
+        .map(|(link, next)| (link.id.as_str(), (link, next.as_str())))
+        .collect();
+    let target_terms = matched_terms(&target.name, terms);
+    // Nearest first, so the first chain that fits is the shortest.
+    climb.above.iter().find_map(|(entry, _)| {
+        let mut chain = Vec::new();
+        let mut at = entry.id.as_str();
+        while at != target.id {
+            let &(link, next) = down.get(at)?;
+            if chain.len() >= ANSWER_MAX_STEPS {
+                return None;
+            }
+            chain.push(link.clone());
+            at = next;
+        }
+        chain.push(target.clone());
+        let named: HashSet<usize> = chain
+            .iter()
+            .flat_map(|link| matched_terms(&link.name, terms))
+            .collect();
+        let entry_adds = matched_terms(&entry.name, terms)
+            .iter()
+            .any(|term| !target_terms.contains(term));
+        let fits = (ANSWER_MIN_STEPS..=ANSWER_MAX_STEPS).contains(&chain.len())
+            && named.len() == terms.len()
+            && entry_adds
+            && (tests_asked || !chain.iter().any(|link| names_a_test(&link.name)));
+        fits.then_some(chain)
+    })
+}
+
+/// The chain above `target` while each entity has exactly one caller and
+/// that call is resolved. It stops where an entity has several callers,
+/// none, or callers that were not read whole.
+fn sole_caller_chain(target: &Link, climb: &Climb, tests_asked: bool) -> Option<Vec<Link>> {
+    let mut upward = vec![target.clone()];
+    while upward.len() < ANSWER_MAX_STEPS {
+        let below = &upward[upward.len() - 1];
+        let Some(only) = climb.callers.get(&below.id).and_then(Callers::only) else {
+            break;
+        };
+        if upward.iter().any(|seen| seen.id == only.id)
+            || (!tests_asked && names_a_test(&only.name))
+        {
+            break;
+        }
+        upward.push(only.clone());
+    }
+    upward.reverse();
+    (upward.len() >= ANSWER_MIN_STEPS).then_some(upward)
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// One sentence that says a chain, in the graph's own names and nothing else.
+fn answer_sentence(asks: Asks, chain: &[Link]) -> String {
+    let names: Vec<&str> = chain.iter().map(|link| link.name.as_str()).collect();
+    let (Some(entry), Some(target)) = (names.first(), names.last()) else {
+        return String::new();
+    };
+    let between = listed(&names[1..names.len() - 1]);
+    match asks {
+        Asks::Where => {
+            format!("This happens in {target}, which {entry} reaches through {between}.")
+        }
+        Asks::How if names.len() <= 4 => {
+            let mut sentence = format!("{entry} calls {}", names[1]);
+            for name in &names[2..] {
+                sentence.push_str(&format!(", which calls {name}"));
+            }
+            sentence.push('.');
+            sentence
+        }
+        Asks::How => {
+            format!("{entry} reaches {target} through {between}, each calling the next.")
+        }
+    }
+}
+
+fn answer_json(asks: Asks, basis: &str, chain: &[Link]) -> Value {
+    let steps: Vec<Value> = chain
+        .iter()
+        .enumerate()
+        .map(|(index, link)| {
+            json!({
+                "id": link.id,
+                "name": link.name,
+                "kind": link.kind,
+                "relation_to_next": (index + 1 < chain.len()).then_some("calls"),
+            })
+        })
+        .collect();
+    json!({
+        "asks": asks.word(),
+        "sentence": plain(&answer_sentence(asks, chain)),
+        "basis": basis,
+        "steps": steps,
+    })
+}
+
+/// The chain the calls above one ranked result give the question, and the
+/// rule it stands on.
+fn chain_from(
+    target: &Link,
+    climb: &Climb,
+    terms: &[String],
+    tests_asked: bool,
+) -> Option<(&'static str, Vec<Link>)> {
+    if matched_terms(&target.name, terms).len() < terms.len() {
+        let chain = named_ends_chain(target, climb, terms, tests_asked)?;
+        Some(("named_ends", chain))
+    } else {
+        Some((
+            "sole_callers",
+            sole_caller_chain(target, climb, tests_asked)?,
+        ))
+    }
+}
+
+/// The ranked results an answer may end at: functions and methods defined
+/// here whose names carry a word of the question, best first.
+fn answer_seeds(hits: &[Hit], terms: &[String]) -> Vec<Link> {
+    hits.iter()
+        .filter(|hit| {
+            hit.defined_here
+                && is_callable(&hit.kind)
+                && !matched_terms(&hit.name, terms).is_empty()
+        })
+        .take(ANSWER_SEEDS)
+        .map(|hit| Link {
+            id: hit.id.clone(),
+            name: hit.name.clone(),
+            kind: hit.kind.clone(),
+        })
+        .collect()
+}
+
+/// Whether the route query behind `kin path` finds `chain`'s first entity
+/// reaching its last within the chain's own length.
+async fn route_confirmed(client: &DaemonClient, chain: &[Link]) -> bool {
+    let (Some(entry), Some(target)) = (chain.first(), chain.last()) else {
+        return false;
+    };
+    let request = kin_mcp::handlers::path::PathRequest {
+        from: entry.id.clone(),
+        to: target.id.clone(),
+        max_depth: Some(chain.len() - 1),
+        limit: Some(1),
+        direction: Some(kin_mcp::handlers::path::PathDirection::Forward),
+        ..Default::default()
+    };
+    client
+        .path(&request)
+        .await
+        .is_ok_and(|route| route["found"] == true)
+}
+
+/// The answer to a how or where question, or nothing when the graph holds
+/// no chain Kin can stand behind. The best-ranked result with a chain wins.
+async fn answer(client: &DaemonClient, question: &str, hits: &[Hit]) -> Option<Value> {
+    let asks = asks(question)?;
+    let terms = question_terms(question);
+    if terms.len() < ANSWER_MIN_TERMS {
+        return None;
+    }
+    let tests_asked = names_a_test(question);
+    let read = async {
+        let seeds = answer_seeds(hits, &terms);
+        let climbs =
+            futures_util::future::join_all(seeds.iter().map(|seed| climb(client, seed))).await;
+        for (target, climb) in seeds.iter().zip(&climbs) {
+            let Some((basis, chain)) = chain_from(target, climb, &terms, tests_asked) else {
+                continue;
+            };
+            if route_confirmed(client, &chain).await {
+                return Some(answer_json(asks, basis, &chain));
+            }
+        }
+        None
+    };
+    tokio::time::timeout(ANSWER_TIMEOUT, read)
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn serve_ask(State(state): State<Arc<UiState>>, Query(query): Query<AskQuery>) -> Response {
@@ -1039,10 +1925,19 @@ async fn serve_ask(State(state): State<Arc<UiState>>, Query(query): Query<AskQue
         named.as_ref().map(name_hits).unwrap_or_default(),
         limit,
     );
-    let sources = enrich(&client, hits.iter().map(|hit| hit.id.clone()).collect()).await;
+    // The chain behind a how or where question is read while the results
+    // are placed, so it adds no wait of its own unless its reads are slower.
+    let ((sources, outer), answer) = tokio::join!(
+        async {
+            let sources = enrich(&client, hits.iter().map(|hit| hit.id.clone()).collect()).await;
+            let outer = outer_containers(&client, &sources).await;
+            (sources, outer)
+        },
+        answer(&client, &text, &hits),
+    );
     let results: Vec<Value> = hits
         .iter()
-        .map(|hit| hit_json(hit, sources.get(&hit.id)))
+        .map(|hit| hit_json(hit, sources.get(&hit.id), &outer))
         .collect();
     let meaning = located.map(|located| {
         fields(json!({
@@ -1058,6 +1953,7 @@ async fn serve_ask(State(state): State<Arc<UiState>>, Query(query): Query<AskQue
         "notice": notice.map(|notice| plain(&notice)),
         "meaning": section("Meaning search could not answer.", meaning),
         "names": section("Name search could not answer.", names),
+        "answer": answer,
         "total": results.len(),
         "results": results,
         "read_at": read_at(),
@@ -1220,6 +2116,12 @@ pub(super) fn header_section(
 
 /// The entity's own text for the working tree. Prefers the guide's read,
 /// which carries the start line; falls back to the plain source read.
+///
+/// The guide's exact read also carries `body_hash`, the digest of the span it
+/// cut, the same one a guide step reports as `after.body_hash`. It is passed
+/// on so the page can tell whether something said about the entity at a
+/// recorded change still describes it as it is now. The plain source read is
+/// not an exact span, so it carries no digest.
 pub(super) fn source_section(
     guide_source: Option<&Value>,
     source: Option<&Value>,
@@ -1233,13 +2135,20 @@ pub(super) fn source_section(
             if let Some(text) = body["text"].as_str() {
                 let start = body["start_line"].as_u64();
                 let lines = text.lines().count().max(1) as u64;
-                return Ok(fields(json!({
+                let mut section = fields(json!({
                     "text": text,
                     "start_line": start,
                     "end_line": start.map(|start| start + lines - 1),
                     "language": language,
                     "working": body["working"].as_bool().unwrap_or(false),
-                })));
+                }));
+                if let Some(digest) = body["body_hash"]
+                    .as_str()
+                    .filter(|digest| is_digest(digest))
+                {
+                    section.insert("body_hash".into(), Value::String(digest.to_string()));
+                }
+                return Ok(section);
             }
         }
         if source.and_then(|source| source["body"].as_str()).is_none() {
@@ -1256,6 +2165,11 @@ pub(super) fn source_section(
         "text": text, "start_line": Value::Null, "end_line": Value::Null,
         "language": language, "working": true,
     })))
+}
+
+/// Whether `text` is a whole content digest: 64 hex digits.
+fn is_digest(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn coverage_bound(answer: &Value) -> (&'static str, Option<&'static str>) {
@@ -1310,6 +2224,14 @@ impl Relier {
 }
 
 impl Relier {
+    fn primary_relationship(&self) -> Option<&String> {
+        self.relationships.iter().min_by(|left, right| {
+            relationship_precedence(left)
+                .cmp(&relationship_precedence(right))
+                .then_with(|| left.cmp(right))
+        })
+    }
+
     fn relate(&mut self, kind: String) {
         if !kind.is_empty() && !self.relationships.contains(&kind) {
             self.relationships.push(kind);
@@ -1339,6 +2261,20 @@ impl Relier {
             self.is_test = Some(role == "test");
         }
     }
+}
+
+fn relationship_precedence(kind: &str) -> u8 {
+    let mut variant = String::new();
+    for part in kind.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            variant.extend(first.to_uppercase());
+            variant.extend(chars);
+        }
+    }
+    serde_json::from_value::<kin_model::RelationKind>(Value::String(variant))
+        .map(super::review_guide::connection_precedence)
+        .unwrap_or(u8::MAX)
 }
 
 /// What reaches the entity, one row per entity: every relationship the graph
@@ -1407,7 +2343,7 @@ pub(super) fn relied_on_by_section(
             let relies = relier.relies();
             let mut item = fields(json!({
                 "id": other, "name": relier.name, "kind": relier.kind,
-                "relationship": relier.relationships.first(),
+                "relationship": relier.primary_relationship(),
                 "relationships": relier.relationships,
                 "is_test": is_test, "confirmed": relier.confirmed, "sites": relier.sites,
                 "relies": relies,
@@ -1459,12 +2395,14 @@ pub(super) fn relied_on_by_section(
         );
     }
     if references.is_none() {
+        // Its rows still came from its relationships, matches by name alone
+        // among them, so the sentence says only what the reference read adds.
         said.push(
-            "Kin could not read its references, so sites and matches by name are missing."
+            "Kin could not read its references, so where each one uses it is not shown, and \
+             there could be more."
                 .to_string(),
         );
-    }
-    if let Some(coverage) = coverage {
+    } else if let Some(coverage) = coverage {
         said.push(coverage.to_string());
     } else if truncated {
         said.push(INCOMPLETE_COVERAGE.to_string());
@@ -1803,10 +2741,9 @@ pub(super) fn impact_sections(
         .iter()
         .filter(|candidate| candidate.hop == 1)
         .count();
-    let tests: Vec<&kin_review::RankedImpactCandidate> = candidates
-        .iter()
-        .filter(|candidate| bucket(candidate) == "test")
-        .collect();
+    // Tests as the walk counts them, one per test, nearest and most direct
+    // first: the same reading a guided review's step and verification use.
+    let tests = &ranked.tests;
     let mut ordered: Vec<&kin_review::RankedImpactCandidate> = candidates.iter().collect();
     ordered.sort_by(|a, b| {
         b.priority_score
@@ -1814,8 +2751,11 @@ pub(super) fn impact_sections(
             .then_with(|| a.hop.cmp(&b.hop))
             .then_with(|| a.identity.name.cmp(&b.identity.name))
     });
+    // Tests are the tests section's rows, nearest first; listed here too, the
+    // same test read twice on one page, once as further out.
     let top: Vec<Value> = ordered
         .into_iter()
+        .filter(|candidate| bucket(candidate) != "test")
         .take(IMPACT_TOP)
         .map(|candidate| {
             let reason = bucket(candidate);
@@ -1834,23 +2774,42 @@ pub(super) fn impact_sections(
     }));
     let mut test_items: Vec<Value> = tests
         .iter()
-        .map(|candidate| {
-            json!({
-                "id": candidate.entity_id.to_string(), "name": candidate.identity.name,
-                "kind": kind_label(&candidate.identity.kind), "hops": candidate.hop,
-            })
+        .map(|test| {
+            let mut item = json!({
+                "id": test.entity_id.to_string(), "name": test.identity.name,
+                "kind": kind_label(&test.identity.kind), "hops": test.hop,
+            });
+            if test.by_call() {
+                item["by_call"] = Value::Bool(true);
+            }
+            // Tests of one name are told apart by the module each sits in,
+            // or, for test modules of one name, the namespace each sits in.
+            let places = |of: &kin_review::TestReach| {
+                super::review_guide::enclosing_namespaces(
+                    Some(&of.identity.file),
+                    of.identity.kind != "module",
+                )
+            };
+            let others: Vec<Vec<String>> = tests
+                .iter()
+                .filter(|other| {
+                    other.entity_id != test.entity_id && other.identity.name == test.identity.name
+                })
+                .map(places)
+                .collect();
+            if !others.is_empty() {
+                if let Some(place) = super::review_guide::distinct_place(&places(test), &others) {
+                    item["module"] = Value::String(place);
+                }
+            }
+            item
         })
         .collect();
-    test_items.sort_by(|a, b| {
-        a["hops"]
-            .as_u64()
-            .cmp(&b["hops"].as_u64())
-            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
-    });
     let total = test_items.len();
     test_items.truncate(ENTITY_LIST_CAP);
     let mut tests_section = fields(json!({
         "shown": test_items.len(), "items": test_items, "total": total, "bound": bound,
+        "depth": ranked.max_depth,
     }));
     if let Some(notice) = notice {
         impact.insert("notice".into(), Value::String(notice.into()));
@@ -1860,7 +2819,16 @@ pub(super) fn impact_sections(
 }
 
 /// Recent recorded changes that changed the entity, newest first.
-pub(super) fn history_section(history: &Value) -> Result<Map<String, Value>> {
+///
+/// While the store holds only part of the repository's history
+/// (`history_partial`), the change Kin's record of it starts at, when that is
+/// the one change the store began with, is named as `record_start`: the page
+/// says the record starts there, with the repository as it was, as the
+/// repository's own history does.
+pub(super) fn history_section(
+    history: &Value,
+    history_partial: bool,
+) -> Result<Map<String, Value>> {
     let revisions = history["revisions"]
         .as_array()
         .context("the history answer omitted its revisions")?;
@@ -1879,10 +2847,18 @@ pub(super) fn history_section(history: &Value) -> Result<Map<String, Value>> {
     let total = history["revisions_total"]
         .as_u64()
         .unwrap_or(revisions.len() as u64);
-    Ok(fields(json!({
+    let mut section = fields(json!({
         "shown": items.len(), "items": items, "total": total,
         "unchanged": history["unchanged_revisions"].as_u64().unwrap_or(0),
-    })))
+    }));
+    let start = history["record_start"].as_str();
+    let listed_last = items.last().and_then(|item| item["change_id"].as_str());
+    if let (true, Some(start)) = (history_partial, start) {
+        if listed_last == Some(start) && items.len() as u64 == total {
+            section.insert("record_start".into(), Value::String(start.to_string()));
+        }
+    }
+    Ok(section)
 }
 
 fn review_json(response: Result<super::review::ReviewResponse>) -> Result<Value> {
@@ -2116,6 +3092,17 @@ async fn serve_entity(
     };
     let references = not_read(references);
     let incoming = not_read(incoming);
+    let history_partial = asked.contains(&"history") && {
+        let layout = state.layout.clone();
+        tokio::task::spawn_blocking(move || {
+            matches!(
+                kin_core::history_state::standing(&layout),
+                kin_core::history_state::HistoryStanding::Partial { .. }
+            )
+        })
+        .await
+        .unwrap_or(false)
+    };
     let mut history = Some(not_read(history));
     let mut relies_on = Some(relies_on);
     let mut members = Some(members);
@@ -2191,7 +3178,7 @@ async fn serve_entity(
                 history
                     .take()
                     .unwrap_or_else(|| Err(anyhow::anyhow!("it was not read")))
-                    .and_then(|answer| history_section(&answer)),
+                    .and_then(|answer| history_section(&answer, history_partial)),
             ),
             "editor" => section(
                 "This entity cannot be opened in an editor.",
@@ -2508,6 +3495,58 @@ mod tests {
         assert_eq!(kind_label("ApiEndpoint"), "api_endpoint");
     }
 
+    /// Every entity kind reads in the one spelling the graph serializes,
+    /// whether it arrives as that spelling, as its variant name, or as the
+    /// variant name lowercased the way locate publishes it.
+    #[test]
+    fn every_entity_kind_reads_as_its_serialized_word_however_it_arrives() {
+        use kin_model::EntityKind::{self, *};
+        let every = [
+            Function,
+            Class,
+            Interface,
+            TraitDef,
+            TypeAlias,
+            Module,
+            Package,
+            Test,
+            Schema,
+            ApiEndpoint,
+            EventContract,
+            File,
+            DocumentNode,
+            Method,
+            EnumDef,
+            EnumVariant,
+            Constant,
+            StaticVar,
+            Macro,
+            Field,
+        ];
+        // A kind added later fails to compile here until it is listed above.
+        for kind in every {
+            match kind {
+                Function | Class | Interface | TraitDef | TypeAlias | Module | Package | Test
+                | Schema | ApiEndpoint | EventContract | File | DocumentNode | Method | EnumDef
+                | EnumVariant | Constant | StaticVar | Macro | Field => {}
+            }
+        }
+        let serialized = |kind: EntityKind| {
+            serde_json::to_value(kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for kind in every {
+            let word = serialized(kind);
+            let variant = format!("{kind:?}");
+            assert_eq!(kind_label(&word), word);
+            assert_eq!(kind_label(&variant), word, "{variant}");
+            assert_eq!(kind_label(&variant.to_lowercase()), word, "{variant}");
+        }
+    }
+
     #[test]
     fn shown_text_never_carries_an_em_dash() {
         assert_eq!(
@@ -2602,6 +3641,135 @@ mod tests {
         assert_eq!(containers["items"][1]["container"]["name"], "signer");
     }
 
+    /// The most relied-on list and the relationship count say whether they
+    /// are exact or lower bounds, from the daemon's store-wide call-site
+    /// reading. A daemon that does not report the reading, or a summary that
+    /// was not read, leaves both with no bound at all, never a guessed one.
+    #[test]
+    fn overview_counts_say_whether_they_can_miss_callers_only_when_the_daemon_says() {
+        let payload = fixture();
+        let census = Census::new(&payload);
+        let inventory = json!({"total": 1, "entities": [
+            {"id": "f-function", "name": "want_bytes", "kind": "Function",
+             "file_path": "held/for/grouping/only.py", "dependents": 2},
+        ]});
+        let summary = |settled: Value| {
+            let mut summary = json!({"entities": 7, "edges": 9, "kinds": {}, "languages": {}});
+            if !settled.is_null() {
+                summary["call_sites_settled"] = settled;
+            }
+            summary
+        };
+        let read = |summary: Option<&Value>| {
+            let bound = relied_on_bound(summary);
+            let counts = section(
+                "counts",
+                Ok(with_bound(
+                    overview_counts(&payload),
+                    "relationships_bound",
+                    bound,
+                )),
+            );
+            let relied_on = section(
+                "relied on",
+                overview_relied_on(&inventory, Some(&census), 10)
+                    .map(|relied_on| with_bound(relied_on, "bound", bound)),
+            );
+            (counts, relied_on)
+        };
+
+        let unsettled = summary(json!(false));
+        let (counts, relied_on) = read(Some(&unsettled));
+        assert_eq!(counts["relationships_bound"], "at_least");
+        assert_eq!(relied_on["bound"], "at_least");
+        assert_eq!(counts["relationships"], payload.relation_count);
+        assert_eq!(relied_on["items"][0]["dependents"], 2);
+
+        let settled = summary(json!(true));
+        let (counts, relied_on) = read(Some(&settled));
+        assert_eq!(counts["relationships_bound"], "exact");
+        assert_eq!(relied_on["bound"], "exact");
+
+        // An older daemon, a reading that is not a yes or no, and a summary
+        // that failed all say nothing about the bound.
+        let older = summary(Value::Null);
+        let malformed = summary(json!("settled"));
+        for summary in [Some(&older), Some(&malformed), None] {
+            let (counts, relied_on) = read(summary);
+            assert_eq!(counts["ok"], true);
+            assert!(counts.get("relationships_bound").is_none(), "{counts}");
+            assert_eq!(relied_on["ok"], true);
+            assert!(relied_on.get("bound").is_none(), "{relied_on}");
+        }
+    }
+
+    /// Two entities can share a name, a kind and the name of what contains
+    /// them. What their container sits in tells them apart, so each
+    /// container says it, one level up and by name alone.
+    #[test]
+    fn a_container_says_what_it_sits_in() {
+        let payload = fixture();
+        let census = Census::new(&payload);
+        // A method sits in a class, and the class in a module.
+        assert_eq!(
+            census.container_of("c-method"),
+            Some(json!({
+                "id": "b-class", "name": "Signer", "kind": "class",
+                "within": {"id": "a-module", "name": "signer", "kind": "module"},
+            }))
+        );
+        // A module here sits in nothing, so its members' container says
+        // nothing more.
+        assert_eq!(
+            census.container_of("b-class"),
+            Some(json!({"id": "a-module", "name": "signer", "kind": "module"}))
+        );
+
+        // A ranked result carries the same, read from its container's own
+        // answer and never from where anything is kept.
+        let owners = |id: &str, name: &str, kind: &str| json!([{"entity_id": id, "name": name, "kind": kind, "relationship": "Contains"}]);
+        let sources: HashMap<String, Value> = [(SEND, HOOK), (REDIRECT, HOOK_END)]
+            .into_iter()
+            .map(|(id, class)| {
+                let source = json!({
+                    "name": "MultipartError.status", "kind": "Method",
+                    "module": "extract.multipart",
+                    "semantic_owners": owners(class, "MultipartError", "class"),
+                    "file_path": "held/for/grouping/only.rs",
+                });
+                (id.to_string(), source)
+            })
+            .collect();
+        let outer: HashMap<String, Value> = [(HOOK, "multipart"), (HOOK_END, "multipart_extra")]
+            .into_iter()
+            .map(|(class, module)| {
+                let within = owner_ref(&owners(OTHER, module, "Module")).unwrap();
+                (class.to_string(), within)
+            })
+            .collect();
+        let rows: Vec<Value> = [SEND, REDIRECT]
+            .into_iter()
+            .map(|id| {
+                let hit = hit(id, "MultipartError.status", true, None);
+                hit_json(&hit, sources.get(id), &outer)
+            })
+            .collect();
+        assert_eq!(rows[0]["container"]["name"], rows[1]["container"]["name"]);
+        assert_eq!(
+            rows[0]["container"]["within"],
+            json!({"id": OTHER, "name": "multipart", "kind": "module"})
+        );
+        assert_eq!(rows[1]["container"]["within"]["name"], "multipart_extra");
+        // A container whose own container is not known says nothing of it.
+        let alone = hit_json(
+            &hit(SEND, "MultipartError.status", true, None),
+            sources.get(SEND),
+            &HashMap::new(),
+        );
+        assert!(alone["container"].get("within").is_none());
+        assert!(!json!(rows).to_string().contains("held/for/grouping"));
+    }
+
     /// Two containers can share a name and a kind, as a JavaScript module and
     /// the TypeScript one beside it do, and no answer says where either is.
     /// Each row carries its language so a page can tell them apart, and null
@@ -2660,10 +3828,17 @@ mod tests {
         assert_eq!(relied_on["excluded_without_definition"], 1);
         assert_eq!(relied_on["items"][0]["name"], "want_bytes");
         assert_eq!(relied_on["items"][0]["container"]["name"], "encoding");
+        let mut with_untested = inventory.clone();
+        with_untested["untested"] = json!({"total": 1, "entities": [
+            {"id": "f-function", "name": "want_bytes", "kind": "Function",
+             "file_path": "held/for/grouping/only.py", "degree": 3, "dependents": 2},
+        ]});
+        let untested = overview_untested(&with_untested, Some(&census)).unwrap();
         for answer in [
             Value::Object(overview_counts(&payload)),
             Value::Object(overview_containers(&census, 10)),
             Value::Object(relied_on),
+            Value::Object(untested),
             build_map(&payload, MAP_NODE_CAP, MAP_EDGE_CAP),
         ] {
             let text = answer.to_string();
@@ -2673,6 +3848,55 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// What no test reaches is the daemon's own reading, shaped for the page:
+    /// each entity by id, name, kind, container and how many depend on it,
+    /// with the whole count and what the list means. A daemon that does not
+    /// report the reading is a gap said in one sentence, never a guessed
+    /// list.
+    #[test]
+    fn the_untested_section_is_the_daemons_reading_or_its_gap_in_one_sentence() {
+        let payload = fixture();
+        let census = Census::new(&payload);
+        let inventory = json!({"total": 2, "entities": [], "untested": {"total": 7, "entities": [
+            {"id": "f-function", "name": "want_bytes", "kind": "Function",
+             "file_path": "held/for/grouping/only.py", "degree": 3, "dependents": 2},
+        ]}});
+        let read = untested_section(overview_untested(&inventory, Some(&census)));
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["total"], 7);
+        assert_eq!(
+            read["items"],
+            json!([{
+                "id": "f-function", "name": "want_bytes", "kind": "function",
+                "container": census.container_of("f-function"), "dependents": 2,
+            }])
+        );
+        assert_eq!(read["items"][0]["container"]["name"], "encoding");
+        let basis = read["basis"].as_str().unwrap();
+        assert!(
+            basis.contains("no recorded test") && basis.contains("whole repository"),
+            "{basis}"
+        );
+
+        // An older daemon answers the ranking without the reading.
+        let older = json!({"total": 2, "entities": []});
+        let gap = untested_section(overview_untested(&older, Some(&census)));
+        assert_eq!(gap["ok"], false);
+        assert!(gap.get("items").is_none() && gap.get("total").is_none());
+        let reason = gap["reason"].as_str().unwrap();
+        assert!(reason.starts_with("Kin could not read which entities no test reaches: "));
+        assert_eq!(reason.matches(". ").count(), 0, "one sentence: {reason}");
+        assert!(reason.ends_with('.'), "{reason}");
+        assert!(!reason.contains('`'), "no command to run: {reason}");
+
+        // A refusal that ends its own sentence still reads as one.
+        let refused = untested_section(Err(anyhow::anyhow!("the daemon did not answer in time.")));
+        assert_eq!(
+            refused["reason"],
+            "Kin could not read which entities no test reaches: the daemon did not answer in time."
+        );
     }
 
     #[test]
@@ -2773,6 +3997,41 @@ mod tests {
     }
 
     #[test]
+    fn a_primary_call_preserves_every_recorded_relationship_in_any_order() {
+        for kinds in [
+            ["UsesType", "Calls", "References"],
+            ["UsesType", "References", "Calls"],
+            ["References", "UsesType", "Calls"],
+            ["References", "Calls", "UsesType"],
+            ["Calls", "References", "UsesType"],
+            ["Calls", "UsesType", "References"],
+        ] {
+            let incoming = json!({
+                "truncated": false,
+                "entities": [
+                    {"id": "focal", "name": "normalizeRequestId", "kind": "Function"},
+                    {"id": "caller", "name": "buildOptionalHeaderReqId", "kind": "Function"},
+                ],
+                "relations": kinds.iter().map(|kind| json!({
+                    "direction": "incoming", "kind": kind, "resolution": "type_resolved",
+                    "src": {"Entity": "caller"}, "dst": {"Entity": "focal"},
+                })).collect::<Vec<_>>(),
+            });
+            let section =
+                relied_on_by_section("focal", Some(&incoming), None, &HashMap::new()).unwrap();
+            assert_eq!(section["total"], 1);
+            assert_eq!(section["confirmed"], 1);
+            let caller = &section["items"][0];
+            assert_eq!(caller["relationship"], "calls");
+            assert_eq!(
+                caller["relationships"],
+                json!(kinds.map(kind_label)),
+                "the primary label must not discard or reorder the graph's facts"
+            );
+        }
+    }
+
+    #[test]
     fn who_relies_on_an_entity_reads_one_row_per_entity_with_its_sites() {
         let answer = json!({
             "_kin": {"completeness": {"bound": "at_least"}},
@@ -2840,7 +4099,7 @@ mod tests {
             "2 of them match by name alone, and Kin could not prove they use this one."
         ));
         let serializer = &section["items"][0];
-        assert_eq!(serializer["relationship"], "references");
+        assert_eq!(serializer["relationship"], "calls");
         assert_eq!(serializer["relationships"], json!(["references", "calls"]));
         assert_eq!(serializer["sites"], 4);
         assert_eq!(serializer["container"]["name"], "serializer");
@@ -2864,6 +4123,66 @@ mod tests {
             .unwrap()
             .starts_with("Kin could not read its references"));
         assert!(relied_on_by_section("focal", None, None, &HashMap::new()).is_err());
+    }
+
+    /// fastify's `serialize`, as the entity page read it while Kin could not
+    /// read its references: three callers proven and one test matched by
+    /// name alone. The notice said "sites and matches by name are missing"
+    /// and then "1 of them matches by name alone". It now says only what the
+    /// reference read would have added, and the match by name alone is still
+    /// said to be one.
+    #[test]
+    fn without_its_references_the_notice_says_only_what_the_references_add() {
+        let incoming = json!({
+            "truncated": false,
+            "entities": [
+                {"id": "focal", "name": "serialize", "kind": "Function"},
+                {"id": "r1", "name": "Reply.serialize", "kind": "Method"},
+                {"id": "t1", "name": "reply-serialize.test", "kind": "Module", "role": "test"},
+            ],
+            "relations": [
+                {"direction": "incoming", "kind": "Calls", "resolution": "type_resolved",
+                 "src": {"Entity": "r1"}, "dst": {"Entity": "focal"}},
+                {"direction": "incoming", "kind": "Calls", "resolution": "name_only",
+                 "src": {"Entity": "t1"}, "dst": {"Entity": "focal"}},
+            ]
+        });
+        let section =
+            relied_on_by_section("focal", Some(&incoming), None, &HashMap::new()).unwrap();
+        assert_eq!(section["total"], 2);
+        assert_eq!(section["confirmed"], 1);
+        assert_eq!(section["relies_total"], 1);
+        assert_eq!(
+            section["notice"],
+            "Kin could not read its references, so where each one uses it is not shown, and \
+             there could be more. 1 of them matches by name alone, and Kin could not prove it \
+             uses this one."
+        );
+    }
+
+    #[test]
+    fn an_entity_history_names_where_the_record_starts_while_history_is_partial() {
+        let import = "9dda05f2fa165dc5274f2b047c582df107fd0caf118989243c0c10db08bb4eb6";
+        let answer = json!({
+            "revisions_total": 1, "unchanged_revisions": 0, "record_start": import,
+            "revisions": [{"id": import, "title": "docs: clarify the threat model (#6537)",
+                "author": "Matteo Collina <hello@example.com>",
+                "timestamp": "2026-03-11T10:57:14+00:00"}]
+        });
+        let partial = history_section(&answer, true).unwrap();
+        assert_eq!(partial["record_start"], import);
+        // A store that holds the whole history began where the repository did.
+        assert!(history_section(&answer, false)
+            .unwrap()
+            .get("record_start")
+            .is_none());
+        // Nor is it named when the oldest revision listed is not the start.
+        let mut later = answer.clone();
+        later["revisions_total"] = json!(2);
+        assert!(history_section(&later, true)
+            .unwrap()
+            .get("record_start")
+            .is_none());
     }
 
     /// The overload declarations of one callable read as one row, kept under
@@ -2953,6 +4272,40 @@ mod tests {
         assert!(source_section(Some(&gap), None).is_err());
     }
 
+    /// The exact read carries the digest of the span it cut, the one a guide
+    /// step reports, so the page can tell whether a flag set on a recorded
+    /// change is still about the entity as it is now. A read that is not an
+    /// exact span carries none, and nothing malformed is passed on.
+    #[test]
+    fn the_source_section_carries_the_exact_reads_digest_and_no_other() {
+        let text = "class Signer:\n    pass";
+        let digest = kin_blobs::digest(text.as_bytes()).to_string();
+        let source = json!({"id": "e", "name": "Signer", "kind": "Class", "language": "python", "body": text});
+        let recorded = json!({"body": {
+            "state": "recorded", "text": text, "start_line": 76, "working": true,
+            "body_hash": digest,
+        }});
+        let exact = source_section(Some(&recorded), Some(&source)).unwrap();
+        assert_eq!(exact["body_hash"], json!(digest));
+
+        // The plain source read is not an exact span, so it has no digest to
+        // give, whether the guide's read was absent or refused.
+        let fallback = source_section(None, Some(&source)).unwrap();
+        assert!(fallback.get("body_hash").is_none(), "{fallback:?}");
+        let refused = json!({"body": {"state": "no_source", "body_hash": digest}});
+        let fallback = source_section(Some(&refused), Some(&source)).unwrap();
+        assert!(fallback.get("body_hash").is_none(), "{fallback:?}");
+
+        // A recorded read with no digest, or one that is not a whole digest,
+        // passes none on.
+        for body_hash in [Value::Null, json!("abc123"), json!(42)] {
+            let mut read = recorded.clone();
+            read["body"]["body_hash"] = body_hash;
+            let section = source_section(Some(&read), Some(&source)).unwrap();
+            assert!(section.get("body_hash").is_none(), "{section:?}");
+        }
+    }
+
     #[test]
     fn a_graph_tool_refusal_reads_as_its_sentence() {
         let refusal = anyhow::anyhow!(
@@ -3016,7 +4369,7 @@ mod tests {
                 "author": "Grace Hopper <grace@example.com> 1713298162 -0700",
                 "timestamp": "2024-04-16T20:09:22+00:00"}]
         });
-        let section = history_section(&answer).unwrap();
+        let section = history_section(&answer, false).unwrap();
         assert_eq!(section["items"][0]["author"], "Grace Hopper");
         assert_eq!(section["items"][0]["time"], "2024-04-16T20:09:22+00:00");
         assert_eq!(section["total"], 3);
@@ -3038,6 +4391,346 @@ mod tests {
         let answered = section("unused", Ok(fields(json!({"total": 0}))));
         assert_eq!(answered["ok"], true);
         assert_eq!(answered["total"], 0);
+    }
+
+    const SEND: &str = "7fe6951b-4071-4e59-a4d8-83ebecc63e4b";
+    const HOOK: &str = "4086b425-a85e-4470-9e4f-7207dfdadbe6";
+    const HOOK_END: &str = "15ca387d-91f0-4258-8053-ab6e664a38e1";
+    const SERIALIZE: &str = "30677f6b-2a16-459e-a1da-ec3a66235429";
+    const REDIRECT: &str = "c9620963-28ef-4698-9c11-5982e0e971f2";
+    const OTHER: &str = "47460d30-4af2-4faa-888b-191f7804efd7";
+
+    fn terms(question: &str) -> Vec<String> {
+        question_terms(question)
+    }
+
+    fn entity(id: &str, name: &str) -> Link {
+        Link {
+            id: id.into(),
+            name: name.into(),
+            kind: if name.contains('.') {
+                "method"
+            } else {
+                "function"
+            }
+            .into(),
+        }
+    }
+
+    /// One entity's incoming relations, as the daemon answers them: each
+    /// caller with how its call was matched.
+    fn incoming(callers: &[(&str, &str, &str, &str)], truncated: bool) -> Value {
+        let entities: Vec<Value> = callers
+            .iter()
+            .map(|(id, name, kind, _)| {
+                json!({"id": id, "name": name, "kind": kind,
+                       "signature": "held/for/grouping/only.js"})
+            })
+            .collect();
+        let mut relations: Vec<Value> = callers
+            .iter()
+            .map(|(id, _, _, resolution)| {
+                json!({"direction": "incoming", "kind": "Calls", "resolution": resolution,
+                       "src": {"Entity": id}, "dst": {"Entity": SERIALIZE}})
+            })
+            .collect();
+        // What holds the entity, and its own recursion, call nothing into it.
+        relations.push(json!({"direction": "incoming", "kind": "Contains",
+            "resolution": "type_resolved", "src": {"Entity": OTHER}, "dst": {"Entity": SERIALIZE}}));
+        relations.push(json!({"direction": "incoming", "kind": "Calls",
+            "resolution": "type_resolved", "src": {"Entity": SERIALIZE},
+            "dst": {"Entity": SERIALIZE}}));
+        json!({"truncated": truncated, "entities": entities, "relations": relations})
+    }
+
+    /// The calls above `serialize` in a web framework: a method that calls
+    /// it directly, and the hook chain a reply's send runs through.
+    fn serialize_climb() -> (Link, Climb) {
+        let climb = Climb {
+            above: vec![
+                (entity(OTHER, "Reply.serialize"), SERIALIZE.into()),
+                (
+                    entity(HOOK_END, "preSerializationHookEnd"),
+                    SERIALIZE.into(),
+                ),
+                (entity(HOOK, "preSerializationHook"), HOOK_END.into()),
+                (entity(SEND, "Reply.send"), HOOK.into()),
+                (entity(REDIRECT, "Reply.redirect"), SEND.into()),
+            ],
+            callers: HashMap::new(),
+        };
+        (entity(SERIALIZE, "serialize"), climb)
+    }
+
+    #[test]
+    fn only_a_question_that_asks_how_or_where_is_given_an_answer() {
+        assert_eq!(asks("how does a reply get serialized"), Some(Asks::How));
+        assert_eq!(asks("Where are errors formatted?"), Some(Asks::Where));
+        assert_eq!(asks("show me how a route is registered"), Some(Asks::How));
+        assert_eq!(asks("how many routes are registered"), None);
+        assert_eq!(asks("Reply.send"), None);
+        assert_eq!(asks("what calls serialize"), None);
+        assert_eq!(asks("list every entity that says where it is used"), None);
+    }
+
+    #[test]
+    fn a_question_keeps_the_words_that_could_name_something() {
+        assert_eq!(
+            terms("how does a reply get serialized"),
+            ["repli", "serializ"]
+        );
+        assert_eq!(terms("Where are errors formatted?"), ["error", "format"]);
+        assert_eq!(terms("how is a 404 handled"), ["404", "handl"]);
+        assert_eq!(terms("how is a reply sent"), ["repli", "send"]);
+        assert_eq!(
+            terms("how does contentTypeParser work"),
+            ["content", "type", "pars"]
+        );
+        assert!(terms("how does it work").is_empty());
+    }
+
+    #[test]
+    fn the_forms_of_a_word_meet_in_a_name() {
+        let all = |question: &str, name: &str| {
+            let terms = terms(question);
+            matched_terms(name, &terms).len() == terms.len()
+        };
+        assert!(all("serialized replies", "Reply.serializeInput"));
+        assert!(all("serialization", "preSerializationHookEnd"));
+        assert!(all("registered", "registerPluginName"));
+        assert!(all("routing", "fastify.<locals>.fastify.route"));
+        assert!(all("formatted errors", "validateSchemaErrorFormatter"));
+        assert!(all("cookies", "parseCookie"));
+        assert!(all("HTTP2 server", "createHTTP2Server"));
+        assert!(!all("serialized", "Reply.send"));
+        // A short word is matched whole, never as the start of a longer one.
+        assert!(!all("id", "identity"));
+        assert!(!all("run", "runtime"));
+    }
+
+    #[test]
+    fn what_calls_an_entity_is_read_from_its_incoming_relations() {
+        let read = callers_of(
+            &incoming(
+                &[
+                    (
+                        HOOK_END,
+                        "preSerializationHookEnd",
+                        "Function",
+                        "type_resolved",
+                    ),
+                    (OTHER, "Reply.serialize", "Method", "type_resolved"),
+                    // Two call sites in one caller are one caller.
+                    (OTHER, "Reply.serialize", "Method", "type_resolved"),
+                    // A call matched by name alone, and a caller that is no
+                    // function, call it but are no hop of a chain.
+                    (SEND, "handleRequest", "Function", "name_only"),
+                    (REDIRECT, "reply.test", "Module", "type_resolved"),
+                ],
+                false,
+            ),
+            SERIALIZE,
+        );
+        let names: Vec<&str> = read.proven.iter().map(|link| link.name.as_str()).collect();
+        assert_eq!(names, ["Reply.serialize", "preSerializationHookEnd"]);
+        assert_eq!(read.proven[0].kind, "method");
+        assert_eq!((read.all, read.cut), (4, false));
+        assert_eq!(read.only(), None);
+
+        let one = [(HOOK, "buildRouting", "Function", "type_resolved")];
+        assert_eq!(
+            callers_of(&incoming(&one, false), SERIALIZE).only(),
+            Some(&entity(HOOK, "buildRouting"))
+        );
+        // One caller of a read that was cut short may not be the only one,
+        // and one caller matched by name alone is not known to call it.
+        assert_eq!(callers_of(&incoming(&one, true), SERIALIZE).only(), None);
+        let guessed = [(HOOK, "buildRouting", "Function", "name_only")];
+        assert_eq!(
+            callers_of(&incoming(&guessed, false), SERIALIZE).only(),
+            None
+        );
+        assert_eq!(
+            callers_of(&incoming(&[], false), SERIALIZE),
+            Callers::default()
+        );
+    }
+
+    #[test]
+    fn a_chain_begins_and_ends_at_entities_the_question_names() {
+        let (target, climb) = serialize_climb();
+        let asked = terms("how does a reply get serialized");
+        let (basis, chain) = chain_from(&target, &climb, &asked, false).expect("a chain");
+        assert_eq!(basis, "named_ends");
+        let names: Vec<&str> = chain.iter().map(|link| link.name.as_str()).collect();
+        // The nearest caller that adds a word the last entity lacks:
+        // `Reply.serialize` is one call away, which is not a chain, and
+        // `Reply.redirect` reaches the same place by a longer way.
+        assert_eq!(
+            names,
+            [
+                "Reply.send",
+                "preSerializationHook",
+                "preSerializationHookEnd",
+                "serialize"
+            ]
+        );
+        let answer = answer_json(Asks::How, basis, &chain);
+        assert_eq!(
+            answer["sentence"],
+            "Reply.send calls preSerializationHook, which calls preSerializationHookEnd, which \
+             calls serialize."
+        );
+        assert_eq!(answer["asks"], "how");
+        assert_eq!(
+            answer["steps"][0],
+            json!({
+                "id": SEND, "name": "Reply.send", "kind": "method", "relation_to_next": "calls",
+            })
+        );
+        assert_eq!(answer["steps"][3]["relation_to_next"], Value::Null);
+        assert_eq!(answer["steps"][3]["kind"], "function");
+        let text = answer.to_string();
+        assert!(
+            !text.contains("held/for/grouping") && !text.contains("file"),
+            "{text}"
+        );
+        assert_eq!(
+            answer_json(Asks::Where, basis, &chain)["sentence"],
+            "This happens in serialize, which Reply.send reaches through preSerializationHook \
+             and preSerializationHookEnd."
+        );
+    }
+
+    #[test]
+    fn a_question_the_names_do_not_carry_is_given_no_chain() {
+        let (target, climb) = serialize_climb();
+        // Nothing on any chain is named for a route.
+        assert!(chain_from(&target, &climb, &terms("how is a route serialized"), false).is_none());
+        // One word names a topic. It ties no chain to a question.
+        assert!(question_terms("how does serialization work").len() < ANSWER_MIN_TERMS);
+        // Nothing is known to call the result.
+        let asked = terms("how does a reply get serialized");
+        assert!(chain_from(&target, &Climb::default(), &asked, false).is_none());
+    }
+
+    #[test]
+    fn a_test_is_never_where_a_chain_begins_unless_tests_are_asked_about() {
+        let (target, mut climb) = serialize_climb();
+        // The only caller named for a reply is a test of it.
+        climb.above[3].0.name = "test_reply_send".into();
+        climb.above[4].0.name = "ReplySpec.redirects".into();
+        let asked = terms("how does a reply get serialized");
+        assert!(chain_from(&target, &climb, &asked, false).is_none());
+        assert!(!names_a_test("how does a reply get serialized"));
+        let about_tests = "how does a reply test get serialized";
+        assert!(names_a_test(about_tests));
+        assert!(chain_from(&target, &climb, &terms(about_tests), true).is_some());
+        assert!(names_a_test("TestTimed.test_max_age") && !names_a_test("attestation"));
+    }
+
+    /// `compileSchemas` is called only by `buildRouting`, which is called
+    /// only by `fastify`, which several entities call.
+    fn sole_climb() -> (Link, Climb) {
+        let only = |caller: Link| Callers {
+            proven: vec![caller],
+            all: 1,
+            cut: false,
+        };
+        let callers = HashMap::from([
+            (SERIALIZE.to_string(), only(entity(HOOK, "buildRouting"))),
+            (HOOK.to_string(), only(entity(SEND, "fastify"))),
+            (
+                SEND.to_string(),
+                Callers {
+                    proven: Vec::new(),
+                    all: 3,
+                    cut: false,
+                },
+            ),
+        ]);
+        let climb = Climb {
+            above: vec![
+                (entity(HOOK, "buildRouting"), SERIALIZE.into()),
+                (entity(SEND, "fastify"), HOOK.into()),
+            ],
+            callers,
+        };
+        (entity(SERIALIZE, "compileSchemas"), climb)
+    }
+
+    #[test]
+    fn an_entity_named_by_the_whole_question_is_reached_through_its_only_callers() {
+        let asked = terms("where are schemas compiled");
+        let (target, climb) = sole_climb();
+        let (basis, chain) = chain_from(&target, &climb, &asked, false).expect("a chain");
+        assert_eq!(basis, "sole_callers");
+        let names: Vec<&str> = chain.iter().map(|link| link.name.as_str()).collect();
+        assert_eq!(names, ["fastify", "buildRouting", "compileSchemas"]);
+        assert_eq!(
+            answer_json(Asks::Where, basis, &chain)["sentence"],
+            "This happens in compileSchemas, which fastify reaches through buildRouting."
+        );
+
+        // A second caller anywhere on the way leaves a choice, so no chain.
+        let (_, mut two) = sole_climb();
+        two.callers.get_mut(HOOK).unwrap().all = 2;
+        assert!(chain_from(&target, &two, &asked, false).is_none());
+        // So does a caller list that was not read whole.
+        let (_, mut cut) = sole_climb();
+        cut.callers.get_mut(SERIALIZE).unwrap().cut = true;
+        assert!(chain_from(&target, &cut, &asked, false).is_none());
+        // And one call is not a chain.
+        let (_, mut short) = sole_climb();
+        short.callers.remove(HOOK);
+        assert!(chain_from(&target, &short, &asked, false).is_none());
+    }
+
+    #[test]
+    fn a_long_chain_is_said_in_one_sentence() {
+        let chain: Vec<Link> = [
+            "handleRequest",
+            "handler",
+            "preValidationCallback",
+            "validate",
+            "wrap",
+        ]
+        .iter()
+        .map(|name| Link {
+            id: SEND.into(),
+            name: (*name).into(),
+            kind: "function".into(),
+        })
+        .collect();
+        assert_eq!(
+            answer_sentence(Asks::How, &chain),
+            "handleRequest reaches wrap through handler, preValidationCallback and validate, \
+             each calling the next."
+        );
+        assert_eq!(
+            answer_sentence(Asks::How, &chain[..3]),
+            "handleRequest calls handler, which calls preValidationCallback."
+        );
+    }
+
+    #[test]
+    fn an_answer_ends_only_at_a_ranked_function_or_method_defined_here() {
+        let mut function = hit(SERIALIZE, "serialize", false, Some(Meaning::Words));
+        function.kind = "function".into();
+        function.defined_here = true;
+        let mut outside = function.clone();
+        outside.id = OTHER.into();
+        outside.defined_here = false;
+        let mut class = function.clone();
+        class.id = SEND.into();
+        class.kind = "class".into();
+        let mut unrelated = function.clone();
+        unrelated.id = HOOK.into();
+        unrelated.name = "fallbackErrorHandler".into();
+        let hits = [outside, class, unrelated, function];
+        let seeds = answer_seeds(&hits, &terms("how does a reply get serialized"));
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].id, SERIALIZE);
     }
 
     /// The explore routes refuse a malformed request before resolving a

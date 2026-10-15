@@ -4468,10 +4468,13 @@ struct LocalRepositoryLock {
 #[derive(Debug)]
 pub(crate) struct LocalAuthorityFreezeLock {
     repo_id: String,
-    authority: SnapshotAuthority,
-    /// Acknowledged authority frames between the snapshot base and the head,
-    /// read and digest-verified under the same lock hold as `authority`.
-    frames: Vec<PersistedDelta>,
+    /// The head's bytes, when this lock was taken to read an existing head.
+    ///
+    /// `None` for the lock a commit retained. The committing writer holds the
+    /// exact state it serialized, so copying the base snapshot into the lock,
+    /// or reading it back after a frame append, would only cost time for bytes
+    /// no caller of a committed freeze reads.
+    captured: Option<CapturedAuthority>,
     /// The head these bytes are, named by digests that were checked against
     /// the bytes under this lock hold.
     identity: DurableAuthorityIdentity,
@@ -4479,6 +4482,15 @@ pub(crate) struct LocalAuthorityFreezeLock {
     // roots. Preserve the fact read under this exact retained backend lock.
     active_session_publication: bool,
     lock: LocalRepositoryLock,
+}
+
+/// One existing head read under a freeze lock.
+#[derive(Debug)]
+struct CapturedAuthority {
+    authority: SnapshotAuthority,
+    /// Acknowledged authority frames between the snapshot base and the head,
+    /// read and digest-verified under the same lock hold as `authority`.
+    frames: Vec<PersistedDelta>,
 }
 
 impl LocalAuthorityFreezeLock {
@@ -4491,20 +4503,37 @@ impl LocalAuthorityFreezeLock {
         Ok(())
     }
 
-    pub(crate) fn authority(&self) -> &SnapshotAuthority {
-        &self.authority
+    fn captured(&self) -> Result<&CapturedAuthority, KinDbError> {
+        self.captured
+            .as_ref()
+            .ok_or_else(|| Self::captured_nothing(&self.repo_id))
     }
 
-    pub(crate) fn frames(&self) -> &[PersistedDelta] {
-        &self.frames
+    fn captured_nothing(repo_id: &str) -> KinDbError {
+        KinDbError::StorageError(format!(
+            "repo {repo_id}: a freeze retained by a commit captured no authority bytes"
+        ))
+    }
+
+    pub(crate) fn authority(&self) -> Result<&SnapshotAuthority, KinDbError> {
+        Ok(&self.captured()?.authority)
+    }
+
+    pub(crate) fn frames(&self) -> Result<&[PersistedDelta], KinDbError> {
+        Ok(&self.captured()?.frames)
     }
 
     /// The captured head and acknowledged frames, with the lock released.
     ///
     /// Both were digest-checked against the authority record under this hold,
     /// so a reader that only decodes them needs the lock no longer.
-    pub(crate) fn into_captured(self) -> (SnapshotAuthority, Vec<PersistedDelta>) {
-        (self.authority, self.frames)
+    pub(crate) fn into_captured(
+        self,
+    ) -> Result<(SnapshotAuthority, Vec<PersistedDelta>), KinDbError> {
+        match self.captured {
+            Some(captured) => Ok((captured.authority, captured.frames)),
+            None => Err(Self::captured_nothing(&self.repo_id)),
+        }
     }
 
     pub(crate) fn identity(&self) -> &DurableAuthorityIdentity {
@@ -4612,6 +4641,22 @@ struct LocalAuthorityRecord {
     history_validation: Option<HistoryValidationProof>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     session_publications: Vec<SessionPublicationAcknowledgement>,
+}
+
+impl LocalAuthorityRecord {
+    /// The head this record acknowledges: its base snapshot and every
+    /// acknowledged frame, by the digests the record binds them to.
+    fn durable_identity(&self) -> DurableAuthorityIdentity {
+        DurableAuthorityIdentity {
+            snapshot_generation: self.snapshot_generation,
+            snapshot_sha256: self.snapshot_sha256.clone(),
+            frames: self
+                .acknowledged_deltas
+                .iter()
+                .map(|identity| (identity.generation, identity.sha256.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl LocalFileBackend {
@@ -6676,20 +6721,11 @@ impl LocalFileBackend {
         // frame's by the capture beside it. A journal-free record acknowledges
         // no frame, which the record decoder already enforces.
         let active_session_publication = record.active_session().is_some();
-        let identity = DurableAuthorityIdentity {
-            snapshot_generation: record.snapshot_generation,
-            snapshot_sha256: record.snapshot_sha256,
-            frames: record
-                .acknowledged_deltas
-                .into_iter()
-                .map(|identity| (identity.generation, identity.sha256))
-                .collect(),
-        };
+        let identity = record.durable_identity();
         self.confirm_existing_lock_visible(&lock.namespace)?;
         Ok(Some(LocalAuthorityFreezeLock {
             repo_id: repo_id.to_string(),
-            authority,
-            frames,
+            captured: Some(CapturedAuthority { authority, frames }),
             identity,
             active_session_publication,
             lock,
@@ -8201,19 +8237,43 @@ impl LocalFileBackend {
     /// snapshot promotion follows. The base snapshot bytes are not re-read
     /// here: installed files are immutable, the record binds the base by
     /// digest, and every open verifies that binding before it trusts the base.
+    ///
+    /// Returns the committed head generation and the head the record now
+    /// acknowledges, named from the record this call wrote or, for an exact
+    /// retry, the record that already acknowledged these bytes.
     fn save_authority_frame_unlocked(
         &self,
         namespace: &LocalRepositoryCapability,
         frame_data: &[u8],
         expected_gen: Generation,
         history_validator_version: Option<u32>,
-    ) -> Result<Generation, KinDbError> {
+    ) -> Result<(Generation, DurableAuthorityIdentity), KinDbError> {
         let repo_id = &namespace.repo_id;
-        let Some(mut record) = self.read_authority_record_unlocked(namespace)? else {
+        let Some(record) = self.read_authority_record_unlocked(namespace)? else {
             return Err(KinDbError::StorageError(format!(
                 "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before authority frames"
             )));
         };
+        self.save_authority_frame_from_record_unlocked(
+            namespace,
+            record,
+            frame_data,
+            expected_gen,
+            history_validator_version,
+        )
+    }
+
+    /// Append against a record already read and validated under the same
+    /// repository lock, without reading and hashing its journal twice.
+    fn save_authority_frame_from_record_unlocked(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        mut record: LocalAuthorityRecord,
+        frame_data: &[u8],
+        expected_gen: Generation,
+        history_validator_version: Option<u32>,
+    ) -> Result<(Generation, DurableAuthorityIdentity), KinDbError> {
+        let repo_id = &namespace.repo_id;
         record.refuse_active_session()?;
         if !record.supports_frames() && !record.acknowledged_deltas.is_empty() {
             return Err(KinDbError::StorageError(format!(
@@ -8265,7 +8325,7 @@ impl LocalFileBackend {
                         "repo {repo_id} exact authority frame retry refers to committed generation {current_gen}, but final namespace confirmation failed: {error}"
                     )));
                 }
-                return Ok(current_gen);
+                return Ok((current_gen, record.durable_identity()));
             }
         }
         if current_gen != expected_gen {
@@ -8323,7 +8383,60 @@ impl LocalFileBackend {
                 "repo {repo_id} authority frame committed generation {new_gen}, but post-commit namespace confirmation failed: {error}"
             )));
         }
-        Ok(new_gen)
+        Ok((new_gen, record.durable_identity()))
+    }
+
+    /// Append one authority frame and return the same still-held repository
+    /// lock that protected its commit point.
+    ///
+    /// The frame counterpart of [`Self::save_snapshot_and_freeze`], for a
+    /// freezing publication whose successor extends the acknowledged head by
+    /// one frame: a branch, tag, stash or merge-state move. The append is
+    /// exactly the one [`StorageBackend::save_authority_frame`] makes, under
+    /// the same exclusive lock and with the same commit point, the rename of
+    /// the record. The lock is then handed back instead of released, so the
+    /// caller keeps the exclusion it committed under with no release and
+    /// reacquire window, as it does after a full snapshot.
+    ///
+    /// Any failure after the record rename is reported as
+    /// [`KinDbError::SnapshotPersistenceIndeterminate`] by the append itself,
+    /// and nothing here can fail after it, so an error never hides a commit.
+    pub(crate) fn save_authority_frame_and_freeze(
+        &self,
+        repo_id: &str,
+        frame: &[u8],
+        expected_cursor: SnapshotCursor,
+        history_validator_version: Option<u32>,
+    ) -> Result<(SnapshotCursor, LocalAuthorityFreezeLock), KinDbError> {
+        let lock = self.acquire_existing_lock(repo_id)?;
+        // A returned freeze vouches for a durable head, including its base.
+        // The append checks acknowledged frames while reading the record, but
+        // an ordinary append assumes the base remains immutable after open.
+        // Check its mapped bytes here before writing anything, so corruption
+        // cannot turn a successful freezing commit into an unreopenable head.
+        let record = self
+            .read_authority_record_unlocked(&lock.namespace)?
+            .ok_or_else(|| no_existing_authority_to_freeze(repo_id))?;
+        self.read_authoritative_snapshot_bytes_unlocked(&lock.namespace, &record)?;
+        let (generation, identity) = self.save_authority_frame_from_record_unlocked(
+            &lock.namespace,
+            record,
+            frame,
+            expected_cursor.backend_generation(),
+            history_validator_version,
+        )?;
+        Ok((
+            SnapshotCursor::from_backend_generation(generation),
+            LocalAuthorityFreezeLock {
+                repo_id: repo_id.to_string(),
+                captured: None,
+                identity,
+                // The append refuses a record with an active preparation, so
+                // the record it acknowledged carries none.
+                active_session_publication: false,
+                lock,
+            },
+        ))
     }
 
     /// Persist a local full-snapshot CAS and return the same still-held
@@ -8367,27 +8480,11 @@ impl LocalFileBackend {
         )?;
         let cursor = SnapshotCursor::from_backend_generation(generation);
         let snapshot_sha256 = hex::encode(Sha256::digest(data));
-        let authority = SnapshotAuthority {
-            snapshot_bytes: data.to_vec().into(),
-            snapshot_source: None,
-            snapshot_generation: generation,
-            head_generation: generation,
-            history_validation: history_validator_version.map(|validator_version| {
-                HistoryValidationProof {
-                    validator_version,
-                    repository_id: repo_id.to_string(),
-                    generation,
-                    snapshot_sha256: snapshot_sha256.clone(),
-                    journal_sha256: None,
-                }
-            }),
-        };
         Ok((
             cursor,
             LocalAuthorityFreezeLock {
                 repo_id: repo_id.to_string(),
-                authority,
-                frames: Vec::new(),
+                captured: None,
                 identity: DurableAuthorityIdentity::full_snapshot(generation, snapshot_sha256),
                 // Ordinary save refuses active preparation; a prepared save
                 // atomically completes its exact acknowledged operation.
@@ -9176,7 +9273,7 @@ impl StorageBackend for LocalFileBackend {
             expected.backend_generation(),
             history_validator_version,
         ) {
-            Ok(generation) => SnapshotSaveOutcome::Committed {
+            Ok((generation, _)) => SnapshotSaveOutcome::Committed {
                 cursor: SnapshotCursor::from_backend_generation(generation),
             },
             Err(error @ KinDbError::SnapshotPersistenceIndeterminate(_)) => {

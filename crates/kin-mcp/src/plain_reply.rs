@@ -480,6 +480,12 @@ fn plain_answer_with_details(mut machine: Map<String, Value>, tool: &str, detail
     }
     if let Some(unadmitted) = unadmitted {
         compact_unadmitted_declarations(&mut plain, &unadmitted);
+        // After grouping, which reads rows aligned with the census: rows still
+        // alike, such as one callback declared in sixteen tests, are said once
+        // in a short reply. Details lists every declaration as it is.
+        if let Some(Value::Array(rows)) = plain.get_mut("not_held") {
+            *rows = crate::answer_account::said_once(std::mem::take(rows));
+        }
     }
     hold_to_account(tool, &account, &plain);
     plain
@@ -4510,6 +4516,7 @@ fn plain_name_search(
         folded_attributes,
         folded_total,
         not_held_total,
+        not_held_listed,
         closure,
         artifacts,
     } = NameSearchAccount::read(&machine, &verdict, &rows, details, plain_not_held_row);
@@ -4553,10 +4560,10 @@ fn plain_name_search(
                 "Answer: no entity Kin holds is named {query}, but {} named like it {} where Kin keeps no entity; not_held lists {}. Kin cannot read {} on its own; locate with mode literal finds recorded code that mentions it.",
                 counted(not_held_total, "declaration", "declarations"),
                 plural(not_held_total, "sits", "sit"),
-                listed_of(not_held.len() as u64, not_held_total),
+                listed_of(not_held_listed, not_held_total),
                 plural(not_held_total, "it", "one"),
             );
-            if let Some(all) = closure.stated(&query, 0, not_held.len() as u64, folded_total) {
+            if let Some(all) = closure.stated(&query, 0, not_held_listed, folded_total) {
                 text.push(' ');
                 text.push_str(&all);
             }
@@ -4575,7 +4582,7 @@ fn plain_name_search(
             let stated = closure.stated(
                 &query,
                 rows.len() as u64,
-                not_held.len() as u64,
+                not_held_listed,
                 folded_total,
             );
             // A reply of nothing but declarations named exactly so leads with
@@ -4596,7 +4603,7 @@ fn plain_name_search(
                     " {} more named like it {} where Kin keeps no entity; not_held lists {}.",
                     counted(not_held_total, "declaration", "declarations"),
                     plural(not_held_total, "sits", "sit"),
-                    listed_of(not_held.len() as u64, not_held_total),
+                    listed_of(not_held_listed, not_held_total),
                 ));
             }
             if let (Some(all), false) = (&stated, leads) {

@@ -1,6 +1,18 @@
 {
   "allowlist": [
     {
+      "file": "crates/kin-core/src/git_update.rs",
+      "reason": "The typed repository_metadata accessor returns the persisted Git aliases, refs and workspace state held by RepositoryAuthorityState. Its sole authority.metadata() call reads graph-owned repository metadata, never host filesystem metadata. Only that exact expression is pinned; the Git ingestion preparation and every other call remain scanned.",
+      "owner": "kin-core",
+      "expiration": "2027-10-13",
+      "allow_match": [
+        {
+          "expr": "authority.metadata()",
+          "count": 1
+        }
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/recovery_carrier.rs",
       "reason": "Explicit recovery input/output boundary. These helpers copy and verify a caller-selected frozen repository state into an outside carrier or an absent restore destination. Filesystem hashes establish artifact completeness, never semantic query answers; native authority, roots and referenced content are validated through KinDB before publication. Only the recovery boundary functions are exempt. The same checked copy also moves a prepared store into an absent `.kin` beside another checkout of the same Git state (`reuse_copy`), with its durability batched; the copied authority is validated through KinDB against the roots the donor was checked at before it is published.",
       "owner": "kin-cli",
@@ -442,10 +454,11 @@
     },
     {
       "file": "crates/kin-daemon-spawn/src/runtime_authority.rs",
-      "reason": "Shared per-repository runtime capability boundary. try_acquire_repository_runtime_authority canonicalizes the exact .kin root before it opens the never-unlinked daemon.lock and daemon.lifecycle inodes, so authority for one repository cannot open another. It writes only the caller-owned process stamp after exclusive acquisition and answers no repository query. Two exact Drop expressions check the acquiring PID and unlock that owned descriptor after clearing its stamp; a forked child must not release its parent's lock. Owner-stamp validation, retry policy, public wrappers, the rest of Drop, and all new filesystem access remain scanned. No whole-file or whole-Drop exemption.",
+      "reason": "Shared per-repository runtime capability boundary. try_acquire_repository_runtime_authority canonicalizes the exact .kin root before it opens the never-unlinked daemon.lock and daemon.lifecycle inodes, so authority for one repository cannot open another. It writes only the caller-owned process stamp after exclusive acquisition and answers no repository query. repository_runtime_authority_is_held opens the same daemon.lock inode, never creating it, and only asks whether another process holds it: it takes the lock when it is free and releases it at once, writes nothing and answers no repository query. Two exact Drop expressions check the acquiring PID and unlock that owned descriptor after clearing its stamp; a forked child must not release its parent's lock. Owner-stamp validation, retry policy, public wrappers, the rest of Drop, and all new filesystem access remain scanned. No whole-file or whole-Drop exemption.",
       "owner": "kin-daemon-spawn",
       "expiration": "2026-12-31",
       "allow_fn": [
+        "repository_runtime_authority_is_held",
         "try_acquire_repository_runtime_authority"
       ],
       "allow_match": [
@@ -761,7 +774,7 @@
     },
     {
       "file": "crates/kin-daemon/src/bin/kin-daemon.rs",
-      "reason": "Daemon process entry point. The pins cover process exits, the directory probe recognizing a named Kin store, and canonical path equality enforcing that an explicitly named external store serves the requested checkout. These binding checks precede any graph consult and do not read repository content or answer a semantic query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify. The eleventh failure exit refuses invalid repository model configuration before startup; it cannot launch a subprocess or supply a semantic answer.",
+      "reason": "Daemon process entry point. The pins cover process exits, the directory probe recognizing a named Kin store, and canonical path equality enforcing that an explicitly named external store serves the requested checkout. These binding checks precede any graph consult and do not read repository content or answer a semantic query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify. The eleventh failure exit refuses invalid repository model configuration before startup; it cannot launch a subprocess or supply a semantic answer. The three exact exit-2 sites refuse invalid local runtime selection, installed-pair authority, or home-namespace capture before profiles, models or graph stores load. The added filesystem expressions inspect only the selected installed daemon executable: its regular non-symlink type and canonical equality with the running executable. They neither read repository source nor execute a subprocess. The process id pin asks only whether this daemon is its container's init, which decides whether it may hand its store to a successor; it reads nothing and starts nothing.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -775,7 +788,16 @@
         },
         "process::exit(exit_code);",
         "if names_store && path.is_dir() {",
-        "let same_tree = match (layout.working_dir().canonicalize(), path.canonicalize()) {"
+        "let same_tree = match (layout.working_dir().canonicalize(), path.canonicalize()) {",
+        {
+          "expr": "process::exit(2);",
+          "count": 3
+        },
+        "std::fs::symlink_metadata(&expected)",
+        "if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {",
+        "std::fs::canonicalize(&expected)",
+        ".and_then(std::fs::canonicalize)",
+        "process::id() != 1"
       ]
     },
     {
@@ -787,6 +809,18 @@
         {
           "expr": ".metadata()",
           "count": 13
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/entity_keep.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Both `.metadata()` expressions are called on a read lease of repository-v6 authority and return graph-owned authority metadata: `workspace_in` reads this working copy's workspace state, and `receipt_in` reads the receipt an operation left, which is how a commit of chosen entities and an entity restore answer a request that already landed. The name is shared with the filesystem metadata probe in the deny set, which is the only reason they appear here. The module carries no raw filesystem primitive: every body it reads comes from repository CAS or ingestion staging through `source_cas`, and the working copy is written only by the kin-core workspace transition a restore publishes through. Pinned by exact occurrence count so every planning path stays scanned and any further `.metadata()` call, filesystem or not, fails the guard until it is justified.",
+      "owner": "kin-daemon",
+      "expiration": "2027-04-09",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
         }
       ]
     },
@@ -1332,6 +1366,12 @@
       "expiration": "2027-04-23"
     },
     {
+      "file": "crates/kin-cli/src/commands/kin_copies.rs",
+      "reason": "Install-inventory boundary for one Kin per machine. It finds every executable named kin, kin-daemon or kin-mcp on PATH, in the Cargo home, npm global prefixes, Homebrew and /usr/local/bin, and classifies each from install metadata: directory entries and links, an npm package.json, the Cargo install record, Cargo's target-directory markers, and the static build identity an executable carries in its own bytes. It reads the process table for running kin-daemon executables, and removes a copy only through that copy's own uninstall (npm, cargo, brew) or by deleting a standalone release file, when a person or an explicit doctor flag asks. Its subject is the installation, the same boundary as setup.rs and update.rs; it reads no repository content and answers no locate, search, context, trace, review or xref query.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30"
+    },
+    {
       "file": "crates/kin-cli/src/commands/update.rs",
       "reason": "The updater: downloads, verifies and swaps the installed binaries, holding file locks over the install root. 359 sites, all install-time IO, and it resolves no semantic query. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
       "owner": "kin-cli",
@@ -1444,6 +1484,18 @@
       "reason": "The commit surface. Two of its three sites are the authority-lease `.metadata()` accessor rather than a filesystem probe, the collision FIR-3162 tracks; the third is subprocess. Brought under the guard by FIR-2282 on 2026-09-04, when the command surface stopped being opt-in. This module was never scanned before, by nobody's decision: it simply was not named in QUERY_COMMANDS. The entry preserves that effective scope while making it accountable, and the expiry is when it has to be narrowed to pins or defended again.",
       "owner": "kin-cli",
       "expiration": "2027-05-21"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/entity_work.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. The one `.metadata()` expression is in `restored_by_operation`, called on a read lease of repository-v6 authority to learn whether an operation left a receipt, which is how an entity restore whose answer was lost is settled without sending it again. The name is shared with the filesystem metadata probe in the deny set. The module is otherwise request and response types and the daemon transport for entity work, and reads no repository content. Pinned by exact occurrence count so the rest of the module stays scanned.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-09",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 1
+        }
+      ]
     },
     {
       "file": "crates/kin-cli/src/commands/commit_progress.rs",
@@ -2515,7 +2567,7 @@
     },
     {
       "file": "crates/kin-db/src/storage/repository.rs",
-      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe. Review 2026-09-27: carrying_workspace_base reads the exact admitted predecessor through `let metadata = current.metadata();`; this typed authority accessor supplies the held change and tree-hash binding and performs no filesystem query.",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe. Review 2026-09-27: carrying_workspace_base reads the exact admitted predecessor through `let metadata = current.metadata();`; this typed authority accessor supplies the held change and tree-hash binding and performs no filesystem query. Review 2026-10-13: frozen-frame and graph-cache integration adds typed authority reads in inherit_workspace_graph, inherited_workspace_graph, operation_identities, lineage_identities and qualify_binding_history_decision_with. The latter now passes next.metadata() to validate_metadata_with together with cached operation identities, so remove the obsolete validate_metadata expression. The seven remaining multiline or next metadata sites belong to workspace_graph_snapshot, inherit_workspace_graph, candidate_frame, workspace_native_admission_snapshot, commit_rederived_repository_transaction and qualify_binding_history_decision_with. The five self.metadata() sites bind or materialize workspace graphs and hash or inspect their operation lineage. All receivers are RepositoryAuthorityState values; none reads filesystem metadata. Counts were verified over the checker's exact scannable lines after function masks and longest pin matches.",
       "owner": "kin-db",
       "expiration": "2027-03-22",
       "allow_fn": [
@@ -2538,19 +2590,18 @@
         "let metadata = current.metadata();",
         {
           "expr": ".metadata()",
-          "count": 5
+          "count": 7
         },
         {
           "expr": "current.metadata().schema_version",
           "count": 2
         },
-        "super::binding_history::validate_metadata(next.metadata())?",
         "target_change_id(lease.metadata(), target)",
         "lease.metadata(),",
         "local_overlay_for_workspace(lease.metadata(), workspace)?",
         {
           "expr": "self.metadata()",
-          "count": 2
+          "count": 5
         },
         "self.metadata().roots.generation"
       ]
@@ -3069,7 +3120,7 @@
     },
     {
       "file": "crates/kin-core/src/history_attach.rs",
-      "reason": "History admission and atomic store replacement boundary. Exact pins create and reap repository-identified derivation stages, read the versioned attach journal, refuse replacement during merge/stash state, move store entries and persist/fsync the journal. Directory walks are confined to stage and Kin store entries, never semantic source search. The metadata() pin is AuthorityReadLease graph ref state, not filesystem metadata. Every unpinned expression remains scanned.",
+      "reason": "History admission and atomic store replacement boundary. Exact pins create and reap repository-identified derivation stages, read the versioned attach journal, wait while the store holds open work (a stash or an entity draft, found by listing the store's own directory for them), move store entries and persist/fsync the journal. Directory walks are confined to stage and Kin store entries, never semantic source search. The metadata() pin is AuthorityReadLease graph ref state, not filesystem metadata. Every unpinned expression remains scanned.",
       "owner": "kin-core",
       "expiration": "2027-04-09",
       "allow_match": [
@@ -3089,13 +3140,14 @@
         },
         "std::fs::remove_file(&journal_path)",
         "std::fs::remove_dir_all(&journal.stage_parent)",
-        "std::fs::symlink_metadata(layout.merge_state_path())",
-        "std::fs::read_dir(layout.stashes_dir())",
         {
           "expr": ".metadata()",
           "count": 1
         },
-        "std::fs::read_dir(dir)",
+        {
+          "expr": "std::fs::read_dir(dir)",
+          "count": 2
+        },
         "std::fs::symlink_metadata(path)",
         "metadata.is_dir()",
         "std::fs::remove_dir_all(path)",
@@ -3200,25 +3252,34 @@
     },
     {
       "file": "crates/kin-daemon/src/history_schedule.rs",
-      "reason": "History worker deployment boundary. The exact probe checks the Kin executable beside the current daemon executable before starting history derivation. This is process setup, not a repository content probe or semantic fallback.",
+      "reason": "History worker deployment and daemon handover boundary. The exact probe checks the Kin executable beside the current daemon executable before starting history derivation. The process pins start this daemon's own successor, the same program with the same arguments, environment and output and no input, as a daemon that stopped serving to hand its store over ends. This is process setup, not a repository content probe or semantic fallback.",
       "owner": "kin-daemon",
       "expiration": "2027-08-06",
       "allow_match": [
-        "candidate.is_file()"
+        "candidate.is_file()",
+        "std::process::Command::new(program)",
+        "std::process::Stdio::null()"
       ]
     },
     {
       "file": "crates/kin-io/src/confined.rs",
-      "reason": "The capability crate's own directory handle, the boundary every kin-io capability is built on. Each body resolves its path beneath a cap-std directory opened from a Grant, so none can reach outside the directory it was handed: replace and replace_unflushed take the process id for a temporary name beside the record they replace, kind reads one entry's type without following a link, names lists one directory, and read_bounded asks an entry it already opened for its length before reading it. The is_symlink, is_dir and is_file calls in kind read a FileType already returned, not the filesystem. Function-scoped so any other primitive added to this module is reported.",
+      "reason": "The capability crate's own directory handle, the boundary every kin-io capability is built on. Each body resolves its path beneath a cap-std directory opened from a Grant, so none can reach outside the directory it was handed: replace and replace_unflushed take the process id for a temporary name beside the record they replace, kind reads one entry's type without following a link, names lists one directory, and read_bounded asks an entry it already opened for its length before reading it. The is_symlink, is_dir and is_file calls in kind read a FileType already returned, not the filesystem. Function-scoped so any other primitive added to this module is reported. The new expression pins cover only regular-entry type checks and no-follow metadata beneath the retained cap-std directory, including their method declaration; no new function body is exempted. Each body resolves its path beneath a cap-std directory opened from a Grant, so none can reach outside the directory it was handed: replace and replace_unflushed take the process id for a temporary name beside the record they replace, kind reads one entry's type without following a link, modified reads when one entry or the directory itself last changed without following a link and without opening it, names lists one directory, and read_bounded asks an entry it already opened for its length before reading it.",
       "owner": "kin-io",
       "expiration": "2027-04-16",
       "allow_fn": [
         "replace",
         "kind",
+        "modified",
         "names",
         "read_bounded",
         "create_file",
         "replace_unflushed"
+      ],
+      "allow_match": [
+        "self.dir.symlink_metadata(relative)?.is_file()",
+        "file.metadata()?.is_file()",
+        "pub(crate) fn symlink_metadata(&self, relative: &Path) -> io::Result<cap_std::fs::Metadata>",
+        "self.dir.symlink_metadata(relative)"
       ]
     },
     {
@@ -3236,11 +3297,15 @@
     },
     {
       "file": "crates/kin-io/src/store.rs",
-      "reason": "The capability crate's store and host directory types. HostDir::create_file hands back an opened std::fs::File for a writer that streams into it, such as a transcript; the entry is created beneath the directory the HostDir was opened on, so it cannot land outside it. Function-scoped so any other primitive added to this module is reported.",
+      "reason": "The capability crate's store and host directory types. HostDir::create_file hands back an opened std::fs::File for a writer that streams into it, such as a transcript; the entry is created beneath the directory the HostDir was opened on, so it cannot land outside it. Function-scoped so any other primitive added to this module is reported. The new expression pins cover only the HostDir no-follow metadata declaration and delegation to its confined directory; no new function body is exempted.",
       "owner": "kin-io",
       "expiration": "2027-04-16",
       "allow_fn": [
         "create_file"
+      ],
+      "allow_match": [
+        "pub fn symlink_metadata(&self, name: impl AsRef<Path>) -> io::Result<cap_std::fs::Metadata>",
+        "self.inner.symlink_metadata(name.as_ref())"
       ]
     },
     {
@@ -3256,12 +3321,13 @@
     },
     {
       "file": "crates/kin-cli/src/commands/workspace_home.rs",
-      "reason": "Local human workspace add-repository boundary. resolve_location canonicalizes only a directory the reader named on the page that lists repositories, so that page shows one location and runs one operation per location. run_child starts the two processes that page may start, each through a kin-io Spawner: this same Kin binary with a fixed init or clone argument vector and the reader's location, so adding a repository is Kin's own conversion, and Git, to count a project's commits before it is added. Neither function reads source bytes, searches a directory or supplies a semantic entity, source, relationship, review or merge answer; all such reads are forwarded to an identity-verified daemon. No whole-module exemption.",
+      "reason": "Local human workspace add-repository boundary. resolve_location canonicalizes only a directory the reader named on the page that lists repositories, or one look_around found for that page to offer, so the page shows one location and runs one operation per location. run_child starts the two processes that page may start, each through a kin-io Spawner: this same Kin binary with a fixed init or clone argument vector and the reader's location, so adding a repository is Kin's own conversion, and Git, to count a project's commits before it is added. look_around finds the projects that page offers to add, so a reader picks one instead of typing where it is: through one kin-io WorktreeSource opened on the reader's home directory it reads directory names and change times in that directory and, one and two levels deep, in the directories there that are named like a code root. It knows a project by the .git or .kin directory at its top or by the name of a build manifest there and opens nothing inside one, follows no link, skips hidden directories, dependency and build trees and the folders an operating system keeps documents and media in, and is bounded in the directories it lists and in time. What it finds is a list of locations a reader may add and nothing else. None of these functions reads source bytes, ranks or searches content, or supplies a semantic entity, source, relationship, review or merge answer; all such reads are forwarded to an identity-verified daemon. No whole-module exemption.",
       "owner": "kin-cli",
       "expiration": "2027-04-13",
       "allow_fn": [
         "resolve_location",
-        "run_child"
+        "run_child",
+        "look_around"
       ]
     },
     {
@@ -3271,6 +3337,57 @@
       "expiration": "2027-04-09",
       "allow_fn": [
         "make_editor_uri"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/runtime.rs",
+      "reason": "Managed-install admission and runtime-diagnostics boundary. The exact pins resolve selected executable paths, inspect only selected install entries and native update policy/restart metadata, inspect already-opened executable handles for bounded hashing, and declare the owned metadata-probe process handles/imports. The probes use fixed bench-meta --runtime-identity-only, daemon --compat-json or legacy --version arguments; managed-entry delegation forwards unchanged arguments only to the admitted canonical executable. None reads repository source, supplies graph-query results or provides a raw-filesystem fallback. Exact expression/count pins keep neighboring reads, additional subprocess sites and every other line scanned.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30",
+      "allow_match": [
+        "use std::process::Stdio;",
+        "absolute.canonicalize()",
+        "metadata.symlink_metadata(\"update.toml\")",
+        "!entry.is_file()",
+        "metadata.symlink_metadata(\"update-restart-ack-required.json\")",
+        "directory.symlink_metadata(name)",
+        "!metadata.file_type().is_symlink()",
+        "metadata.is_dir()",
+        "metadata.is_file()",
+        {
+          "expr": "use std::os::unix::process::CommandExt;",
+          "count": 2
+        },
+        "file.metadata()?.is_file()",
+        "file.metadata()?.len()",
+        "fn stop_probe(child: &mut std::process::Child)"
+      ]
+    },
+    {
+      "file": "crates/kin-core/src/runtime_identity.rs",
+      "reason": "Local runtime identity metadata binds the selected Kin home directory to its canonical path and retained native object identity. The two exact canonicalization expressions capture and recheck only that administrative root; the exact process-id expression reports the current service incarnation. These metadata checks precede graph access and do not read repository contents or supply semantic answers. Every other expression remains scanned.",
+      "owner": "kin-core",
+      "expiration": "2027-02-26",
+      "allow_match": [
+        "let canonical = home.canonicalize().map_err(refusal)?;",
+        "if home.canonicalize().map_err(refusal)? != canonical",
+        "pid: std::process::id(),"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client/succession.rs",
+      "reason": "Daemon process lifecycle and managed-generation succession boundary. runs_from_managed_generation canonicalizes only the peer daemon's executable path (or its parent directory when an update has already unlinked the replaced binary) and the configured managed Kin home directory so a client can tell whether a running daemon comes from an older generation of that managed install. These path comparisons precede graph access, never read repository content, and cannot produce, rank, fill or repair an answer to locate, search, context, trace, review, xref, or rename. Pinned by exact expression with counts so any additional filesystem primitive in this module fails the guard.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-30",
+      "allow_match": [
+        {
+          "expr": "path.canonicalize()",
+          "count": 1
+        },
+        {
+          "expr": "parent.canonicalize().map(|parent| parent.join(name))",
+          "count": 1
+        }
       ]
     }
   ]

@@ -937,6 +937,7 @@ pub struct IsolatedDaemonRuntime {
     repository: PathBuf,
     registry_path: PathBuf,
     home_path: PathBuf,
+    kin_home_path: PathBuf,
     owner_token: String,
     owned_children: Mutex<Vec<Arc<Mutex<RuntimeOwnedChildState>>>>,
     containment: RuntimeContainment,
@@ -952,6 +953,9 @@ impl IsolatedDaemonRuntime {
             .tempdir()
             .unwrap_or_else(|error| panic!("create isolated runtime root: {error}"));
         let home_path = runtime_root.path().join("home");
+        let kin_home_path = runtime_root.path().join("kin-home");
+        std::fs::create_dir_all(&kin_home_path)
+            .unwrap_or_else(|error| panic!("create isolated Kin home: {error}"));
         let owner_token = uuid::Uuid::new_v4().to_string();
         let containment = RuntimeContainment::new(runtime_root.path(), &owner_token)
             .unwrap_or_else(|error| panic!("create isolated runtime containment: {error}"));
@@ -959,6 +963,7 @@ impl IsolatedDaemonRuntime {
             repository: repository.to_path_buf(),
             registry_path: runtime_root.path().join("registry.toml"),
             home_path,
+            kin_home_path,
             owner_token,
             owned_children: Mutex::new(Vec::new()),
             containment,
@@ -986,6 +991,7 @@ impl IsolatedDaemonRuntime {
     }
 
     pub fn kin_command(&self) -> Command<'_> {
+        let _ = self.daemon_bin();
         self.command(env!("CARGO_BIN_EXE_kin"))
     }
 
@@ -1055,11 +1061,10 @@ impl IsolatedDaemonRuntime {
         scrub_inherited_kin_authority(command);
         command
             .env("KIN_REGISTRY_PATH", &self.registry_path)
-            // Bind the managed install and store root explicitly. HOME and
-            // USERPROFILE remain a fail-closed fallback for any child boundary
-            // that intentionally rebuilds its environment instead of
-            // inheriting the override.
-            .env("KIN_HOME", self.home_path.join(".kin"))
+            // Development binaries use an explicitly isolated state root.
+            // HOME and USERPROFILE still describe the user configuration home;
+            // their ordinary `.kin` directory is not this runtime's namespace.
+            .env("KIN_HOME", &self.kin_home_path)
             .env("HOME", &self.home_path)
             .env("USERPROFILE", &self.home_path)
             .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
@@ -1227,7 +1232,7 @@ impl IsolatedDaemonRuntime {
                 .envs(cleanup.env.iter().map(|(key, value)| (key, value)));
             command
         } else {
-            let mut command = self.kin_command();
+            let mut command = self.command(env!("CARGO_BIN_EXE_kin"));
             command.args(["daemon", "stop", "--all"]);
             command
         }
@@ -1439,6 +1444,9 @@ pub struct Command<'runtime> {
 impl Command<'static> {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
         let program = program.as_ref();
+        if program == OsStr::new(env!("CARGO_BIN_EXE_kin")) {
+            let _ = ensure_sibling_daemon_built();
+        }
         let mut inner = std::process::Command::new(program);
         if is_git_program(program) {
             inner
@@ -1842,6 +1850,10 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         // per-command configuration rather than repository or session
         // authority, so carrying it costs the isolation boundary nothing.
         "KIN_DAEMON_AUTO_EMBED",
+        // Holds a development daemon to the managed admission contract, so a
+        // test can prove a command sends the runtime claims a release daemon
+        // refuses requests without. It can only make admission stricter.
+        "KIN_DAEMON_REQUIRE_RUNTIME_IDENTITY",
         // The runtime's three seconds are a default for daemons its Drop has to
         // stop. A test about what a daemon finishes inside its shutdown budget
         // needs to set that budget, and it waits for its daemon to end before
@@ -3191,11 +3203,11 @@ pub fn daemon_compat_mismatch(
 }
 
 pub fn daemon_compat(runtime: &IsolatedDaemonRuntime, path: &Path) -> Result<(), String> {
-    daemon_compat_within(runtime, path, COMMAND_TIMEOUT)
+    daemon_compat_within(Some(runtime), path, COMMAND_TIMEOUT)
 }
 
 fn daemon_compat_within(
-    runtime: &IsolatedDaemonRuntime,
+    runtime: Option<&IsolatedDaemonRuntime>,
     path: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -3217,7 +3229,10 @@ fn daemon_compat_within(
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
-    let mut command = runtime.command(path);
+    let mut command = match runtime {
+        Some(runtime) => runtime.command(path),
+        None => Command::new(path),
+    };
     let output = command
         .arg("--compat-json")
         .output_within(timeout)
@@ -3273,6 +3288,15 @@ fn daemon_rebuild_target<'a>(kin_bin: &Path, triple: &'a str) -> Option<&'a str>
     (profile_parent.file_name()?.to_str() == Some(triple)).then_some(triple)
 }
 
+fn daemon_rebuild_target_dir<'a>(kin_bin: &'a Path, triple: &str) -> Option<&'a Path> {
+    let profile_parent = kin_bin.parent()?.parent()?;
+    if daemon_rebuild_target(kin_bin, triple).is_some() {
+        profile_parent.parent()
+    } else {
+        Some(profile_parent)
+    }
+}
+
 /// The profile arguments a `kin-daemon` rebuild has to carry to land beside
 /// `kin`.
 ///
@@ -3295,12 +3319,16 @@ fn daemon_rebuild_profile(kin_bin: &Path) -> Vec<String> {
     }
 }
 
+pub fn ensure_sibling_daemon_built() -> PathBuf {
+    fresh_daemon_bin_with_deadline(None, None)
+}
+
 fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
-    fresh_daemon_bin_with_deadline(runtime, None)
+    fresh_daemon_bin_with_deadline(Some(runtime), None)
 }
 
 fn fresh_daemon_bin_before(runtime: &IsolatedDaemonRuntime, deadline: Instant) -> PathBuf {
-    fresh_daemon_bin_with_deadline(runtime, Some(deadline))
+    fresh_daemon_bin_with_deadline(Some(runtime), Some(deadline))
 }
 
 fn daemon_preparation_budget(
@@ -3319,7 +3347,7 @@ fn daemon_preparation_budget(
 }
 
 fn fresh_daemon_bin_with_deadline(
-    runtime: &IsolatedDaemonRuntime,
+    runtime: Option<&IsolatedDaemonRuntime>,
     deadline: Option<Instant>,
 ) -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
@@ -3349,8 +3377,13 @@ fn fresh_daemon_bin_with_deadline(
         // the stderr this call captures, so the wait is bounded here.
         let mut build = Command::new(env!("CARGO"));
         scrub_inherited_kin_authority(build.inner_mut());
+        build.args(&args);
+        if let Some(target_dir) =
+            daemon_rebuild_target_dir(&kin_bin, env!("KIN_CLI_TARGET_TRIPLE"))
+        {
+            build.arg("--target-dir").arg(target_dir);
+        }
         let output = build
-            .args(&args)
             .current_dir(workspace_root)
             .output_within(daemon_preparation_budget(
                 deadline,

@@ -8,9 +8,9 @@ A guard that passes before and after a fix is not evidence. Each probe below
 plants exactly one disagreement between what an install surface asks a release
 for and what that release publishes, and requires
 `scripts/verify-installer-release-assets.py` to fail and to name the asset it
-could not find. The first probe reproduces the defect that shipped through every
-release to date: the Windows leg published only a `.zip` while the POSIX
-installer asked every platform, Windows included, for a `.tar.gz`.
+could not find. Windows POSIX entry points must redirect before download or
+managed mutation, while the ZIP installer surfaces and separately declared
+compatibility TAR containers keep their publication and provenance checks.
 
 The last two probes are about the guard's own honesty rather than about a
 missing asset: a new release platform must not arrive unguarded, and a probe
@@ -135,8 +135,8 @@ def unmodified_tree_passes(tree: Path) -> None:
 
 
 def windows_tarball_unpublished(tree: Path) -> None:
-    # The exact state every release shipped in: the POSIX installer asks Windows
-    # for a tarball and the release publishes only the zip.
+    # The release's separate compatibility declaration still requires the TAR,
+    # although the current POSIX installer redirects Windows users to PowerShell.
     poison(
         tree,
         ".github/workflows/release.yml",
@@ -205,6 +205,23 @@ def windows_zip_unpublished(tree: Path) -> None:
         "",
     )
     expect_failure("the Windows zip is not published", tree, "kin-windows-x86_64.zip")
+
+
+def windows_redirect_removed(tree: Path) -> None:
+    poison(tree, "scripts/install.sh", 'if [ "$OS" = windows ]; then', 'if [ "$OS" = unsupported ]; then')
+    expect_failure("Windows POSIX entry no longer redirects", tree, "official PowerShell redirect")
+
+
+def windows_redirect_writes_managed_home(tree: Path) -> None:
+    poison(tree, "scripts/install.sh", 'if [ "$OS" = windows ]; then',
+           'if [ "$OS" = windows ]; then\n    mkdir -p "$KIN_BIN" "$KIN_LIB"')
+    expect_failure("Windows refusal mutates managed home", tree, "official PowerShell redirect")
+
+
+def compatibility_declaration_unreadable(tree: Path) -> None:
+    poison(tree, ".github/workflows/release.yml", 'additionalArchives: ["kin-windows-x86_64.tar.gz"],',
+           'additionalArchives: compatibilityArchives(),')
+    expect_failure("compatibility archives cannot be derived", tree, "compatibility archive declarations")
 
 
 def installer_extension_drift(tree: Path) -> None:
@@ -389,6 +406,9 @@ PROBES: tuple[tuple[str, Callable[[Path], None]], ...] = (
     ("windows tarball unattested", windows_tarball_unattested),
     ("windows tarball uninventoried", windows_tarball_uninventoried),
     ("windows zip unpublished", windows_zip_unpublished),
+    ("windows redirect removed", windows_redirect_removed),
+    ("windows redirect writes managed home", windows_redirect_writes_managed_home),
+    ("compatibility declaration unreadable", compatibility_declaration_unreadable),
     ("installer extension drift", installer_extension_drift),
     ("unguarded release platform", unguarded_release_platform),
     ("unreadable installer probe", unreadable_installer_probe),

@@ -98,6 +98,103 @@ async fn worker_publication_verify_cancel_keeps_gate_until_proof_publication() {
     drop(released);
 }
 
+/// A recorded run is repository authority before the live graph sees it, so
+/// the working-copy admission after it still succeeds and a daemon that
+/// reopens the store still holds the run.
+///
+/// Written to the graph alone, the run left a relation from a run authority
+/// had never seen. Admission checks every relation's ends against authority's
+/// records, so each one after the run was refused with `unadmitted source
+/// endpoint verification_run`, and the repository stopped following its own
+/// working copy. Falsify by applying the record without committing it in
+/// `verification_write::commit_verification_record`.
+#[tokio::test]
+async fn a_recorded_run_does_not_refuse_the_next_admission_and_survives_a_reopen() {
+    let (repo, state) = mcp_lifecycle_fixture();
+    std::fs::write(
+        repo.path().join("source.py"),
+        "def verified():\n    return 1\n",
+    )
+    .unwrap();
+    waiting_admit(&state, "verification baseline").await;
+    waiting_commit(&state, "verification baseline").await;
+    let entity = waiting_entity(&state, "source.py", "verified");
+
+    let response = router(Arc::clone(&state))
+        .oneshot(
+            Request::post("/verify/run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"entity":"verified","runner":"true","depth":0}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let answer: kin_cli::commands::verify::VerifyRunResponse =
+        serde_json::from_slice(&body).unwrap();
+    let run_id = answer
+        .lines
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("Run ID:"))
+        .map(|id| {
+            kin_model::VerificationRunId::from_hash(
+                kin_model::Hash256::from_hex(id.trim()).expect("the run id is a hash"),
+            )
+        })
+        .expect("the answer names the run");
+    let runs = state.graph.list_runs_proving_entity(&entity.id).unwrap();
+    assert_eq!(runs.len(), 1, "the run proves the entity it ran for");
+    assert_eq!(runs[0].run_id, run_id);
+    assert_eq!(
+        runs[0].ran_against,
+        [kin_model::RunFingerprint {
+            entity: entity.id,
+            behavior_hash: entity.fingerprint.behavior_hash,
+        }],
+        "the run is tied to the fingerprint it ran against"
+    );
+
+    // The working copy moves on, and the repository still follows it.
+    std::fs::write(
+        repo.path().join("source.py"),
+        "def verified():\n    return 2\n",
+    )
+    .unwrap();
+    waiting_admit(&state, "after the recorded run").await;
+    let edited = waiting_entity(&state, "source.py", "verified");
+    assert_ne!(
+        edited.fingerprint.behavior_hash, entity.fingerprint.behavior_hash,
+        "the admission after the run read the edit"
+    );
+
+    assert_eq!(
+        state.graph.list_runs_proving_entity(&entity.id).unwrap()[0].run_id,
+        run_id,
+        "a later admission retains the durable proof link"
+    );
+    let layout = state.layout.clone();
+    drop(state);
+    let reopened = DaemonState::open(layout).unwrap();
+    let held = reopened
+        .graph
+        .get_verification_run(&run_id)
+        .unwrap()
+        .expect("a reopened daemon serves the run it answered with");
+    assert_eq!(held.status, kin_model::VerificationStatus::Passing);
+    assert_eq!(held.ran_against.len(), 1);
+    assert_eq!(
+        reopened.graph.list_runs_proving_entity(&entity.id).unwrap(),
+        [held],
+        "a reopened daemon restores the proof link, not just the run record"
+    );
+}
+
 #[tokio::test]
 async fn worker_publication_pull_cancel_keeps_gate_until_workspace_publication() {
     let baseline = b"services:\n  api: { image: baseline }\n";
@@ -143,7 +240,10 @@ async fn worker_publication_pull_cancel_keeps_gate_until_workspace_publication()
         workspace.base_target,
         Some(kin_model::RefTarget::change(fixture.peer_head))
     );
-    assert!(gate_was_retained, "cancelling the request released coordination before the blocking workspace writer finished");
+    assert!(
+        gate_was_retained,
+        "cancelling the request released coordination before the blocking workspace writer finished"
+    );
     let released = tokio::time::timeout(
         Duration::from_secs(20),
         fixture.state.coordination_gate.lock(),

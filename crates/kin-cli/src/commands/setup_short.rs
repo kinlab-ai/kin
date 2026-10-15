@@ -49,6 +49,8 @@ enum Asked {
     Path,
     Servers,
     Model,
+    /// Whether to remove the other copy of Kin at this offer's position.
+    RemoveCopy(usize),
 }
 
 /// One question and, when a flag already answered it, that answer.
@@ -71,8 +73,20 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
     let in_repo = current_initialized_setup_repo("setup").is_ok();
     let model = crate::embed_model::EmbedModelFetch::probe(false);
     let machine = screen::this_machine();
+    // Every other copy of Kin, each asked about with the default to keep it.
+    let copies = crate::commands::kin_copies::ScanRoots::from_environment()
+        .ok()
+        .map(|roots| {
+            let scan = crate::commands::kin_copies::scan(&roots);
+            (roots, scan)
+        });
+    let copy_offers = copies
+        .as_ref()
+        .map(|(_, scan)| scan.removal_offers())
+        .unwrap_or_default();
 
-    let steps = steps(&opts, &assistants, shell_name, &model, kin_home.as_deref());
+    let mut steps = steps(&opts, &assistants, shell_name, &model, kin_home.as_deref());
+    steps.extend(copy_removal_steps(&copy_offers));
     let to_ask: Vec<&Step> = steps.iter().filter(|step| step.preset.is_none()).collect();
     // The logo, the welcome and the first question have to fit on screen
     // together, so a short terminal gets the compact logo.
@@ -260,6 +274,17 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         }
     }
     record_language_tool_dirs_in_wizard();
+    let copy_removals = copies.as_ref().map(|(roots, scan)| {
+        super::offer_other_copy_removals(
+            scan,
+            interactive,
+            |index, _| answer(Asked::RemoveCopy(index)) == Some(true),
+            |offer| {
+                note("removing another copy of Kin");
+                crate::commands::kin_copies::remove(offer, roots)
+            },
+        )
+    });
     // macOS's request waits for an answer, so the live line says what setup
     // is waiting on for as long as it waits.
     let notifications = report_notification_identity(interactive, || match &live {
@@ -294,6 +319,7 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         report: &report,
         in_repo,
         defaults_taken: if interactive { 0 } else { skipped.len() },
+        copy_removals: copy_removals.as_ref(),
     });
     println!();
     for line in completion_lines(style, &summary, screen::terminal_width()) {
@@ -309,6 +335,42 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// One question per other copy of Kin that its own channel can remove.
+///
+/// Never answered by a flag and always defaulting to keep, so a run with no
+/// one at the terminal names the copies and removes none of them.
+fn copy_removal_steps(offers: &[crate::commands::kin_copies::RemovalOffer]) -> Vec<Step> {
+    offers
+        .iter()
+        .enumerate()
+        .map(|(index, offer)| {
+            let paths: Vec<String> = offer
+                .paths
+                .iter()
+                .map(|path| screen::home_relative(path))
+                .collect();
+            Step {
+                asked: Asked::RemoveCopy(index),
+                question: Question::yes_no(
+                    "Other Kin",
+                    format!("Remove the {}?", offer.what),
+                    ("Yes, remove it", &format!("remove {}", offer.what)),
+                    ("No, keep it", &format!("keep {}", offer.what)),
+                    false,
+                )
+                .consent(format!(
+                    "Runs `{}`. The managed Kin in ~/.kin/bin stays as it is.",
+                    offer.removal.command_line()
+                ))
+                .note(join_names(
+                    &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                preset: None,
+            }
+        })
+        .collect()
 }
 
 /// The questions this machine needs asked, each answered already when a flag
@@ -851,6 +913,8 @@ struct Observed<'a> {
     /// Decisions a run without a terminal took without asking, which the
     /// completion counts and `--verbose` lists.
     defaults_taken: usize,
+    /// What became of the other copies of Kin this run asked about.
+    copy_removals: Option<&'a super::CopyRemovals>,
 }
 
 /// Something that needs the person, and what fixes it.
@@ -975,6 +1039,15 @@ fn summarize(observed: Observed<'_>) -> Summary {
     if let Some(item) = observed.notifications.and_then(notification_attention) {
         attention.push(item);
     }
+    if let Some(removals) = observed.copy_removals {
+        for (offer, reason) in &removals.failed {
+            attention.push(Attention {
+                status: Status::Fail,
+                what: format!("The {} was not removed: {reason}", offer.what),
+                fix: Some(offer.removal.command_line()),
+            });
+        }
+    }
     let needs: Vec<&crate::commands::health::HealthCheck> = observed
         .report
         .checks
@@ -1036,6 +1109,17 @@ fn summarize(observed: Observed<'_>) -> Summary {
     }
     if !observed.installed_servers.is_empty() {
         facts.push(("Installed", observed.installed_servers.join(", ")));
+    }
+    if let Some(removals) = observed
+        .copy_removals
+        .filter(|removals| !removals.removed.is_empty())
+    {
+        let removed: Vec<&str> = removals
+            .removed
+            .iter()
+            .map(|offer| offer.what.as_str())
+            .collect();
+        facts.push(("Removed", join_names(&removed)));
     }
     if observed.defaults_taken > 0 {
         facts.push((
@@ -1438,6 +1522,7 @@ mod tests {
                 report: &report,
                 in_repo: false,
                 defaults_taken: 0,
+                copy_removals: None,
             });
             assert_eq!(summary.attention.len(), usize::from(missing));
             let lines = completion_lines(Style::plain(), &summary, 60);
@@ -1661,6 +1746,7 @@ mod tests {
                 report: &report,
                 in_repo: false,
                 defaults_taken: 0,
+                copy_removals: None,
             });
             let text = completion_lines(Style::plain(), &summary, 80).join("\n");
             assert_eq!(
@@ -1707,6 +1793,7 @@ mod tests {
             report: &report,
             in_repo: false,
             defaults_taken: 0,
+            copy_removals: None,
         });
         let text = completion_lines(Style::plain(), &summary, 80).join("\n");
         assert!(
@@ -1750,6 +1837,7 @@ mod tests {
                 report: &report,
                 in_repo: false,
                 defaults_taken: 0,
+                copy_removals: None,
             });
             completion_lines(Style::plain(), &summary, 80).join("\n")
         };
@@ -1878,5 +1966,114 @@ mod tests {
         for line in &lines {
             assert!(console::measure_text_width(line) < 60, "{line:?}");
         }
+    }
+
+    fn other_copies() -> crate::commands::kin_copies::CopyScan {
+        use crate::commands::kin_copies::{CopyKind, CopyScan, KinCopy, Removal};
+
+        let copy = |path: &str, kind: CopyKind, version: &str, removal: Removal| KinCopy {
+            path: PathBuf::from(path),
+            program: "kin",
+            target: None,
+            kind,
+            version: Some(version.to_string()),
+            channel: None,
+            removal: Some(removal),
+            first_on_path: false,
+            in_kin_home: false,
+        };
+        CopyScan {
+            kin_home: PathBuf::from("/fixture/.kin"),
+            managed_version: Some("0.8.7".to_string()),
+            copies: vec![
+                copy(
+                    "/node/bin/kin",
+                    CopyKind::NpmLauncher {
+                        package: "@kinlab/kin".to_string(),
+                    },
+                    "0.6.6",
+                    Removal::Npm {
+                        prefix: PathBuf::from("/node"),
+                        package: "@kinlab/kin".to_string(),
+                    },
+                ),
+                copy(
+                    "/cargo/bin/kin",
+                    CopyKind::IndependentRelease,
+                    "0.7.18",
+                    Removal::Cargo {
+                        root: PathBuf::from("/cargo"),
+                        package: "kin-cli".to_string(),
+                    },
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_one_at_the_terminal_names_other_copies_and_removes_none() {
+        let scan = other_copies();
+        let outcome = super::super::offer_other_copy_removals(
+            &scan,
+            false,
+            |_, _| panic!("a run with no terminal asked about a copy"),
+            |_| panic!("a run with no terminal removed a copy"),
+        );
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.failed.is_empty());
+        assert_eq!(
+            outcome
+                .kept
+                .iter()
+                .map(|offer| offer.what.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "npm launcher @kinlab/kin 0.6.6",
+                "cargo package kin-cli 0.7.18"
+            ]
+        );
+
+        // The short form asks one question per copy. No flag answers them and
+        // each defaults to keeping the copy, which is what a run with no
+        // terminal takes.
+        let steps = copy_removal_steps(&scan.removal_offers());
+        assert_eq!(steps.len(), 2);
+        for step in &steps {
+            assert!(step.preset.is_none());
+            assert!(!step.question.choices[step.question.default].value);
+        }
+        assert_eq!(steps[0].asked, Asked::RemoveCopy(0));
+        assert_eq!(
+            steps[1].question.title,
+            "Remove the cargo package kin-cli 0.7.18?"
+        );
+        assert!(steps[1].question.consent[0].contains("cargo uninstall --root /cargo kin-cli"));
+    }
+
+    #[test]
+    fn a_person_removes_only_the_copies_they_say_yes_to() {
+        let scan = other_copies();
+        let mut ran = Vec::new();
+        let outcome = super::super::offer_other_copy_removals(
+            &scan,
+            true,
+            |index, _| index == 1,
+            |offer| {
+                ran.push(offer.removal.command_line());
+                Ok(())
+            },
+        );
+        assert_eq!(ran, ["cargo uninstall --root /cargo kin-cli"]);
+        assert_eq!(outcome.removed.len(), 1);
+        assert_eq!(outcome.kept.len(), 1);
+
+        let outcome = super::super::offer_other_copy_removals(
+            &scan,
+            true,
+            |_, _| true,
+            |_| anyhow::bail!("npm is not installed on this machine"),
+        );
+        assert_eq!(outcome.failed.len(), 2);
+        assert!(outcome.failed[0].1.contains("npm is not installed"));
     }
 }

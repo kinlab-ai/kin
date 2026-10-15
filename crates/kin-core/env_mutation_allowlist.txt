@@ -29,6 +29,15 @@ crates/kin-cli/src/commands/mcp.rs
 # write is the feature.
 crates/kin-cli/src/commands/routed_words.rs
 
+# Runtime admission publishes KIN_RUNTIME_MODE and the selected KIN_HOME in
+# the single-threaded CLI/daemon entry prologue, before profiles or workers can
+# observe them. Both writes are idempotent. Managed-entry routing then pins
+# KIN_DAEMON_BIN only after the selected pair is admitted, before any child or
+# worker starts. These three values are the process-lifetime interface spawned
+# clients and daemons inherit, so the writes are product behavior rather than
+# a test fixture. Tests continue to use EnvVarGuard for scoped overrides.
+crates/kin-cli/src/commands/runtime.rs
+
 # `kin` and `kin-daemon` select their resource profile at startup when the
 # operator set none, and `kin-daemon` additionally adopts the profile this
 # repository recorded in its `[resources]` config so a knob set to survive an OOM

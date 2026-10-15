@@ -68,6 +68,7 @@ import urllib.request
 os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 from trace_pages import mcp_references
+from runtime_fixture import native_request_headers, prepare_runtime_fixture
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -201,6 +202,8 @@ class Suite(object):
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, os.path.join(workdir, "kin-home"))
 
     # ---------------------------------------------------------------- plumbing
 
@@ -652,6 +655,7 @@ class Suite(object):
         with open(os.path.join(repo, ".kin", "daemon.token")) as handle:
             token = handle.read().strip()
         endpoint = "http://127.0.0.1:%d/lsp/sweep/status" % port
+        headers = native_request_headers(self.kin, self.env, endpoint, token, cwd=repo)
         started = time.monotonic()
         deadline = started + timeout
         samples = 0
@@ -671,8 +675,7 @@ class Suite(object):
                 raise RuntimeError("isolated graph status failed: %s"
                                    % failure_excerpt(err or out))
             graph = json.loads(out)
-            request = urllib.request.Request(endpoint, headers={
-                "Authorization": "Bearer " + token})
+            request = urllib.request.Request(endpoint, headers=headers)
             with urllib.request.urlopen(request, timeout=remaining()) as response:
                 work = json.load(response)
             samples += 1
@@ -694,12 +697,12 @@ class Suite(object):
         with open(os.path.join(repo, ".kin", "daemon.token")) as handle:
             token = handle.read().strip()
         endpoint = "http://127.0.0.1:%d/lsp/sweep/status" % port
+        headers = native_request_headers(self.kin, self.env, endpoint, token, cwd=repo)
         started = time.monotonic()
         deadline = started + timeout
         samples = 0
         while True:
-            request = urllib.request.Request(endpoint, headers={
-                "Authorization": "Bearer " + token})
+            request = urllib.request.Request(endpoint, headers=headers)
             with urllib.request.urlopen(request, timeout=5) as response:
                 state = json.load(response)
             samples += 1

@@ -168,6 +168,11 @@ pub struct GuideRange {
     pub changes_total: usize,
     /// The newest of them, newest first.
     pub changes: Vec<GuideRangeChange>,
+    /// How many changes the base holds that the head does not, so a reader
+    /// can tell a branch that is behind its base from one that is even with
+    /// it. A branch is even only when this and `changes_total` are both zero.
+    #[serde(default)]
+    pub base_changes_total: usize,
     /// Every change the range holds, by id, so a reader can tell whether a
     /// change it sees elsewhere belongs to the range. Up to
     /// `RANGE_MEMBERS_MAX`; `members_complete` says whether that was all.
@@ -205,6 +210,12 @@ pub struct GuideHistory {
     /// range, by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_range: Vec<String>,
+    /// The entity's oldest revision, when it is the change the store's
+    /// history begins with: a change with no parent. In a store that holds
+    /// only part of the repository's history, that is where Kin's record of
+    /// the entity starts, with the repository as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_start: Option<String>,
 }
 
 /// Where each reviewed change stands, for a list of changes.
@@ -330,12 +341,28 @@ pub struct GuideSummary {
     /// Their names, up to `THROUGH_MEMBERS_LISTED_MAX`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub through_members: Vec<String>,
+    /// Of `provenance_only_entity_changes`, the entities whose documentation
+    /// Kin read again in a different form while their code and the comment
+    /// above them held still. Not modifications, so never walked; said once
+    /// so a reader who sees the entity re-recorded knows why.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub documentation_rereads: usize,
+    /// Their names, up to `THROUGH_MEMBERS_LISTED_MAX`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documentation_reread_names: Vec<String>,
     /// Distinct entities outside this change that reach an entity it changed.
     /// Declarations of one callable, such as `@overload` stubs beside their
     /// implementation, count once.
     pub recorded_consumers: usize,
-    /// Distinct recorded tests that reach an entity it changed.
+    /// Distinct tests outside the change within the connection test-depth
+    /// bound. Unsettled graph coverage remains a lower bound. A test is a
+    /// test entity or a test module; test code inside one, such as a
+    /// constant, is counted as the test that holds it
+    /// ([`kin_review::is_test_unit`]).
     pub recorded_tests: usize,
+    /// The recorded impact hops `recorded_tests` were counted within.
+    #[serde(default = "test_reach_depth")]
+    pub tests_depth: u32,
     /// Of `recorded_consumers`, the ones a step's `consumer_verdict` says
     /// were `not_updated`: they reach a changed entity whose signature
     /// changed, that stopped being public or was removed, or whose recorded
@@ -358,18 +385,33 @@ pub struct GuideSummary {
     pub completeness: GuideCompleteness,
     /// One plain sentence a reader can take away without opening a step.
     pub narration: String,
+    /// The agent sessions whose writes through Kin wrote entities this guide
+    /// walks, newest write first, each with how many of the steps it wrote.
+    /// Left out when no step was written through Kin. See
+    /// [`GuideStep::authored_by`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<GuideAuthor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuideCompleteness {
-    /// `not_settled`, `no_recorded_debt` or `unavailable`. No state here
-    /// claims the review is complete, because the review never proves that.
+    /// `not_settled` while enrichment of entities in the review's reach is
+    /// still owed, `settled` when none is, or `unavailable`. No state here
+    /// claims the review is complete, because the review never proves that:
+    /// `settled` says nothing is waiting, not that every relation is known.
     pub state: String,
     pub message: String,
-    /// While `not_settled`: how many entities Kin is still mapping, so a
-    /// reader can be told the counts may grow by how much work remains.
+    /// While `not_settled`: how many entities are still owed enrichment, so a
+    /// reader can be told the counts may grow by how much work remains. Only
+    /// owed work is counted here, because only owed work changes by waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_entities: Option<u64>,
+    /// Entities with unproven call sites and no enrichment currently owed.
+    /// This includes unresolved resolver answers, unavailable resolvers and
+    /// stale or unverified proof context. Impact counts may miss callers
+    /// through those sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_entities: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,7 +469,273 @@ pub struct GuideStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_verdict: Option<GuideConsumerVerdict>,
     pub findings: Vec<GuideFinding>,
+    /// Every agent session that wrote this entity in the work the guide
+    /// walks, newest first. A write made through Kin names the entity its own
+    /// operation named or created, never one that only came along in the same
+    /// change. An edit the agent made with its own tools names the entities
+    /// whose content that edit changed, once its client reported the edit and
+    /// Kin confirmed the edit was all that changed. Left out when neither
+    /// names this entity: it was then changed by a person, or by a tool that
+    /// told Kin nothing. A write through Kin is a recorded change the moment
+    /// it lands, so on uncommitted work only edits made with an agent's own
+    /// tools appear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authored_by: Vec<GuideAuthorship>,
     pub evidence: GuideEvidence,
+    /// How every test that reaches the entity stands for the work as it is
+    /// now, listed or not. Present in a guide of uncommitted work only, where
+    /// each listed test carries its own `result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_result: Option<GuideTestsResult>,
+}
+
+/// How many of the tests that reach a step's entity passed, failed, have no
+/// run, or have only a run recorded before something they ran against
+/// changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideTestsResult {
+    pub passed: usize,
+    pub failed: usize,
+    pub not_run: usize,
+    pub stale: usize,
+}
+
+impl GuideTestsResult {
+    fn count(&mut self, state: super::verify::TestResultState) {
+        use super::verify::TestResultState;
+        match state {
+            TestResultState::Passed => self.passed += 1,
+            TestResultState::Failed => self.failed += 1,
+            TestResultState::NotRun => self.not_run += 1,
+            TestResultState::Stale => self.stale += 1,
+        }
+    }
+}
+
+/// One agent session's writing of a step's entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideAuthorship {
+    /// The agent as a reader knows it, such as `Codex` or `Claude Code`.
+    pub name: String,
+    /// The session the entity was written in: Kin's own session for a write
+    /// through Kin, the client's session for an edit made with its tools.
+    pub session: String,
+    /// When its newest writing of the entity was recorded.
+    pub at: String,
+    /// How the writing reached the entity: `kin` for a write made through
+    /// Kin, `client` for an edit the agent made with its own tools.
+    pub through: String,
+    /// For `client`: the Kin session the same agent was connected through,
+    /// when exactly one session of that client was connected at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_session: Option<String>,
+}
+
+/// One agent session among a guide's authors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideAuthor {
+    pub name: String,
+    pub session: String,
+    /// How many of the guide's steps it wrote.
+    pub entities: usize,
+    /// `kin` or `client`, as on a step.
+    #[serde(default = "through_kin")]
+    pub through: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_session: Option<String>,
+}
+
+fn through_kin() -> String {
+    THROUGH_KIN.to_string()
+}
+
+/// One edit an agent made with its own tools, as its client reported it and
+/// the daemon confirmed it: the entities whose content that edit changed, the
+/// client and its session, and the head the working copy stood on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientEdit {
+    /// The change the working copy stood on when the edit was admitted.
+    /// Absent in a repository with no change yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// The change that recorded the edit, once one did. Until then the edit
+    /// is uncommitted work on `base`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+    /// The client as it names itself, such as `claude-code`.
+    pub client: String,
+    /// The client's own session.
+    pub session: String,
+    /// The Kin session the same agent was connected through, when exactly
+    /// one session of that client was connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kin_session: Option<String>,
+    pub at: String,
+    pub entities: Vec<EntityId>,
+}
+
+/// What an edit an agent made with its own tools is shown as having reached
+/// its entity by.
+pub const THROUGH_CLIENT: &str = "client";
+
+/// One write an agent made through Kin, as the daemon that ran it recorded it:
+/// the change the write was published as, the session that made it, and the
+/// entities its own operations wrote. A change can hold more than that, work
+/// it carried in and spans that only moved, and those are not among them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWrite {
+    pub change_id: String,
+    pub session: String,
+    pub vendor: String,
+    pub client: String,
+    pub at: String,
+    pub entities: Vec<EntityId>,
+}
+
+/// What a write through Kin is shown as having reached its entity by.
+pub const THROUGH_KIN: &str = "kin";
+
+/// Mark each step with the agent sessions that wrote its entity, and the
+/// guide's summary with those sessions.
+///
+/// A write through Kin belongs to the work a guide walks when it was published
+/// as that work: the change a change guide walks, or one of a range's changes.
+/// A guide of uncommitted work holds no change, and nothing written through
+/// Kin is uncommitted, so it is never marked from `writes`. A step is marked
+/// only for the entity a write's own operation wrote, so an edit that came
+/// along in the same change, or a span that only moved, is not.
+///
+/// An edit an agent made with its own tools belongs to uncommitted work while
+/// no change holds it and the working copy still stands on the head it was
+/// made on, and to a change or a range once a change of theirs recorded it.
+pub fn attribute_agent_writes(
+    guide: &mut ReviewGuide,
+    writes: &[AgentWrite],
+    edits: &[ClientEdit],
+) {
+    struct Mark<'a> {
+        name: String,
+        session: &'a str,
+        at: &'a str,
+        through: &'static str,
+        kin_session: Option<&'a str>,
+    }
+
+    let members: HashSet<&str> = guide
+        .range
+        .as_ref()
+        .map(|range| range.members.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let working = guide.kind == "working";
+    let walked = |change_id: &str| match guide.kind.as_str() {
+        "change" => change_id.eq_ignore_ascii_case(&guide.change.id),
+        "range" => members.contains(change_id),
+        _ => false,
+    };
+    type Newest<'a> = HashMap<EntityId, HashMap<(&'static str, &'a str), Mark<'a>>>;
+    fn keep<'a>(newest: &mut Newest<'a>, entity: EntityId, mark: Mark<'a>) {
+        let by_session = newest.entry(entity).or_default();
+        match by_session.get_mut(&(mark.through, mark.session)) {
+            Some(kept) if mark.at > kept.at => *kept = mark,
+            Some(_) => {}
+            None => {
+                by_session.insert((mark.through, mark.session), mark);
+            }
+        }
+    }
+    // Each session's newest writing of each entity, by how it reached it.
+    let mut newest: Newest<'_> = HashMap::new();
+    for write in writes.iter().filter(|write| walked(&write.change_id)) {
+        for entity in &write.entities {
+            keep(
+                &mut newest,
+                *entity,
+                Mark {
+                    name: super::workspace_agents::agent_display_name(&write.vendor, &write.client),
+                    session: &write.session,
+                    at: &write.at,
+                    through: THROUGH_KIN,
+                    kin_session: None,
+                },
+            );
+        }
+    }
+    for edit in edits.iter().filter(|edit| match &edit.change_id {
+        Some(change_id) => walked(change_id),
+        None => working && edit.base == guide.change.base,
+    }) {
+        for entity in &edit.entities {
+            keep(
+                &mut newest,
+                *entity,
+                Mark {
+                    name: super::workspace_agents::agent_display_name(&edit.client, &edit.client),
+                    session: &edit.session,
+                    at: &edit.at,
+                    through: THROUGH_CLIENT,
+                    kin_session: edit.kin_session.as_deref(),
+                },
+            );
+        }
+    }
+    let mut authors: Vec<(GuideAuthor, String)> = Vec::new();
+    for step in guide
+        .chapters
+        .iter_mut()
+        .flat_map(|chapter| chapter.steps.iter_mut())
+    {
+        step.authored_by.clear();
+        let Some(by_session) = uuid::Uuid::parse_str(&step.entity_id)
+            .ok()
+            .and_then(|id| newest.get(&EntityId(id)))
+        else {
+            continue;
+        };
+        let mut marks: Vec<&Mark<'_>> = by_session.values().collect();
+        marks.sort_by(|left, right| {
+            right
+                .at
+                .cmp(left.at)
+                .then_with(|| left.session.cmp(right.session))
+                .then_with(|| left.through.cmp(right.through))
+        });
+        for mark in marks {
+            step.authored_by.push(GuideAuthorship {
+                name: mark.name.clone(),
+                session: mark.session.to_string(),
+                at: mark.at.to_string(),
+                through: mark.through.to_string(),
+                kin_session: mark.kin_session.map(str::to_string),
+            });
+            match authors.iter_mut().find(|(author, _)| {
+                author.session == mark.session && author.through == mark.through
+            }) {
+                Some((author, latest)) => {
+                    author.entities += 1;
+                    if mark.at > latest.as_str() {
+                        *latest = mark.at.to_string();
+                    }
+                }
+                None => authors.push((
+                    GuideAuthor {
+                        name: mark.name.clone(),
+                        session: mark.session.to_string(),
+                        entities: 1,
+                        through: mark.through.to_string(),
+                        kin_session: mark.kin_session.map(str::to_string),
+                    },
+                    mark.at.to_string(),
+                )),
+            }
+        }
+    }
+    authors.sort_by(|(left, left_at), (right, right_at)| {
+        right_at
+            .cmp(left_at)
+            .then_with(|| left.session.cmp(&right.session))
+            .then_with(|| left.through.cmp(&right.through))
+    });
+    guide.summary.authors = authors.into_iter().map(|(author, _)| author).collect();
 }
 
 /// What one changed entity's change asks of the recorded consumers that reach
@@ -472,6 +780,10 @@ pub struct GuideBody {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The exact content address of this entity's span, for a source-guarded
+    /// restore. Unlike semantic fingerprints, it includes comments and spacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +808,10 @@ pub struct GuideConnections {
     pub consumers_changed_here: usize,
     pub tests: Vec<GuideConnection>,
     pub tests_total: usize,
+    /// Tests are counted within this many recorded impact hops. Enrichment
+    /// limits remain qualified by the guide's completeness reading.
+    #[serde(default = "test_reach_depth")]
+    pub tests_depth: u32,
     /// Modules whose only recorded reach is importing this entity. Listed
     /// apart, because the functions inside them that use it are the consumers.
     #[serde(default)]
@@ -519,12 +835,37 @@ pub struct GuideConnection {
     pub entity: GuideEntityRef,
     /// Whether this change also changed the connected entity.
     pub changed_here: bool,
+    /// How many recorded impact edges connect this entity to the step.
+    #[serde(default = "direct_hop", skip_serializing_if = "is_direct_hop")]
+    pub hops: u32,
+    /// How many of those edges are calls, or recorded `tests` and `covers`
+    /// relations. Equal to `hops` when a test reaches the step by calls alone,
+    /// so running it runs the step. Set on tests only.
+    #[serde(default, skip_serializing_if = "is_zero_hops")]
+    pub call_hops: u32,
     /// Other declarations of the same callable this row stands for: the
     /// `@overload` stubs, prototypes or ambient declarations its language
     /// adapter says only declare what `entity` defines. A reader sees one
     /// callable, so the list shows one row.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub overloads: usize,
+    /// A test's latest result for the work as it is now. Set on the tests of
+    /// a guide of uncommitted work only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<super::verify::TestResultReading>,
+}
+
+fn direct_hop() -> u32 {
+    1
+}
+fn is_direct_hop(hops: &u32) -> bool {
+    *hops == 1
+}
+fn is_zero_hops(hops: &u32) -> bool {
+    *hops == 0
+}
+fn test_reach_depth() -> u32 {
+    super::verify::WORK_TEST_REACH_DEPTH
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -1071,6 +1412,9 @@ struct Reacher {
     entity: Entity,
     changed_here: bool,
     is_test: bool,
+    hops: u32,
+    /// How many of `hops` are calls; see [`GuideConnection::call_hops`].
+    call_hops: u32,
     /// The entity a reader knows it by; see [`canonical_callable`].
     canonical: EntityId,
     overloads: usize,
@@ -1125,11 +1469,15 @@ fn field_changes(old: &Entity, new: &Entity) -> Vec<GuideFieldChange> {
     );
     compare("role", Some(label(old.role)), Some(label(new.role)));
     compare("file", entity_file(old), entity_file(new));
-    compare(
-        "doc_summary",
-        old.doc_summary.clone(),
-        new.doc_summary.clone(),
-    );
+    // Documentation read again in another form says the same thing, so it is
+    // not a field that moved; see `kin_review::documentation_agrees`.
+    if !kin_review::documentation_agrees(old.doc_summary.as_deref(), new.doc_summary.as_deref()) {
+        compare(
+            "doc_summary",
+            old.doc_summary.clone(),
+            new.doc_summary.clone(),
+        );
+    }
     if old.fingerprint.behavior_hash != new.fingerprint.behavior_hash {
         changes.push(GuideFieldChange {
             field: "body".to_string(),
@@ -1164,6 +1512,7 @@ fn read_body(
     match read_entity_source_exact_at(held, entity, BODY_MAX_BYTES, scope) {
         Ok(Some(source)) => GuideBody {
             state: "recorded".to_string(),
+            body_hash: Some(kin_blobs::digest(source.body.as_bytes()).to_string()),
             text: Some(source.body),
             start_line: entity_presentation_start_line(entity),
             change_id,
@@ -1177,6 +1526,7 @@ fn read_body(
         Ok(None) => GuideBody {
             state: "no_source".to_string(),
             text: None,
+            body_hash: None,
             start_line: None,
             change_id,
             working,
@@ -1186,6 +1536,7 @@ fn read_body(
         Err(error) => GuideBody {
             state: "unavailable".to_string(),
             text: None,
+            body_hash: None,
             start_line: None,
             change_id,
             working,
@@ -1562,6 +1913,7 @@ pub(crate) fn entity_source_at(
         body: GuideBody {
             state: "unavailable".to_string(),
             text: None,
+            body_hash: None,
             start_line: None,
             change_id: None,
             working: false,
@@ -1623,6 +1975,20 @@ fn is_import(kind: RelationKind) -> bool {
     matches!(kind, RelationKind::Imports | RelationKind::Includes)
 }
 
+/// Prefer the specific recorded use when several relations join one caller
+/// to the same entity. Generic references and type uses do not hide calls.
+pub(super) fn connection_precedence(kind: RelationKind) -> u8 {
+    match kind {
+        RelationKind::Tests | RelationKind::Covers => 0,
+        RelationKind::Calls => 1,
+        RelationKind::Instantiates | RelationKind::Spawns => 2,
+        RelationKind::UsesType => 4,
+        RelationKind::References => 5,
+        RelationKind::Imports | RelationKind::Includes => 6,
+        _ => 3,
+    }
+}
+
 /// Whether `relation` ties its two ends into one chapter.
 ///
 /// Wider than an impact relation on purpose. A class and the method it
@@ -1641,7 +2007,10 @@ fn connection(relation: &Relation, entity: &Entity, changed_here: bool) -> Guide
         recorded_in: relation.created_in.map(|change| change.to_string()),
         entity: entity_ref(entity),
         changed_here,
+        hops: 1,
+        call_hops: 0,
         overloads: 0,
+        result: None,
     }
 }
 
@@ -1649,6 +2018,89 @@ fn sort_connections(connections: &mut Vec<GuideConnection>) {
     connections.sort_by(|a, b| {
         b.changed_here
             .cmp(&a.changed_here)
+            .then_with(|| a.entity.name.cmp(&b.entity.name))
+            .then_with(|| a.entity.parameters.cmp(&b.entity.parameters))
+            .then_with(|| a.entity.file.cmp(&b.entity.file))
+            .then_with(|| a.entity.id.cmp(&b.entity.id))
+    });
+}
+
+/// Tell apart listed rows that share a name and that nothing contains, as
+/// test modules of one name in different packages are: each is placed in the
+/// fewest enclosing namespace names, read from where it is declared, that no
+/// other row of that name shares, such as `classic.tests` beside
+/// `mini.tests`. A row a container already names keeps that name.
+fn place_repeated_modules(rows: &mut [GuideConnection]) {
+    let mut named: HashMap<String, usize> = HashMap::new();
+    for row in rows.iter() {
+        *named.entry(row.entity.name.clone()).or_default() += 1;
+    }
+    let namespaces =
+        |row: &GuideConnection| enclosing_namespaces(row.entity.file.as_deref(), false);
+    let placed: Vec<Option<String>> = rows
+        .iter()
+        .map(|row| {
+            if row.entity.within.is_some() || named[&row.entity.name] < 2 {
+                return None;
+            }
+            let others: Vec<Vec<String>> = rows
+                .iter()
+                .filter(|other| {
+                    other.entity.id != row.entity.id && other.entity.name == row.entity.name
+                })
+                .map(namespaces)
+                .collect();
+            distinct_place(&namespaces(row), &others).map(|place| format!("namespace {place}"))
+        })
+        .collect();
+    for (row, place) in rows.iter_mut().zip(placed) {
+        if place.is_some() {
+            row.entity.within = place;
+        }
+    }
+}
+
+/// The namespaces enclosing what is declared at `file`, outermost first: its
+/// directories, and with `with_module` the module the file itself is, named
+/// as its module entity is, without the last extension.
+pub(super) fn enclosing_namespaces(file: Option<&str>, with_module: bool) -> Vec<String> {
+    let file = file.unwrap_or_default();
+    let (dir, leaf) = file.rsplit_once('/').unwrap_or(("", file));
+    let mut names: Vec<String> = dir
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    if with_module {
+        let module = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+        if !module.is_empty() {
+            names.push(module.to_string());
+        }
+    }
+    names
+}
+
+/// The fewest innermost names of `own` that none of `others` ends with,
+/// joined as one dotted name, or `None` when even all of them are shared.
+pub(super) fn distinct_place(own: &[String], others: &[Vec<String>]) -> Option<String> {
+    (1..=own.len()).find_map(|taken| {
+        let tail = &own[own.len() - taken..];
+        others
+            .iter()
+            .all(|other| !other.ends_with(tail))
+            .then(|| tail.join("."))
+    })
+}
+
+/// Tests in the order a reader weighs them: one this change also changed
+/// first, then the nearest, then at one distance the ones that reach by the
+/// most calls, as [`kin_review::test_reach_order`] ranks a walk's tests.
+fn sort_tests(tests: &mut [GuideConnection]) {
+    tests.sort_by(|a, b| {
+        b.changed_here
+            .cmp(&a.changed_here)
+            .then_with(|| a.hops.cmp(&b.hops))
+            .then_with(|| b.call_hops.cmp(&a.call_hops))
             .then_with(|| a.entity.name.cmp(&b.entity.name))
             .then_with(|| a.entity.parameters.cmp(&b.entity.parameters))
             .then_with(|| a.entity.file.cmp(&b.entity.file))
@@ -1724,31 +2176,90 @@ fn find_root(parents: &mut HashMap<EntityId, EntityId>, id: EntityId) -> EntityI
     root
 }
 
+/// What the review's enrichment observation says about the counts, split by
+/// whether waiting can change it.
+///
+/// The observation counts every entity whose call sites are not settled, and
+/// most of those, on a store whose sweep has finished, are sites a resolver
+/// already answered without settling: a call into a dependency nothing pins,
+/// a call through a value binding. Reporting all of them as pending told a
+/// reader Kin was still mapping hundreds of entities on a store that had
+/// nothing queued, and the number never moved. Only owed work is pending, and
+/// the rest is said for what it is.
 fn completeness(review: &kin_review::Review) -> GuideCompleteness {
-    match review.impact.enrichment.as_ref() {
-        Some(observation) if observation.bounds_answer() => GuideCompleteness {
-            state: "not_settled".to_string(),
-            message: format!(
-                "Not settled: {} entities pending enrichment. Impact counts are lower bounds and \
-                 risk may change.",
-                observation.total_pending_entities
-            ),
-            pending_entities: Some(observation.total_pending_entities as u64),
-        },
-        Some(observation) if observation.status == "no_recorded_call_site_debt" => {
-            GuideCompleteness {
-                state: "no_recorded_debt".to_string(),
-                message: "No recorded call-site debt. Overall completeness is unverified."
-                    .to_string(),
-                pending_entities: None,
-            }
-        }
-        _ => GuideCompleteness {
+    completeness_of(review.impact.enrichment.as_ref())
+}
+
+fn completeness_of(
+    observation: Option<&kin_review::enrichment::EnrichmentObservation>,
+) -> GuideCompleteness {
+    let Some(observation) = observation.filter(|observation| {
+        observation.bounds_answer() || observation.status == "no_recorded_call_site_debt"
+    }) else {
+        return GuideCompleteness {
             state: "unavailable".to_string(),
             message: "Completeness unavailable. This review does not establish a clear result."
                 .to_string(),
             pending_entities: None,
-        },
+            unresolved_entities: None,
+        };
+    };
+    let owed = if observation.bounds_answer() {
+        observation.owed_entities
+    } else {
+        0
+    };
+    let unresolved = if observation.bounds_answer() {
+        observation.total_pending_entities.saturating_sub(owed)
+    } else {
+        0
+    };
+    let unresolved_sentence = (unresolved > 0).then(|| {
+        format!(
+            "{} {} call sites that remain unproven, so impact counts may miss callers through \
+             them. No enrichment is currently owed for {}.",
+            entity_count(unresolved),
+            if unresolved == 1 { "holds" } else { "hold" },
+            if unresolved == 1 { "it" } else { "them" },
+        )
+    });
+    if owed > 0 {
+        let mut message = format!(
+            "Not settled: {} pending enrichment. Impact counts are lower bounds and risk may \
+             change.",
+            entity_count(owed)
+        );
+        if let Some(sentence) = &unresolved_sentence {
+            message.push(' ');
+            message.push_str(sentence);
+        }
+        return GuideCompleteness {
+            state: "not_settled".to_string(),
+            message,
+            pending_entities: Some(owed as u64),
+            unresolved_entities: (unresolved > 0).then_some(unresolved as u64),
+        };
+    }
+    let message = match unresolved_sentence {
+        Some(sentence) => format!("Settled: no entity is waiting on enrichment. {sentence}"),
+        None => "Settled: no entity is waiting on enrichment and no call site is left \
+                 unsettled. Overall completeness is unverified."
+            .to_string(),
+    };
+    GuideCompleteness {
+        state: "settled".to_string(),
+        message,
+        pending_entities: None,
+        unresolved_entities: (unresolved > 0).then_some(unresolved as u64),
+    }
+}
+
+/// `1 entity` or `N entities`.
+fn entity_count(count: usize) -> String {
+    if count == 1 {
+        "1 entity".to_string()
+    } else {
+        format!("{count} entities")
     }
 }
 
@@ -1973,18 +2484,26 @@ fn step_narration(
     }
     if !draft.is_test() {
         match wiring.tests.len() {
-            0 => text.push_str(if gone {
-                " No test reached it."
-            } else {
-                " No test reaches it."
-            }),
+            0 => write!(
+                text,
+                " No test {} it within {} recorded hops.",
+                if gone { "reached" } else { "reaches" },
+                test_reach_depth()
+            )
+            .unwrap(),
             tests => {
                 let reach = match (gone, tests) {
                     (true, _) => "reached",
                     (false, 1) => "reaches",
                     (false, _) => "reach",
                 };
-                write!(text, " {} {reach} it.", plural(tests, "test", "tests")).unwrap();
+                write!(
+                    text,
+                    " {} {reach} it within {} recorded hops.",
+                    plural(tests, "test", "tests"),
+                    test_reach_depth()
+                )
+                .unwrap();
             }
         }
     }
@@ -2422,6 +2941,9 @@ fn derive_working_guide(
                 // of this entity, here as in a recorded change.
                 if !kin_review::is_semantic_modification(&old, &new) {
                     semantic.provenance_only_entity_changes += 1;
+                    if kin_review::is_documentation_reread(&old, &new) {
+                        semantic.documentation_rereads.push(new.id);
+                    }
                     continue;
                 }
                 (new.id, EntityChangeKind::Modified { old, new })
@@ -2449,8 +2971,19 @@ fn derive_working_guide(
             },
         });
     }
-    let review =
-        kin_review::SemanticReview::review_from_diff_with_source(semantic, graph, escape_evidence)?;
+    // Live work, so a caller with no ledger reads the way impact and the
+    // store-wide status read it: unproven for want of a resolver on this host,
+    // not enrichment still owed. Without this, a language no resolver serves
+    // kept the guide saying its entities were still being mapped, forever.
+    let no_resolver = kin_mcp::call_sites::host_no_resolver();
+    let review = kin_review::SemanticReview::review_from_diff_with_sources(
+        semantic,
+        graph,
+        kin_review::enrichment::ObservationSources {
+            escape_evidence,
+            no_resolver: Some(&no_resolver),
+        },
+    )?;
 
     let mut message = String::from(if working_tree.differs {
         "Uncommitted work\n\nChanges you haven't committed yet."
@@ -2502,6 +3035,30 @@ fn derive_working_guide(
     )?;
     guide.summary.relation_changes_settling = relation_changes_settling;
     Ok(guide)
+}
+
+/// How many changes `base` holds that the range's head does not.
+///
+/// Walked back from `base`, stopping at any change in `shared`, the merge
+/// base's ancestry. With a single merge base that ancestry holds every change
+/// the two sides have in common, so the walk reads only the base's own line
+/// since the two parted and never the history they share.
+fn base_only_changes(
+    graph: &kin_db::InMemoryGraph,
+    base: &SemanticChangeId,
+    shared: &HashSet<SemanticChangeId>,
+) -> Result<usize> {
+    let mut seen: HashSet<SemanticChangeId> = HashSet::new();
+    let mut pending = vec![*base];
+    while let Some(id) = pending.pop() {
+        if shared.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        if let Some(change) = graph.get_change(&id)? {
+            pending.extend(change.parents.iter().copied());
+        }
+    }
+    Ok(seen.len())
 }
 
 /// Build the guide for a range: everything `head` reaches that `base` does
@@ -2558,6 +3115,7 @@ pub(crate) fn build_range_guide(
     members.sort_unstable();
     let members_complete = members.len() <= RANGE_MEMBERS_MAX;
     members.truncate(RANGE_MEMBERS_MAX);
+    let base_changes_total = base_only_changes(graph, &base, &base_ancestry)?;
 
     let empty = || {
         let diff = kin_review::SemanticDiff {
@@ -2641,6 +3199,7 @@ pub(crate) fn build_range_guide(
                 head_ref: head_label.to_string(),
                 merge_base: merge_base.to_string(),
                 changes_total,
+                base_changes_total,
                 members,
                 members_complete,
                 changes: listed
@@ -2874,6 +3433,13 @@ pub(crate) fn entity_history(
         }
         None => Vec::new(),
     };
+    let record_start = match own.first() {
+        Some(oldest) => graph
+            .get_change(&oldest.introduced_by)?
+            .filter(|change| change.parents.is_empty())
+            .map(|change| change.id.to_string()),
+        None => None,
+    };
     Ok(GuideHistory {
         entity_id: entity_id.to_string(),
         revisions: listed,
@@ -2881,6 +3447,7 @@ pub(crate) fn entity_history(
         unchanged_revisions: unchanged.len(),
         removed_by,
         in_range,
+        record_start,
     })
 }
 
@@ -3044,6 +3611,17 @@ fn assemble<I: ImpactGraph>(
     through_members.truncate(THROUGH_MEMBERS_LISTED_MAX);
     drafts.retain(|draft| !through.contains(&draft.id));
 
+    // Entities whose documentation was only read again: named, never walked.
+    let documentation_rereads = review.diff.documentation_rereads.len();
+    let mut documentation_reread_names: Vec<String> = Vec::new();
+    for id in &review.diff.documentation_rereads {
+        if let Some(entity) = at_head.get_entity(id)? {
+            documentation_reread_names.push(entity.name);
+        }
+    }
+    documentation_reread_names.sort();
+    documentation_reread_names.truncate(THROUGH_MEMBERS_LISTED_MAX);
+
     let (mut added, mut modified, mut removed) = (0, 0, 0);
     for draft in &drafts {
         match draft.change {
@@ -3118,12 +3696,46 @@ fn assemble<I: ImpactGraph>(
         let entry = wiring.entry(draft.id).or_default();
         let mut seen: HashSet<EntityId> = HashSet::new();
         let mut reachers: Vec<Reacher> = Vec::new();
-        // One row per source, and a source that both imports and calls is
-        // shown by its call, so the use is read before the import.
+        // A test may reach this work through unchanged consumers. Read the
+        // same recorded impact walk as Code and verification, on the exact
+        // side this guide describes; names and today's graph cannot fill a
+        // historical gap. The walk decides what is a test, so a direct
+        // source it lists as one is left to it below.
+        // A step the side cannot hold, such as one only a merge's other
+        // parent declares, has no walk; its direct tests are read below.
+        let held_here = match base_side {
+            Some(at_base) => at_base.get_entity(&draft.id)?,
+            None => at_head.get_entity(&draft.id)?,
+        };
+        let ranked = match (held_here, base_side) {
+            (None, _) => None,
+            (Some(_), Some(at_base)) => Some(kin_review::rank_impact_at(
+                at_base,
+                &draft.id,
+                test_reach_depth(),
+            )?),
+            (Some(_), None) => Some(kin_review::rank_impact_at(
+                at_head,
+                &draft.id,
+                test_reach_depth(),
+            )?),
+        };
+        // Every piece of test code the walk read, and the tests it counts
+        // them as: a direct source among them is the walk's to name.
+        let ranked_tests: HashSet<EntityId> = ranked
+            .iter()
+            .flat_map(|ranked| {
+                ranked
+                    .test_candidates()
+                    .map(|candidate| candidate.entity_id)
+                    .chain(ranked.tests.iter().map(|test| test.entity_id))
+            })
+            .collect();
+        // One row per source, named by its most specific recorded use.
         let mut inbound = kin_review::inbound_impact_relations(&all, &draft.id);
         inbound.sort_by(|a, b| {
-            is_import(a.kind)
-                .cmp(&is_import(b.kind))
+            connection_precedence(a.kind)
+                .cmp(&connection_precedence(b.kind))
                 .then_with(|| a.id.cmp(&b.id))
         });
         for relation in inbound {
@@ -3150,14 +3762,95 @@ fn assemble<I: ImpactGraph>(
                 entry.importing_modules.push(entity_ref(source_entity));
                 continue;
             }
-            let is_test = is_test_entity(source_entity)
-                || matches!(relation.kind, RelationKind::Tests | RelationKind::Covers);
+            if ranked_tests.contains(&source) {
+                continue;
+            }
+            // A test the walk cannot see from this side, such as one this
+            // change removed, is still read as the test it directly is, and
+            // test code that is not a test as the test that holds it.
+            let declared = matches!(relation.kind, RelationKind::Tests | RelationKind::Covers);
+            let mut entity = source_entity.clone();
+            let is_test = declared || is_test_entity(source_entity);
+            if is_test && !declared && !kin_review::is_test_unit(source_entity) {
+                let holding = match base_side {
+                    Some(at_base) => kin_review::test_unit_holding(at_base, source_entity)?,
+                    None => kin_review::test_unit_holding(at_head, source_entity)?,
+                };
+                let Some(holding) = holding else {
+                    continue;
+                };
+                if ranked_tests.contains(&holding.id) || !seen.insert(holding.id) {
+                    continue;
+                }
+                entity = holding;
+            }
             reachers.push(Reacher {
                 relation: relation.clone(),
-                entity: source_entity.clone(),
+                canonical: entity.id,
+                entity,
                 changed_here,
                 is_test,
-                canonical: source,
+                hops: 1,
+                call_hops: u32::from(kin_review::is_call_route(relation.kind)),
+                overloads: 0,
+                labelled: false,
+            });
+        }
+        let test_code_walked: HashMap<EntityId, &kin_review::RankedImpactCandidate> = ranked
+            .iter()
+            .flat_map(|ranked| ranked.test_candidates())
+            .map(|candidate| (candidate.entity_id, candidate))
+            .collect();
+        for test in ranked.iter().flat_map(|ranked| ranked.tests.iter()) {
+            let Some(candidate) = test_code_walked.get(&test.via) else {
+                continue;
+            };
+            // The test code the walk reached, which names the use below; the
+            // row is the test that holds it.
+            let source = candidate.entity_id;
+            let entity = match base_side {
+                Some(at_base) => at_base.get_entity(&test.entity_id)?,
+                None => at_head.get_entity(&test.entity_id)?,
+            };
+            let Some(entity) = entity else {
+                continue;
+            };
+            let Some(edge) = candidate.path.last() else {
+                continue;
+            };
+            let relations = match base_side {
+                Some(at_base) => at_base.get_all_relations_for_entity(&source)?,
+                None => at_head.get_all_relations_for_entity(&source)?,
+            };
+            // Named like a consumer row and Code's relied-on-by row: by the
+            // most specific recorded use into the entity it reaches, not by
+            // whichever edge scored highest in the walk.
+            let Some(relation) =
+                kin_review::inbound_impact_relations(&relations, &edge.to_entity_id)
+                    .into_iter()
+                    .filter(|relation| relation.src.as_entity() == Some(source))
+                    .min_by(|a, b| {
+                        connection_precedence(a.kind)
+                            .cmp(&connection_precedence(b.kind))
+                            .then_with(|| a.id.cmp(&b.id))
+                    })
+                    .or_else(|| {
+                        relations
+                            .iter()
+                            .find(|relation| relation.id == edge.relation_id)
+                            .cloned()
+                    })
+            else {
+                continue;
+            };
+            reachers.push(Reacher {
+                relation,
+                changed_here: changed.contains(&entity.id),
+                canonical: entity.id,
+                entity,
+                is_test: true,
+                hops: test.hop,
+                call_hops: test.call_hops,
                 overloads: 0,
                 labelled: false,
             });
@@ -3169,6 +3862,10 @@ fn assemble<I: ImpactGraph>(
         for reacher in fold_declarations(reachers, &canonical)? {
             let mut row = connection(&reacher.relation, &reacher.entity, reacher.changed_here);
             row.overloads = reacher.overloads;
+            row.hops = reacher.hops;
+            if reacher.is_test {
+                row.call_hops = reacher.call_hops;
+            }
             if reacher.labelled {
                 row.entity.parameters = parameters_of(&reacher.entity.signature);
             }
@@ -3409,11 +4106,37 @@ fn assemble<I: ImpactGraph>(
     let mut not_updated: BTreeSet<EntityId> = BTreeSet::new();
     let mut may_need_review: BTreeSet<EntityId> = BTreeSet::new();
     let mut need_no_update: BTreeSet<EntityId> = BTreeSet::new();
+    // Each entity's fingerprint as the graph holds it now, read once for
+    // every test result that is checked against it.
+    let mut fingerprints_now: HashMap<EntityId, Option<kin_model::Hash256>> = HashMap::new();
     let mut build_step = |id: &EntityId| -> Result<GuideStep> {
         let draft = by_id[id];
         let mut entry = wiring.remove(id).unwrap_or_default();
         sort_connections(&mut entry.consumers);
-        sort_connections(&mut entry.tests);
+        sort_tests(&mut entry.tests);
+        // Uncommitted work is the graph as it is now, so each test's latest
+        // recorded result can be read against it. Every test is read, before
+        // the list is cut to the ones shown, so the tally covers them all.
+        let tests_result = if kind == "working" {
+            let subject = draft.new.map(|entity| entity.id);
+            let mut tally = GuideTestsResult::default();
+            for row in entry.tests.iter_mut() {
+                let Ok(uuid) = uuid::Uuid::parse_str(&row.entity.id) else {
+                    continue;
+                };
+                let reading = super::verify::test_result(
+                    graph,
+                    &EntityId(uuid),
+                    subject.as_ref(),
+                    &mut fingerprints_now,
+                )?;
+                tally.count(reading.state);
+                row.result = Some(reading);
+            }
+            Some(tally)
+        } else {
+            None
+        };
         let fields = match (draft.old, draft.new) {
             (Some(old), Some(new)) => field_changes(old, new),
             _ => Vec::new(),
@@ -3512,6 +4235,7 @@ fn assemble<I: ImpactGraph>(
                 row.entity.within = within(&EntityId(uuid))?;
             }
         }
+        place_repeated_modules(&mut entry.tests);
         let step_within = within(id)?;
         entry
             .importing_modules
@@ -3549,6 +4273,7 @@ fn assemble<I: ImpactGraph>(
                 consumers_changed_here,
                 tests: entry.tests,
                 tests_total,
+                tests_depth: test_reach_depth(),
                 importing_modules: entry.importing_modules,
                 importing_modules_total,
                 relation_changes,
@@ -3556,12 +4281,14 @@ fn assemble<I: ImpactGraph>(
             },
             consumer_verdict: Some(verdict),
             findings,
+            authored_by: Vec::new(),
             evidence: GuideEvidence {
                 base_change: base.map(|base| base.to_string()),
                 head_change: head_label.clone(),
                 fingerprint_before: draft.old.map(fingerprint),
                 fingerprint_after: draft.new.map(fingerprint),
             },
+            tests_result,
         })
     };
 
@@ -3715,14 +4442,18 @@ fn assemble<I: ImpactGraph>(
             module_containers,
             containers_through_members,
             through_members,
+            documentation_rereads,
+            documentation_reread_names,
             recorded_consumers: outside_consumers.len(),
             recorded_tests: outside_tests.len(),
+            tests_depth: test_reach_depth(),
             consumers_not_updated: consumer_verdicts.not_updated,
             consumers_may_need_review: consumer_verdicts.may_need_review,
             consumers_need_no_update: consumer_verdicts.need_no_update,
             finding_count,
             completeness: completeness(&review),
             narration,
+            authors: Vec::new(),
         },
         chapters,
         findings: GuideFindings {
@@ -3790,6 +4521,29 @@ fn through_members_sentence(summary: &GuideSummary) -> Option<String> {
         join_and(&names),
         if count == 1 { "its" } else { "their" },
         if count == 1 { "is" } else { "are" }
+    ))
+}
+
+/// The sentence that names the entities whose documentation was only read
+/// again, or nothing when there are none.
+fn documentation_rereads_sentence(summary: &GuideSummary) -> Option<String> {
+    let count = summary.documentation_rereads;
+    if count == 0 {
+        return None;
+    }
+    let mut names: Vec<String> = summary
+        .documentation_reread_names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect();
+    if count > names.len() {
+        names.push(plural(count - names.len(), "other", "others"));
+    }
+    Some(format!(
+        "Kin re-read the documentation of {}; {} code is identical, so {} not walked.",
+        join_and(&names),
+        if count == 1 { "its" } else { "their" },
+        if count == 1 { "it is" } else { "they are" }
     ))
 }
 
@@ -3943,7 +4697,10 @@ fn summary_narration(
     // them, then the tests, so each sentence names what the one before it did.
     let mut sentences = Vec::new();
     if consumers == 0 && tests == 0 {
-        sentences.push(format!("Nothing outside the {subject} reaches {them}."));
+        sentences.push(format!(
+            "No direct outside consumer or test within {} recorded hops reaches {them}.",
+            test_reach_depth()
+        ));
     }
     if consumers > 0 {
         sentences.push(format!(
@@ -3955,11 +4712,15 @@ fn summary_narration(
     }
     if tests > 0 {
         let reach = if tests == 1 { "reaches" } else { "reach" };
+        let depth = test_reach_depth();
         sentences.push(if consumers > 0 {
-            format!("{} {reach} {them}.", plural(tests, "test", "tests"))
+            format!(
+                "{} {reach} {them} within {depth} recorded hops.",
+                plural(tests, "test", "tests")
+            )
         } else {
             format!(
-                "{} outside the {subject} {reach} {them}.",
+                "{} outside the {subject} {reach} {them} within {depth} recorded hops.",
                 plural(tests, "test", "tests")
             )
         });
@@ -4112,6 +4873,9 @@ pub(crate) fn guide_text(guide: &ReviewGuide) -> String {
     if let Some(line) = through_members_sentence(summary) {
         writeln!(text, "{line}").unwrap();
     }
+    if let Some(line) = documentation_rereads_sentence(summary) {
+        writeln!(text, "{line}").unwrap();
+    }
     if summary.relation_changes_settling > 0 {
         writeln!(
             text,
@@ -4183,6 +4947,20 @@ pub(crate) fn guide_text(guide: &ReviewGuide) -> String {
             )
             .unwrap();
             writeln!(text, "    {}", step.narration).unwrap();
+            for (through, said) in [
+                (THROUGH_KIN, "Written through Kin by"),
+                (THROUGH_CLIENT, "Edited with its own tools by"),
+            ] {
+                let names: Vec<&str> = step
+                    .authored_by
+                    .iter()
+                    .filter(|author| author.through == through)
+                    .map(|author| author.name.as_str())
+                    .collect();
+                if !names.is_empty() {
+                    writeln!(text, "    {said} {}", join_and(&names)).unwrap();
+                }
+            }
             for field in &step.fields {
                 if let (Some(before), Some(after)) = (&field.before, &field.after) {
                     if field.field != "doc_summary" {
@@ -4489,6 +5267,11 @@ fn write_connections(text: &mut String, heading: &str, rows: &[GuideConnection],
             Some(within) => format!("in {within}  "),
             None => String::new(),
         };
+        let hops = if row.hops > 1 {
+            format!("{} recorded hops  ", row.hops)
+        } else {
+            String::new()
+        };
         let overloads = match row.overloads {
             0 => String::new(),
             count => format!(
@@ -4498,7 +5281,7 @@ fn write_connections(text: &mut String, heading: &str, rows: &[GuideConnection],
         };
         writeln!(
             text,
-            "      {:<12} {}{}  {place}{overloads}[{}{}]",
+            "      {:<12} {}{}  {place}{hops}{overloads}[{}{}]",
             row.relation.replace('_', " "),
             row.entity.name,
             row.entity.parameters.as_deref().unwrap_or_default(),
@@ -4763,6 +5546,535 @@ mod tests {
         .unwrap()
     }
 
+    /// An entity whose oldest revision is the change a store began with says
+    /// so: in a store that holds only part of the repository's history, that
+    /// is where Kin's record of it starts, and the entity page says it the way
+    /// the repository's history does. An entity a later change created starts
+    /// nowhere special.
+    #[test]
+    fn an_entity_history_names_the_change_the_store_began_with() {
+        let graph = kin_db::InMemoryGraph::new();
+        let kept = function("serialize", "lib/reply.js", 1);
+        let born = function("serializeLater", "lib/reply.js", 2);
+        let import = commit(&graph, vec![], "Import", added(&[&kept]), vec![]);
+        let mut edited = kept.clone();
+        edited.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0xab; 32]);
+        let mut deltas = added(&[&born]);
+        deltas.push(EntityDelta::Modified {
+            old: kept.clone(),
+            new: edited,
+        });
+        let head = commit(&graph, vec![import], "Edit and add", deltas, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().to_path_buf());
+        let read = |entity: &Entity| {
+            entity_history(
+                &binding(&layout),
+                &graph,
+                &entity.id.to_string(),
+                Some(&head.to_string()),
+                None,
+            )
+            .unwrap()
+        };
+        let history = read(&kept);
+        assert_eq!(history.revisions_total, 2);
+        assert_eq!(history.record_start, Some(import.to_string()));
+        assert_eq!(read(&born).record_start, None);
+    }
+
+    #[test]
+    fn a_recorded_call_names_a_consumer_before_type_uses_or_references() {
+        for call_has_smallest_id in [false, true] {
+            let graph = kin_db::InMemoryGraph::new();
+            let callee = function("normalizeRequestId", "lib/request-id.js", 1);
+            let caller = function("buildOptionalHeaderReqId", "lib/request-id.js", 2);
+            let mut call = linked(RelationOrigin::Parsed, &caller, &callee);
+            let mut type_use = linked(RelationOrigin::Lsp, &caller, &callee);
+            let mut reference = linked(RelationOrigin::Lsp, &caller, &callee);
+            type_use.kind = RelationKind::UsesType;
+            reference.kind = RelationKind::References;
+            let id = |value| kin_model::RelationId(uuid::Uuid::from_u128(value));
+            call.id = id(if call_has_smallest_id { 1 } else { 3 });
+            type_use.id = id(if call_has_smallest_id { 2 } else { 1 });
+            reference.id = id(if call_has_smallest_id { 3 } else { 2 });
+            let call_id = call.id.to_string();
+            let root = commit(
+                &graph,
+                vec![],
+                "Add the request id helper and its caller",
+                added(&[&callee, &caller]),
+                vec![reference, type_use, call]
+                    .into_iter()
+                    .map(|new| RelationDelta::Added { new })
+                    .collect(),
+            );
+            let mut changed = callee.clone();
+            changed.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([4; 32]);
+            changed.fingerprint.ast_hash = kin_model::Hash256::from_bytes([4; 32]);
+            let head = commit(
+                &graph,
+                vec![root],
+                "Bound the normalized request id",
+                vec![EntityDelta::Modified {
+                    old: callee.clone(),
+                    new: changed,
+                }],
+                vec![],
+            );
+
+            let guide = guide_of(&graph, head);
+            let step = guide
+                .chapters
+                .iter()
+                .flat_map(|chapter| &chapter.steps)
+                .find(|step| step.entity_id == callee.id.to_string())
+                .unwrap();
+            assert_eq!(step.connections.consumers_total, 1);
+            assert_eq!(step.connections.consumers.len(), 1);
+            let consumer = &step.connections.consumers[0];
+            assert_eq!(consumer.entity.id, caller.id.to_string());
+            assert_eq!(consumer.relation, "calls");
+            assert_eq!(consumer.relation_id, call_id);
+        }
+    }
+
+    fn test_code(name: &str, file: &str, kind: EntityKind, body: u8) -> Entity {
+        let mut entity = function(name, file, body);
+        entity.kind = kind;
+        entity.role = EntityRole::Test;
+        entity
+    }
+
+    /// Test reach counts tests, never every piece of code inside a test
+    /// module: a constant and an interface a test module declares are counted
+    /// as the module that holds them, once. The nearest come first and, at one
+    /// distance, the ones that reach by calls before those that only name a
+    /// type; two test modules of one name say where each sits; and the guide
+    /// and Code read one list.
+    #[test]
+    fn test_reach_counts_tests_nearest_and_by_calls_first() {
+        let graph = kin_db::InMemoryGraph::new();
+        let zod = "packages/zod/src/v4";
+        let focal = function("_toLowerCase", &format!("{zod}/core/api.ts"), 1);
+        let string_class = function("_ZodString", &format!("{zod}/classic/schemas.ts"), 2);
+        let mut checks = function("checks", &format!("{zod}/classic/checks.ts"), 3);
+        checks.kind = EntityKind::Module;
+        let module = EntityKind::Module;
+        let classic_index = test_code(
+            "index.test",
+            &format!("{zod}/classic/tests/index.test.ts"),
+            module,
+            4,
+        );
+        let mini_index = test_code(
+            "index.test",
+            &format!("{zod}/mini/tests/index.test.ts"),
+            module,
+            5,
+        );
+        let string_test = test_code(
+            "string.test",
+            &format!("{zod}/classic/tests/string.test.ts"),
+            module,
+            6,
+        );
+        let utils = format!("{zod}/classic/tests/error-utils.test.ts");
+        let error_utils = test_code("error-utils.test", &utils, module, 7);
+        let fixture = test_code("Test", &utils, EntityKind::Constant, 8);
+        let shape = test_code("Shape", &utils, EntityKind::Interface, 9);
+        let root = commit(
+            &graph,
+            vec![],
+            "zod baseline",
+            added(&[
+                &focal,
+                &string_class,
+                &checks,
+                &classic_index,
+                &mini_index,
+                &string_test,
+                &error_utils,
+                &fixture,
+                &shape,
+            ]),
+            vec![
+                calls(&string_class, &focal),
+                related(RelationKind::References, &checks, &focal),
+                calls(&string_test, &string_class),
+                related(RelationKind::UsesType, &classic_index, &checks),
+                related(RelationKind::UsesType, &mini_index, &checks),
+                related(RelationKind::UsesType, &fixture, &checks),
+                related(RelationKind::UsesType, &shape, &checks),
+                contains(&error_utils, &fixture),
+                contains(&error_utils, &shape),
+            ],
+        );
+        let mut new = focal.clone();
+        new.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0xee; 32]);
+        let head = commit(
+            &graph,
+            vec![root],
+            "Lowercase strings with the locale's rules",
+            vec![EntityDelta::Modified {
+                old: focal.clone(),
+                new,
+            }],
+            vec![],
+        );
+
+        let guide = guide_of(&graph, head);
+        let step = guide
+            .chapters
+            .iter()
+            .flat_map(|chapter| &chapter.steps)
+            .find(|step| step.entity_id == focal.id.to_string())
+            .unwrap();
+        let read: Vec<(&str, Option<&str>, u32, u32)> = step
+            .connections
+            .tests
+            .iter()
+            .map(|row| {
+                (
+                    row.entity.name.as_str(),
+                    row.entity.within.as_deref(),
+                    row.hops,
+                    row.call_hops,
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("string.test", None, 2, 2),
+                ("error-utils.test", None, 2, 0),
+                ("index.test", Some("namespace classic.tests"), 2, 0),
+                ("index.test", Some("namespace mini.tests"), 2, 0),
+            ]
+        );
+        assert_eq!(step.connections.tests_total, 4);
+        assert_eq!(guide.summary.recorded_tests, 4);
+        assert_eq!(guide.summary.tests_depth, 3);
+        assert!(
+            step.narration
+                .ends_with("4 tests reach it within 3 recorded hops."),
+            "{}",
+            step.narration
+        );
+
+        let at_head = GraphAtRef::materialize(&graph, &head).unwrap();
+        let ranked = kin_review::rank_impact_at(&at_head, &focal.id, test_reach_depth()).unwrap();
+        let response: super::super::impact::ImpactResponse =
+            serde_json::from_value(serde_json::json!({
+                "lines": [], "resolution": "resolved", "ranked": ranked,
+            }))
+            .unwrap();
+        let (impact, code_tests) =
+            super::super::workspace_explore::impact_sections(&response).unwrap();
+        assert_eq!(impact["tests"], 4);
+        // A test is a row of the tests section, and only there: the entity
+        // page listed reply.test both as a test that reaches it and, labelled
+        // Test, as further out.
+        let walked_tests = ranked
+            .candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.bucket, kin_review::ImpactBucket::Test))
+            .count();
+        assert!(
+            walked_tests > 0,
+            "the walk reaches tests among its candidates"
+        );
+        let top = impact["top"].as_array().unwrap();
+        assert!(!top.is_empty());
+        assert!(top.iter().all(|row| row["is_test"] == false), "{top:?}");
+        assert_eq!(code_tests["total"], 4);
+        assert_eq!(code_tests["depth"], 3);
+        let items = code_tests["items"].as_array().unwrap();
+        let named: Vec<(&str, Option<&str>, bool)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap(),
+                    item["module"].as_str(),
+                    item["by_call"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("string.test", None, true),
+                ("error-utils.test", None, false),
+                ("index.test", Some("classic.tests"), false),
+                ("index.test", Some("mini.tests"), false),
+            ]
+        );
+    }
+
+    /// Editing one declaration re-reads the documentation of the ones beside
+    /// it. One whose code and comment held still is named once and never
+    /// walked, and the change counts one entity for the History row too.
+    #[test]
+    fn a_documentation_reread_is_named_once_and_never_walked() {
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = function("_toLowerCase", "packages/zod/src/v4/core/api.ts", 1);
+        let mut documented = function(
+            "$ZodStringBoolParams.case",
+            "packages/zod/src/v4/core/api.ts",
+            2,
+        );
+        documented.kind = EntityKind::Method;
+        documented.doc_summary = Some(
+            "* Options: `\"sensitive\"`, `\"insensitive\"` * * @default `\"insensitive\"` */"
+                .to_string(),
+        );
+        let root = commit(
+            &graph,
+            vec![],
+            "zod baseline",
+            added(&[&focal, &documented]),
+            vec![],
+        );
+        let mut edited = focal.clone();
+        edited.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0xee; 32]);
+        let mut reread = documented.clone();
+        reread.doc_summary = Some("Options: `\"sensitive\"`, `\"insensitive\"`".to_string());
+        reread.span.as_mut().unwrap().start_byte += 6;
+        let head = commit(
+            &graph,
+            vec![root],
+            "Lowercase strings with the locale's rules",
+            vec![
+                EntityDelta::Modified {
+                    old: focal.clone(),
+                    new: edited,
+                },
+                EntityDelta::Modified {
+                    old: documented.clone(),
+                    new: reread,
+                },
+            ],
+            vec![],
+        );
+
+        let guide = guide_of(&graph, head);
+        let steps: Vec<&str> = guide
+            .chapters
+            .iter()
+            .flat_map(|chapter| &chapter.steps)
+            .map(|step| step.name.as_str())
+            .collect();
+        assert_eq!(steps, vec!["_toLowerCase"]);
+        assert_eq!(guide.summary.modified, 1);
+        assert_eq!(guide.summary.documentation_rereads, 1);
+        assert_eq!(
+            guide.summary.documentation_reread_names,
+            vec!["$ZodStringBoolParams.case".to_string()]
+        );
+        assert!(guide_text(&guide).contains(
+            "Kin re-read the documentation of `$ZodStringBoolParams.case`; its code is \
+             identical, so it is not walked."
+        ));
+        let counts = change_counts(&graph, &[head.to_string()], None).unwrap();
+        assert_eq!(counts.counts[&head.to_string()].entities, 1);
+    }
+
+    /// Code, guided review and work verification use the same recorded
+    /// three-hop path, and repository coverage records its transitive reach.
+    #[test]
+    fn a_three_hop_test_reaches_code_the_guide_and_verification_consistently() {
+        use kin_model::{EntityStore, VerificationStore};
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = function("normalizeRequestId", "src/request.ts", 1);
+        let middle = function("wrapRequestId", "src/wrapper.ts", 2);
+        let caller = function("requestIdFactory", "src/factory.ts", 3);
+        let mut test = function("req-id-gen-factory.test", "tests/factory.ts", 4);
+        test.kind = EntityKind::Test;
+        let mut farther_test = function("outsideDepth", "tests/outer.ts", 5);
+        farther_test.role = EntityRole::Test;
+        let edges = vec![
+            calls(&middle, &focal),
+            calls(&caller, &middle),
+            calls(&test, &caller),
+            calls(&farther_test, &test),
+        ];
+        let root = commit(
+            &graph,
+            vec![],
+            "request id baseline",
+            added(&[&focal, &middle, &caller, &test, &farther_test]),
+            edges.clone(),
+        );
+        let mut new = focal.clone();
+        new.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0xee; 32]);
+        let head = commit(
+            &graph,
+            vec![root],
+            "normalize request ids",
+            vec![EntityDelta::Modified {
+                old: focal.clone(),
+                new: new.clone(),
+            }],
+            vec![],
+        );
+        let guide = guide_of(&graph, head);
+        let step = guide
+            .chapters
+            .iter()
+            .flat_map(|chapter| &chapter.steps)
+            .find(|step| step.entity_id == focal.id.to_string())
+            .unwrap();
+        assert_eq!(guide.summary.recorded_tests, 1);
+        assert_eq!(
+            step.connections.consumers_total, 1,
+            "consumers remain direct"
+        );
+        assert_eq!(step.connections.tests_total, 1);
+        assert_eq!(step.connections.tests_depth, 3);
+        assert_eq!(step.connections.tests[0].entity.id, test.id.to_string());
+        assert_eq!(step.connections.tests[0].entity.name, test.name);
+        assert_eq!(step.connections.tests[0].hops, 3);
+        assert!(step.connections.tests[0].result.is_none());
+
+        let at_head = GraphAtRef::materialize(&graph, &head).unwrap();
+        let ranked = kin_review::rank_impact_at(&at_head, &focal.id, test_reach_depth()).unwrap();
+        let response: super::super::impact::ImpactResponse =
+            serde_json::from_value(serde_json::json!({
+                "lines": [], "resolution": "resolved", "ranked": ranked,
+            }))
+            .unwrap();
+        let (_, code_tests) = super::super::workspace_explore::impact_sections(&response).unwrap();
+        assert_eq!(code_tests["total"], 1);
+        assert_eq!(code_tests["items"][0]["id"], test.id.to_string());
+        assert_eq!(code_tests["items"][0]["hops"], 3);
+
+        for entity in [&new, &middle, &caller, &test, &farther_test] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for edge in edges {
+            let RelationDelta::Added { new } = edge else {
+                unreachable!()
+            };
+            graph.upsert_relation(&new).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        let authority = crate::commands::repository_authority::RequestRepositoryAuthority::pinned(
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap(),
+        );
+        struct TestManifest;
+        impl kin_parser::project_manifest::ProjectFiles for TestManifest {
+            fn manifest(
+                &self,
+                name: &str,
+            ) -> Result<Option<std::sync::Arc<str>>, kin_parser::project_manifest::UnreadableManifest>
+            {
+                Ok((name == "package.json")
+                    .then(|| std::sync::Arc::from(r#"{"scripts":{"test":"node --test"}}"#)))
+            }
+        }
+        let planned = super::super::verify::prepare_work_verify(
+            &authority,
+            &graph,
+            &TestManifest,
+            &super::super::verify::WorkVerifyRequest::Plan(super::super::verify::WorkVerifyScope {
+                entities: vec![focal.id.to_string()],
+                change: None,
+                depth: 2,
+            }),
+        )
+        .unwrap();
+        let super::super::verify::PreparedWork::Answered(planned) = planned else {
+            panic!("planning runs nothing")
+        };
+        assert_eq!(planned.tests.len(), 1);
+        assert_eq!(
+            planned.tests[0].entity_id.as_deref(),
+            Some(test.id.to_string().as_str())
+        );
+        let direct = super::super::verify::coverage_reading(&graph).unwrap();
+        assert!(
+            !direct.missing_proof.contains(&focal.id),
+            "Code untested excludes a helper with recorded transitive test reach"
+        );
+
+        let now = kin_model::Timestamp::now();
+        graph
+            .create_verification_run(&kin_model::VerificationRun {
+                run_id: kin_model::VerificationRunId::new(),
+                test_ids: vec![super::super::verify::test_id_for_entity(&test.id)],
+                status: kin_model::VerificationStatus::Passing,
+                runner: kin_model::TestRunner::Cargo,
+                started_at: now.clone(),
+                finished_at: Some(now),
+                duration_ms: Some(4),
+                evidence_blob: None,
+                exit_code: Some(0),
+                ran_against: vec![
+                    kin_model::RunFingerprint {
+                        entity: focal.id,
+                        behavior_hash: new.fingerprint.behavior_hash,
+                    },
+                    kin_model::RunFingerprint {
+                        entity: test.id,
+                        behavior_hash: test.fingerprint.behavior_hash,
+                    },
+                ],
+                proof: None,
+            })
+            .unwrap();
+        let live = kin_review::impact::LiveGraph(&graph);
+        let mut review = kin_review::SemanticReview::review_from_diff(
+            kin_review::SemanticDiff {
+                base: Some(root),
+                entity_changes: vec![edit_of(&focal)],
+                ..Default::default()
+            },
+            &graph,
+        )
+        .unwrap();
+        review.impact.enrichment = Some(observation(1, 0));
+        let working = assemble(
+            &graph,
+            None,
+            Subject {
+                kind: "working",
+                review,
+                connections: &live,
+                before_at: Some(root),
+                after: EntitySourceScope::WorkspaceHead,
+                change: change_header(
+                    &head,
+                    Some(root),
+                    &graph.get_change(&head).unwrap().unwrap(),
+                ),
+                head_label: WORKING.to_string(),
+                detail_command: "kin diff".into(),
+                reviews: GuideReviews::default(),
+                range: None,
+                working_tree: None,
+            },
+        )
+        .unwrap();
+        let step = &working.chapters[0].steps[0];
+        assert_eq!(working.summary.recorded_tests, 1);
+        assert_eq!(step.connections.tests[0].entity.id, test.id.to_string());
+        assert_eq!(step.connections.tests[0].hops, 3);
+        assert_eq!(
+            step.connections.tests[0].result.as_ref().unwrap().state,
+            super::super::verify::TestResultState::Passed
+        );
+        assert_eq!(step.tests_result.as_ref().unwrap().passed, 1);
+        assert_eq!(step.tests_result.as_ref().unwrap().not_run, 0);
+        assert_eq!(working.summary.completeness.state, "not_settled");
+        assert!(working
+            .summary
+            .completeness
+            .message
+            .contains("lower bounds"));
+    }
+
     /// The change the guide exists to show well: one function's body moves,
     /// and the three callers and the test that reach it do not.
     #[test]
@@ -4856,11 +6168,18 @@ mod tests {
             .all(|row| { row.relation == "calls" && row.origin == "parsed" && !row.changed_here }));
         assert_eq!(step.connections.tests_total, 1);
         assert_eq!(step.connections.tests[0].entity.name, "testListRun");
+        // A recorded change is not the work as it is now, so its tests carry
+        // no result and its JSON no result fields.
+        assert!(step.tests_result.is_none());
+        assert!(step.connections.tests[0].result.is_none());
+        let json = serde_json::to_value(step).unwrap();
+        assert!(json.get("tests_result").is_none());
+        assert!(json["connections"]["tests"][0].get("result").is_none());
         assert_eq!(
             step.narration,
             "The function `listRun` was modified. Its body changed; its signature did not. \
              3 places rely on it, and none of them changed here. They may need review. 1 \
-             test reaches it."
+             test reaches it within 3 recorded hops."
         );
         assert_eq!(
             step.consumer_verdict,
@@ -5843,6 +7162,175 @@ mod tests {
         .unwrap()
     }
 
+    fn agent_write(
+        change: SemanticChangeId,
+        vendor: &str,
+        at: &str,
+        entities: &[&Entity],
+    ) -> AgentWrite {
+        AgentWrite {
+            change_id: change.to_string(),
+            session: uuid::Uuid::new_v4().to_string(),
+            vendor: vendor.to_string(),
+            client: vendor.to_string(),
+            at: at.to_string(),
+            entities: entities.iter().map(|entity| entity.id).collect(),
+        }
+    }
+
+    fn authors_of(guide: &ReviewGuide, name: &str) -> Vec<String> {
+        let step = guide
+            .chapters
+            .iter()
+            .flat_map(|chapter| chapter.steps.iter())
+            .find(|step| step.name == name)
+            .unwrap_or_else(|| panic!("a step for {name}"));
+        assert!(step
+            .authored_by
+            .iter()
+            .all(|author| author.through == THROUGH_KIN));
+        step.authored_by
+            .iter()
+            .map(|author| author.name.clone())
+            .collect()
+    }
+
+    /// Two agents each wrote one entity through Kin. The second agent's change
+    /// also holds an entity it did not write, an edit that came along in the
+    /// same change, and that one reads as changed outside Kin. A guide of
+    /// uncommitted work is never marked: a write through Kin is a recorded
+    /// change the moment it lands.
+    #[test]
+    fn each_step_names_the_agent_that_wrote_it_through_kin_and_no_other() {
+        let graph = kin_db::InMemoryGraph::new();
+        let ranked = function("rankRuns", "src/runs/rank.ts", 1);
+        let listed = function("listRuns", "src/runs/list.ts", 2);
+        let carried = function("formatRun", "src/runs/format.ts", 3);
+        let root = commit(
+            &graph,
+            vec![],
+            "Add runs",
+            added(&[&ranked, &listed, &carried]),
+            vec![],
+        );
+        let edited = |entity: &Entity, body: u8| {
+            let mut new = entity.clone();
+            new.fingerprint.ast_hash = kin_model::Hash256::from_bytes([body; 32]);
+            new.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([body; 32]);
+            EntityDelta::Modified {
+                old: entity.clone(),
+                new,
+            }
+        };
+        let by_codex = commit(
+            &graph,
+            vec![root],
+            "Rank runs by start",
+            vec![edited(&ranked, 21)],
+            vec![],
+        );
+        let by_claude = commit(
+            &graph,
+            vec![by_codex],
+            "List runs newest first",
+            vec![edited(&listed, 22), edited(&carried, 23)],
+            vec![],
+        );
+        let writes = vec![
+            agent_write(by_codex, "codex", "2026-10-13T21:00:00+00:00", &[&ranked]),
+            agent_write(
+                by_claude,
+                "claude-code",
+                "2026-10-13T22:00:00+00:00",
+                &[&listed],
+            ),
+            // A write recorded as a change this guide does not walk.
+            agent_write(
+                SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([5; 32])),
+                "gemini-cli",
+                "2026-10-13T23:00:00+00:00",
+                &[&carried],
+            ),
+        ];
+
+        let mut range = range_of(&graph, root, by_claude);
+        attribute_agent_writes(&mut range, &writes, &[]);
+        assert_eq!(authors_of(&range, "rankRuns"), vec!["Codex"]);
+        assert_eq!(authors_of(&range, "listRuns"), vec!["Claude Code"]);
+        assert!(
+            authors_of(&range, "formatRun").is_empty(),
+            "changed in an agent's change, written by no agent"
+        );
+        assert_eq!(
+            range
+                .summary
+                .authors
+                .iter()
+                .map(|author| (author.name.as_str(), author.entities))
+                .collect::<Vec<_>>(),
+            vec![("Claude Code", 1), ("Codex", 1)],
+            "newest write first"
+        );
+        assert_eq!(range.summary.authors[0].session, writes[1].session);
+        let text = guide_text(&range);
+        assert!(
+            text.contains("Written through Kin by Claude Code"),
+            "{text}"
+        );
+
+        let mut change = guide_of(&graph, by_claude);
+        attribute_agent_writes(&mut change, &writes, &[]);
+        assert_eq!(authors_of(&change, "listRuns"), vec!["Claude Code"]);
+        assert!(authors_of(&change, "formatRun").is_empty());
+        let json = serde_json::to_value(&change).unwrap();
+        let steps: Vec<&serde_json::Value> = json["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|chapter| chapter["steps"].as_array().unwrap())
+            .collect();
+        let listed_step = steps
+            .iter()
+            .find(|step| step["name"] == "listRuns")
+            .unwrap();
+        assert_eq!(
+            listed_step["authored_by"],
+            serde_json::json!([{
+                "name": "Claude Code",
+                "session": writes[1].session,
+                "at": "2026-10-13T22:00:00+00:00",
+                "through": "kin",
+            }])
+        );
+        let carried_step = steps
+            .iter()
+            .find(|step| step["name"] == "formatRun")
+            .unwrap();
+        assert!(
+            carried_step.get("authored_by").is_none(),
+            "nothing is said on a step no agent wrote through Kin"
+        );
+        assert_eq!(
+            json["summary"]["authors"],
+            serde_json::json!([{
+                "name": "Claude Code",
+                "session": writes[1].session,
+                "entities": 1,
+                "through": "kin",
+            }])
+        );
+
+        let mut working = change.clone();
+        working.kind = "working".to_string();
+        attribute_agent_writes(&mut working, &writes, &[]);
+        assert!(working
+            .chapters
+            .iter()
+            .flat_map(|chapter| chapter.steps.iter())
+            .all(|step| step.authored_by.is_empty()));
+        assert!(working.summary.authors.is_empty());
+    }
+
     /// A range is what a review of a branch reads: everything the head holds
     /// that the base does not, with "before" read where the two parted. What
     /// the base did on its own since then is not part of it.
@@ -5908,14 +7396,33 @@ mod tests {
             "{text}"
         );
 
+        // Main moved on by one change of its own after the branch left it,
+        // so the branch is two ahead and one behind, not merely ahead.
+        assert_eq!(range.base_changes_total, 1);
+
         // A range that holds nothing is an answer, not a refusal.
         let nothing = range_of(&graph, head, head);
         assert_eq!(nothing.range.as_ref().unwrap().changes_total, 0);
+        assert_eq!(
+            nothing.range.as_ref().unwrap().base_changes_total,
+            0,
+            "a branch at its base's own change is even with it"
+        );
         assert!(nothing.chapters.is_empty());
-        // A base that is ahead of the head leaves nothing either.
+        // A base that is ahead of the head leaves nothing either, and says
+        // how far ahead it is, so a branch behind does not read as even.
         let behind = range_of(&graph, head, first);
         assert_eq!(behind.range.as_ref().unwrap().changes_total, 0);
+        assert_eq!(
+            behind.range.as_ref().unwrap().base_changes_total,
+            1,
+            "the base holds one change the branch does not"
+        );
         assert!(behind.chapters.is_empty());
+        // A branch that only adds to its base is ahead and not behind.
+        let ahead = range_of(&graph, root, head);
+        assert_eq!(ahead.range.as_ref().unwrap().changes_total, 2);
+        assert_eq!(ahead.range.as_ref().unwrap().base_changes_total, 0);
     }
 
     /// A range and its last change share a head. A review of the last change
@@ -6456,8 +7963,7 @@ mod tests {
         );
         assert_eq!(
             summary_narration("change", 2, 0, 0, 0, 0, 1, &counts(0, 0, 0)),
-            "This change added 2 entities, read here in 1 chapter. Nothing outside the change \
-             reaches them."
+            "This change added 2 entities, read here in 1 chapter. No direct outside consumer or test within 3 recorded hops reaches them."
         );
         assert_eq!(
             summary_narration("change", 0, 0, 0, 0, 0, 0, &counts(0, 0, 0)),
@@ -6466,7 +7972,7 @@ mod tests {
         assert_eq!(
             summary_narration("work", 0, 1, 0, 0, 2, 1, &counts(0, 0, 0)),
             "This work modified 1 entity, read here in 1 chapter. 2 tests outside the work \
-             reach it."
+             reach it within 3 recorded hops."
         );
         assert_eq!(
             summary_narration("range", 0, 0, 0, 0, 0, 0, &counts(0, 0, 0)),
@@ -6478,7 +7984,7 @@ mod tests {
             summary_narration("change", 0, 1, 0, 16, 2, 1, &counts(0, 0, 16)),
             "This change modified 1 entity, read here in 1 chapter. 16 places outside the \
              change rely on it. None of them needs an update: what they rely on kept its \
-             signature and behaves as it did. 2 tests reach it."
+             signature and behaves as it did. 2 tests reach it within 3 recorded hops."
         );
         assert_eq!(
             summary_narration("change", 0, 1, 0, 1, 0, 1, &counts(1, 0, 0)),
@@ -7085,5 +8591,140 @@ mod tests {
             "the list and the merge's walk say the same number"
         );
         assert_eq!(counted.entities, 2);
+    }
+
+    /// An enrichment observation as the review records it: `owed` entities
+    /// whose enrichment a sweep will still reach, and `answered` entities
+    /// holding call sites a resolver already answered without settling.
+    fn observation(owed: usize, answered: usize) -> kin_review::enrichment::EnrichmentObservation {
+        let mut pending_by_code = std::collections::BTreeMap::new();
+        if owed > 0 {
+            pending_by_code.insert(
+                kin_review::enrichment::ENRICHMENT_INCOMPLETE.to_string(),
+                owed,
+            );
+        }
+        if answered > 0 {
+            pending_by_code.insert("call_sites_unresolved".to_string(), answered);
+        }
+        let total = owed + answered;
+        kin_review::enrichment::EnrichmentObservation {
+            scope: "selected_graph_impact".to_string(),
+            selected_change: None,
+            status: if total > 0 {
+                "bounded"
+            } else {
+                "no_recorded_call_site_debt"
+            }
+            .to_string(),
+            basis: String::new(),
+            limitation: None,
+            total_pending_entities: total,
+            pending_entities: Vec::new(),
+            entities_withheld: total,
+            owed_entities: owed,
+            pending_by_code,
+            clauses: Vec::new(),
+        }
+    }
+
+    /// The guide says entities are pending only while their enrichment is
+    /// owed. A converted store whose sweep had finished held 552 entities with
+    /// call sites the resolver had answered without settling and none owed,
+    /// and the guide told its reader Kin was still mapping 552 entities, a
+    /// number that never moved.
+    #[test]
+    fn completeness_is_settled_when_no_enrichment_is_owed() {
+        let answered_only = completeness_of(Some(&observation(0, 552)));
+        assert_eq!(answered_only.state, "settled");
+        assert_eq!(answered_only.pending_entities, None);
+        assert_eq!(answered_only.unresolved_entities, Some(552));
+        assert!(
+            answered_only
+                .message
+                .starts_with("Settled: no entity is waiting on enrichment."),
+            "{}",
+            answered_only.message
+        );
+        assert!(
+            answered_only
+                .message
+                .contains("552 entities hold call sites")
+                && answered_only
+                    .message
+                    .contains("No enrichment is currently owed for them"),
+            "{}",
+            answered_only.message
+        );
+        assert!(
+            !answered_only.message.contains("Not settled"),
+            "a page reading the count out of the message must find none: {}",
+            answered_only.message
+        );
+
+        let one = completeness_of(Some(&observation(0, 1)));
+        assert!(
+            one.message.contains("1 entity holds call sites")
+                && one
+                    .message
+                    .contains("No enrichment is currently owed for it"),
+            "{}",
+            one.message
+        );
+
+        let nothing = completeness_of(Some(&observation(0, 0)));
+        assert_eq!(nothing.state, "settled");
+        assert_eq!(nothing.pending_entities, None);
+        assert_eq!(nothing.unresolved_entities, None);
+        assert!(
+            nothing
+                .message
+                .contains("Overall completeness is unverified"),
+            "settled never claims the review is complete: {}",
+            nothing.message
+        );
+    }
+
+    /// Owed enrichment is what waiting changes, so it alone is counted as
+    /// pending, and what a resolver already answered is counted beside it.
+    #[test]
+    fn completeness_counts_only_owed_enrichment_as_pending() {
+        let both = completeness_of(Some(&observation(3, 7)));
+        assert_eq!(both.state, "not_settled");
+        assert_eq!(both.pending_entities, Some(3));
+        assert_eq!(both.unresolved_entities, Some(7));
+        assert!(
+            both.message.starts_with(
+                "Not settled: 3 entities pending enrichment. Impact counts are lower bounds"
+            ),
+            "{}",
+            both.message
+        );
+        assert!(
+            both.message.contains("7 entities hold call sites"),
+            "{}",
+            both.message
+        );
+
+        let owed_only = completeness_of(Some(&observation(1, 0)));
+        assert_eq!(owed_only.state, "not_settled");
+        assert_eq!(owed_only.pending_entities, Some(1));
+        assert_eq!(owed_only.unresolved_entities, None);
+        assert!(
+            owed_only
+                .message
+                .starts_with("Not settled: 1 entity pending enrichment."),
+            "{}",
+            owed_only.message
+        );
+    }
+
+    /// With no observation the guide claims nothing either way.
+    #[test]
+    fn completeness_without_an_observation_is_unavailable() {
+        let unavailable = completeness_of(None);
+        assert_eq!(unavailable.state, "unavailable");
+        assert_eq!(unavailable.pending_entities, None);
+        assert_eq!(unavailable.unresolved_entities, None);
     }
 }

@@ -2232,3 +2232,93 @@ fn a_files_imported_names_are_read_from_its_record() {
     assert_eq!(imports.bound_in(&FilePathId::new("web/app.ts")), None);
     assert_eq!(imports.bound_in(&FilePathId::new("tests/missing.py")), None);
 }
+
+/// A census graph that counts how often the census asks it for each file's
+/// member reads, and answers as the fixture it wraps does.
+struct CountingReads<'f> {
+    inner: &'f Fixture,
+    asked: std::cell::RefCell<HashMap<String, usize>>,
+}
+
+impl EscapeCensusGraph for CountingReads<'_> {
+    fn census_files(&self, languages: &[LanguageId]) -> Option<Vec<CensusFile>> {
+        self.inner.census_files(languages)
+    }
+
+    fn entities_in(&self, path: &FilePathId) -> Option<Vec<Entity>> {
+        self.inner.entities_in(path)
+    }
+
+    fn import_evidence_into(&self, target: EntityId) -> Option<Vec<RelationEvidence>> {
+        self.inner.import_evidence_into(target)
+    }
+
+    fn uses_into(&self, target: EntityId) -> Option<Vec<StoredUse>> {
+        self.inner.uses_into(target)
+    }
+
+    fn outside_member_reads(&self, file: &CensusFile) -> Vec<OutsideMemberRead> {
+        *self
+            .asked
+            .borrow_mut()
+            .entry(file.path.0.clone())
+            .or_default() += 1;
+        Vec::new()
+    }
+}
+
+/// A batch census reads each file's member reads once, however many of its
+/// focals have names read there.
+///
+/// What a graph holds for a file does not depend on the focal whose names led
+/// the census to it. A guide of a change asks about every entity the change
+/// reaches in one batch, and each focal used to read every such file again.
+#[test]
+fn a_batch_reads_each_files_member_reads_once_for_all_its_focals() {
+    let mut user = record(ModuleScope::Open);
+    for (name, line) in [("first", 3), ("second", 7)] {
+        let mut read = occurrence(line, OccurrenceContext::Argument, OccurrenceBinding::Member);
+        read.receiver = Some("obj".into());
+        read.receiver_kind = Some(ReceiverKind::Other);
+        user.values.insert(name.into(), vec![read]);
+    }
+    let mut owner = record(ModuleScope::Open);
+    owner.classes.push(class("Owner", 1, &[], false));
+    let fixture = Fixture::default()
+        .recorded("app.py", owner)
+        .declares(
+            "app.py",
+            "Owner.first",
+            EntityKind::Method,
+            2,
+            Visibility::Public,
+        )
+        .declares(
+            "app.py",
+            "Owner.second",
+            EntityKind::Method,
+            4,
+            Visibility::Public,
+        )
+        .recorded("user.py", user);
+    let first = fixture.named("Owner.first");
+    let second = fixture.named("Owner.second");
+    let counting = CountingReads {
+        inner: &fixture,
+        asked: Default::default(),
+    };
+    let answers = focal_escape_evidence_batch(
+        &counting,
+        &[
+            (first, kin_model::focal_call_names(first)),
+            (second, kin_model::focal_call_names(second)),
+        ],
+    );
+    assert_eq!(answers.len(), 2);
+    assert_eq!(
+        counting.asked.borrow().get("user.py").copied(),
+        Some(1),
+        "the file both focals' names are read in is read once: {:?}",
+        counting.asked.borrow()
+    );
+}

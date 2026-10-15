@@ -83,6 +83,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import tempfile
 
+from runtime_fixture import prepare_runtime_fixture
+
 PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
@@ -662,6 +664,7 @@ def check_1(suite):
     # one its own commands put there. Without this the probe resolves the
     # operator's installed kin and passes a block that installs nothing.
     env["PATH"] = suite.sanitized_path(work)
+    suite.prepare_runtime(env)
     rc, out, err = run(["bash", "-euo", "pipefail", "-c", script],
                        cwd=work, env=env, timeout=900)
     said = flatten(out + " " + err)
@@ -719,6 +722,12 @@ def check_2(suite):
     env["HOME"] = home
     env["PATH"] = binpath
     env["KIN_HOME"] = os.path.join(home, ".kin")
+    # The built PATH is the only place a server may be found. Kin otherwise
+    # also searches the usual install places, and a runner image that ships
+    # the servers in /usr/local/bin or a rustup proxy under CARGO_HOME then
+    # reads every recipe as installed, so nothing is attempted and this check
+    # grades silence.
+    env["KIN_LANGUAGE_TOOL_SEARCH"] = "0"
     # A real npm against a port nothing listens on: the error text is npm's own,
     # not this script's. A stubbed npm printing the words the classifier looks
     # for would be a check that cannot fail.
@@ -742,13 +751,14 @@ def check_2(suite):
     # terminal otherwise prints only the short summary.
     command = [suite.kin, "setup", "--no-interactive", "--verbose", "--skip-mcp-check",
                "--install-language-servers"]
+    command[0] = suite.prepare_runtime(env)
     rc, out, err = run(command, cwd=work, env=env, timeout=1800)
     # The installer's full account, beside the files it touched: the verdict
     # below quotes 220 characters of it.
     keep_probe_output(
         work, "install-language-servers", command, rc, out, err,
         {name: env.get(name) for name in (
-            "HOME", "KIN_HOME", "PATH", "npm_config_registry",
+            "HOME", "KIN_HOME", "PATH", "KIN_LANGUAGE_TOOL_SEARCH", "npm_config_registry",
             "KIN_LANGUAGE_SERVER_ASSET_BASE", "npm_config_prefix",
             "npm_config_fetch_retries")})
     ok, detail = grade_network_diagnosis(out + "\n" + err)
@@ -780,7 +790,8 @@ def doctor_report(suite, extra_env=None):
     work = os.path.join(suite.workdir, "no-repository")
     if not os.path.isdir(work):
         os.makedirs(work)
-    rc, out, err = run([suite.kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
+    kin = suite.prepare_runtime(env)
+    rc, out, err = run([kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
     if not out.strip():
         return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
             rc, flatten(failure_excerpt(err)))
@@ -1156,9 +1167,11 @@ def check_4(suite):
         for name in TOOLCHAIN_HOME_VARS:
             env.pop(name, None)
 
+        kin = suite.prepare_runtime(env)
+
         work = suite.scratch("toolchain-free-repo")
         suite.own(work, env)
-        rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
+        rc, out, err = run([kin, "init", "."], cwd=work, env=env, timeout=900)
         if rc != 0:
             res.unknown("kin init exited %d in the fixture repository: %s"
                         % (rc, flatten(failure_excerpt(err))))
@@ -1173,7 +1186,7 @@ def check_4(suite):
         with open(os.path.join(work, "src", "lib.rs"), "w") as source:
             source.write("pub fn answer() -> u32 {\n    42\n}\n")
         rc, out, err = run(
-            [suite.kin, "doctor", "--fix", "--install-language-servers"],
+            [kin, "doctor", "--fix", "--install-language-servers"],
             cwd=work, env=env, timeout=900)
         combined = (out or "") + "\n" + (err or "")
 
@@ -1362,6 +1375,430 @@ def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
                   "behind the user, and the notice named the gap and the repair on stderr")
 
 
+def _setup_expect(res, name, conditions, transcript=""):
+    """Keep the named Managed controls inside the existing first-contact row."""
+    missing = [label for label, holds in conditions if not holds]
+    if missing:
+        res.bad("Managed setup %s: %s; %s" % (
+            name, "; ".join(missing), flatten(failure_excerpt(transcript))))
+    else:
+        res.ok("Managed setup %s" % name)
+
+
+def _setup_fixture(suite, name, claude=None):
+    root = suite.scratch("managed-setup-" + name)
+    home, cwd = os.path.join(root, "home"), os.path.join(root, "outside-repository")
+    os.makedirs(home, mode=0o755)
+    os.makedirs(cwd, mode=0o755)
+    env = suite.base_env()
+    env.update({"HOME": home, "USERPROFILE": home,
+                "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+                "APPDATA": os.path.join(home, "AppData", "Roaming"),
+                "LOCALAPPDATA": os.path.join(home, "AppData", "Local"),
+                "KIN_HOME": os.path.join(home, ".kin"), "KIN_NO_DAEMON": "1",
+                "KIN_REGISTRY_PATH": os.path.join(home, ".kin", "registry.toml")})
+    for key in ("KIN_STORE", "KIN_STORE_LAYOUT", "KIN_MCP_SCAN_ROOT",
+                "KIN_RUNTIME_MODE", "KIN_MCP_KIN_BINARY"):
+        env.pop(key, None)
+    if claude is not None:
+        with open(os.path.join(home, ".claude.json"), "wb") as stream:
+            stream.write(claude)
+    kin = suite.prepare_runtime(env)
+    with open(os.path.join(env["KIN_HOME"], "acceptance-runtime.json")) as stream:
+        receipt = json.load(stream)
+    if (receipt.get("schema") != "kin.acceptance-runtime-fixture.v1"
+            or receipt.get("mode") != "managed"
+            or env.get("KIN_RUNTIME_MODE") != "managed"):
+        raise ValueError("setup behavior acceptance needs a genuine admitted Managed release pair")
+    return {"root": root, "home": home, "cwd": cwd, "env": env, "kin": kin}
+
+
+def _setup_run(fixture, name, args, cwd=None, umask=False, kin=None):
+    command = [kin or fixture["kin"]] + args
+    if umask:
+        command = ["/bin/sh", "-c", 'umask 0002 && exec "$0" "$@"'] + command
+    rc, out, err = run(command, cwd=cwd or fixture["cwd"], env=fixture["env"], timeout=240)
+    keep_probe_output(fixture["root"], name, command, rc, out, err,
+                      {key: fixture["env"].get(key) for key in
+                       ("HOME", "KIN_HOME", "KIN_RUNTIME_MODE", "KIN_REGISTRY_PATH", "PATH")})
+    return rc, out, err
+
+
+def _setup_read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as stream:
+            return stream.read()
+    except OSError:
+        return None
+
+
+def _setup_client_written(home):
+    try:
+        value = json.loads(_setup_read(os.path.join(home, ".claude.json")) or "null")
+        return isinstance(value.get("mcpServers", {}).get("kin"), dict)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _setup_home_snapshot(home):
+    entries = {}
+    for directory, directories, files in os.walk(home, followlinks=False):
+        for name in directories + files:
+            path = os.path.join(directory, name)
+            info = os.lstat(path)
+            relative = os.path.relpath(path, home)
+            if stat.S_ISLNK(info.st_mode):
+                entries[relative] = ("symlink", os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                entries[relative] = ("directory", stat.S_IMODE(info.st_mode))
+            elif stat.S_ISREG(info.st_mode):
+                entries[relative] = ("file", stat.S_IMODE(info.st_mode),
+                                     hashlib.sha256(_setup_read(path, True)).hexdigest())
+            else:
+                entries[relative] = ("other", info.st_mode)
+    return entries
+
+
+def _setup_summary_conditions(rc, out):
+    return [("setup failed", rc == 0),
+            ("missing noninteractive disclosure", "This run asks nothing and takes the defaults." in out),
+            ("missing closing verdict", "Kin is set up on" in out),
+            ("missing defaults disclosure", "taken without asking; kin setup --verbose lists each one" in out),
+            ("verbose record leaked into the short summary",
+             "=== Health checklist ===" not in out and "Hardware check" not in out),
+            ("summary contains escape codes", "\x1b" not in out),
+            ("summary exceeds 30 lines", len(out.splitlines()) <= 30)]
+
+
+def _setup_round_trip_line(out):
+    if "MCP round trip" not in out:
+        return ""
+    return next((line.strip() for line in out.split("MCP round trip", 1)[1].splitlines()
+                 if "Claude Code: " in line), "")
+
+
+def _setup_shell_report_conditions(rc, report, refused=False):
+    report = report if isinstance(report, dict) else {}
+    conditions = [("wrong exit status", rc == (1 if refused else 0)),
+                  ("missing shell report schema", report.get("schema") == "kin.setup-shell.v1"),
+                  ("wrong shell", report.get("shell") == "zsh"),
+                  ("wrong shell status", report.get("status") == ("not_written" if refused else "installed")),
+                  ("shell-only connected a client", report.get("clients_connected") == [])]
+    if refused:
+        conditions += [("missing profile refusal", bool(report.get("reason"))),
+                       ("unwritten hook claimed loadable", report.get("next") is None),
+                       ("missing manual profile additions", bool(report.get("add_by_hand")))]
+    else:
+        conditions += [("unexpected refusal", report.get("reason") is None),
+                       ("unexpected manual additions", report.get("add_by_hand") == [])]
+    return conditions
+
+
+def _setup_authority_file_snapshot(path):
+    observed = os.lstat(path)
+    return {"mode": stat.S_IMODE(observed.st_mode), "regular": stat.S_ISREG(observed.st_mode),
+            "device": observed.st_dev, "inode": observed.st_ino,
+            "uid": observed.st_uid, "gid": observed.st_gid,
+            "sha256": hashlib.sha256(_setup_read(path, True)).hexdigest()}
+
+
+def _setup_registry_repair_conditions(rc, out, before, after):
+    identity = ("regular", "device", "inode", "uid", "gid", "sha256")
+    return [("doctor --fix failed", rc == 0),
+            ("registry permission repair was not reported", "repaired registry authority permissions to 0600" in out),
+            ("unsafe authority control was vacuous", all(row.get("mode") == 0o644 for row in before.values())
+             and set(before) == {"registry", "lock"}),
+            ("registry or lock was not repaired to 0600", set(after) == set(before)
+             and all(row.get("mode") == 0o600 for row in after.values())),
+            ("permission-only repair changed content, owner or file identity",
+             set(after) == set(before) and all(
+                 before[name].get("regular") is True
+                 and all(after[name].get(field) == row.get(field) for field in identity)
+                 for name, row in before.items()))]
+
+
+def managed_setup_controls(suite, res):
+    """Preserve setup's release behavior while debug tests prove only refusal.
+
+    Every positive uses runtime_fixture's independently probed release pair in
+    a fresh canonical home. No install ledger or publication provenance is
+    fabricated to admit it. These are assertions on check 5, not new gate rows.
+    """
+    agent = ["setup", "--no-interactive", "--verbose", "--intent", "agent",
+             "--skip-mcp-check", "--shell", "zsh"]
+    invalid = b"this is not JSON\n"
+    fixture = _setup_fixture(suite, "invalid-client", invalid)
+    rc, out, err = _setup_run(fixture, "invalid-client", agent)
+    _setup_expect(res, "invalid-client-preserved-and-diagnosed", [
+        ("invalid client config exited successfully", rc != 0),
+        ("client refusal omitted its cause", "kin setup could not configure Claude Code" in err
+         and "not valid JSON" in err),
+        ("invalid client config changed", _setup_read(os.path.join(fixture["home"], ".claude.json"), True) == invalid),
+        ("setup did not finish its health record", "=== Health checklist ===" in out)], out + err)
+
+    fixture = _setup_fixture(suite, "writable-client", b"{}")
+    if os.name == "posix":
+        shim = os.path.join(fixture["root"], "client-bin")
+        os.makedirs(shim)
+        path = os.path.join(shim, "codex")
+        with open(path, "w") as stream:
+            stream.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+        fixture["env"]["PATH"] = shim + os.pathsep + fixture["env"].get("PATH", "")
+    rc, out, err = _setup_run(fixture, "writable-client", agent)
+    conditions = [("writable setup failed", rc == 0),
+                  ("no Claude Code Kin entry", _setup_client_written(fixture["home"]))]
+    if os.name == "posix":
+        conditions.append(("missing first-install Codex deferral", "Codex CLI is not configured yet" in out))
+    _setup_expect(res, "writable-client-and-honest-deferral", conditions, out + err)
+
+    fixture = _setup_fixture(suite, "plain-summary")
+    short_args = ["setup", "--no-interactive", "--intent", "agent", "--skip-mcp-check", "--shell", "zsh"]
+    rc, out, err = _setup_run(fixture, "short-summary", short_args)
+    _setup_expect(res, "short-noninteractive-summary", _setup_summary_conditions(rc, out), out + err)
+    rc, out, err = _setup_run(fixture, "verbose-summary", short_args + ["--verbose"])
+    _setup_expect(res, "verbose-full-record", [("verbose setup failed", rc == 0),
+        ("verbose decisions or health record absent", "=== Health checklist ===" in out
+         and "This run was not interactive, so it answered these for you:" in out)], out + err)
+    rc, out, err = _setup_run(fixture, "ignored-mode", short_args + ["--mode", "native"])
+    _setup_expect(res, "legacy-mode-ignored", [("legacy flag refused", rc == 0),
+        ("legacy flag silently accepted", "--mode is ignored" in err)], out + err)
+    rc, out, err = _setup_run(fixture, "setup-help", ["setup", "--help"])
+    _setup_expect(res, "legacy-mode-hidden-from-help", [("help failed", rc == 0),
+        ("legacy flag advertised", "--mode" not in out)], out + err)
+
+    fixture = _setup_fixture(suite, "unusable-profile", b"{}")
+    zshrc = os.path.join(fixture["home"], ".zshrc")
+    os.makedirs(zshrc)
+    rc, out, err = _setup_run(fixture, "unusable-profile", agent)
+    _setup_expect(res, "shell-refusal-still-configures-client", [
+        ("partial setup failed", rc == 0), ("client was not configured", _setup_client_written(fixture["home"])),
+        ("profile refusal unnamed", "Shell integration was not written: failed to read " + zshrc in out),
+        ("manual repair absent", "To finish it by hand" in out),
+        ("unwritten hook claimed loadable", "Open a new shell session to load the shell hook" not in out)], out + err)
+    if os.name == "posix":
+        fixture = _setup_fixture(suite, "readonly-profile", b"{}")
+        store = os.path.join(fixture["home"], "store")
+        os.makedirs(store)
+        managed = os.path.join(store, "zshrc")
+        seeded = "# managed by home-manager\n"
+        with open(managed, "w") as stream:
+            stream.write(seeded)
+        os.chmod(managed, 0o444)
+        zshrc = os.path.join(fixture["home"], ".zshrc")
+        os.symlink(managed, zshrc)
+        try:
+            with open(managed, "a"):
+                pass
+        except PermissionError:
+            rc, out, err = _setup_run(fixture, "readonly-profile", agent)
+            tail = out.split("To finish it by hand", 1)[-1]
+            _setup_expect(res, "readonly-profile-partial-success", [
+                ("partial setup failed", rc == 0), ("client was not configured", _setup_client_written(fixture["home"])),
+                ("refusal omitted file or cause", "Shell integration was not written: failed to update " + zshrc in out
+                 and "Permission denied" in out),
+                ("manual hook missing or writable profile included", "To finish it by hand" in out
+                 and "to " + zshrc + ":" in tail and "source " in tail and ".zshenv" not in tail),
+                ("read-only target changed", _setup_read(managed) == seeded and os.path.islink(zshrc)),
+                ("writable PATH profile absent", fixture["env"]["KIN_HOME"] + "/bin" in (_setup_read(os.path.join(fixture["home"], ".zshenv")) or "")),
+                ("client step did not precede shell step", 0 <= out.find("AI client MCP configuration:") < out.find("Shell integration:")),
+                ("health record absent", "=== Health checklist ===" in out)], out + err)
+        else:
+            res.ok("Managed setup readonly-profile: this user can write mode 0444; directory-refusal control exercised instead")
+
+    for installed in (True, False):
+        fixture = _setup_fixture(suite, "editor-installed" if installed else "editor-missing")
+        if installed:
+            extension = os.path.join(fixture["home"], ".vscode", "extensions", "firelock.kin-editor-test")
+            os.makedirs(extension)
+            with open(os.path.join(extension, "package.json"), "w") as stream:
+                json.dump({"publisher": "firelock", "name": "kin-editor", "version": "0.0.0-test"}, stream)
+        rc, out, err = _setup_run(fixture, "editor", ["setup", "--intent", "editor", "--no-interactive", "--skip-mcp-check"])
+        lower = out.lower()
+        conditions = [("editor setup failed", rc == 0)]
+        if installed:
+            conditions += [("installed extension not acknowledged", "kin-editor extension already installed" in lower
+                            and "kin-editor is already installed" in lower),
+                           ("installed extension recommended again", "install the kin-editor" not in lower)]
+        else:
+            section = out.split("Editor extension:", 1)[-1].split("=== Health checklist ===", 1)[0]
+            conditions += [("missing extension plan absent", "plan: editor (vs code + kin-editor)" in lower
+                            and "plus how to install the kin-editor extension" in lower),
+                           ("actionable bounded editor guidance absent", "Editor extension:" in out
+                            and "=== Health checklist ===" in out
+                            and "Install the kin-editor VS Code extension for the entity explorer," in section
+                            and "semantic search, and trace surfaces. See the kin-editor README." in section)]
+        _setup_expect(res, "editor-installed" if installed else "editor-missing", conditions, out + err)
+
+    fixture = _setup_fixture(suite, "mcp-round-trip", b"{}")
+    repo = os.path.join(fixture["root"], "repo")
+    os.makedirs(repo)
+    suite.own(repo, fixture["env"])
+    rc, out, err = _setup_run(fixture, "init", ["init", repo])
+    _setup_expect(res, "mcp-fixture-initialized", [("repository init failed", rc == 0)], out + err)
+    if rc == 0:
+        rc, out, err = _setup_run(fixture, "store-path", ["store", "path", "--json"], repo)
+        try:
+            layout = json.loads(out)
+        except ValueError:
+            layout = {}
+        store = layout.get("store")
+        bound = (rc == 0 and layout.get("schema") == "kin.store-path.v1"
+                 and layout.get("external") is True
+                 and os.path.realpath(layout.get("working_dir", "")) == os.path.realpath(repo)
+                 and isinstance(store, str)
+                 and os.path.commonpath([os.path.realpath(store),
+                                        os.path.realpath(fixture["env"]["KIN_HOME"])])
+                     == os.path.realpath(fixture["env"]["KIN_HOME"])
+                 and os.path.isfile(os.path.join(store, "manifest.json")))
+        _setup_expect(res, "mcp-fixture-private-central-store", [
+            ("product resolver did not bind the fixture's central store", bound)], out + err)
+        if bound:
+            suite.owned_stores[os.path.abspath(repo)] = store
+        mcp_args = ["setup", "--no-interactive", "--verbose", "--intent", "agent"]
+        for name, cwd, extra in (("answered", repo, []), ("skip", repo, ["--skip-mcp-check"]),
+                                 ("no-repository", fixture["cwd"], [])):
+            fixture["env"]["KIN_MCP_SCAN_ROOT"] = cwd
+            rc, out, err = _setup_run(fixture, "mcp-" + name, mcp_args + extra, cwd)
+            line = _setup_round_trip_line(out)
+            conditions = [("setup failed", rc == 0), ("Claude Code round trip row absent", bool(line))]
+            if name == "answered":
+                conditions += [("recorded entry did not answer the real status call", "the entry answered" in line
+                                and "status reports" in line and "no repo daemon is serving" in line),
+                               ("working entry reported unproven", "were not shown to work" not in out)]
+            else:
+                conditions += [("skip or missing repository not named", "not exercised" in line
+                                and ("--skip-mcp-check" if name == "skip" else "no initialized Kin repository") in line),
+                               ("missing repository reported broken", "failed at" not in line)]
+            _setup_expect(res, "mcp-" + name, conditions, out + err)
+
+    fixture = _setup_fixture(suite, "broken-launcher", b"{}")
+    with open(fixture["kin"], "wb") as stream:
+        stream.write(b"this is not a Kin binary\n")
+    before = _setup_home_snapshot(fixture["home"])
+    rc, out, err = _setup_run(fixture, "broken-launcher", agent, kin=suite.kin)
+    _setup_expect(res, "broken-launcher-refused-before-writes", [
+        ("broken canonical launcher accepted", rc != 0),
+        ("native admission refusal absent", "runtime admission refused" in out + err),
+        ("broken launcher omitted", fixture["kin"] in out + err),
+        ("setup wrote before admission", _setup_home_snapshot(fixture["home"]) == before),
+        ("unlaunched entry claimed exercised", "MCP round trip" not in out and "=== Health checklist ===" not in out)], out + err)
+
+    fixture = _setup_fixture(suite, "shell-only", b'{"mcpServers": {}}\n')
+    claude = _setup_read(os.path.join(fixture["home"], ".claude.json"), True)
+    args = ["setup", "--shell-only", "--shell", "zsh"]
+    rc, out, err = _setup_run(fixture, "shell-only-json", args + ["--json"])
+    try:
+        report = json.loads(out)
+    except ValueError:
+        report = None
+    _setup_expect(res, "shell-only-one-json-object", _setup_shell_report_conditions(rc, report), out + err)
+    zshrc = _setup_read(os.path.join(fixture["home"], ".zshrc"))
+    zshenv = _setup_read(os.path.join(fixture["home"], ".zshenv")) or ""
+    other_clients = [".cursor/mcp.json", ".codex/config.toml", ".gemini/settings.json",
+                     ".codeium/windsurf/mcp_config.json", ".lmstudio/mcp.json", ".grok/config.toml"]
+    _setup_expect(res, "shell-only-profile-client-and-ledger", [
+        ("shell hook absent", "kin-vfs" in (zshrc or "")),
+        ("canonical bin absent from PATH profile", os.path.join(fixture["env"]["KIN_HOME"], "bin") in zshenv),
+        ("Claude config changed", _setup_read(os.path.join(fixture["home"], ".claude.json"), True) == claude),
+        ("shell-only created client configs", not any(os.path.exists(os.path.join(fixture["home"], path)) for path in other_clients)),
+        ("shell step missing from setup ledger", "zsh" in (_setup_read(os.path.join(fixture["env"]["KIN_HOME"], "config", "setup-ledger.json")) or ""))], out + err)
+    rc, out, err = _setup_run(fixture, "shell-only-idempotent", args)
+    _setup_expect(res, "shell-only-idempotent-human-summary", [("second run failed", rc == 0),
+        ("human next step or no-client verdict absent", "No AI client was connected" in out and "Open a new terminal" in out),
+        ("second run duplicated the hook", _setup_read(os.path.join(fixture["home"], ".zshrc")) == zshrc)], out + err)
+    fixture = _setup_fixture(suite, "shell-only-refusal")
+    os.makedirs(os.path.join(fixture["home"], ".zshrc"))
+    rc, out, err = _setup_run(fixture, "shell-only-refusal", args + ["--json"])
+    try:
+        report = json.loads(out)
+    except ValueError:
+        report = None
+    _setup_expect(res, "shell-only-profile-refusal", _setup_shell_report_conditions(rc, report, True), out + err)
+
+    if os.name != "posix":
+        res.ok("Managed setup permissive-umask controls apply only to Unix")
+        return
+    fixture = _setup_fixture(suite, "registry-file-permission-repair", b"{}")
+    os.chmod(fixture["root"], 0o700)
+    os.chmod(fixture["env"]["KIN_HOME"], 0o700)
+    paths = {"registry": os.path.join(fixture["root"], "registry.toml"),
+             "lock": os.path.join(fixture["root"], "registry.lock")}
+    for name, content in (("registry", b"repos = []\n"), ("lock", b"")):
+        with open(paths[name], "wb") as stream:
+            stream.write(content)
+        os.chmod(paths[name], 0o600)
+    fixture["env"]["KIN_REGISTRY_PATH"] = paths["registry"]
+    fixture["env"]["PATH"] = "/usr/bin:/bin"
+    # Seed a genuinely configured client under the final authority and launch
+    # environment. Then introduce only permission drift, not a fabricated
+    # entry/ledger or an unrelated invalid client that doctor would also repair.
+    rc, out, err = _setup_run(fixture, "registry-client-baseline", agent)
+    _setup_expect(res, "registry-repair-configured-client-baseline", [
+        ("client baseline setup failed", rc == 0),
+        ("client baseline lacks a real Kin entry", _setup_client_written(fixture["home"])),
+        ("baseline changed literal registry bytes", _setup_read(paths["registry"], True) == b"repos = []\n"),
+        ("baseline changed literal lock bytes", _setup_read(paths["lock"], True) == b"")], out + err)
+    for path in paths.values():
+        os.chmod(path, 0o644)
+    before = {name: _setup_authority_file_snapshot(path) for name, path in paths.items()}
+    home_before = _setup_home_snapshot(fixture["home"])
+    rc, out, err = _setup_run(fixture, "registry-file-permission-repair", ["doctor", "--fix"], fixture["root"])
+    after = {name: _setup_authority_file_snapshot(path) for name, path in paths.items()}
+    home_after = _setup_home_snapshot(fixture["home"])
+    client_roots = (".claude.json", ".claude", ".cursor", ".codex", ".gemini",
+                    ".codeium", ".lmstudio", ".grok", ".continue", "CLAUDE.md", "AGENTS.md")
+
+    def client_entries(snapshot):
+        return {path: value for path, value in snapshot.items()
+                if any(path == root or path.startswith(root + os.sep) for root in client_roots)}
+
+    conditions = _setup_registry_repair_conditions(rc, out, before, after)
+    conditions += [("authority root mode changed", stat.S_IMODE(os.stat(fixture["root"]).st_mode) == 0o700),
+                   ("unrelated configured clients changed", client_entries(home_after) == client_entries(home_before))]
+    _setup_expect(res, "doctor-explicit-registry-file-permission-only-repair", conditions, out + err)
+    with open(os.path.join(fixture["root"], "registry-permission-repair-footprint.json"), "w") as stream:
+        json.dump({"schema": "kin.acceptance-registry-permission-repair.v1",
+                   "authority_before": before, "authority_after": after,
+                   "home_before": home_before, "home_after": home_after,
+                   "client_configs_unchanged": client_entries(home_after) == client_entries(home_before)},
+                  stream, indent=2)
+        stream.write("\n")
+    fixture = _setup_fixture(suite, "permissive-umask", b"{}")
+    fixture["env"].pop("KIN_REGISTRY_PATH", None)
+    rc, out, err = _setup_run(fixture, "permissive-umask", short_args, umask=True)
+    kin_home = fixture["env"]["KIN_HOME"]
+    _setup_expect(res, "permissive-umask-setup-created-config", [("setup failed", rc == 0),
+        ("setup created no config", os.path.isfile(os.path.join(kin_home, "config", "setup.toml")))], out + err)
+    rc, out, err = _setup_run(fixture, "registry-initialize", ["registry", "authority", "--initialize"], umask=True)
+    exposed = []
+    for relative, entry in _setup_home_snapshot(fixture["home"]).items():
+        if (relative == ".kin" or relative.startswith(".kin" + os.sep)
+                or relative in (".zshenv", ".zshrc", ".claude.json")):
+            if entry[0] in ("file", "directory") and entry[1] & 0o022:
+                exposed.append(relative)
+    _setup_expect(res, "permissive-umask-state-private", [("registry initialization failed", rc == 0),
+        ("registry not persisted", os.path.isfile(os.path.join(kin_home, "registry.toml"))),
+        ("group or world writable Kin state: " + repr(exposed), not exposed)], out + err)
+    fixture = _setup_fixture(suite, "unsafe-home")
+    fixture["env"].pop("KIN_REGISTRY_PATH", None)
+    kin_home = fixture["env"]["KIN_HOME"]
+    os.chmod(kin_home, 0o775)
+    for extra in ([], ["--verbose"]):
+        rc, out, err = _setup_run(fixture, "unsafe-home" + ("-verbose" if extra else ""), short_args + extra, umask=True)
+        _setup_expect(res, "unsafe-home-refusal" + ("-verbose" if extra else ""), [
+            ("unsafe registry accepted", rc != 0),
+            ("registry refusal absent", "kin setup cannot use the local registry" in err),
+            ("exact chmod repair absent", "chmod go-w " + kin_home in out + err),
+            ("mode problem called unsafe object", "move the unsafe object aside" not in out + err),
+            ("setup silently repaired mode", stat.S_IMODE(os.stat(kin_home).st_mode) == 0o775)], out + err)
+    rc, out, err = _setup_run(fixture, "unsafe-home-repair", ["doctor", "--fix"], umask=True)
+    _setup_expect(res, "doctor-consented-mode-repair", [
+        ("doctor did not remove shared write", stat.S_IMODE(os.stat(kin_home).st_mode) == 0o755)], out + err)
+    rc, out, err = _setup_run(fixture, "safe-home-after-repair", short_args, umask=True)
+    _setup_expect(res, "setup-succeeds-after-mode-repair", [("repaired setup failed", rc == 0)], out + err)
+
+
 def check_5(suite):
     """The advertised MCP entry serves `initialize` outside a repository.
 
@@ -1419,6 +1856,7 @@ def check_5(suite):
     res.ok("the prober tells a served handshake from a process that exits, proven both ways "
            "before the product was read")
 
+    env["KIN_MCP_KIN_BINARY"] = suite.prepare_runtime(env)
     verdict, out_lines, err, alive = mcp_initialize([node, wrapper], work, env, timeout=300)
     kin_created = os.path.exists(os.path.join(work, ".kin"))
     ok, detail = grade_unbound_start(verdict, alive, err, out_lines, kin_created)
@@ -1429,6 +1867,7 @@ def check_5(suite):
         res.bad(detail)
         return res
     res.ok(detail)
+    managed_setup_controls(suite, res)
     return res
 
 
@@ -1724,9 +2163,10 @@ def check_6(suite):
     skipped_env["HOME"] = home
     skipped_env["KIN_HOME"] = os.path.join(home, ".kin")
     skipped_env["PATH"] = os.pathsep.join([served_only, path])
+    skipped_kin = suite.prepare_runtime(skipped_env)
 
     suite.own(work, skipped_env)
-    rc, out, err = run([suite.kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
+    rc, out, err = run([skipped_kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
     combined = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("kin init exited %d on the fixture: %s"
@@ -1743,7 +2183,7 @@ def check_6(suite):
 
     # The sibling command, on the store that run just built. It holds the whole
     # status object and used to read two numbers out of it.
-    rc, out, err = run([suite.kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
+    rc, out, err = run([skipped_kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
     sweep_output = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("kin daemon sweep exited %d: %s" % (rc, flatten(failure_excerpt(err))))
@@ -1768,9 +2208,10 @@ def check_6(suite):
     control_env["HOME"] = control_home
     control_env["KIN_HOME"] = os.path.join(control_home, ".kin")
     control_env["PATH"] = os.pathsep.join([both, path])
+    control_kin = suite.prepare_runtime(control_env)
 
     suite.own(control, control_env)
-    rc, out, err = run([suite.kin, "init", "."], cwd=control, env=control_env, timeout=1800)
+    rc, out, err = run([control_kin, "init", "."], cwd=control, env=control_env, timeout=1800)
     control_output = (out or "") + "\n" + (err or "")
     if rc != 0:
         res.unknown("the control kin init exited %d: %s"
@@ -1852,7 +2293,8 @@ def check_7(suite):
     work = os.path.join(suite.workdir, "no-repository")
     if not os.path.isdir(work):
         os.makedirs(work)
-    rc, out, err = run([suite.kin, "doctor"], cwd=work, env=env, timeout=600)
+    kin = suite.prepare_runtime(env)
+    rc, out, err = run([kin, "doctor"], cwd=work, env=env, timeout=600)
     page = flatten(strip_ansi(out or ""))
     if not page:
         res.unknown("`kin doctor` exited %d and printed no page: %s"
@@ -1885,6 +2327,13 @@ class Suite(object):
         self.verbose = verbose
         # Repository path to the environment it was built and initialized with.
         self.owned_repos = {}
+        self.owned_stores = {}
+        self.runtime_paths = {}
+
+    def prepare_runtime(self, env):
+        kin, daemon = prepare_runtime_fixture(self.kin, self.daemon, env, env["KIN_HOME"])
+        self.runtime_paths[env["KIN_HOME"]] = (kin, daemon)
+        return kin
 
     def own(self, repo, env=None):
         """Record a repository this run creates, before any init touches it."""
@@ -1910,7 +2359,8 @@ class Suite(object):
                 record.update({"home": env.get("HOME"), "kin_home": env.get("KIN_HOME")})
             records.append(record)
             # Never let discovery walk upward and select an unrelated repository.
-            if not os.path.isfile(os.path.join(repo, ".kin", "manifest.json")):
+            store = self.owned_stores.get(repo, os.path.join(repo, ".kin"))
+            if not os.path.isfile(os.path.join(store, "manifest.json")):
                 record["error"] = "fixture manifest missing; stop was not attempted"
                 errors.append("%s: %s" % (repo, record["error"]))
                 continue
@@ -1919,8 +2369,9 @@ class Suite(object):
                 errors.append("%s: %s" % (repo, record["error"]))
                 continue
             try:
+                kin = self.runtime_paths.get(env.get("KIN_HOME"), (self.kin, self.daemon))[0]
                 proc = subprocess.run(
-                    [self.kin, "daemon", "stop", "--json"], cwd=repo, env=env,
+                    [kin, "daemon", "stop", "--json"], cwd=repo, env=env,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
                     timeout=60)
                 rc, out, err = proc.returncode, proc.stdout, proc.stderr
@@ -1949,8 +2400,13 @@ class Suite(object):
 
     def base_env(self):
         env = dict(os.environ)
-        # This fixture inspects/copies an in-tree store; central layout is
-        # qualified separately by brownfield_repro --store-layout central.
+        home = os.path.join(self.workdir, "base-home")
+        env["HOME"] = home
+        env["KIN_HOME"] = os.path.join(home, ".kin")
+        for name in ("KIN_REGISTRY_PATH", "KIN_MCP_REPO", "KIN_DIR", "KIN_DAEMON_URL"):
+            env.pop(name, None)
+        # Legacy sweep fixtures inspect/copy in-tree stores. Managed setup's
+        # MCP fixture clears this override and verifies its private central store.
         env["KIN_STORE_LAYOUT"] = "in-tree"
         # The same posture the other suites hold: no inference, no projection,
         # and nothing that could reach an operator's real store.
@@ -2002,6 +2458,116 @@ class Suite(object):
 
 
 # ------------------------------------------------------------------- self test
+
+
+def self_test_managed_setup_controls(expect):
+    """Falsify the added graders without launching any runtime or daemon."""
+    from unittest import mock
+
+    def passed(conditions):
+        return all(holds for _, holds in conditions)
+
+    summary = ("This run asks nothing and takes the defaults.\n"
+               "3 defaults taken without asking; kin setup --verbose lists each one\n"
+               "Kin is set up on this machine.\n")
+    expect("Managed short summary positive", passed(_setup_summary_conditions(0, summary)), True)
+    for name, rc, text in (("failed exit", 1, summary),
+                           ("silent defaults", 0, summary.replace("taken without asking", "taken")),
+                           ("verbose leak", 0, summary + "=== Health checklist ===\n"),
+                           ("escape sequence", 0, "\x1b[32m" + summary),
+                           ("excessive lines", 0, summary + "line\n" * 31)):
+        expect("Managed summary rejects " + name, passed(_setup_summary_conditions(rc, text)), False)
+
+    installed = {"schema": "kin.setup-shell.v1", "shell": "zsh", "status": "installed",
+                 "clients_connected": [], "reason": None, "add_by_hand": []}
+    refused = dict(installed, status="not_written", reason="profile is a directory",
+                   next=None, add_by_hand=[{"profile": "/home/.zshrc", "lines": ["source hook"]}])
+    expect("Managed shell JSON positive", passed(_setup_shell_report_conditions(0, installed)), True)
+    expect("Managed shell refusal positive", passed(_setup_shell_report_conditions(1, refused, True)), True)
+    for name, value in (("wrong schema", dict(installed, schema="other")),
+                        ("client connection", dict(installed, clients_connected=["Claude Code"])),
+                        ("missing client disclosure", {k: v for k, v in installed.items() if k != "clients_connected"}),
+                        ("non-object JSON", [])):
+        expect("Managed shell JSON rejects " + name, passed(_setup_shell_report_conditions(0, value)), False)
+    expect("Managed shell refusal rejects missing manual hook",
+           passed(_setup_shell_report_conditions(1, dict(refused, add_by_hand=[]), True)), False)
+    expect("Managed shell refusal rejects loadable claim",
+           passed(_setup_shell_report_conditions(1, dict(refused, next="Open a terminal"), True)), False)
+
+    line = "Claude Code: the entry answered; status reports no repo daemon is serving"
+    expect("round-trip grader takes only the actual MCP section",
+           _setup_round_trip_line("Claude Code: configured\nMCP round trip\n  " + line + "\n"), line)
+    expect("configuration alone is not a round trip", _setup_round_trip_line("Claude Code: configured"), "")
+    result = Result("5", "control", "control")
+    _setup_expect(result, "positive", [("missing", True)])
+    expect("named Managed assertion passes only with evidence", result.status, PASS)
+    _setup_expect(result, "negative", [("missing field", False)], "probe output")
+    expect("named Managed assertion rejects a false condition", result.status, FAIL)
+    expect("named Managed assertion keeps the failed name", "negative" in result.detail, True)
+    _setup_expect(result, "later positive", [("missing", True)])
+    expect("later positive cannot erase an earlier Managed failure", result.status, FAIL)
+    expect("later positive preserves the earlier failure detail", "negative" in result.detail, True)
+
+    authority = {"mode": 0o644, "regular": True, "device": 3, "inode": 7,
+                 "uid": 501, "gid": 20, "sha256": "unchanged-fixture-content"}
+    before = {"registry": dict(authority), "lock": dict(authority, inode=8)}
+    after = {name: dict(row, mode=0o600) for name, row in before.items()}
+    repaired = "repaired registry authority permissions to 0600"
+    expect("Managed registry permission-only repair positive",
+           passed(_setup_registry_repair_conditions(0, repaired, before, after)), True)
+    for field, value in (("mode", 0o644), ("inode", 9), ("uid", 0),
+                         ("sha256", "changed-content"), ("regular", False)):
+        changed = dict(after, registry=dict(after["registry"], **{field: value}))
+        expect("Managed registry repair rejects changed " + field,
+               passed(_setup_registry_repair_conditions(0, repaired, before, changed)), False)
+    expect("Managed registry repair rejects already safe control",
+           passed(_setup_registry_repair_conditions(0, repaired, after, after)), False)
+    expect("Managed registry repair requires native repair report",
+           passed(_setup_registry_repair_conditions(0, "", before, after)), False)
+
+    with tempfile.TemporaryDirectory(prefix="first-contact-managed-setup-self-test-") as root:
+        suite = Suite("/not-executed/kin", "/not-executed/kin-daemon", root, root)
+
+        def prepared(env):
+            # A mock receipt tests the harness branch only. It never admits or
+            # measures a binary, and cannot reach the live acceptance entrypoint.
+            os.makedirs(env["KIN_HOME"])
+            env["KIN_RUNTIME_MODE"] = "managed"
+            with open(os.path.join(env["KIN_HOME"], "acceptance-runtime.json"), "w") as stream:
+                json.dump({"schema": "kin.acceptance-runtime-fixture.v1", "mode": "managed"}, stream)
+            return "/not-executed/canonical/kin"
+
+        with mock.patch.object(suite, "prepare_runtime", side_effect=prepared):
+            fixture = _setup_fixture(suite, "harness", b"{}")
+        expect("Managed fixture gives clients their isolated home", fixture["env"]["USERPROFILE"], fixture["home"])
+        expect("Managed fixture disables repo daemon discovery", fixture["env"]["KIN_NO_DAEMON"], "1")
+        expect("Managed fixture keeps central store behavior", "KIN_STORE_LAYOUT" in fixture["env"], False)
+        expect("Managed fixture keeps registry and central store authority in its Kin home",
+               os.path.dirname(fixture["env"]["KIN_REGISTRY_PATH"]), fixture["env"]["KIN_HOME"])
+        expect("Managed fixture detects seeded Claude client", _setup_read(os.path.join(fixture["home"], ".claude.json"), True), b"{}")
+        before = _setup_home_snapshot(fixture["home"])
+        with open(os.path.join(fixture["home"], ".zshrc"), "w") as stream:
+            stream.write("unexpected write\n")
+        expect("admission snapshot catches a new profile", _setup_home_snapshot(fixture["home"]) == before, False)
+        with open(os.path.join(fixture["home"], ".claude.json"), "w") as stream:
+            json.dump({"mcpServers": {"kin": {"command": "canonical"}}}, stream)
+        expect("client grader requires the actual entry", _setup_client_written(fixture["home"]), True)
+
+        def development(env):
+            prepared(env)
+            env["KIN_RUNTIME_MODE"] = "development"
+            return "/not-executed/development/kin"
+
+        with mock.patch.object(suite, "prepare_runtime", side_effect=development):
+            try:
+                _setup_fixture(suite, "development")
+            except ValueError:
+                rejected = True
+            else:
+                rejected = False
+        expect("Managed behavior checks refuse Development fixture", rejected, True)
+    expect("first-contact result inventory stays eight checks", [key for key, _ in CHECKS],
+           [str(number) for number in range(8)])
 
 
 def self_test_toolchain_fixture(expect):
@@ -2061,6 +2627,7 @@ def self_test_toolchain_fixture(expect):
 
         with mock.patch(__name__ + "._serve_asset", side_effect=serve), \
                 mock.patch(__name__ + ".run", side_effect=repair), \
+                mock.patch.object(suite, "prepare_runtime", return_value=suite.kin), \
                 mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
                 mock.patch(__name__ + ".HTTPServer", side_effect=AssertionError("unexpected listener")):
             result = check_4(suite)
@@ -2264,6 +2831,9 @@ def self_test_cleanup_dispositions(expect):
             env = {"FIRST_CONTACT_STUB_LOG": log, "FIRST_CONTACT_STUB_STOP": mode}
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.dict(os.environ, env))
+                # The cleanup stub is intentionally not a native runtime pair.
+                stack.enter_context(mock.patch.object(
+                    Suite, "prepare_runtime", lambda suite, child_env: suite.kin))
                 if checks is not None:
                     stack.enter_context(mock.patch(__name__ + ".CHECKS", checks))
                 for patch in patches:
@@ -2853,6 +3423,7 @@ def self_test():
     expect("the control on no output is UNREADABLE",
            grade_served_sweep_outcome("")[0], None)
 
+    self_test_managed_setup_controls(expect)
     self_test_toolchain_fixture(expect)
 
     # A run root goes only when nothing was lost and nobody asked to keep it.

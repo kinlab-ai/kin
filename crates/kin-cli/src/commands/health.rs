@@ -283,9 +283,14 @@ pub async fn run_health_checks() -> HealthReport {
 /// surface Kin has on a real store.
 pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> HealthReport {
     let mut checks = vec![
+        check_managed_runtime(),
         check_kin_binary(),
         check_kin_daemon_binary(),
         check_supervisor_startup_protocol(),
+        check_launcher_stamp(),
+    ];
+    checks.extend(check_kin_copies());
+    checks.extend([
         check_daemon_running().await,
         check_daemon_idle_window(),
         check_vfs_projection(),
@@ -295,7 +300,7 @@ pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> 
         check_session_runtime(),
         check_shell_path(),
         check_registry_authority(),
-    ];
+    ]);
     checks.extend(check_mcp_clients());
     checks.extend(check_discovery_blocks());
     checks.push(check_setup_ledger());
@@ -332,6 +337,40 @@ pub(crate) async fn run_health_checks_sharing(graph_status: &RunGraphStatus) -> 
     checks.push(check_binary_assessment_load());
 
     assemble_health_report(env::consts::OS.to_string(), checks)
+}
+/// Installation identity is independent from repository and client readiness.
+fn check_managed_runtime() -> HealthCheck {
+    let report = crate::commands::runtime::inspect(&Default::default());
+    let ready = report.ready && report.pair_matches;
+    let detail = if ready {
+        format!(
+            "validated CLI and daemon pair at {} ({})",
+            report.cli.path.display(),
+            report.cli.commit_sha.as_deref().unwrap_or("unknown")
+        )
+    } else {
+        report
+            .detail
+            .or(report.reason)
+            .unwrap_or_else(|| "the managed CLI and daemon pair did not pass validation".into())
+    };
+    HealthCheck {
+        id: "managed_runtime".into(),
+        label: "Managed runtime".into(),
+        status: if ready {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Misconfigured
+        },
+        detail,
+        platform_note: None,
+        fixable: false,
+        manual_fix: if ready {
+            None
+        } else {
+            Some("Run `kin runtime status --json`, then repair the managed installation before using clients".into())
+        },
+    }
 }
 
 /// Report the active update policy and where it came from.
@@ -659,6 +698,326 @@ fn supervisor_startup_protocol_check(
     }
 }
 
+/// Whether the npm launcher's version stamp names the installed release.
+///
+/// Launchers from before September 2026 read the stamp as the installed
+/// version, so a stamp naming an older release than the one in `bin/` is how
+/// such a launcher reinstalls its own release over a newer one. `kin update`
+/// keeps the stamp current and recovery rewrites one it finds wrong; this row
+/// is how a person, or `kin doctor --fix`, sees one that is still wrong.
+fn check_launcher_stamp() -> HealthCheck {
+    // Never under test: the unit suite would read whatever this machine has
+    // installed. The verdict is exercised against constructed inspections.
+    if cfg!(test) {
+        return HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Unsupported,
+            "not inspected in unit tests",
+        );
+    }
+    match kin_dir() {
+        Ok(home) => {
+            launcher_stamp_check_from(crate::commands::update::inspect_launcher_stamp(&home))
+        }
+        Err(error) => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Unsupported,
+            format!("the Kin home could not be resolved: {error}"),
+        ),
+    }
+}
+
+const LAUNCHER_STAMP_ID: &str = "launcher_version_stamp";
+const LAUNCHER_STAMP_LABEL: &str = "Launcher version stamp";
+
+pub(crate) fn launcher_stamp_check_from(
+    inspection: crate::commands::update::LauncherStampInspection,
+) -> HealthCheck {
+    use crate::commands::update::LauncherStampInspection;
+    match inspection {
+        LauncherStampInspection::Absent => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Unsupported,
+            "no stamp; the npm launcher did not provision this install",
+        ),
+        LauncherStampInspection::Current { path, version } => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "{} names {version}, the installed release",
+                crate::screen::home_relative(&path)
+            ),
+        ),
+        LauncherStampInspection::Disagrees {
+            path,
+            recorded,
+            installed,
+        } => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Stale,
+            format!(
+                "{} names {recorded}, but the installed Kin is {installed}. An npm launcher older \
+                 than September 2026 trusts this stamp and can reinstall its own release over the \
+                 newer one",
+                crate::screen::home_relative(&path)
+            ),
+        )
+        .fixable()
+        .with_manual_fix("kin doctor --fix"),
+        LauncherStampInspection::Unverifiable {
+            path,
+            recorded,
+            reason,
+        } => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Unsupported,
+            format!(
+                "{} names {recorded}; the installed Kin's release cannot be read to compare ({reason})",
+                crate::screen::home_relative(&path)
+            ),
+        ),
+        LauncherStampInspection::Unusable { path, reason } => HealthCheck::new(
+            LAUNCHER_STAMP_ID,
+            LAUNCHER_STAMP_LABEL,
+            HealthStatus::Misconfigured,
+            format!(
+                "{} is not a version stamp: {reason}",
+                crate::screen::home_relative(&path)
+            ),
+        )
+        .with_manual_fix(format!(
+            "move {} aside; Kin never writes over it",
+            crate::screen::home_relative(&path)
+        )),
+    }
+}
+
+const OTHER_COPIES_ID: &str = "other_kin_copies";
+const OTHER_COPIES_LABEL: &str = "Other Kin copies";
+const LIVE_DAEMONS_ID: &str = "live_daemons_by_release";
+const LIVE_DAEMONS_LABEL: &str = "Running daemons";
+
+/// Every other copy of Kin this machine can run, and every running daemon by
+/// the release it runs. One scan serves both rows.
+fn check_kin_copies() -> Vec<HealthCheck> {
+    // Never under test, for the same reason as the stamp: the unit suite would
+    // grade whatever this machine has installed and running.
+    if cfg!(test) {
+        return vec![
+            HealthCheck::new(
+                OTHER_COPIES_ID,
+                OTHER_COPIES_LABEL,
+                HealthStatus::Unsupported,
+                "not scanned in unit tests",
+            ),
+            HealthCheck::new(
+                LIVE_DAEMONS_ID,
+                LIVE_DAEMONS_LABEL,
+                HealthStatus::Unsupported,
+                "not scanned in unit tests",
+            ),
+        ];
+    }
+    let roots = match crate::commands::kin_copies::ScanRoots::from_environment() {
+        Ok(roots) => roots,
+        Err(error) => {
+            let detail = format!("the Kin home could not be resolved: {error}");
+            return vec![
+                HealthCheck::new(
+                    OTHER_COPIES_ID,
+                    OTHER_COPIES_LABEL,
+                    HealthStatus::Unsupported,
+                    detail.clone(),
+                ),
+                HealthCheck::new(
+                    LIVE_DAEMONS_ID,
+                    LIVE_DAEMONS_LABEL,
+                    HealthStatus::Unsupported,
+                    detail,
+                ),
+            ];
+        }
+    };
+    let scan = crate::commands::kin_copies::scan(&roots);
+    let groups = crate::commands::kin_copies::group_live_daemons(
+        &crate::commands::kin_copies::live_daemons(),
+        &scan,
+    );
+    vec![
+        other_copies_check_from(&scan),
+        live_daemons_check_from(&groups),
+    ]
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// The other-copies row for one scan.
+pub(crate) fn other_copies_check_from(scan: &crate::commands::kin_copies::CopyScan) -> HealthCheck {
+    let managed = scan.managed_version.as_deref();
+    let one_kin = match managed {
+        Some(version) => format!(
+            "the managed Kin {version} at {}",
+            crate::screen::home_relative(&scan.kin_home.join("bin"))
+        ),
+        None => format!(
+            "the managed Kin at {}",
+            crate::screen::home_relative(&scan.kin_home.join("bin"))
+        ),
+    };
+    let concerns = scan.concerns();
+    let harmless: Vec<String> = scan
+        .others()
+        .filter(|copy| !copy.is_concern(managed))
+        .map(|copy| copy.describe(managed))
+        .collect();
+    let also = if harmless.is_empty() {
+        String::new()
+    } else {
+        format!(". Also found, and harmless: {}", harmless.join("; "))
+    };
+    if concerns.is_empty() {
+        return HealthCheck::new(
+            OTHER_COPIES_ID,
+            OTHER_COPIES_LABEL,
+            HealthStatus::Healthy,
+            format!("no Kin besides {one_kin}{also}"),
+        );
+    }
+    let named: Vec<String> = concerns.iter().map(|copy| copy.describe(managed)).collect();
+    let offers = scan.removal_offers();
+    let unremovable: Vec<String> = concerns
+        .iter()
+        .filter(|copy| copy.removal.is_none())
+        .map(|copy| crate::screen::home_relative(&copy.path))
+        .collect();
+    let mut fix = Vec::new();
+    if !offers.is_empty() {
+        fix.push(
+            "kin setup asks about each one; kin setup doctor --fix --remove-other-copies removes \
+             them all with each one's own uninstall:"
+                .to_string(),
+        );
+        for offer in &offers {
+            fix.push(offer.removal.command_line());
+        }
+    }
+    if !unremovable.is_empty() {
+        fix.push(format!(
+            "Kin cannot tell what installed {}; remove {} yourself.",
+            unremovable.join(", "),
+            if unremovable.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    HealthCheck::new(
+        OTHER_COPIES_ID,
+        OTHER_COPIES_LABEL,
+        HealthStatus::Stale,
+        format!(
+            "{} besides {one_kin}: {}{also}",
+            plural(
+                concerns.len(),
+                "other Kin can run here",
+                "other Kins can run here"
+            ),
+            named.join("; ")
+        ),
+    )
+    .with_manual_fix(fix.join("\n"))
+}
+
+/// The running-daemons row for daemons grouped by release.
+pub(crate) fn live_daemons_check_from(
+    groups: &[crate::commands::kin_copies::DaemonGroup],
+) -> HealthCheck {
+    let total: usize = groups.iter().map(|group| group.daemons.len()).sum();
+    if total == 0 {
+        return HealthCheck::new(
+            LIVE_DAEMONS_ID,
+            LIVE_DAEMONS_LABEL,
+            HealthStatus::Healthy,
+            "no kin-daemon is running",
+        );
+    }
+    let describe = |group: &crate::commands::kin_copies::DaemonGroup| {
+        let pids: Vec<String> = group
+            .daemons
+            .iter()
+            .map(|daemon| match &daemon.repo {
+                Some(repo) => format!(
+                    "pid {} for {}",
+                    daemon.pid,
+                    crate::screen::home_relative(repo)
+                ),
+                None if daemon.supervisor => format!("pid {}, the supervisor", daemon.pid),
+                None => format!("pid {}", daemon.pid),
+            })
+            .collect();
+        format!(
+            "{} {} ({})",
+            plural(group.daemons.len(), "runs", "run"),
+            group.release,
+            pids.join(", ")
+        )
+    };
+    let concerns: Vec<String> = groups
+        .iter()
+        .filter(|group| group.concern)
+        .map(describe)
+        .collect();
+    let rest: Vec<String> = groups
+        .iter()
+        .filter(|group| !group.concern)
+        .map(describe)
+        .collect();
+    if concerns.is_empty() {
+        return HealthCheck::new(
+            LIVE_DAEMONS_ID,
+            LIVE_DAEMONS_LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "{}: {}",
+                plural(total, "kin-daemon", "kin-daemons"),
+                rest.join("; ")
+            ),
+        );
+    }
+    let stray: usize = groups
+        .iter()
+        .filter(|group| group.concern)
+        .map(|group| group.daemons.len())
+        .sum();
+    let mut detail = format!(
+        "{} not the managed Kin: {}",
+        if stray == 1 {
+            "1 kin-daemon runs a release that is".to_string()
+        } else {
+            format!("{stray} kin-daemons run releases that are")
+        },
+        concerns.join("; ")
+    );
+    if !rest.is_empty() {
+        detail.push_str(&format!(". The rest: {}", rest.join("; ")));
+    }
+    HealthCheck::new(
+        LIVE_DAEMONS_ID,
+        LIVE_DAEMONS_LABEL,
+        HealthStatus::Stale,
+        detail,
+    )
+    .with_manual_fix(
+        "Each keeps answering from its own release until it stops. Run kin daemon stop in each \
+         repository named above; the managed Kin starts its own daemon on the next command there.",
+    )
+}
+
 fn check_supervisor_startup_protocol() -> HealthCheck {
     let sentinel = crate::daemon_client::supervisor_startup_sentinel();
     let sentinel_path = crate::daemon_client::supervisor_startup_sentinel_path();
@@ -666,8 +1025,10 @@ fn check_supervisor_startup_protocol() -> HealthCheck {
     // daemon_client. The probe is requested only in the state whose answer can
     // change the verdict, but that state is the steady one for every current
     // user, so this runs on essentially every invocation rather than rarely.
-    // What keeps it acceptable is its bound, not its frequency: at most two
-    // deduped candidates, each capped by the daemon probe timeout.
+    // What keeps it acceptable is its bound, not its frequency: one probe per
+    // deduped native `kin` the copy enumeration finds, which on a machine with
+    // one Kin is the managed pair alone, each capped by the daemon probe
+    // timeout.
     //
     // Never under test. This runs inside the unit suite through
     // `run_health_checks`, where spawning the host's installed kin-daemon would
@@ -3032,13 +3393,23 @@ fn evaluate_antigravity_binding_for(
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
     let expected_command = configured_mcp_launcher().ok()?;
+    evaluate_antigravity_binding_against(entry, path, workspace, repo_root, &expected_command)
+}
+
+fn evaluate_antigravity_binding_against(
+    entry: &Value,
+    path: &Path,
+    workspace: bool,
+    repo_root: &Path,
+    expected_command: &str,
+) -> Option<(HealthStatus, String)> {
     let client_id = if workspace {
         "antigravity_workspace"
     } else {
         "antigravity"
     };
     let expected_repo = repo_root.to_string_lossy();
-    let topology = mcp_launcher_topology(entry, &expected_command);
+    let topology = mcp_launcher_topology(entry, expected_command);
     let launcher_and_args_match = topology.is_some_and(|topology| {
         mcp_argument_vector_matches(entry, client_id, topology)
             && mcp_repo_argument(entry, topology) == Some(expected_repo.as_ref())
@@ -12720,9 +13091,11 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let kin_home = dir.path().join("kin-home");
-        let managed = kin_home.join("bin/kin");
-        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
-        std::fs::copy(std::env::current_exe().unwrap(), &managed).unwrap();
+        crate::commands::setup::write_managed_runtime_fixture(
+            &kin_home,
+            "1111111111111111111111111111111111111111",
+        );
+        let managed = kin_home.join("bin/kin").canonicalize().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let path = dir.path().join("claude.json");
         let config = |command: &Path| {
@@ -12901,12 +13274,12 @@ mod tests {
         let (status, detail) =
             evaluate_mcp_client_against(&config, "antigravity_workspace", "/managed/kin");
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
-        assert!(evaluate_antigravity_binding(&config, true).is_none());
+        assert!(evaluate_antigravity_fixture_binding(&config, true, &repo).is_none());
 
         let other = dir.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
         write_config(&other);
-        assert!(evaluate_antigravity_binding(&config, true).is_some());
+        assert!(evaluate_antigravity_fixture_binding(&config, true, &repo).is_some());
     }
 
     /// Write the global Antigravity binding exactly as `kin setup` does: with
@@ -12927,6 +13300,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn evaluate_antigravity_fixture_binding(
+        config: &Path,
+        workspace: bool,
+        repo_root: &Path,
+    ) -> Option<(HealthStatus, String)> {
+        let root: Value = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        evaluate_antigravity_binding_against(
+            &root["mcpServers"]["kin"],
+            config,
+            workspace,
+            repo_root,
+            "/managed/kin",
+        )
     }
 
     /// The two sides of an MCP binding check name the repository differently:
@@ -12990,8 +13378,12 @@ mod tests {
         assert_ne!(discovered, canonical);
 
         assert!(
-            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(discovered))
-                .is_none(),
+            evaluate_antigravity_fixture_binding(
+                &config,
+                false,
+                &canonical_health_repo(discovered)
+            )
+            .is_none(),
             "a binding written with the canonicalized repository root must be accepted when \
              discovery names that same repository through an equivalent path"
         );
@@ -13003,7 +13395,7 @@ mod tests {
         let other = other.canonicalize().unwrap();
         write_global_antigravity_binding(&config, &other);
         assert!(
-            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(canonical))
+            evaluate_antigravity_fixture_binding(&config, false, &canonical_health_repo(canonical))
                 .is_some(),
             "a binding pointed at a different repository must still be misconfigured"
         );
@@ -13035,7 +13427,7 @@ mod tests {
         write_global_antigravity_binding(&config, &canonical);
 
         assert!(
-            evaluate_antigravity_binding_for(
+            evaluate_antigravity_fixture_binding(
                 &config,
                 false,
                 &canonical_health_repo(PathBuf::from(plain)),
@@ -13046,17 +13438,13 @@ mod tests {
         );
 
         // Without this, the assertion above could pass for the wrong reason.
-        // `evaluate_antigravity_binding_for` returns None both when the binding
-        // is correct and when it cannot resolve this installation's launcher at
-        // all, and this is the first test to reach that code on a Windows
-        // runner. A binding pointed elsewhere must still be rejected, so a
-        // launcher that failed to resolve fails the test instead of passing it.
+        // A binding pointed elsewhere must still be rejected.
         let other = dir.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
         let other = other.canonicalize().unwrap();
         write_global_antigravity_binding(&config, &other);
         assert!(
-            evaluate_antigravity_binding_for(
+            evaluate_antigravity_fixture_binding(
                 &config,
                 false,
                 &canonical_health_repo(PathBuf::from(plain)),
@@ -14572,5 +14960,231 @@ mod tests {
                 "a credential naming no provider must name none: {unnamed}"
             );
         }
+    }
+
+    #[test]
+    fn a_launcher_stamp_naming_another_release_is_stale_and_doctor_fixes_it() {
+        use crate::commands::update::LauncherStampInspection;
+
+        let path = PathBuf::from("/fixture/.kin/bin/.kinlab-kin-version");
+        let stale = launcher_stamp_check_from(LauncherStampInspection::Disagrees {
+            path: path.clone(),
+            recorded: "0.6.6".to_string(),
+            installed: "0.8.6".to_string(),
+        });
+        assert_eq!(stale.id, "launcher_version_stamp");
+        assert!(matches!(stale.status, HealthStatus::Stale));
+        assert!(stale.fixable, "doctor --fix owns this repair");
+        assert!(
+            stale
+                .detail
+                .contains("names 0.6.6, but the installed Kin is 0.8.6"),
+            "{}",
+            stale.detail
+        );
+        assert_eq!(stale.manual_fix.as_deref(), Some("kin doctor --fix"));
+
+        let current = launcher_stamp_check_from(LauncherStampInspection::Current {
+            path: path.clone(),
+            version: "0.8.6".to_string(),
+        });
+        assert!(matches!(current.status, HealthStatus::Healthy));
+        assert!(!current.fixable);
+
+        let absent = launcher_stamp_check_from(LauncherStampInspection::Absent);
+        assert!(matches!(absent.status, HealthStatus::Unsupported));
+
+        let unusable = launcher_stamp_check_from(LauncherStampInspection::Unusable {
+            path,
+            reason: "it is not a regular file".to_string(),
+        });
+        assert!(matches!(unusable.status, HealthStatus::Misconfigured));
+        assert!(!unusable.fixable, "Kin never writes over something else");
+    }
+
+    fn copy(
+        path: &str,
+        program: &'static str,
+        kind: crate::commands::kin_copies::CopyKind,
+        version: Option<&str>,
+        removal: Option<crate::commands::kin_copies::Removal>,
+    ) -> crate::commands::kin_copies::KinCopy {
+        crate::commands::kin_copies::KinCopy {
+            path: PathBuf::from(path),
+            program,
+            target: None,
+            kind,
+            version: version.map(str::to_string),
+            channel: None,
+            removal,
+            first_on_path: false,
+            in_kin_home: false,
+        }
+    }
+
+    #[test]
+    fn other_copies_name_each_one_and_the_uninstall_that_removes_it() {
+        use crate::commands::kin_copies::{CopyKind, CopyScan, Removal};
+
+        let mut old_npm = copy(
+            "/node/bin/kin",
+            "kin",
+            CopyKind::NpmLauncher {
+                package: "@kinlab/kin".to_string(),
+            },
+            Some("0.6.6"),
+            Some(Removal::Npm {
+                prefix: PathBuf::from("/node"),
+                package: "@kinlab/kin".to_string(),
+            }),
+        );
+        old_npm.first_on_path = true;
+        let mut cargo = copy(
+            "/cargo/bin/kin",
+            "kin",
+            CopyKind::IndependentRelease,
+            Some("0.7.18"),
+            Some(Removal::Cargo {
+                root: PathBuf::from("/cargo"),
+                package: "kin-cli".to_string(),
+            }),
+        );
+        cargo.channel = Some("cargo install kin-cli".to_string());
+        let scan = CopyScan {
+            kin_home: PathBuf::from("/fixture/.kin"),
+            managed_version: Some("0.8.7".to_string()),
+            copies: vec![
+                copy(
+                    "/fixture/.kin/bin/kin",
+                    "kin",
+                    CopyKind::Managed,
+                    Some("0.8.7"),
+                    None,
+                ),
+                copy(
+                    "/usr/local/bin/kin",
+                    "kin",
+                    CopyKind::LinkToManaged,
+                    None,
+                    None,
+                ),
+                old_npm,
+                cargo,
+                copy(
+                    "/src/target/release/kin",
+                    "kin",
+                    CopyKind::DevelopmentBuild,
+                    None,
+                    None,
+                ),
+                copy(
+                    "/scripts/kin",
+                    "kin",
+                    CopyKind::Unknown("a script".to_string()),
+                    None,
+                    None,
+                ),
+            ],
+        };
+
+        let check = other_copies_check_from(&scan);
+        assert_eq!(check.id, "other_kin_copies");
+        assert!(matches!(check.status, HealthStatus::Stale));
+        assert!(
+            !check.fixable,
+            "plain --fix never removes a copy; it takes --remove-other-copies"
+        );
+        for expected in [
+            "3 other Kins can run here besides the managed Kin 0.8.7 at /fixture/.kin/bin",
+            "/node/bin/kin: npm launcher @kinlab/kin 0.6.6, older than the managed Kin 0.8.7; a new shell runs this `kin`",
+            "/cargo/bin/kin: Kin 0.7.18, older than the managed Kin 0.8.7, a separate copy that runs its own daemons (cargo install kin-cli)",
+            "/scripts/kin: unidentified (a script)",
+            "Also found, and harmless: /usr/local/bin/kin: a link to the managed Kin; /src/target/release/kin: a development build",
+        ] {
+            assert!(check.detail.contains(expected), "missing {expected:?} in {}", check.detail);
+        }
+        let fix = check.manual_fix.as_deref().unwrap();
+        for expected in [
+            "kin setup doctor --fix --remove-other-copies",
+            "npm uninstall --global --prefix /node @kinlab/kin",
+            "cargo uninstall --root /cargo kin-cli",
+            "Kin cannot tell what installed /scripts/kin; remove it yourself.",
+        ] {
+            assert!(fix.contains(expected), "missing {expected:?} in {fix}");
+        }
+
+        let one_kin = CopyScan {
+            copies: scan
+                .copies
+                .iter()
+                .filter(|copy| {
+                    matches!(
+                        copy.kind,
+                        CopyKind::Managed | CopyKind::LinkToManaged | CopyKind::DevelopmentBuild
+                    )
+                })
+                .cloned()
+                .collect(),
+            ..scan.clone()
+        };
+        let healthy = other_copies_check_from(&one_kin);
+        assert!(matches!(healthy.status, HealthStatus::Healthy));
+        assert!(
+            healthy
+                .detail
+                .starts_with("no Kin besides the managed Kin 0.8.7 at /fixture/.kin/bin"),
+            "{}",
+            healthy.detail
+        );
+        assert!(
+            healthy.detail.contains("a development build"),
+            "{}",
+            healthy.detail
+        );
+    }
+
+    #[test]
+    fn running_daemons_are_named_by_release_and_only_strays_need_attention() {
+        use crate::commands::kin_copies::{DaemonGroup, LiveDaemon};
+
+        let daemon = |pid: u32| LiveDaemon {
+            pid,
+            executable: PathBuf::from("/x/kin-daemon"),
+            repo: Some(PathBuf::from(format!("/repo/{pid}"))),
+            supervisor: false,
+            started_at: 0,
+        };
+        let managed = DaemonGroup {
+            release: "the managed Kin 0.8.7".to_string(),
+            concern: false,
+            daemons: vec![daemon(1), daemon(2)],
+        };
+        let replaced = DaemonGroup {
+            release: "a managed release that has since been replaced".to_string(),
+            concern: true,
+            daemons: vec![daemon(3)],
+        };
+
+        assert!(matches!(
+            live_daemons_check_from(&[]).status,
+            HealthStatus::Healthy
+        ));
+        let calm = live_daemons_check_from(std::slice::from_ref(&managed));
+        assert!(matches!(calm.status, HealthStatus::Healthy));
+        assert_eq!(
+            calm.detail,
+            "2 kin-daemons: 2 run the managed Kin 0.8.7 (pid 1 for /repo/1, pid 2 for /repo/2)"
+        );
+
+        let check = live_daemons_check_from(&[managed, replaced]);
+        assert_eq!(check.id, "live_daemons_by_release");
+        assert!(matches!(check.status, HealthStatus::Stale));
+        assert_eq!(
+            check.detail,
+            "1 kin-daemon runs a release that is not the managed Kin: 1 runs a managed release \
+             that has since been replaced (pid 3 for /repo/3). The rest: 2 run the managed Kin \
+             0.8.7 (pid 1 for /repo/1, pid 2 for /repo/2)"
+        );
+        assert!(check.manual_fix.unwrap().contains("kin daemon stop"));
     }
 }

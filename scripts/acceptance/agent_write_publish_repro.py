@@ -85,6 +85,7 @@ import tempfile
 import threading
 import time
 import uuid
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -756,6 +757,8 @@ class Suite(object):
         self.last_result = None
         self.last_requests = None
         self.last_tool_error = None
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def git(self, cwd, args):
         # The caller's global and system git config stay out of the fixture: a hooks

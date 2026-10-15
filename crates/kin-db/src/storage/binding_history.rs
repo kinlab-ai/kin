@@ -248,9 +248,12 @@ pub(super) fn checked_witnesses(
             }
         }
         let metadata = transition.successor.metadata();
-        let selected = transition
+        // A successor that inherited this workspace's graph from its
+        // predecessor inherited the digest the predecessor checked it against,
+        // and hashing the same graph again would only reach it a second time.
+        let graph_digest = transition
             .successor
-            .workspace_graph_snapshot(&workspace)?
+            .workspace_graph_digest(&workspace)?
             .ok_or_else(|| invalid("qualified workspace is absent"))?;
         let scope = metadata
             .workspaces
@@ -258,7 +261,6 @@ pub(super) fn checked_witnesses(
             .find(|item| item.workspace_id == workspace)
             .ok_or_else(|| invalid("qualified workspace is absent"))?
             .snapshot_binding(metadata.roots.clone())?;
-        let graph_digest = graph_digest(&selected)?;
         // A re-derivation starts its own lineage: the selected graph was derived
         // again from exact bytes, so nothing an earlier proof covered, and
         // nothing an earlier unproven operation did, is carried into it.
@@ -286,9 +288,13 @@ pub(super) fn checked_witnesses(
                 "qualified transition differs from the DB-held operation",
             ));
         }
+        let identities = transition.successor.operation_identities()?;
+        let operation_identity = *identities
+            .last()
+            .ok_or_else(|| invalid("qualified transition has no committed operation"))?;
         let step = BindingHistoryStep {
             operation_id: operation.operation_id,
-            operation_identity: operation.identity_hash()?,
+            operation_identity,
             qualification: match eligibility {
                 BindingHistoryEligibility::NewNativeGenesis => {
                     BindingHistoryQualification::NewNativeGenesis
@@ -327,7 +333,7 @@ pub(super) fn checked_witnesses(
             proof,
             lineage_digest,
         };
-        witness.validate_lineage(metadata)?;
+        witness.validate_lineage(metadata, Some(&identities))?;
         result.push(witness);
     }
     Ok(result)
@@ -395,10 +401,19 @@ impl BindingHistoryWitness {
         self.scope.workspace_id
     }
 
-    fn validate_lineage(&self, metadata: &PersistedRepositoryAuthority) -> Result<(), KinDbError> {
+    /// `identities`, when given, is the identity hash of every record in
+    /// `metadata.operation_log`, by position, held by the state that owns this
+    /// exact log. A list of any other length describes some other log and is
+    /// not consulted; the identities are then hashed here.
+    fn validate_lineage(
+        &self,
+        metadata: &PersistedRepositoryAuthority,
+        identities: Option<&[Hash256]>,
+    ) -> Result<(), KinDbError> {
         if self.proof.is_empty() || self.proof.len() > metadata.operation_log.len() {
             return Err(invalid("unqualified or incomplete operation lineage"));
         }
+        let identities = identities.filter(|held| held.len() == metadata.operation_log.len());
         // A proof names every operation from its own start to the head. It
         // starts at genesis, or at a checked re-derivation part way through the
         // log; the operations before a re-derivation are not part of it.
@@ -412,8 +427,12 @@ impl BindingHistoryWitness {
             .enumerate()
         {
             let index = offset + position;
+            let identity = match identities {
+                Some(held) => held[index],
+                None => operation.identity_hash()?,
+            };
             if step.operation_id != operation.operation_id
-                || step.operation_identity != operation.identity_hash()?
+                || step.operation_identity != identity
                 || operation.repository_id != metadata.repository_id
                 || operation.roots_before.generation != index as u64
                 || operation.roots_after.generation != index as u64 + 1
@@ -461,6 +480,12 @@ pub struct VerifiedBindingHistory {
 }
 
 impl VerifiedBindingHistory {
+    /// Digest of the selected graph this capability was bound to, which
+    /// [`bind_selected_graph`] compared with that graph's own digest.
+    pub(crate) fn selected_graph_digest(&self) -> Hash256 {
+        self.selected_graph_digest
+    }
+
     pub(crate) fn validate_selected(&self, snapshot: &GraphSnapshot) -> Result<(), KinDbError> {
         if graph_digest(snapshot)? != self.selected_graph_digest {
             return Err(invalid("runtime capability no longer names this graph"));
@@ -481,6 +506,21 @@ fn invalid(reason: impl std::fmt::Display) -> KinDbError {
 }
 
 pub(crate) fn validate_metadata(metadata: &PersistedRepositoryAuthority) -> Result<(), KinDbError> {
+    validate_metadata_with(metadata, None)
+}
+
+/// [`validate_metadata`] for a caller that holds the identity hash of every
+/// record in `metadata.operation_log`, by position.
+///
+/// Every lineage step is checked against its operation's identity, and an
+/// identity is a canonical encoding of the whole record, workspace mutation
+/// included. The log only grows, so the state that owns it hashes each record
+/// once and hands the list in rather than paying for the whole log again on
+/// every validation.
+pub(crate) fn validate_metadata_with(
+    metadata: &PersistedRepositoryAuthority,
+    identities: Option<&[Hash256]>,
+) -> Result<(), KinDbError> {
     if metadata.schema_version < BINDING_HISTORY_AUTHORITY_SCHEMA
         && !metadata.binding_history.is_empty()
     {
@@ -506,7 +546,7 @@ pub(crate) fn validate_metadata(metadata: &PersistedRepositoryAuthority) -> Resu
         if witness.scope != expected || witness.scope.repository_id != metadata.repository_id {
             return Err(invalid("authority or workspace binding differs"));
         }
-        witness.validate_lineage(metadata)?;
+        witness.validate_lineage(metadata, identities)?;
     }
     Ok(())
 }
@@ -551,9 +591,14 @@ pub(in crate::storage) fn restore_prepared_successor(
 pub(crate) fn graph_digest(snapshot: &GraphSnapshot) -> Result<Hash256, KinDbError> {
     let mut hasher = Sha256::new();
     hasher.update(b"kin.binding-history.selected-graph.v1\0");
+    let semantic_relations: std::collections::HashMap<_, _> = snapshot
+        .relations
+        .iter()
+        .filter(|(_, relation)| crate::engine::is_semantic_relation(relation))
+        .collect();
     for result in [
         super::canonical_hash::canonical_hash_into(&mut hasher, &snapshot.entities),
-        super::canonical_hash::canonical_hash_into(&mut hasher, &snapshot.relations),
+        super::canonical_hash::canonical_hash_into(&mut hasher, &semantic_relations),
         super::canonical_hash::canonical_hash_into(&mut hasher, &snapshot.external_references),
         super::canonical_hash::canonical_hash_into(&mut hasher, &snapshot.resolved_tree),
     ] {
@@ -562,21 +607,37 @@ pub(crate) fn graph_digest(snapshot: &GraphSnapshot) -> Result<Hash256, KinDbErr
     Ok(Hash256::from_bytes(hasher.finalize().into()))
 }
 
+/// Bind the binding-history capability `metadata` holds for `workspace` onto
+/// its selected graph, returning that graph's digest when one is known.
+///
+/// A caller that already holds what this would otherwise derive hands it in.
+/// `known_digest` is [`graph_digest`] of this exact `snapshot`, from a caller
+/// that computed it over these entities, relations, external references and
+/// tree, or checked it against a witness, and has not changed them since.
+/// `identities` is as [`validate_metadata_with`] takes it. Nothing is skipped
+/// but those two derivations: the metadata is validated and the digest is
+/// compared with the witness either way.
 pub(crate) fn bind_selected_graph(
     metadata: &PersistedRepositoryAuthority,
     workspace: kin_model::WorkspaceId,
     snapshot: &mut GraphSnapshot,
-) -> Result<(), KinDbError> {
+    known_digest: Option<Hash256>,
+    identities: Option<&[Hash256]>,
+) -> Result<Option<Hash256>, KinDbError> {
     snapshot.verified_binding_history = None;
-    validate_metadata(metadata)?;
+    validate_metadata_with(metadata, identities)?;
     let Some(witness) = metadata
         .binding_history
         .iter()
         .find(|w| w.scope.workspace_id == workspace)
     else {
-        return Ok(());
+        return Ok(known_digest);
     };
-    if graph_digest(snapshot)? != witness.graph_digest {
+    let digest = match known_digest {
+        Some(digest) => digest,
+        None => graph_digest(snapshot)?,
+    };
+    if digest != witness.graph_digest {
         return Err(invalid("selected graph differs"));
     }
     snapshot.verified_binding_history = Some(VerifiedBindingHistory {
@@ -584,7 +645,7 @@ pub(crate) fn bind_selected_graph(
         selected_graph_digest: witness.graph_digest,
         runtime_lineage: witness.lineage_digest,
     });
-    Ok(())
+    Ok(Some(digest))
 }
 
 /// Runtime derivations carry the exact durable anchor plus a checked selected

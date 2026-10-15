@@ -96,6 +96,7 @@ import sys
 import tempfile
 import threading
 import time
+from runtime_fixture import prepare_runtime_fixture
 
 print = functools.partial(print, flush=True)
 
@@ -451,6 +452,8 @@ class Suite(object):
         # share would decide check 5's control arm instead of the check doing it.
         self.env.pop(DAEMON_BUDGET_ENV, None)
         self.repos = {}
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, None, self.env, self.env["KIN_HOME"])
 
     def git(self, args, cwd):
         proc = subprocess.run(
@@ -1206,9 +1209,30 @@ def grade_report_shape(expect):
         # the row was replaced, not what it was replaced with. Check 0 grades the
         # stub's silence as a FAIL and that is a graded row.
         stub = os.path.join(scratch, "kin-stub")
+        stub_identity = {"version": "0.0.0", "commit_sha": "0" * 40,
+                         "source_dirty": True, "source_known": True,
+                         "target": "report-writer-fixture", "build_profile": "debug"}
+        stub_build = dict(zip(
+            ("kin_version", "kin_commit", "kin_dirty", "kin_source_known",
+             "kin_target", "kin_build_profile"), stub_identity.values()),
+            schema="kin.runtime-build-identity.v1")
         with open(stub, "w") as handle:
-            handle.write("#!/bin/sh\nexit 9\n")
+            handle.write("#!%s\nimport json, sys\n"
+                         "if sys.argv[1:2] == ['bench-meta']:\n"
+                         "    print(json.dumps(%r)); sys.exit(0)\n"
+                         "sys.exit(9)\n" % (sys.executable, stub_build))
         os.chmod(stub, 0o755)
+        # Activation observes a matching Development pair, while the actual
+        # check still receives exit 9. This arm tests report wiring, not a
+        # release runtime or the check's product behavior.
+        daemon_stub = os.path.join(scratch, "kin-daemon")
+        with open(daemon_stub, "w") as handle:
+            handle.write("#!%s\nimport json, sys\n"
+                         "if sys.argv[1:2] == ['--compat-json']:\n"
+                         "    print(json.dumps(%r)); sys.exit(0)\n"
+                         "sys.exit(9)\n" %
+                         (sys.executable, {"runtime_identity": stub_identity}))
+        os.chmod(daemon_stub, 0o755)
         answered_path = os.path.join(scratch, "answered.json")
         subprocess.run(
             [sys.executable, os.path.abspath(__file__),

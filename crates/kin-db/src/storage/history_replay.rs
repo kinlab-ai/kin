@@ -366,6 +366,9 @@ pub(crate) fn validate_first_parent_history<S: LineageSource + ?Sized>(
         }
     }
 
+    #[cfg(test)]
+    VALIDATED_HISTORY_CHANGES
+        .with(|counter| counter.set(counter.get().saturating_add(lineage.len())));
     let mut progress = ReplayProgress::new("history_replay", "changes", lineage.len());
     match walk_first_parent_forest(changes, &lineage, &children, &roots, &mut progress) {
         Ok(()) => {
@@ -669,6 +672,23 @@ fn record_lineage_steps(steps: usize) {
 #[cfg(test)]
 pub(crate) fn take_lineage_steps() -> usize {
     LINEAGE_STEPS.with(|counter| counter.replace(0))
+}
+
+// Changes entered by every first-parent history validation on this thread,
+// whichever caller asked for it. A test asserts on this rather than on a lap's
+// milliseconds, because a commit that is meant to carry its predecessor's
+// validated history must enter none of it, and one that adds a change must
+// enter that change's lineage once rather than the whole store several times.
+#[cfg(test)]
+thread_local! {
+    static VALIDATED_HISTORY_CHANGES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Zero the validated-history counter and report what it held.
+#[cfg(test)]
+pub(crate) fn take_validated_history_changes() -> usize {
+    VALIDATED_HISTORY_CHANGES.with(|counter| counter.replace(0))
 }
 
 /// Apply or unwind one change's complete transition.

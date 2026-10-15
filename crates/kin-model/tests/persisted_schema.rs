@@ -155,6 +155,13 @@ const HAND_WRITTEN_SERIALIZATIONS: &[(&str, &str, &str)] = &[
         "",
     ),
     (
+        // Writes ran_against, even empty, whenever proof follows it, and
+        // stays nine elements for a run recorded before either existed.
+        "VerificationRun",
+        "a_run_keeps_its_bytes_without_fingerprints_and_its_fingerprints_with_them",
+        "",
+    ),
+    (
         "TransactionDelta",
         "a_transaction_delta_keeps_its_bytes_until_it_carries_records",
         "",

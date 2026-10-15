@@ -27,10 +27,10 @@ pub use embed::{
 #[cfg(feature = "vector")]
 pub use engine::VectorSalvageStats;
 pub use engine::{
-    EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts,
-    FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
-    ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
-    SourceDerivationItem, SourceDerivationLimit, SourceDerivationLimits,
+    is_semantic_relation, EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError,
+    EnrichmentStatusFacts, FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch,
+    ProducedSemanticSearch, ProducedSemanticSearchBatch, ResolvedRetrievalItem,
+    SourceDerivationFacts, SourceDerivationItem, SourceDerivationLimit, SourceDerivationLimits,
     SourceDerivationUnavailable, SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact,
     SourceReservedRelation,
 };

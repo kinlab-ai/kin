@@ -18,6 +18,11 @@
 //!
 //! The log lives and dies with the session: ending or reaping a session drops
 //! its log, so `/agents` describes agents that are here now.
+//!
+//! It also holds, briefly, which sessions were handed a reviewer's open flag
+//! ([`AgentActivity::note_flag_sightings`]). Those outlive the session, because
+//! they are on their way into the repository: `crate::review_flags` writes
+//! them into the flag once the agents that saw it have gone quiet.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -54,6 +59,9 @@ pub const MAX_TOOL_NAME_BYTES: usize = 64;
 pub const MAX_ENTITY_ID_CANDIDATES: usize = 2048;
 /// Committed change ids one session keeps.
 pub const MAX_CHANGES_PER_SESSION: usize = 16;
+/// Flag sightings held before they are written into the repository. Past it,
+/// the oldest goes.
+pub const MAX_PENDING_FLAG_SIGHTINGS: usize = 1024;
 
 /// At most one `ToolCall` event per session in this window.
 pub const TOOL_CALL_EVENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
@@ -98,6 +106,13 @@ pub struct ToolCallEntry {
     /// named. Absent for a call on the daemon's own repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
+    /// The change a write committed, as its answer named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+    /// The call finished after the agent that made it stopped waiting for its
+    /// answer, so what it did is known here and the agent was never told.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caller_left: bool,
 }
 
 /// What a call contributes to its entry before the log numbers and stamps it.
@@ -110,6 +125,10 @@ pub struct ToolCallDraft {
     pub duration_ms: u64,
     pub is_error: bool,
     pub repo_id: Option<String>,
+    /// The change a write committed.
+    pub change_id: Option<String>,
+    /// The caller stopped waiting before the call finished.
+    pub caller_left: bool,
 }
 
 /// One entry as the event bus carries it.
@@ -208,6 +227,8 @@ impl CallLog {
             duration_ms: draft.duration_ms,
             is_error: draft.is_error,
             repo_id: draft.repo_id,
+            change_id: draft.change_id,
+            caller_left: draft.caller_left,
         };
         log.calls.push_back((order, entry.clone()));
         let mut added = 1;
@@ -342,11 +363,34 @@ impl EventGate {
     }
 }
 
+/// One session that was handed one open review flag, not yet written into
+/// the flag.
+pub type FlagSighting = (kin_model::AnnotationId, kin_model::ReviewFlagSighting);
+
+#[derive(Debug, Default)]
+struct FlagSightings {
+    pending: VecDeque<FlagSighting>,
+    /// A task is running that will write what is pending.
+    settling: bool,
+}
+
+/// What one session's log held when the session ended.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EndedLog {
+    pub calls_total: u64,
+    /// Its newest calls, oldest first.
+    pub calls: Vec<ToolCallEntry>,
+    /// The changes it committed, newest first.
+    pub changes: Vec<String>,
+    pub last_call_at: Option<Timestamp>,
+}
+
 /// The call logs and the event gate, owned by the session coordinator.
 #[derive(Debug, Default)]
 pub struct AgentActivity {
     log: Mutex<CallLog>,
     events: Mutex<EventGate>,
+    flag_sightings: Mutex<FlagSightings>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -433,15 +477,104 @@ impl AgentActivity {
             .unwrap_or_default()
     }
 
-    /// Drop everything held for a session that ended.
-    pub fn forget(&self, session_id: &SessionId) {
-        {
+    /// Drop everything held for a session that ended, and hand back what its
+    /// log held so the session can be kept past its end
+    /// ([`crate::ended_sessions`]).
+    pub fn forget(&self, session_id: &SessionId) -> EndedLog {
+        let ended = {
             let mut log = lock(&self.log);
-            if let Some(evicted) = log.sessions.remove(session_id) {
-                log.entries -= evicted.calls.len();
+            match log.sessions.remove(session_id) {
+                Some(evicted) => {
+                    log.entries -= evicted.calls.len();
+                    EndedLog {
+                        calls_total: evicted.calls_total,
+                        calls: evicted.calls.into_iter().map(|(_, entry)| entry).collect(),
+                        changes: evicted.changes.into_iter().collect(),
+                        last_call_at: evicted.last_call_at,
+                    }
+                }
+                None => EndedLog::default(),
+            }
+        };
+        lock(&self.events).forget(session_id);
+        ended
+    }
+
+    /// Hold that `sighting`'s session was handed each flag in `flags`, until
+    /// it is written into the repository. A flag the session is already held
+    /// for is not held twice. Returns whether the caller must start the task
+    /// that writes them: true for exactly the call that found none running.
+    pub fn note_flag_sightings(
+        &self,
+        flags: &[kin_model::AnnotationId],
+        sighting: &kin_model::ReviewFlagSighting,
+    ) -> bool {
+        let mut held = lock(&self.flag_sightings);
+        let mut added = false;
+        for flag in flags {
+            let known = held
+                .pending
+                .iter()
+                .any(|(pending, seen)| pending == flag && seen.session == sighting.session);
+            if !known {
+                held.pending.push_back((*flag, sighting.clone()));
+                added = true;
             }
         }
-        lock(&self.events).forget(session_id);
+        while held.pending.len() > MAX_PENDING_FLAG_SIGHTINGS {
+            held.pending.pop_front();
+        }
+        let start = added && !held.settling;
+        if start {
+            held.settling = true;
+        }
+        start
+    }
+
+    /// The sightings held, oldest first.
+    pub fn pending_flag_sightings(&self) -> Vec<FlagSighting> {
+        lock(&self.flag_sightings).pending.iter().cloned().collect()
+    }
+
+    /// Take the held sightings `ready` accepts, oldest first, leaving the
+    /// rest held.
+    pub fn take_flag_sightings(&self, ready: impl Fn(&FlagSighting) -> bool) -> Vec<FlagSighting> {
+        let mut held = lock(&self.flag_sightings);
+        let (taken, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut held.pending)
+            .into_iter()
+            .partition(ready);
+        held.pending = kept;
+        taken.into()
+    }
+
+    /// Hold sightings again that could not be written, ahead of any noted
+    /// since they were taken. Returns whether the caller must start the task
+    /// that writes them, as [`Self::note_flag_sightings`] does.
+    pub fn return_flag_sightings(&self, unwritten: Vec<FlagSighting>) -> bool {
+        let mut held = lock(&self.flag_sightings);
+        if unwritten.is_empty() {
+            return false;
+        }
+        for sighting in unwritten.into_iter().rev() {
+            held.pending.push_front(sighting);
+        }
+        while held.pending.len() > MAX_PENDING_FLAG_SIGHTINGS {
+            held.pending.pop_front();
+        }
+        let start = !held.settling;
+        held.settling = true;
+        start
+    }
+
+    /// Whether the task that writes sightings may stop: nothing is held. It
+    /// is marked stopped under the lock a new sighting takes, so one noted
+    /// after this starts a new task.
+    pub fn flag_sightings_settled(&self) -> bool {
+        let mut held = lock(&self.flag_sightings);
+        if held.pending.is_empty() {
+            held.settling = false;
+        }
+        held.pending.is_empty()
     }
 
     /// Entries held across every log.
@@ -561,6 +694,11 @@ pub fn argument_uuids(arguments: &HashMap<String, serde_json::Value>) -> Vec<Uui
 /// path, question, control sequence or arbitrarily large string.
 fn activity_tool_name(tool: &str) -> String {
     static REGISTERED_NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    // A keyed mutate reaches the daemon under its versioned internal name,
+    // which is no tool an agent sees: it called `kin_mutate`.
+    if tool == crate::mcp_mutate::TOOL {
+        return "kin_mutate".to_string();
+    }
     if tool.len() <= MAX_TOOL_NAME_BYTES
         && REGISTERED_NAMES
             .get_or_init(|| {
@@ -625,21 +763,47 @@ pub fn draft_for_call(
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         is_error: result.is_error == Some(true),
         repo_id: None,
+        change_id: None,
+        caller_left: false,
     }
 }
 
+/// Whether a call writes: it opens, stages, commits or drops a change, or
+/// mutates in one call. A write lands whether or not its caller is still
+/// waiting when it ends, so its record must too; see [`record_tool_call`].
+pub fn is_write_tool(tool: &str) -> bool {
+    tool.starts_with("kin_transaction")
+        || matches!(tool, "kin_mutate" | "mutate" | "transaction")
+        || tool == crate::mcp_mutate::TOOL
+}
+
 /// Tools whose calls are session lifecycle rather than work.
-fn is_lifecycle_tool(tool: &str) -> bool {
+pub(crate) fn is_lifecycle_tool(tool: &str) -> bool {
     matches!(
         tool,
         "kin_session_start" | "kin_session_heartbeat" | "kin_session_end" | "register_session"
     )
 }
 
+/// How one finished call met the session that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallMeeting {
+    /// The session was live when the call began.
+    pub began_live: bool,
+    /// The caller stopped waiting before the call finished.
+    pub caller_left: bool,
+}
+
 /// Record one finished `/mcp/tools/call` for the session that made it, and
 /// put it on the event bus within the gate's bound. Returns whether the daemon
-/// holds that session at all; a call naming one it does not hold is not
-/// recorded.
+/// still holds that session; a call naming one it never held is not recorded.
+///
+/// A call whose session ended while it ran, as one does when its agent gives
+/// up on a slow commit and closes its connection, is kept on what was kept of
+/// the session ([`crate::session_registry::SessionCoordinator::record_finished_call`]),
+/// so what the agent did is never lost to how long Kin took to do it. A write
+/// says the change it committed, and every call says whether its caller had
+/// stopped waiting.
 pub(crate) async fn record_tool_call(
     state: &Arc<DaemonState>,
     session_id: SessionId,
@@ -647,6 +811,7 @@ pub(crate) async fn record_tool_call(
     targets: &[Uuid],
     result: &kin_mcp::ToolCallResult,
     duration: Duration,
+    meeting: CallMeeting,
 ) -> bool {
     let coordinator = &state.coordinator;
     let is_live = || {
@@ -660,18 +825,22 @@ pub(crate) async fn record_tool_call(
         return is_live();
     }
     let graph = state.graph_for_request(Some(&session_id)).await;
-    let draft = draft_for_call(tool, targets, result, duration, |id| {
+    let mut draft = draft_for_call(tool, targets, result, duration, |id| {
         graph.get_entity(id).ok().flatten().is_some()
     });
-    let Some(entry) =
-        coordinator
-            .activity()
-            .record_call_if(&session_id, draft, Timestamp::now(), is_live)
-    else {
-        return false;
-    };
-    publish_tool_call(state, session_id, entry);
-    true
+    if is_write_tool(tool) {
+        draft.change_id = committed_change_id(result);
+    }
+    draft.caller_left = meeting.caller_left;
+    match coordinator.record_finished_call(&session_id, draft, Timestamp::now(), meeting.began_live)
+    {
+        crate::session_registry::FinishedCall::Live(entry) => {
+            publish_tool_call(state, session_id, entry);
+            true
+        }
+        crate::session_registry::FinishedCall::AfterEnd
+        | crate::session_registry::FinishedCall::Unknown => false,
+    }
 }
 
 /// Record one finished `/repos/{repo_id}/mcp/tools/call` for the session its
@@ -820,8 +989,7 @@ pub(crate) fn attribute_commit(state: &DaemonState, owner: Option<&str>, change_
     let session_id = SessionId(owner);
     state
         .coordinator
-        .activity()
-        .record_change(&session_id, change_id.to_string());
+        .record_committed_change(&session_id, change_id.to_string());
     let Ok(hash) = kin_model::Hash256::from_hex(change_id) else {
         return;
     };
@@ -946,7 +1114,7 @@ pub fn scrub_task(text: &str, limit: usize) -> String {
     cut
 }
 
-fn transport_name(transport: SessionTransport) -> &'static str {
+pub(crate) fn transport_name(transport: SessionTransport) -> &'static str {
     match transport {
         SessionTransport::Mcp => "mcp",
         SessionTransport::Cli => "cli",
@@ -1015,7 +1183,59 @@ pub struct SessionCallsResponse {
     pub calls_total: u64,
     pub retained: usize,
     pub calls: Vec<ToolCallEntry>,
+    /// When the session ended, for one the daemon keeps past its end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
 }
+
+/// The agents that worked in this repository and are gone, as
+/// `/agents/ended` shows them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndedAgentsResponse {
+    pub schema: String,
+    pub generated_at: Timestamp,
+    /// How long Kin keeps a session after it ends.
+    pub kept_days: u64,
+    /// How many ended sessions Kin keeps at most, the newest.
+    pub kept_sessions: usize,
+    /// Newest activity first.
+    pub agents: Vec<EndedAgentView>,
+}
+
+/// One agent session that is gone: who it was, when it worked, what it read,
+/// what it wrote and the changes it committed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndedAgentView {
+    pub session_id: String,
+    pub client: String,
+    pub vendor: String,
+    /// How it connected. Empty when Kin kept only what it wrote.
+    pub transport: String,
+    pub started_at: Timestamp,
+    pub last_activity_at: Timestamp,
+    pub ended_at: Timestamp,
+    /// Whether Kin kept the session's calls. When it did not, what Kin kept
+    /// is what the session wrote, and what it read is not known.
+    pub calls_kept: bool,
+    pub calls_total: u64,
+    pub calls_retained: usize,
+    /// Its newest calls, newest first.
+    pub recent_calls: Vec<ToolCallEntry>,
+    /// The entities its kept reads were about, newest first, each once: what
+    /// each read asked about first, then what its answers named.
+    pub read_entity_ids: Vec<EntityId>,
+    /// How many distinct entities its kept reads were about.
+    pub read_entities: usize,
+    /// The entities it wrote, through Kin or with its own tools, newest
+    /// first, each once.
+    pub edited_entity_ids: Vec<EntityId>,
+    pub edited_entities: usize,
+    /// The changes it committed, newest first.
+    pub change_ids: Vec<String>,
+}
+
+/// Entities an ended agent's read or write list names at most.
+pub const ENDED_ENTITIES_SHOWN: usize = 24;
 
 fn seconds_between(earlier: &Timestamp, later: &Timestamp) -> u64 {
     later
@@ -1162,9 +1382,11 @@ pub(crate) fn agents_response(state: &DaemonState) -> Result<AgentsResponse, (St
             .map(|entity| entity.name)
     };
     let mut agents = Vec::with_capacity(sessions.len());
+    // A session whose process is gone is an agent that left, even in the
+    // moments before the sweep reaps it, so it is not shown as here.
     for session in sessions
         .iter()
-        .filter(|session| session.vendor != DAEMON_OWN_VENDOR)
+        .filter(|session| session.vendor != DAEMON_OWN_VENDOR && !coordinator.process_gone(session))
     {
         let owner = session.session_id.to_string().to_ascii_lowercase();
         let mut owned: Vec<kin_mcp::McpTransaction> = transactions
@@ -1216,7 +1438,8 @@ pub(crate) struct CallsParams {
     limit: Option<usize>,
 }
 
-/// GET /session/{session_id}/calls — one live session's call log, newest first.
+/// GET /session/{session_id}/calls — one session's call log, newest first:
+/// a live session's own, or what was kept of one that ended.
 pub(crate) async fn session_calls_route(
     Path(session_id): Path<String>,
     Query(params): Query<CallsParams>,
@@ -1229,21 +1452,36 @@ pub(crate) async fn session_calls_route(
         )
     })?;
     let session_id = SessionId(uuid);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_CALLS_LIMIT)
+        .clamp(1, MAX_CALLS_PER_SESSION);
     if state
         .coordinator
         .get_session(&session_id)
         .map_err(internal)?
         .is_none()
     {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("session not found: {session_id}"),
-        ));
+        // A session that ended answers from what was kept of it.
+        let Some(ended) = state
+            .agent_authorship
+            .ended_session(&session_id.to_string(), &Timestamp::now())
+        else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("session not found: {session_id}"),
+            ));
+        };
+        let retained = ended.calls.len();
+        return Ok(Json(SessionCallsResponse {
+            schema: "kin.agent-calls.v1".to_string(),
+            session_id: session_id.to_string(),
+            calls_total: ended.calls_total,
+            retained,
+            calls: ended.calls.into_iter().rev().take(limit).collect(),
+            ended_at: Some(ended.ended_at),
+        }));
     }
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_CALLS_LIMIT)
-        .clamp(1, MAX_CALLS_PER_SESSION);
     let (calls_total, retained, calls) = state
         .coordinator
         .activity()
@@ -1254,7 +1492,306 @@ pub(crate) async fn session_calls_route(
         calls_total,
         retained,
         calls,
+        ended_at: None,
     }))
+}
+
+/// Whether a logged call read the graph, rather than opening, staging or
+/// committing a change or managing its session.
+pub fn is_read_tool(tool: &str) -> bool {
+    !(is_lifecycle_tool(tool)
+        || tool.starts_with("kin_transaction")
+        || tool.starts_with("kin_session")
+        || matches!(
+            tool,
+            "kin_mutate" | "mutate" | "transaction" | "unrecognized_tool"
+        ))
+}
+
+/// What a session's kept calls read: the entity each read asked about first,
+/// newest first, then the others their answers named. At most `shown`, with
+/// the count of every distinct one.
+pub fn read_entities(calls_newest_first: &[ToolCallEntry], shown: usize) -> (Vec<EntityId>, usize) {
+    let reads: Vec<&ToolCallEntry> = calls_newest_first
+        .iter()
+        .filter(|call| is_read_tool(&call.tool) && !call.is_error)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for id in reads.iter().filter_map(|call| call.entity_ids.first()) {
+        if seen.insert(*id) {
+            ids.push(*id);
+        }
+    }
+    for id in reads.iter().flat_map(|call| call.entity_ids.iter()) {
+        if seen.insert(*id) {
+            ids.push(*id);
+        }
+    }
+    let total = ids.len();
+    ids.truncate(shown);
+    (ids, total)
+}
+
+fn parse_time(at: &str) -> Option<Timestamp> {
+    chrono::DateTime::parse_from_rfc3339(at.trim())
+        .ok()
+        .map(|at| Timestamp(at.with_timezone(&chrono::Utc)))
+}
+
+/// What a session wrote, newest first, each once, and the changes its writes
+/// were published as, newest first, from the record of what agents wrote.
+fn written_by(
+    session: &str,
+    writes: &[kin_cli::commands::review_guide::AgentWrite],
+    edits: &[kin_cli::commands::review_guide::ClientEdit],
+) -> (Vec<EntityId>, Vec<String>) {
+    let mut entities = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut changes = Vec::new();
+    let mut dated: Vec<(&str, &[EntityId], Option<&str>)> = writes
+        .iter()
+        .filter(|write| write.session.eq_ignore_ascii_case(session))
+        .map(|write| {
+            (
+                write.at.as_str(),
+                write.entities.as_slice(),
+                Some(write.change_id.as_str()),
+            )
+        })
+        .chain(
+            edits
+                .iter()
+                .filter(|edit| {
+                    edit.kin_session
+                        .as_deref()
+                        .is_some_and(|kin| kin.eq_ignore_ascii_case(session))
+                })
+                .map(|edit| (edit.at.as_str(), edit.entities.as_slice(), None)),
+        )
+        .collect();
+    dated.sort_by(|left, right| {
+        let at = |text: &str| parse_time(text);
+        at(right.0).cmp(&at(left.0))
+    });
+    for (_, written, change) in dated {
+        for id in written {
+            if seen.insert(*id) {
+                entities.push(*id);
+            }
+        }
+        if let Some(change) = change {
+            let change = change.to_ascii_lowercase();
+            if !changes.contains(&change) {
+                changes.push(change);
+            }
+        }
+    }
+    (entities, changes)
+}
+
+/// The agents that worked here and are gone, newest activity first: each
+/// session the daemon kept past its end, each one still listed whose process
+/// is gone, and each session the record of what agents wrote names that
+/// neither holds. That last kind ended before its calls were kept, so only
+/// what it wrote is known. All of them inside the window ended sessions are
+/// kept for, and no more of them than are kept.
+pub(crate) fn ended_agents_response(
+    state: &DaemonState,
+    calls_shown: usize,
+) -> Result<EndedAgentsResponse, (StatusCode, String)> {
+    use crate::ended_sessions::{within_window, ENDED_KEPT_DAYS, MAX_ENDED_SESSIONS};
+
+    let now = Timestamp::now();
+    let coordinator = &state.coordinator;
+    let writes = state.agent_authorship.writes();
+    let edits = state.agent_authorship.edits();
+    let sessions = coordinator.list_sessions().map_err(internal)?;
+    let mut agents: Vec<EndedAgentView> = Vec::new();
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let view = |session_id: &str,
+                vendor: &str,
+                client: &str,
+                transport: &str,
+                started_at: Timestamp,
+                last_activity_at: Timestamp,
+                ended_at: Timestamp,
+                calls: Option<(u64, Vec<ToolCallEntry>)>,
+                changes: Vec<String>|
+     -> EndedAgentView {
+        let (written, written_changes) = written_by(session_id, &writes, &edits);
+        let mut change_ids = changes;
+        for change in written_changes {
+            if !change_ids.contains(&change) {
+                change_ids.push(change);
+            }
+        }
+        change_ids.truncate(crate::ended_sessions::MAX_ENDED_CHANGES);
+        let calls_kept = calls.is_some();
+        let (calls_total, newest_first) = calls.unwrap_or_default();
+        let (read_entity_ids, read_entities) = read_entities(&newest_first, ENDED_ENTITIES_SHOWN);
+        let edited_entities = written.len();
+        EndedAgentView {
+            session_id: session_id.to_ascii_lowercase(),
+            client: client.to_string(),
+            vendor: vendor.to_string(),
+            transport: transport.to_string(),
+            started_at,
+            last_activity_at,
+            ended_at,
+            calls_kept,
+            calls_total,
+            calls_retained: newest_first.len(),
+            recent_calls: newest_first.into_iter().take(calls_shown).collect(),
+            read_entity_ids,
+            read_entities,
+            edited_entity_ids: written.into_iter().take(ENDED_ENTITIES_SHOWN).collect(),
+            edited_entities,
+            change_ids,
+        }
+    };
+
+    // Still listed, but its process is gone: it left, and the next sweep
+    // reaps it. Its log is still the live one.
+    for session in sessions
+        .iter()
+        .filter(|session| session.vendor != DAEMON_OWN_VENDOR && coordinator.process_gone(session))
+    {
+        let (calls_total, _, newest_first) = coordinator
+            .activity()
+            .recent_calls(&session.session_id, MAX_CALLS_PER_SESSION);
+        let changes = coordinator.activity().recent_changes(&session.session_id);
+        if calls_total == 0 && changes.is_empty() {
+            continue;
+        }
+        let mut last = session.started_at.clone();
+        if session.last_heartbeat > last {
+            last = session.last_heartbeat.clone();
+        }
+        let last = coordinator
+            .activity()
+            .last_call_at(&session.session_id)
+            .unwrap_or(last);
+        let id = session.session_id.to_string();
+        known.insert(id.to_ascii_lowercase());
+        agents.push(view(
+            &id,
+            &display_name(&session.vendor, "unknown"),
+            &display_name(&session.client_name, "unnamed client"),
+            transport_name(session.transport),
+            session.started_at.clone(),
+            last.clone(),
+            last,
+            Some((calls_total, newest_first)),
+            changes,
+        ));
+    }
+    // Every session still listed is here now, or was just shown as gone.
+    for session in &sessions {
+        known.insert(session.session_id.to_string().to_ascii_lowercase());
+    }
+
+    for ended in state.agent_authorship.ended_sessions(&now) {
+        let id = ended.session_id.to_ascii_lowercase();
+        if !known.insert(id.clone()) {
+            continue;
+        }
+        let mut newest_first = ended.calls;
+        newest_first.reverse();
+        agents.push(view(
+            &id,
+            &ended.vendor,
+            &ended.client,
+            &ended.transport,
+            ended.started_at,
+            ended.last_activity_at,
+            ended.ended_at,
+            Some((ended.calls_total, newest_first)),
+            ended.change_ids,
+        ));
+    }
+
+    // Sessions known only by what they wrote: the newest write names them.
+    let mut by_session: Vec<(String, Timestamp, Timestamp, String, String)> = Vec::new();
+    for write in writes.iter().rev() {
+        let id = write.session.trim().to_ascii_lowercase();
+        if known.contains(&id) || !within_window(&write.at, &now) {
+            continue;
+        }
+        let Some(at) = parse_time(&write.at) else {
+            continue;
+        };
+        match by_session.iter_mut().find(|(session, ..)| *session == id) {
+            Some((_, first, last, ..)) => {
+                if at < *first {
+                    *first = at;
+                } else if at > *last {
+                    *last = at;
+                }
+            }
+            None => by_session.push((
+                id,
+                at.clone(),
+                at,
+                write.vendor.clone(),
+                write.client.clone(),
+            )),
+        }
+    }
+    for (id, first, last, vendor, client) in by_session {
+        if vendor == DAEMON_OWN_VENDOR {
+            continue;
+        }
+        agents.push(view(
+            &id,
+            &display_name(&vendor, "unknown"),
+            &display_name(&client, "unnamed client"),
+            "",
+            first,
+            last.clone(),
+            last,
+            None,
+            Vec::new(),
+        ));
+    }
+
+    agents.sort_by(|left, right| {
+        right
+            .last_activity_at
+            .cmp(&left.last_activity_at)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    agents.truncate(MAX_ENDED_SESSIONS);
+    Ok(EndedAgentsResponse {
+        schema: "kin.agents-ended.v1".to_string(),
+        generated_at: now,
+        kept_days: ENDED_KEPT_DAYS,
+        kept_sessions: MAX_ENDED_SESSIONS,
+        agents,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct EndedParams {
+    /// The newest calls shown for each agent.
+    #[serde(default)]
+    calls: Option<usize>,
+}
+
+/// GET /agents/ended — the agents that worked here and are gone, path-free.
+pub(crate) async fn ended_agents_route(
+    Query(params): Query<EndedParams>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Json<EndedAgentsResponse>, (StatusCode, String)> {
+    let shown = params
+        .calls
+        .unwrap_or(AGENT_RECENT_CALLS)
+        .min(crate::ended_sessions::MAX_ENDED_CALLS);
+    tokio::task::spawn_blocking(move || ended_agents_response(&state, shown))
+        .await
+        .map_err(internal)?
+        .map(Json)
 }
 
 #[cfg(test)]
@@ -1271,6 +1808,8 @@ mod tests {
             duration_ms: 3,
             is_error: false,
             repo_id: None,
+            change_id: None,
+            caller_left: false,
         }
     }
 
@@ -1285,6 +1824,8 @@ mod tests {
             duration_ms: 0,
             is_error: false,
             repo_id: None,
+            change_id: None,
+            caller_left: false,
         }
     }
 

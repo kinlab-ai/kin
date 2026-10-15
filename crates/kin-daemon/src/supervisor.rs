@@ -1008,7 +1008,7 @@ async fn request_supervisor_shutdown(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("current process identity unavailable: {error}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
     if current != expected {
@@ -1318,6 +1318,7 @@ fn router_with_rotation_tokens(
             SupervisorAuthState { tokens },
             supervisor_auth,
         ))
+        .route("/runtime/identity", get(runtime_identity))
         .layer(middleware::from_fn(validate_host_and_origin));
 
     // Synthetic in-process tower test requests (`Request::get("/…")`) omit the
@@ -1363,6 +1364,15 @@ async fn health(State(state): State<Arc<SupervisorState>>) -> impl IntoResponse 
         repo_daemon_count,
         idle_seconds: state.idle_duration().as_secs(),
     })
+}
+
+async fn runtime_identity() -> std::result::Result<
+    Json<kin_core::runtime_identity::RuntimeServiceIdentity>,
+    (axum::http::StatusCode, String),
+> {
+    kin_core::runtime_identity::RuntimeServiceIdentity::current("supervisor")
+        .map(Json)
+        .map_err(|error| (axum::http::StatusCode::SERVICE_UNAVAILABLE, error))
 }
 
 async fn readiness() -> impl IntoResponse {
@@ -1414,7 +1424,18 @@ async fn route_repo(
 async fn register_daemon(
     State(state): State<Arc<SupervisorState>>,
     Json(payload): Json<RepoDaemonRegistration>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    let runtime = kin_cli::daemon_client::read_runtime_endpoint(&format!(
+        "http://127.0.0.1:{}",
+        payload.port
+    ))
+    .await;
+    let proven = runtime.as_ref().is_ok_and(|identity| {
+        identity.pid == payload.pid && identity.validate_for_current("daemon").is_ok()
+    });
+    if !proven {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"daemon runtime identity is missing or differs from the supervisor; daemon left running"}))).into_response();
+    }
     state.touch();
     state.prune_unhealthy_daemons().await;
     let now = chrono::Utc::now().to_rfc3339();
@@ -1425,7 +1446,7 @@ async fn register_daemon(
     let mut repos = state.repo_daemons.write().await;
     if let Some(existing) = repos.get(&payload.repo_id) {
         if existing.instance_id != instance_id {
-            return (StatusCode::CONFLICT, Json(existing.clone()));
+            return (StatusCode::CONFLICT, Json(existing.clone())).into_response();
         }
     }
     let record = RegisteredRepoDaemon {
@@ -1443,7 +1464,7 @@ async fn register_daemon(
         last_heartbeat_elapsed_ms: heartbeat_ms,
     };
     repos.insert(payload.repo_id, record.clone());
-    (StatusCode::OK, Json(record))
+    (StatusCode::OK, Json(record)).into_response()
 }
 
 async fn heartbeat_daemon(
@@ -2146,6 +2167,148 @@ struct DiscoveredDaemon {
 }
 
 #[cfg(unix)]
+struct VerifiedDaemonOwner {
+    process: kin_cli::daemon_client::ProcessIdentity,
+    port: u16,
+}
+
+#[cfg(unix)]
+fn process_owner_is_current(process: &kin_cli::daemon_client::ProcessIdentity) -> bool {
+    kin_cli::daemon_client::process_identity_is_current(process).unwrap_or(false)
+}
+
+#[cfg(unix)]
+async fn verify_discovered_runtime(
+    client: &reqwest::Client,
+    daemon: &DiscoveredDaemon,
+) -> Option<VerifiedDaemonOwner> {
+    let port = daemon.port?;
+    let process = kin_cli::daemon_client::process_identity(daemon.pid).ok()??;
+    let identity = client
+        .get(format!("http://127.0.0.1:{port}/runtime/identity"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<kin_core::runtime_identity::RuntimeServiceIdentity>()
+        .await
+        .ok()?;
+    if identity.pid != daemon.pid
+        || identity.validate_for_current("daemon").is_err()
+        || !process_owner_is_current(&process)
+    {
+        return None;
+    }
+    Some(VerifiedDaemonOwner { process, port })
+}
+
+#[cfg(unix)]
+async fn verified_owner_is_current(owner: &VerifiedDaemonOwner) -> bool {
+    if !process_owner_is_current(&owner.process) {
+        return false;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let identity = match client
+        .get(format!("http://127.0.0.1:{}/runtime/identity", owner.port))
+        .send()
+        .await
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => match response
+                .json::<kin_core::runtime_identity::RuntimeServiceIdentity>()
+                .await
+            {
+                Ok(identity) => identity,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    identity.pid == owner.process.pid()
+        && identity.validate_for_current("daemon").is_ok()
+        && process_owner_is_current(&owner.process)
+}
+
+#[cfg(all(test, unix))]
+mod runtime_identity_tests {
+    use super::*;
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn other_runtime_generation_is_neither_signaled_nor_written() {
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let process = kin_cli::daemon_client::process_identity(child.0.id())
+            .unwrap()
+            .unwrap();
+        let mut unrelated =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        unrelated.pid = child.0.id();
+        unrelated.identity.commit_sha = if unrelated.identity.commit_sha == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/runtime/identity",
+            get(move || {
+                let unrelated = unrelated.clone();
+                async move { Json(unrelated) }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = VerifiedDaemonOwner { process, port };
+        assert!(!verified_owner_is_current(&owner).await);
+        let store = tempfile::tempdir().unwrap();
+        graceful_terminate(
+            child.0.id(),
+            store.path().to_str().unwrap(),
+            store.path().to_str().unwrap(),
+            "reaping",
+            "fixture negative control",
+            &owner,
+        )
+        .await;
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "the unrelated live actor received a signal"
+        );
+        assert_eq!(
+            store.path().read_dir().unwrap().count(),
+            0,
+            "the unrelated store was written"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(unix)]
 async fn reaper_sweep(
     state: &SupervisorState,
     client: &reqwest::Client,
@@ -2155,7 +2318,14 @@ async fn reaper_sweep(
     self_pid: u32,
     policy: ReapPolicy,
 ) {
-    let discovered = enumerate_repo_daemons(sys, self_pid);
+    let mut discovered = Vec::new();
+    let mut verified_owners = HashMap::new();
+    for daemon in enumerate_repo_daemons(sys, self_pid) {
+        if let Some(owner) = verify_discovered_runtime(client, &daemon).await {
+            verified_owners.insert(daemon.pid, owner);
+            discovered.push(daemon);
+        }
+    }
 
     // Supervisor self-identity, read from the just-refreshed process table: the
     // binary it is executing, that binary's mtime, and its own start_time. These
@@ -2276,17 +2446,17 @@ async fn reaper_sweep(
         };
         match classify_daemon(&observation, &policy) {
             DaemonDecision::Reap(reason) => {
-                reap_daemon(&observation, reason).await;
+                reap_daemon(&observation, reason, &verified_owners[&daemon.pid]).await;
                 pinned_sweeps.remove(&daemon.pid);
                 stalled_sweeps.remove(&daemon.pid);
             }
             DaemonDecision::Redeploy(reason) => {
-                redeploy_daemon(&observation, reason).await;
+                redeploy_daemon(&observation, reason, &verified_owners[&daemon.pid]).await;
                 pinned_sweeps.remove(&daemon.pid);
                 stalled_sweeps.remove(&daemon.pid);
             }
             DaemonDecision::Adopt(reason) => {
-                adopt_daemon(state, daemon, reason).await;
+                adopt_daemon(state, daemon, reason, &verified_owners[&daemon.pid]).await;
             }
             DaemonDecision::Keep => {
                 // Surface a persistent split-brain: two live daemons claim one
@@ -2317,7 +2487,15 @@ async fn reaper_sweep(
 /// produces (`pid-<pid>-port-<port>`), so the daemon's next heartbeat reconciles
 /// with the adopted entry instead of conflicting with it.
 #[cfg(unix)]
-async fn adopt_daemon(state: &SupervisorState, daemon: &DiscoveredDaemon, reason: AdoptReason) {
+async fn adopt_daemon(
+    state: &SupervisorState,
+    daemon: &DiscoveredDaemon,
+    reason: AdoptReason,
+    owner: &VerifiedDaemonOwner,
+) {
+    if !verified_owner_is_current(owner).await {
+        return;
+    }
     // A routable entry needs a port. Health is only `Healthy` when a port was
     // probed, so an Adopt decision implies `Some` here; guard defensively anyway.
     let Some(port) = daemon.port else {
@@ -2336,6 +2514,9 @@ async fn adopt_daemon(state: &SupervisorState, daemon: &DiscoveredDaemon, reason
         if existing.pid != daemon.pid && is_process_alive(existing.pid) {
             return;
         }
+    }
+    if !process_owner_is_current(&owner.process) {
+        return;
     }
     let record = RegisteredRepoDaemon {
         repo_id: repo_id.clone(),
@@ -2524,7 +2705,11 @@ async fn graceful_terminate(
     store_root: &str,
     action: &str,
     reason: &str,
+    owner: &VerifiedDaemonOwner,
 ) {
+    if owner.process.pid() != pid || !verified_owner_is_current(owner).await {
+        return;
+    }
     warn!(
         pid,
         repo = %repo_root,
@@ -2549,12 +2734,18 @@ async fn graceful_terminate(
         in_flight,
         at: chrono::Utc::now().to_rfc3339(),
     };
+    if !process_owner_is_current(&owner.process) {
+        return;
+    }
     kin_daemon_spawn::append_to_daemon_log(
         &kin_root,
         &format!("kin-daemon TERMINATED BY SUPERVISOR: {}", note.summary()),
     );
     kin_daemon_spawn::write_daemon_death_note(&kin_root, &note);
 
+    if !process_owner_is_current(&owner.process) {
+        return;
+    }
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
@@ -2572,7 +2763,7 @@ async fn graceful_terminate(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    if is_process_alive(pid) {
+    if is_process_alive(pid) && verified_owner_is_current(owner).await {
         warn!(
             pid,
             repo = %repo_root,
@@ -2627,7 +2818,11 @@ fn retire_endpoint_of_terminated_daemon(kin_root: &Path, pid: u32) {
 /// outcome plus the CPU-pinned and persisted-progress-stall streak counts — so an
 /// operator can see exactly why a daemon was judged rogue.
 #[cfg(unix)]
-async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
+async fn reap_daemon(
+    observation: &DaemonObservation,
+    reason: ReapReason,
+    owner: &VerifiedDaemonOwner,
+) {
     let probe = match observation.health {
         DaemonHealth::Healthy(_) => "healthy",
         DaemonHealth::Unhealthy => "answered-unhealthy",
@@ -2660,6 +2855,7 @@ async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
         &observation.store_root,
         "reaping misbehaving repo daemon",
         &context,
+        owner,
     )
     .await;
 }
@@ -2667,13 +2863,18 @@ async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
 /// Redeploy a stale idle daemon: terminate it so it respawns on demand into the
 /// fresh build. Uses the same graceful ladder as reaping.
 #[cfg(unix)]
-async fn redeploy_daemon(observation: &DaemonObservation, reason: RedeployReason) {
+async fn redeploy_daemon(
+    observation: &DaemonObservation,
+    reason: RedeployReason,
+    owner: &VerifiedDaemonOwner,
+) {
     graceful_terminate(
         observation.pid,
         &observation.repo_root,
         &observation.store_root,
         "redeploying stale repo daemon",
         &format!("{reason:?}"),
+        owner,
     )
     .await;
 }
@@ -2911,8 +3112,30 @@ mod tests {
 
     async fn register_repo(
         app: Router,
-        payload: &RepoDaemonRegistration,
+        payload: &mut RepoDaemonRegistration,
     ) -> axum::response::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        payload.port = listener.local_addr().unwrap().port();
+        payload.endpoint = format!("http://127.0.0.1:{}", payload.port);
+        let identity =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        assert_eq!(identity.pid, payload.pid);
+        let metadata = Router::new().route(
+            "/runtime/identity",
+            get(move || {
+                let identity = identity.clone();
+                async move { Json(identity) }
+            }),
+        );
+        struct FixtureServer(tokio::task::JoinHandle<()>);
+        impl Drop for FixtureServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = FixtureServer(tokio::spawn(async move {
+            axum::serve(listener, metadata).await.unwrap();
+        }));
         tower::ServiceExt::oneshot(
             app,
             axum::http::Request::post("/daemons/register")
@@ -2932,10 +3155,10 @@ mod tests {
     #[tokio::test]
     async fn supervisor_register_route_and_deregister() {
         let state = Arc::new(SupervisorState::new());
-        let payload = repo_payload("instance-a", 49152);
+        let mut payload = repo_payload("instance-a", 49152);
 
         let app = router(Arc::clone(&state));
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = tower::ServiceExt::oneshot(
@@ -2963,8 +3186,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_register_rejects_conflicting_live_instance() {
         let state = Arc::new(SupervisorState::new());
-        let payload = repo_payload("instance-a", 49152);
-        let conflicting = RepoDaemonRegistration {
+        let mut payload = repo_payload("instance-a", 49152);
+        let mut conflicting = RepoDaemonRegistration {
             instance_id: "instance-b".to_string(),
             port: 49153,
             endpoint: "http://127.0.0.1:49153".to_string(),
@@ -2972,23 +3195,23 @@ mod tests {
         };
 
         let app = router(Arc::clone(&state));
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let response = register_repo(app, &conflicting).await;
+        let response = register_repo(app, &mut conflicting).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
 
         let repos = state.repo_daemons.read().await;
         let registered = repos.get("demo").unwrap();
         assert_eq!(registered.instance_id, "instance-a");
-        assert_eq!(registered.endpoint, "http://127.0.0.1:49152");
+        assert_eq!(registered.endpoint, payload.endpoint);
     }
 
     #[tokio::test]
     async fn supervisor_register_replaces_stale_conflicting_instance() {
         let state = old_supervisor_state();
-        let payload = repo_payload("instance-a", 49152);
-        let replacement = RepoDaemonRegistration {
+        let mut payload = repo_payload("instance-a", 49152);
+        let mut replacement = RepoDaemonRegistration {
             instance_id: "instance-b".to_string(),
             port: 49153,
             endpoint: "http://127.0.0.1:49153".to_string(),
@@ -2997,27 +3220,27 @@ mod tests {
         };
 
         let app = router(Arc::clone(&state));
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
         force_stale_route(&state, "demo").await;
 
-        let response = register_repo(app, &replacement).await;
+        let response = register_repo(app, &mut replacement).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let repos = state.repo_daemons.read().await;
         let registered = repos.get("demo").unwrap();
         assert_eq!(registered.instance_id, "instance-b");
-        assert_eq!(registered.endpoint, "http://127.0.0.1:49153");
+        assert_eq!(registered.endpoint, replacement.endpoint);
         assert_eq!(registered.graph_entity_count, Some(24));
     }
 
     #[tokio::test]
     async fn supervisor_deregister_ignores_wrong_or_missing_instance() {
         let state = Arc::new(SupervisorState::new());
-        let payload = repo_payload("instance-a", 49152);
+        let mut payload = repo_payload("instance-a", 49152);
 
         let app = router(Arc::clone(&state));
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = tower::ServiceExt::oneshot(
@@ -3049,10 +3272,10 @@ mod tests {
     #[tokio::test]
     async fn supervisor_route_list_and_health_prune_stale_routes() {
         let state = old_supervisor_state();
-        let payload = repo_payload("instance-a", 49152);
+        let mut payload = repo_payload("instance-a", 49152);
         let app = router(Arc::clone(&state));
 
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
         force_stale_route(&state, "demo").await;
         let response = tower::ServiceExt::oneshot(
@@ -3066,7 +3289,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.repo_daemons.read().await.is_empty());
 
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
         force_stale_route(&state, "demo").await;
         let response = tower::ServiceExt::oneshot(
@@ -3080,7 +3303,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.repo_daemons.read().await.is_empty());
 
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
         force_stale_route(&state, "demo").await;
         let response = tower::ServiceExt::oneshot(
@@ -3098,15 +3321,17 @@ mod tests {
     #[tokio::test]
     async fn supervisor_heartbeat_refreshes_route_before_ttl_prune() {
         let state = old_supervisor_state();
-        let payload = repo_payload("instance-a", 49152);
-        let refreshed = RepoDaemonRegistration {
+        let mut payload = repo_payload("instance-a", 49152);
+        let mut refreshed = RepoDaemonRegistration {
             graph_entity_count: Some(99),
             ..payload.clone()
         };
 
         let app = router(Arc::clone(&state));
-        let response = register_repo(app.clone(), &payload).await;
+        let response = register_repo(app.clone(), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
+        refreshed.port = payload.port;
+        refreshed.endpoint = payload.endpoint.clone();
         let previous_heartbeat = {
             let repos = state.repo_daemons.read().await;
             repos.get("demo").unwrap().last_heartbeat_elapsed_ms
@@ -4223,21 +4448,13 @@ mod tests {
         assert_eq!(current.status(), StatusCode::OK);
     }
 
-    /// Building a supervisor router must not disturb an open window's durable
-    /// record, which lives in one directory shared by the whole machine.
+    /// Building a supervisor router must preserve the selected runtime's open
+    /// rotation-window record. Construction must never complete a primary-only
+    /// rotation or delete its durable state.
     ///
-    /// `router_with_auth_and_shutdown` once built its token set through
-    /// `RotationTokens::new`, which reads a primary-only configuration as a
-    /// finished rotation and removes the record. The supervisor's record sits
-    /// under `supervisor_root()`, keyed on the real home rather than on
-    /// `KIN_HOME`, so that was not confined to a test's own temp directory:
-    /// running any supervisor unit test on a machine with a live rotation
-    /// window deleted that window's state.
-    ///
-    /// Redirecting the environment is the only way to observe it, so this holds
-    /// the binary's env lock and the sanctioned guard, and it asserts the
-    /// redirect took effect BEFORE it asserts anything else. A seed written
-    /// where the code never looks would survive on the broken code too.
+    /// This holds the environment lock, declares an isolated development home,
+    /// and checks its service path before creating any record. A seed outside
+    /// the selected namespace would survive broken router construction too.
     #[tokio::test]
     async fn building_a_supervisor_router_leaves_the_rotation_window_record_intact() {
         if !kin_core::test_env::alone_in_process() {
@@ -4245,6 +4462,8 @@ mod tests {
         }
         let _env = env_test_lock();
         let home = tempfile::tempdir().expect("tempdir");
+        let _kin_home = kin_core::test_env::EnvVarGuard::set("KIN_HOME", home.path());
+        let _mode = kin_core::test_env::EnvVarGuard::set("KIN_RUNTIME_MODE", "development");
         let _registry = kin_core::test_env::EnvVarGuard::set(
             "KIN_REGISTRY_PATH",
             home.path().join("registry.toml"),
@@ -4257,6 +4476,12 @@ mod tests {
             home.path().display(),
             path.display()
         );
+        assert!(
+            path.starts_with(home.path().join("services/development")),
+            "the rotation record must belong to the selected development service namespace"
+        );
+        std::fs::create_dir_all(path.parent().expect("rotation record parent"))
+            .expect("prepare the isolated service namespace");
         let seeded = br#"{"opened_unix":1787900000,"previous_accepted":7}"#;
         std::fs::write(&path, seeded).expect("seed a window record");
 
@@ -4660,18 +4885,18 @@ mod tests {
     #[tokio::test]
     async fn registry_records_the_managed_home_a_daemon_reports() {
         let state = Arc::new(SupervisorState::new());
-        let payload = repo_payload_in_home("instance-a", 49152, "/scratch/home/.kin");
+        let mut payload = repo_payload_in_home("instance-a", 49152, "/scratch/home/.kin");
 
-        let response = register_repo(router(Arc::clone(&state)), &payload).await;
+        let response = register_repo(router(Arc::clone(&state)), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let repos = state.repo_daemons.read().await;
         assert_eq!(repos.get("demo").unwrap().kin_home, "/scratch/home/.kin");
     }
 
-    /// One machine-wide supervisor legitimately holds daemons from several
-    /// managed homes. That is the whole premise of the scoping contract, so it
-    /// is asserted rather than assumed.
+    /// Legacy reported-home labels remain diagnostic metadata. The actual
+    /// registering services must independently prove this supervisor's local
+    /// runtime namespace through their metadata endpoint.
     #[tokio::test]
     async fn one_supervisor_holds_daemons_from_two_homes() {
         let state = Arc::new(SupervisorState::new());
@@ -4683,10 +4908,10 @@ mod tests {
         b.repo_id = "repo-b".to_string();
 
         assert_eq!(
-            register_repo(app.clone(), &a).await.status(),
+            register_repo(app.clone(), &mut a).await.status(),
             StatusCode::OK
         );
-        assert_eq!(register_repo(app, &b).await.status(), StatusCode::OK);
+        assert_eq!(register_repo(app, &mut b).await.status(), StatusCode::OK);
 
         let repos = state.repo_daemons.read().await;
         assert_eq!(repos.get("repo-a").unwrap().kin_home, "/homes/a/.kin");
@@ -4699,9 +4924,9 @@ mod tests {
     #[tokio::test]
     async fn an_unreported_home_is_never_filled_in_from_the_supervisor() {
         let state = Arc::new(SupervisorState::new());
-        let payload = repo_payload_in_home("instance-a", 49152, "   ");
+        let mut payload = repo_payload_in_home("instance-a", 49152, "   ");
 
-        let response = register_repo(router(Arc::clone(&state)), &payload).await;
+        let response = register_repo(router(Arc::clone(&state)), &mut payload).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let repos = state.repo_daemons.read().await;
@@ -4727,9 +4952,9 @@ mod tests {
     async fn a_heartbeat_keeps_the_recorded_home_current() {
         let state = Arc::new(SupervisorState::new());
         let app = router(Arc::clone(&state));
-        let payload = repo_payload_in_home("instance-a", 49152, "/homes/a/.kin");
+        let mut payload = repo_payload_in_home("instance-a", 49152, "/homes/a/.kin");
         assert_eq!(
-            register_repo(app.clone(), &payload).await.status(),
+            register_repo(app.clone(), &mut payload).await.status(),
             StatusCode::OK
         );
 

@@ -510,6 +510,16 @@ fn session_crash_prefix_child() {
     let session = PathBuf::from(configured(SESSION_ENV).expect("controlled session directory"));
     let control = configured_control().expect("controlled stop marker");
     let root = PathBuf::from(repo);
+    let expected_home = root.join(".controlled-runtime/managed");
+    assert_eq!(
+        kin_core::registry::managed_kin_home(),
+        expected_home,
+        "the controlled child must initialize only its own selected runtime home"
+    );
+    // Match real daemon startup before opening any repository authority. The
+    // subprocess spawner selects this home but deliberately does not bind it.
+    kin_core::runtime_identity::RuntimeNamespace::initialize_local_service()
+        .expect("initialize the controlled child's selected runtime namespace");
     let layout = kin_core::KinLayout::new(root.join(".kin"));
     let singleton = crate::lifecycle::acquire_singleton_lock(layout.root())
         .unwrap()

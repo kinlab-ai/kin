@@ -594,8 +594,13 @@ def check_npm_release_path_and_action_pins(
         start = release.index(f"  {job}:")
         end = release.index(f"\n  {next_job}:", start + 3)
         publish_job = release[start:end]
+        publication_needs = (
+            "needs: [publish, install_proof, npm_publish_preflight, publish_npm_canonical]"
+            if job == "publish_npm_compatibility"
+            else "needs: [publish, install_proof, npm_publish_preflight]"
+        )
         for policy in (
-            "needs: [publish, install_proof, npm_publish_preflight]",
+            publication_needs,
             "needs.publish.result == 'success'",
             "needs.install_proof.result == 'success'",
             "needs.npm_publish_preflight.result == 'success'",
@@ -606,6 +611,12 @@ def check_npm_release_path_and_action_pins(
             package_dir,
         ):
             require(publish_job, policy, f"{job} trusted publishing")
+        if job == "publish_npm_compatibility":
+            require(
+                publish_job,
+                "needs.publish_npm_canonical.result == 'success'",
+                "compatibility publication requires its exact canonical dependency",
+            )
 
     install_proof_start = release.index("  install_proof:")
     install_proof_end = release.index("\n  npm_publish_preflight:", install_proof_start)

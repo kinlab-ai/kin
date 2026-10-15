@@ -320,7 +320,7 @@ fn entity_lifecycle_new_unit_receipt_recovers_after_publication_crash() {
 
 #[test]
 fn entity_lifecycle_occupied_new_unit_and_mixed_owner_edits_refuse_atomically() {
-    use kin_mcp::entity_lifecycle::EntityPlacement::{NewSourceUnit, SiblingAfter};
+    use kin_mcp::entity_lifecycle::EntityPlacement::NewSourceUnit;
     for occupied in [true, false] {
         let (_dir, state) = test_state();
         let original = b"def anchor():\n    return 1\n";
@@ -334,16 +334,27 @@ fn entity_lifecycle_occupied_new_unit_and_mixed_owner_edits_refuse_atomically() 
             );
         }
         let sessions = test_sessions();
-        let mut operations = vec![lifecycle_create(
-            &state,
-            &anchor,
-            if occupied {
-                NewSourceUnit
-            } else {
-                SiblingAfter
-            },
-            "def added():\n    return 2",
-        )];
+        let mut operations = if occupied {
+            vec![lifecycle_create(
+                &state,
+                &anchor,
+                NewSourceUnit,
+                "def added():\n    return 2",
+            )]
+        } else {
+            vec![kin_mcp::McpMutationOperation {
+                verb: "remove".into(),
+                target: anchor.id.to_string(),
+                body: None,
+                destination: None,
+                description: "remove anchor".into(),
+                payload: Some(kin_mcp::McpMutationPayload::EntityRemove(
+                    kin_mcp::entity_lifecycle::EntityRemove {
+                        source_base: lifecycle_base(&state, &anchor),
+                    },
+                )),
+            }]
+        };
         if !occupied {
             operations.push(kin_mcp::McpMutationOperation {
                 verb: "update".into(),
@@ -375,6 +386,82 @@ fn entity_lifecycle_occupied_new_unit_and_mixed_owner_edits_refuse_atomically() 
             );
         }
     }
+}
+
+#[test]
+fn entity_lifecycle_create_and_patch_in_same_source_unit_commit_together() {
+    use kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter;
+    let (_dir, state) = test_state();
+    let original = b"def anchor():\n    return 1\n";
+    let (anchor, _) = install_exact_source(&state, "pkg/source.py", original, "anchor");
+    let sessions = test_sessions();
+    let operations = vec![
+        lifecycle_create(&state, &anchor, SiblingAfter, "def added():\n    return 2"),
+        kin_mcp::McpMutationOperation {
+            verb: "update".into(),
+            target: anchor.id.to_string(),
+            payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+                lifecycle_base(&state, &anchor),
+            )),
+            body: Some("def anchor():\n    return added()".into()),
+            destination: None,
+            description: "call added from anchor".into(),
+        },
+    ];
+    let arguments = lifecycle_stage(&sessions, operations);
+    let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert_eq!(
+        std::fs::read(state.layout.working_dir().join("pkg/source.py")).unwrap(),
+        b"def anchor():\n    return added()\n\n\ndef added():\n    return 2\n"
+    );
+    // The graph holds both changes, not only the bytes: the created entity
+    // and the anchor's new body.
+    assert!(lifecycle_entity(&state, "added", kin_model::EntityKind::Function).is_some());
+    let patched = state.graph.get_entity(&anchor.id).unwrap().unwrap();
+    assert_ne!(patched.fingerprint, anchor.fingerprint);
+}
+
+/// Removing a declaration while editing one written inside it must never
+/// report a commit that lost the edit. Here the class removal is refused
+/// before the enclosing check is reached; the planner's own guard covers any
+/// removable declaration that holds an editable one. Either way the pair is
+/// refused whole and nothing is written.
+#[test]
+fn entity_lifecycle_refuses_removing_a_declaration_that_holds_an_edit() {
+    use kin_model::EntityKind;
+    let file = "pkg/app.py";
+    let original =
+        "class App(Base):\n    def first(self):\n        return 1\n\n\ndef helper():\n    return 1\n";
+    let (_dir, state) = test_state();
+    let (method, _) = install_exact_source(&state, file, original.as_bytes(), "App.first");
+    let class = lifecycle_entity(&state, "App", EntityKind::Class).unwrap();
+    let sessions = test_sessions();
+    let operations = vec![
+        lifecycle_remove(&state, &class),
+        kin_mcp::McpMutationOperation {
+            verb: "update".into(),
+            target: method.id.to_string(),
+            payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+                lifecycle_base(&state, &method),
+            )),
+            body: Some("def first(self):\n    return 2".into()),
+            destination: None,
+            description: "change first".into(),
+        },
+    ];
+    let arguments = lifecycle_stage(&sessions, operations);
+    let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+    assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(
+        result_text(&result).contains("repository authority did not move"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(lifecycle_disk(&state, file), original);
+    let kept = state.graph.get_entity(&method.id).unwrap().unwrap();
+    assert_eq!(kept.fingerprint, method.fingerprint);
+    assert!(lifecycle_entity(&state, "App", EntityKind::Class).is_some());
 }
 
 #[test]

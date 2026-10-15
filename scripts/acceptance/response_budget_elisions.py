@@ -73,6 +73,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -712,6 +713,7 @@ class Suite(object):
         self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = self.kin_home
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
+        self.env["KIN_DAEMON_DISABLE_LSP"] = "1"
         self.env["KIN_VFS_DISABLE"] = "1"
         # Written against a store that holds its complete history.
         self.env["KIN_INIT_HISTORY"] = "full"
@@ -721,6 +723,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = os.path.abspath(daemon)
         self.repo = None
         self.owned_repos = set()
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def shutdown(self):
         """Stop only this run's repositories, including a failed initialization."""
@@ -1246,7 +1250,7 @@ def grade_impact_pages(whole, paged):
         if (paged.get(key) or []) != (whole.get(key) or []):
             problems.append("impact pages changed or lost %s" % key)
     for key in ("degradations", "edge_coverage", "negative"):
-        if paged.get(key) != whole.get(key):
+        if without_observation_times(paged.get(key)) != without_observation_times(whole.get(key)):
             problems.append("impact pages changed the original %s reading" % key)
     for key in ("verdict", "completeness"):
         if (paged.get("_kin") or {}).get(key) != (whole.get("_kin") or {}).get(key):

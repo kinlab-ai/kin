@@ -11,6 +11,7 @@
 // launcher pins — so it is unit testable without spawning or touching the
 // network. Downloading and installing live in ./provision.mjs.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -128,9 +129,10 @@ export function binaryName(name, platform = process.platform) {
   return platform === 'win32' ? `${name}.exe` : name;
 }
 
-/** Root of Kin's managed install, honoring $KIN_HOME (default ~/.kin). */
+/** Root of Kin's managed install, honoring $KIN_HOME, then $KIN_DIR (default ~/.kin). */
 export function kinHome(env = process.env, home = os.homedir()) {
-  return env.KIN_HOME && env.KIN_HOME.trim() ? env.KIN_HOME : path.join(home, '.kin');
+  const root = env.KIN_HOME || env.KIN_DIR;
+  return root ? path.resolve(root) : path.join(home, '.kin');
 }
 
 /**
@@ -180,9 +182,37 @@ export function readLauncherStamp(env = process.env) {
   }
 }
 
-/** Record `version` as the provisioned release (directory must exist). */
+/**
+ * Record `version` as the provisioned release (directory must exist).
+ *
+ * The stamp is replaced, never rewritten in place: the bytes go to a fresh
+ * temporary file beside it, which is flushed and then renamed over the stamp.
+ * A reader therefore sees the old version or the new one, never an empty or
+ * half-written file. That matters because launchers older than this package
+ * trusted the stamp as the installed version, and an empty read made them
+ * provision again. The native updater writes the same file the same way.
+ */
 export function writeLauncherStamp(version, env = process.env) {
-  fs.writeFileSync(launcherStampPath(env), `${version}\n`);
+  const stamp = launcherStampPath(env);
+  const temporary = path.join(
+    path.dirname(stamp),
+    `.${path.basename(stamp)}.tmp-${process.pid}-${crypto.randomUUID()}`,
+  );
+  let handle = null;
+  try {
+    handle = fs.openSync(temporary, 'wx', 0o644);
+    fs.writeFileSync(handle, `${version}\n`);
+    fs.fsyncSync(handle);
+    fs.closeSync(handle);
+    handle = null;
+    fs.renameSync(temporary, stamp);
+  } catch (error) {
+    if (handle !== null) {
+      try { fs.closeSync(handle); } catch {}
+    }
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 /** Human-readable, honest explanation for when the managed binary is absent. */

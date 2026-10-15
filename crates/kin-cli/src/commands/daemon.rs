@@ -827,6 +827,574 @@ async fn request_worker_retirement(
     .map_err(|_| "retirement deadline exhausted before the answer completed".to_string())?
 }
 
+// ── replacement ─────────────────────────────────────────────────────────────
+
+/// How often a replacement looks again at the daemon it is waiting on.
+const REPLACEMENT_POLL: Duration = Duration::from_millis(100);
+
+/// How often a replacement asks a daemon it is waiting on what still holds it.
+const REPLACEMENT_REASK: Duration = Duration::from_secs(1);
+
+/// The release that replaces an older daemon, as the one-Kin rule
+/// ([`kin_core::runtime_identity::succession`]) judges it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplacementSuccessor {
+    client: kin_core::runtime_identity::SuccessionClient,
+    /// The managed pair on disk, when it was read. A client that is not it
+    /// retires nothing.
+    installed: Option<kin_core::runtime_identity::RuntimeIdentity>,
+    /// The managed home whose binaries, and whose update backups, are older
+    /// generations of the managed install.
+    managed_home: Option<PathBuf>,
+}
+
+impl ReplacementSuccessor {
+    /// A release this update installs: a clean release build of `version` at
+    /// `commit` for this target.
+    pub(crate) fn new(version: &str, commit: &str) -> Result<Self> {
+        let version = version.trim().trim_start_matches('v');
+        semver::Version::parse(version).with_context(|| {
+            format!("replacement successor version {version:?} is not a release version")
+        })?;
+        let current = kin_core::runtime_identity::RuntimeIdentity::current();
+        Ok(Self {
+            client: kin_core::runtime_identity::SuccessionClient {
+                identity: kin_core::runtime_identity::RuntimeIdentity {
+                    version: version.to_string(),
+                    commit_sha: commit.trim().to_ascii_lowercase(),
+                    source_dirty: false,
+                    source_known: true,
+                    target: current.target,
+                    build_profile: "release".to_string(),
+                },
+                mode: kin_core::runtime_identity::RuntimeMode::Managed,
+                namespace: None,
+            },
+            installed: None,
+            managed_home: None,
+        })
+    }
+
+    /// This process, replacing an older daemon before it starts its own.
+    pub(crate) fn current() -> Result<Self> {
+        Ok(Self {
+            client: crate::daemon_client::succession::current_succession_client()
+                .map_err(|error| anyhow::anyhow!(error))?,
+            installed: crate::daemon_client::succession::installed_runtime(),
+            managed_home: crate::commands::runtime::managed_home().ok(),
+        })
+    }
+
+    pub(crate) fn replacing_install(mut self, install_root: &Path) -> Self {
+        self.managed_home = Some(install_root.to_path_buf());
+        self
+    }
+
+    /// The name every client of the replaced release is told.
+    pub(crate) fn label(&self) -> String {
+        kin_core::runtime_identity::release_label(
+            &self.client.identity.version,
+            &self.client.identity.commit_sha,
+        )
+    }
+}
+
+/// What became of a daemon asked to make way for a successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplacementOutcome {
+    /// No live daemon of that pid serves the repository.
+    NotRunning,
+    /// The daemon is gone and its endpoint is retired. `steps` says what it
+    /// took beyond asking, and is empty when asking was enough.
+    Replaced { steps: Vec<String> },
+    /// The daemon already runs the successor's release, so nothing was asked.
+    AlreadySuccessor,
+    /// Still running at the deadline, with what it was waiting on. Nothing was
+    /// forced; it was left to finish, and nothing should start beside it.
+    Waiting(Vec<String>),
+    /// Never asked to go: a newer release, a development build, or a daemon
+    /// whose release could not be read. The sentence names its pid and
+    /// executable.
+    Refused(String),
+}
+
+/// What a daemon answered a `POST /retire`.
+#[derive(Debug)]
+enum RetireAnswer {
+    Accepted(crate::daemon_client::replacement::RetirementReply),
+    /// 400, 415 or 422: a daemon from before the replacement envelope.
+    Unreadable,
+    /// 404: a daemon from before `/retire`.
+    Absent,
+}
+
+/// The endpoint of the daemon a replacement is talking to.
+struct ReplacementPeer {
+    port: u16,
+    token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl ReplacementPeer {
+    fn new(port: u16, token: Option<String>) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .context("could not build the replacement request client")?;
+        Ok(Self {
+            port,
+            token,
+            client,
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
+    /// Send `request`, read the whole answer, and keep both inside the
+    /// caller's deadline.
+    async fn exchange(
+        &self,
+        request: reqwest::RequestBuilder,
+        deadline: Instant,
+    ) -> std::result::Result<(reqwest::StatusCode, Vec<u8>), String> {
+        let remaining = remaining_budget(deadline);
+        if remaining.is_zero() {
+            return Err("the replacement deadline ran out before the request was sent".to_string());
+        }
+        tokio::time::timeout(remaining.min(Duration::from_secs(5)), async {
+            let response = request
+                .send()
+                .await
+                .map_err(|error| format!("the request did not reach the daemon: {error}"))?;
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| format!("the daemon's answer did not complete: {error}"))?;
+            Ok((status, body.to_vec()))
+        })
+        .await
+        .map_err(|_| "the daemon did not answer in time".to_string())?
+    }
+
+    /// `POST /retire`, as a replacement naming `successor` or, without one, a
+    /// plain retirement.
+    async fn retire(
+        &self,
+        identity: &ProcessIdentity,
+        successor: Option<&str>,
+        deadline: Instant,
+    ) -> std::result::Result<RetireAnswer, String> {
+        use crate::daemon_client::replacement::{ReplacementClaim, RetirementRequest};
+        let body = match successor {
+            Some(successor) => RetirementRequest::Replacement {
+                identity: identity.clone(),
+                replacement: ReplacementClaim {
+                    successor: successor.to_string(),
+                },
+            },
+            None => RetirementRequest::Plain(identity.clone()),
+        };
+        let request = self.authorized(self.client.post(self.url("/retire")).json(&body));
+        let (status, body) = self.exchange(request, deadline).await?;
+        match status.as_u16() {
+            200..=299 => serde_json::from_slice(&body)
+                .map(RetireAnswer::Accepted)
+                .map_err(|error| format!("its retirement answer is unreadable: {error}")),
+            400 | 415 | 422 => Ok(RetireAnswer::Unreadable),
+            404 => Ok(RetireAnswer::Absent),
+            409 | 410 => {
+                Err("its endpoint does not own the recorded process incarnation".to_string())
+            }
+            _ => Err(format!("its retirement endpoint answered HTTP {status}")),
+        }
+    }
+
+    /// `POST /shutdown`, bound to the recorded incarnation.
+    async fn shutdown(
+        &self,
+        identity: &ProcessIdentity,
+        deadline: Instant,
+    ) -> std::result::Result<(), String> {
+        let request = self.authorized(self.client.post(self.url("/shutdown")).json(identity));
+        let (status, _) = self.exchange(request, deadline).await?;
+        match status.as_u16() {
+            200..=299 => Ok(()),
+            409 | 410 => {
+                Err("its endpoint does not own the recorded process incarnation".to_string())
+            }
+            _ => Err(format!("its stop endpoint answered HTTP {status}")),
+        }
+    }
+}
+
+/// A write the daemon at `pid` or a client of it has open right now, in
+/// words. Nothing is stopped under one.
+fn live_write_marker(kin_root: &Path, pid: u32) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    if let Some(open) = kin_daemon_spawn::read_open_transaction(kin_root)
+        .filter(|open| open.pid == pid && open.is_beating(now))
+    {
+        return Some(format!("a write is open: {}", open.summary()));
+    }
+    kin_daemon_spawn::read_approaching_commit(kin_root)
+        .filter(|approaching| approaching.is_fresh(now))
+        .map(|_| "a commit is on its way to the daemon".to_string())
+}
+
+/// What in a retirement answer still holds a replacement asked at
+/// `asked_at`: codes when the daemon sends them, otherwise its sentences read
+/// through the table of what earlier releases said. A sentence this build
+/// does not know holds it.
+fn holding_replacement(
+    reply: &crate::daemon_client::replacement::RetirementReply,
+    asked_at: Instant,
+    now: Instant,
+) -> Vec<String> {
+    use crate::daemon_client::replacement::{
+        legacy_blocker_code, replacement_wait, ReplacementWait, REPLACEMENT_BACKGROUND_GRACE,
+    };
+    let codes: Vec<Option<String>> = match &reply.blockers {
+        Some(codes) if codes.len() == reply.blocked_by.len() => {
+            codes.iter().cloned().map(Some).collect()
+        }
+        _ => reply
+            .blocked_by
+            .iter()
+            .map(|sentence| legacy_blocker_code(sentence).map(str::to_string))
+            .collect(),
+    };
+    reply
+        .blocked_by
+        .iter()
+        .zip(codes)
+        .filter(|(_, code)| {
+            match code
+                .as_deref()
+                .map_or(ReplacementWait::Always, replacement_wait)
+            {
+                ReplacementWait::Always => true,
+                ReplacementWait::Bounded => {
+                    now.saturating_duration_since(asked_at) < REPLACEMENT_BACKGROUND_GRACE
+                }
+                ReplacementWait::Never => false,
+            }
+        })
+        .map(|(sentence, _)| sentence.clone())
+        .collect()
+}
+
+fn incarnation_gone(target: &ProcessIdentity) -> bool {
+    matches!(process_identity_is_current(target), Ok(false))
+}
+
+/// How a replacement's wait for one daemon ended.
+enum ReplacementWait {
+    Gone,
+    Held(Vec<String>),
+}
+
+fn held_or_exiting(waiting_on: Vec<String>) -> ReplacementWait {
+    if waiting_on.is_empty() {
+        ReplacementWait::Held(vec!["it has not finished exiting yet".to_string()])
+    } else {
+        ReplacementWait::Held(waiting_on)
+    }
+}
+
+/// Ask the daemon at `pid` to make way for `successor`, and wait until it has
+/// or `deadline` passes.
+///
+/// One request per call, in the newest form the daemon reads:
+///
+/// - a daemon that takes a replacement finishes its writes, its pending
+///   publication and its first scan, gives background passes a short grace,
+///   tells its clients to restart, flushes and exits by itself;
+/// - a daemon from 0.8.0 to 0.8.6 is asked to retire and asked again what
+///   holds it; once only its own clients, or background work past the grace,
+///   do, and no write is open, it is stopped through its incarnation-bound
+///   `/shutdown`;
+/// - an older daemon, with no `/retire`, gets that `/shutdown` once no write
+///   is open.
+///
+/// A daemon still starting is waited for until it publishes. A newer release,
+/// a development build, or a daemon whose release cannot be read is never
+/// asked, and the refusal names its pid and executable. Signals go only
+/// through the recorded-executable escalation every stop uses, and only with
+/// no write open. Nothing here starts a daemon.
+pub(crate) async fn retire_for_replacement(
+    kin_root: &Path,
+    pid: u32,
+    successor: &ReplacementSuccessor,
+    deadline: Instant,
+) -> Result<ReplacementOutcome> {
+    let Some(mut target) = attributed_worker_identity(kin_root, pid)? else {
+        return Ok(ReplacementOutcome::NotRunning);
+    };
+    while target.is_starting() && !endpoint_published_by(kin_root, &target) {
+        if incarnation_gone(&target) {
+            return Ok(ReplacementOutcome::NotRunning);
+        }
+        if Instant::now() >= deadline {
+            return Ok(ReplacementOutcome::Waiting(
+                vec![STILL_STARTING.to_string()],
+            ));
+        }
+        tokio::time::sleep(remaining_budget(deadline).min(REPLACEMENT_POLL)).await;
+    }
+    if target.is_starting() {
+        let Some(published) = attributed_worker_identity(kin_root, pid)? else {
+            return Ok(ReplacementOutcome::NotRunning);
+        };
+        target = published;
+    }
+    let (recorded_pid, recorded_port) = repo_daemon_recorded_endpoint(kin_root);
+    anyhow::ensure!(
+        recorded_pid == Some(pid),
+        "worker endpoint changed before the replacement request for pid {pid}"
+    );
+    let port = recorded_port
+        .with_context(|| format!("worker pid {pid} has no recorded port to ask it to make way"))?;
+    let peer = ReplacementPeer::new(port, worker_auth_token(kin_root))?;
+    let release = match crate::daemon_client::succession::read_peer_release(
+        &peer.url(""),
+        pid,
+        successor.managed_home.as_deref(),
+        remaining_budget(deadline),
+    )
+    .await
+    {
+        Ok(release) => release,
+        Err(error) => {
+            return Ok(ReplacementOutcome::Refused(format!(
+            "Kin daemon pid {pid} ({}) was left running: its release could not be read: {error}",
+            crate::daemon_client::process_executable_path(pid)
+                .unwrap_or_else(|| "executable unknown".to_string())
+        )))
+        }
+    };
+    match kin_core::runtime_identity::succession(
+        &successor.client,
+        successor.installed.as_ref(),
+        &release,
+    ) {
+        kin_core::runtime_identity::Succession::Replace => {}
+        kin_core::runtime_identity::Succession::Attach => {
+            return Ok(ReplacementOutcome::AlreadySuccessor)
+        }
+        refused => {
+            return Ok(ReplacementOutcome::Refused(
+                refused.refusal().unwrap_or_default().to_string(),
+            ))
+        }
+    }
+
+    let label = successor.label();
+    let mut steps = Vec::new();
+    let answer = peer
+        .retire(&target, Some(&label), deadline)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("daemon pid {pid} did not take the replacement: {error}")
+        })?;
+    let wait = match answer {
+        RetireAnswer::Accepted(reply) if reply.replacing => {
+            await_replacement(&peer, &target, &label, reply.blocked_by, deadline).await
+        }
+        RetireAnswer::Accepted(_) | RetireAnswer::Unreadable => {
+            replace_retiring_daemon(kin_root, &peer, &target, deadline, &mut steps).await?
+        }
+        RetireAnswer::Absent => {
+            replace_unretirable_daemon(kin_root, &peer, &target, deadline, &mut steps).await
+        }
+    };
+    Ok(match wait {
+        ReplacementWait::Gone => {
+            if let Some(survivor) =
+                retire_worker_endpoint(kin_root, &StopOutcome::Stopped, &mut steps)
+            {
+                steps.push(format!("its recorded endpoint survived: {survivor}"));
+            }
+            ReplacementOutcome::Replaced { steps }
+        }
+        ReplacementWait::Held(waiting_on) => ReplacementOutcome::Waiting(waiting_on),
+    })
+}
+
+/// Wait for a daemon that took the replacement to go by itself, asking again
+/// now and then what still holds it, so a wait that runs out names it.
+async fn await_replacement(
+    peer: &ReplacementPeer,
+    target: &ProcessIdentity,
+    label: &str,
+    mut waiting_on: Vec<String>,
+    deadline: Instant,
+) -> ReplacementWait {
+    let mut next_ask = Instant::now() + REPLACEMENT_REASK;
+    loop {
+        if incarnation_gone(target) {
+            return ReplacementWait::Gone;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return held_or_exiting(waiting_on);
+        }
+        if now >= next_ask {
+            next_ask = now + REPLACEMENT_REASK;
+            // The same request again, which changes nothing it has not
+            // already changed; only the answer is new.
+            if let Ok(RetireAnswer::Accepted(reply)) =
+                peer.retire(target, Some(label), deadline).await
+            {
+                waiting_on = reply.blocked_by;
+            }
+        }
+        tokio::time::sleep(remaining_budget(deadline).min(REPLACEMENT_POLL)).await;
+    }
+}
+
+/// Replace a daemon that takes `/retire` but not a replacement. It is asked to
+/// retire, which keeps it from idling on, and asked again what holds it. Once
+/// only what a replacement does not wait for is left and no write is open, it
+/// is stopped through its incarnation.
+async fn replace_retiring_daemon(
+    kin_root: &Path,
+    peer: &ReplacementPeer,
+    target: &AttributedStopTarget,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> Result<ReplacementWait> {
+    let pid = target.pid();
+    let asked_at = Instant::now();
+    let mut next_ask = asked_at;
+    let mut waiting_on = Vec::new();
+    loop {
+        if incarnation_gone(target) {
+            return Ok(ReplacementWait::Gone);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(held_or_exiting(waiting_on));
+        }
+        if now >= next_ask {
+            next_ask = now + REPLACEMENT_REASK;
+            match peer.retire(target, None, deadline).await {
+                Ok(RetireAnswer::Accepted(reply)) => {
+                    let holding = holding_replacement(&reply, asked_at, now);
+                    if !holding.is_empty() {
+                        waiting_on = holding;
+                    } else if reply.blocked_by.is_empty() {
+                        // Nothing holds it, so it is already on its way out.
+                        waiting_on.clear();
+                    } else if let Some(write) = live_write_marker(kin_root, pid) {
+                        waiting_on = vec![write];
+                    } else {
+                        steps.push(format!(
+                            "only what a replacement does not wait for held pid {pid} ({}), so it was stopped through its incarnation",
+                            reply.blocked_by.join("; ")
+                        ));
+                        return Ok(
+                            shutdown_and_await(kin_root, peer, target, deadline, steps).await
+                        );
+                    }
+                }
+                Ok(RetireAnswer::Absent) => {
+                    return Ok(
+                        replace_unretirable_daemon(kin_root, peer, target, deadline, steps).await,
+                    )
+                }
+                Ok(RetireAnswer::Unreadable) => {
+                    anyhow::bail!("daemon pid {pid} cannot read a retirement request")
+                }
+                Err(_) if incarnation_gone(target) => return Ok(ReplacementWait::Gone),
+                Err(error) => {
+                    anyhow::bail!("daemon pid {pid} did not take the retirement: {error}")
+                }
+            }
+        }
+        tokio::time::sleep(remaining_budget(deadline).min(REPLACEMENT_POLL)).await;
+    }
+}
+
+/// Replace a daemon from before `/retire`: once no write is open, through its
+/// incarnation-bound `/shutdown`.
+async fn replace_unretirable_daemon(
+    kin_root: &Path,
+    peer: &ReplacementPeer,
+    target: &AttributedStopTarget,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> ReplacementWait {
+    loop {
+        if incarnation_gone(target) {
+            return ReplacementWait::Gone;
+        }
+        let write = live_write_marker(kin_root, target.pid());
+        let Some(write) = write else {
+            return shutdown_and_await(kin_root, peer, target, deadline, steps).await;
+        };
+        if Instant::now() >= deadline {
+            return ReplacementWait::Held(vec![write]);
+        }
+        tokio::time::sleep(remaining_budget(deadline).min(REPLACEMENT_POLL)).await;
+    }
+}
+
+/// Send the incarnation-bound `/shutdown` once and wait for the daemon to go.
+/// A daemon still there at the deadline is escalated only through the
+/// recorded-executable check every stop uses, and only with no write open.
+async fn shutdown_and_await(
+    kin_root: &Path,
+    peer: &ReplacementPeer,
+    target: &AttributedStopTarget,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> ReplacementWait {
+    let pid = target.pid();
+    let outcome = match peer.shutdown(target, deadline).await {
+        Ok(()) => {
+            steps.push(format!("sent the stop request to pid {pid}"));
+            loop {
+                if incarnation_gone(target) {
+                    return ReplacementWait::Gone;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(remaining_budget(deadline).min(REPLACEMENT_POLL)).await;
+            }
+            StopOutcome::Timeout
+        }
+        Err(_) if incarnation_gone(target) => return ReplacementWait::Gone,
+        Err(error) => StopOutcome::SignalFailed(error),
+    };
+    if let Some(write) = live_write_marker(kin_root, pid) {
+        return ReplacementWait::Held(vec![write]);
+    }
+    match escalate_if_unstopped(target, outcome, steps) {
+        StopOutcome::Stopped | StopOutcome::NotRunning => ReplacementWait::Gone,
+        _ => ReplacementWait::Held(vec![format!(
+            "it was asked to stop and did not exit{}",
+            steps
+                .last()
+                .map(|step| format!(" ({step})"))
+                .unwrap_or_default()
+        )]),
+    }
+}
+
 #[cfg(not(unix))]
 fn stop_worker_identity(
     _kin_root: &Path,
@@ -836,9 +1404,12 @@ fn stop_worker_identity(
     stop_identity_graceful(identity, wait)
 }
 
+/// Stop the supervisor whose endpoint is recorded in `dir`: the managed
+/// services directory for a current supervisor, or where an older one
+/// recorded it (see [`legacy_supervisor_dir`]).
 #[cfg(unix)]
-fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
-    let (recorded_pid, recorded_port) = supervisor_recorded_endpoint();
+fn stop_supervisor_identity(dir: &Path, identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
+    let (recorded_pid, recorded_port, _) = crate::daemon_client::supervisor_endpoint_in_dir(dir);
     if recorded_pid != Some(identity.pid()) {
         return StopOutcome::SignalFailed(format!(
             "supervisor endpoint changed before cooperative shutdown for pid {}",
@@ -856,8 +1427,7 @@ fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopO
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            let path = supervisor_owner_path().with_file_name("supervisor.token");
-            std::fs::read_to_string(path)
+            std::fs::read_to_string(dir.join("supervisor.token"))
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
@@ -868,8 +1438,42 @@ fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopO
 }
 
 #[cfg(not(unix))]
-fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
+fn stop_supervisor_identity(
+    _dir: &Path,
+    identity: &ProcessIdentity,
+    wait: Duration,
+) -> StopOutcome {
     stop_identity_graceful(identity, wait)
+}
+
+/// Where the current supervisor records its endpoint.
+fn current_supervisor_dir() -> PathBuf {
+    supervisor_pid_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// Where a supervisor from 0.8.6 or older recorded its endpoint: beside an
+/// explicit `KIN_REGISTRY_PATH`, or in `.kin` under the real home. Current
+/// supervisors record theirs in the managed services directory instead, so a
+/// reader of only that one never sees an older supervisor still running.
+fn legacy_supervisor_dir() -> Option<PathBuf> {
+    legacy_supervisor_dir_from(
+        std::env::var_os("KIN_REGISTRY_PATH"),
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+    )
+}
+
+/// [`legacy_supervisor_dir`] with the registry path and the real home given.
+fn legacy_supervisor_dir_from(
+    registry_path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(registry) = registry_path.filter(|path| !path.is_empty()) {
+        return PathBuf::from(registry).parent().map(Path::to_path_buf);
+    }
+    home.map(|home| home.join(".kin"))
 }
 
 fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<AttributedStopTarget>> {
@@ -1159,7 +1763,7 @@ fn stop_supervisor_attributed(
     wait: Duration,
     steps: &mut Vec<String>,
 ) -> StopOutcome {
-    let outcome = stop_supervisor_identity(identity, wait);
+    let outcome = stop_supervisor_identity(&current_supervisor_dir(), identity, wait);
     escalate_if_unstopped(identity, outcome, steps)
 }
 
@@ -3387,6 +3991,244 @@ pub(crate) fn stop_install_owned_daemons_for_update(install_root: &Path) -> Resu
             .join(", ")
     );
     Ok(())
+}
+
+/// How long an update waits for this install's daemons to make way: the
+/// stop budget every sweep has, plus the grace a replacement gives background
+/// passes.
+fn update_replacement_budget() -> Duration {
+    stop_all_budget()
+        .saturating_add(crate::daemon_client::replacement::REPLACEMENT_BACKGROUND_GRACE)
+}
+
+/// Replace every daemon this install runs with `successor`, before the
+/// updater commits the successor's bytes.
+///
+/// Workers are asked together through [`retire_for_replacement`], so each
+/// finishes its own writes while the others do. Supervisors, which hold no
+/// store, go after the workers, through the incarnation-bound `/shutdown`
+/// recorded wherever they recorded it, a 0.8.6 or older supervisor's `.kin`
+/// directory included. Daemons of any other install are never in the scan.
+///
+/// Returns what was replaced. Fails, naming every daemon still running and
+/// what holds it, when any was refused, is still finishing its work, or did
+/// not stop; nothing has been installed then, and the next `kin update` asks
+/// again.
+pub(crate) async fn replace_install_owned_daemons_for_update(
+    install_root: &Path,
+    successor: &ReplacementSuccessor,
+) -> Result<Vec<String>> {
+    let deadline = Instant::now() + update_replacement_budget();
+    let processes = managed_daemon_processes(install_root);
+    if let Some(unknown) = processes
+        .iter()
+        .find(|process| process.kind == ManagedDaemonKind::Unknown)
+    {
+        bail!(
+            "update found install-owned daemon pid {} without an attributable role",
+            unknown.pid
+        );
+    }
+    let workers = processes
+        .iter()
+        .filter_map(|process| match &process.kind {
+            ManagedDaemonKind::Worker { repo_root } => Some((process.pid, repo_root.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let outcomes =
+        futures_util::future::join_all(workers.iter().map(|(pid, repo_root)| async move {
+            let kin_root = worker_store_root(repo_root);
+            let outcome = match retire_for_replacement(&kin_root, *pid, successor, deadline).await {
+                // A worker from before endpoint owner records can be named only
+                // by install ownership. It is stopped the way every update has
+                // stopped one, and only with no write open.
+                Err(error)
+                    if matches!(
+                        std::fs::symlink_metadata(repo_daemon_owner_path(&kin_root)),
+                        Err(ref io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    stop_unattributed_worker_for_update(install_root, &kin_root, *pid, deadline)
+                        .with_context(|| format!("after: {error:#}"))
+                }
+                outcome => outcome,
+            };
+            (*pid, repo_root, outcome)
+        }))
+        .await;
+
+    let mut actions = Vec::new();
+    let mut left = Vec::new();
+    for (pid, repo_root, outcome) in outcomes {
+        let label = repo_label(repo_root);
+        match outcome {
+            Ok(ReplacementOutcome::Replaced { steps }) => {
+                actions.push(format!(
+                    "replaced the daemon for {label} (pid {pid}) with {}",
+                    successor.label()
+                ));
+                actions.extend(steps);
+            }
+            Ok(ReplacementOutcome::NotRunning) => {}
+            Ok(ReplacementOutcome::AlreadySuccessor) => left.push(format!(
+                "daemon pid {pid} for {label} already runs {} from the bytes this update replaces",
+                successor.label()
+            )),
+            Ok(ReplacementOutcome::Waiting(holding)) => left.push(format!(
+                "daemon pid {pid} for {label} is still finishing: {}",
+                holding.join("; ")
+            )),
+            Ok(ReplacementOutcome::Refused(reason)) => left.push(reason),
+            Err(error) => left.push(format!(
+                "daemon pid {pid} for {label} could not be replaced: {error:#}"
+            )),
+        }
+    }
+    // Workers first: a supervisor routes to them while they drain.
+    if left.is_empty() {
+        for process in processes
+            .iter()
+            .filter(|process| process.kind == ManagedDaemonKind::Supervisor)
+        {
+            let mut steps = Vec::new();
+            match replace_supervisor_for_update(install_root, process.pid, deadline, &mut steps) {
+                Ok(outcome) if outcome.is_success() => {
+                    if outcome == StopOutcome::Stopped {
+                        actions.push(format!("stopped the supervisor (pid {})", process.pid));
+                    }
+                    actions.extend(steps);
+                }
+                Ok(outcome) => left.push(format!(
+                    "supervisor pid {} did not stop ({}){}",
+                    process.pid,
+                    outcome.detail(),
+                    if steps.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", steps.join("; "))
+                    }
+                )),
+                Err(error) => left.push(format!(
+                    "supervisor pid {} could not be stopped: {error:#}",
+                    process.pid
+                )),
+            }
+        }
+    }
+    if !left.is_empty() {
+        bail!(
+            "the update was not installed because these Kin daemons are still running: {}. \
+             Run `kin update` again once they have finished",
+            left.join("; ")
+        );
+    }
+    Ok(actions)
+}
+
+/// Stop an install-owned worker that published no owner record, the way every
+/// update stopped one, once no write is open.
+fn stop_unattributed_worker_for_update(
+    install_root: &Path,
+    kin_root: &Path,
+    pid: u32,
+    deadline: Instant,
+) -> Result<ReplacementOutcome> {
+    if let Some(write) = live_write_marker(kin_root, pid) {
+        return Ok(ReplacementOutcome::Waiting(vec![write]));
+    }
+    let mut steps = Vec::new();
+    let outcome = stop_worker_at(
+        kin_root,
+        pid,
+        remaining_budget(deadline),
+        Some(install_root),
+        &mut steps,
+    )?;
+    Ok(match outcome {
+        StopOutcome::NotRunning => ReplacementOutcome::NotRunning,
+        StopOutcome::Stopped => {
+            if let Some(survivor) = retire_worker_endpoint(kin_root, &outcome, &mut steps) {
+                steps.push(format!("its recorded endpoint survived: {survivor}"));
+            }
+            ReplacementOutcome::Replaced { steps }
+        }
+        other => ReplacementOutcome::Waiting(vec![format!(
+            "it was asked to stop and did not exit ({})",
+            other.detail()
+        )]),
+    })
+}
+
+/// The directory whose recorded endpoint names the supervisor at `pid`, and
+/// its owner record: the current services directory, or where a supervisor
+/// from 0.8.6 or older recorded it.
+fn supervisor_endpoint_naming(pid: u32) -> Option<(PathBuf, EndpointOwnerRecord)> {
+    supervisor_endpoint_naming_in(
+        pid,
+        [Some(current_supervisor_dir()), legacy_supervisor_dir()]
+            .into_iter()
+            .flatten(),
+    )
+}
+
+/// [`supervisor_endpoint_naming`] over the given directories, in order.
+fn supervisor_endpoint_naming_in(
+    pid: u32,
+    dirs: impl IntoIterator<Item = PathBuf>,
+) -> Option<(PathBuf, EndpointOwnerRecord)> {
+    dirs.into_iter().find_map(|dir| {
+        let (recorded_pid, _, owner) = crate::daemon_client::supervisor_endpoint_in_dir(&dir);
+        let owner =
+            owner.filter(|owner| recorded_pid == Some(pid) && owner.identity().pid() == pid)?;
+        Some((dir, owner))
+    })
+}
+
+/// Stop an install-owned supervisor for an update through the endpoint it
+/// recorded, wherever it recorded it, after proving that endpoint and the
+/// install scan name the same incarnation and image. A supervisor no endpoint
+/// names is stopped the way every update stopped one.
+fn replace_supervisor_for_update(
+    install_root: &Path,
+    pid: u32,
+    deadline: Instant,
+    steps: &mut Vec<String>,
+) -> Result<StopOutcome> {
+    let Some((dir, owner)) = supervisor_endpoint_naming(pid) else {
+        let Some(target) = install_owned_stop_target(install_root, pid, None, deadline)? else {
+            return Ok(StopOutcome::NotRunning);
+        };
+        return Ok(stop_supervisor_attributed(
+            &target,
+            remaining_budget(deadline),
+            steps,
+        ));
+    };
+    let Some(owned) = legacy_managed_identity(
+        install_root,
+        pid,
+        None,
+        deadline.min(Instant::now() + Duration::from_secs(5)),
+    )?
+    else {
+        return Ok(StopOutcome::NotRunning);
+    };
+    let published = AttributedStopTarget::published(owner);
+    anyhow::ensure!(
+        *published == *owned,
+        "supervisor incarnation changed during install attribution"
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        published.expected_image()? == owned.expected_image()?,
+        "published supervisor executable differs from the install-owned image"
+    );
+    if !process_identity_is_current(&published)? {
+        return Ok(StopOutcome::NotRunning);
+    }
+    let outcome = stop_supervisor_identity(&dir, &published, remaining_budget(deadline));
+    Ok(escalate_if_unstopped(&published, outcome, steps))
 }
 
 /// Installation ownership is additional evidence, never a replacement for a
@@ -6249,5 +7091,827 @@ mod tests {
             StopOutcome::Busy("held".into())
         );
         assert!(steps.is_empty(), "{steps:?}");
+    }
+
+    // ── replacement ─────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn successor(version: &str) -> ReplacementSuccessor {
+        ReplacementSuccessor::new(version, &"a".repeat(40)).unwrap()
+    }
+
+    #[test]
+    fn a_retirement_answer_holds_a_replacement_only_for_writes_the_first_scan_and_unknowns() {
+        use crate::daemon_client::replacement::{RetirementReply, REPLACEMENT_BACKGROUND_GRACE};
+        let asked = Instant::now();
+        let legacy = RetirementReply {
+            retiring: true,
+            blocked_by: vec![
+                "a client session is attached".to_string(),
+                "embedding is running or queued".to_string(),
+                "a request is in flight".to_string(),
+                "something a later release says".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            holding_replacement(&legacy, asked, asked),
+            legacy.blocked_by[1..].to_vec(),
+            "inside the grace only the client is dropped"
+        );
+        assert_eq!(
+            holding_replacement(&legacy, asked, asked + REPLACEMENT_BACKGROUND_GRACE),
+            legacy.blocked_by[2..].to_vec(),
+            "past the grace the background pass is dropped too"
+        );
+        // Codes win over sentences when the daemon sends them.
+        let coded = RetirementReply {
+            retiring: true,
+            blocked_by: vec!["reworded attached client".to_string()],
+            blockers: Some(vec!["attached_session".to_string()]),
+            ..Default::default()
+        };
+        assert!(holding_replacement(&coded, asked, asked).is_empty());
+    }
+
+    /// One request a fake daemon was sent.
+    #[cfg(unix)]
+    #[derive(Debug, Clone)]
+    struct FakeRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    #[cfg(unix)]
+    type FakeAnswer = dyn Fn(&FakeRequest) -> (u16, String) + Send + Sync;
+
+    /// A scripted HTTP endpoint standing in for a daemon's, recording every
+    /// request it was sent.
+    #[cfg(unix)]
+    struct FakeEndpoint {
+        port: u16,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<FakeRequest>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl FakeEndpoint {
+        /// `answer` gets each request, the pid it answers for, and `end`, which
+        /// ends that process.
+        async fn serve(
+            pid: u32,
+            end: impl Fn() + Send + Sync + 'static,
+            answer: impl Fn(&FakeRequest, u32, &dyn Fn()) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let answer: std::sync::Arc<FakeAnswer> =
+                std::sync::Arc::new(move |request: &FakeRequest| answer(request, pid, &end));
+            let recorded = std::sync::Arc::clone(&requests);
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let (head_end, length) = loop {
+                        let count = socket.read(&mut chunk).await.unwrap_or(0);
+                        if count == 0 {
+                            break (None, 0);
+                        }
+                        buffer.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            break (Some(end + 4), length);
+                        }
+                    };
+                    let Some(head_end) = head_end else {
+                        continue;
+                    };
+                    while buffer.len() < head_end + length {
+                        let count = socket.read(&mut chunk).await.unwrap_or(0);
+                        if count == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk[..count]);
+                    }
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+                    let mut words = head.split_whitespace();
+                    let request = FakeRequest {
+                        method: words.next().unwrap_or_default().to_string(),
+                        path: words.next().unwrap_or_default().to_string(),
+                        authorization: head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().to_string())
+                        }),
+                        body: String::from_utf8_lossy(&buffer[head_end..]).to_string(),
+                    };
+                    recorded.lock().unwrap().push(request.clone());
+                    let (status, body) = answer(&request);
+                    let response = format!(
+                        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                port,
+                requests,
+                server,
+            }
+        }
+
+        fn sent(&self, method: &str, path: &str) -> Vec<FakeRequest> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == method && request.path == path)
+                .cloned()
+                .collect()
+        }
+
+        fn only_reads(&self) -> bool {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeEndpoint {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Record `endpoint` as the published endpoint of `owner` in `kin_root`.
+    #[cfg(unix)]
+    fn publish_fake_endpoint(
+        kin_root: &Path,
+        owner: &EndpointOwnerRecord,
+        endpoint: &FakeEndpoint,
+    ) {
+        std::fs::write(
+            repo_daemon_owner_path(kin_root),
+            serde_json::to_vec(owner).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            repo_daemon_pid_path(kin_root),
+            owner.identity().pid().to_string(),
+        )
+        .unwrap();
+        std::fs::write(repo_daemon_port_path(kin_root), endpoint.port.to_string()).unwrap();
+    }
+
+    /// A stand-in daemon: a live process whose recorded incarnation, pid and
+    /// port name a scripted endpoint, and which exits when its script says so.
+    #[cfg(unix)]
+    struct FakeDaemon {
+        root: tempfile::TempDir,
+        pid: u32,
+        identity: ProcessIdentity,
+        exit: std::sync::Arc<std::sync::Mutex<Option<std::process::ChildStdin>>>,
+        endpoint: FakeEndpoint,
+        reaper: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeDaemon {
+        async fn start(
+            answer: impl Fn(&FakeRequest, u32, &dyn Fn()) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
+            use std::io::{Read, Write};
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the stand-in daemon");
+            child
+                .stdin
+                .as_mut()
+                .expect("stand-in stdin")
+                .write_all(b"\n")
+                .expect("signal stand-in exec completion");
+            let mut ready = [0_u8; 1];
+            child
+                .stdout
+                .as_mut()
+                .expect("stand-in stdout")
+                .read_exact(&mut ready)
+                .expect("wait for stand-in exec completion");
+            let pid = child.id();
+            let identity = process_identity(pid).unwrap().unwrap();
+            let exit = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));
+            let reaper = std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            let end = {
+                let exit = std::sync::Arc::clone(&exit);
+                move || drop(exit.lock().unwrap().take())
+            };
+            let endpoint = FakeEndpoint::serve(pid, end, answer).await;
+            let root = tempfile::tempdir().unwrap();
+            publish_fake_endpoint(
+                root.path(),
+                &EndpointOwnerRecord::for_identity(identity.clone()),
+                &endpoint,
+            );
+            Self {
+                root,
+                pid,
+                identity,
+                exit,
+                endpoint,
+                reaper: Some(reaper),
+            }
+        }
+
+        fn kin_root(&self) -> &Path {
+            self.root.path()
+        }
+
+        fn sent(&self, method: &str, path: &str) -> Vec<FakeRequest> {
+            self.endpoint.sent(method, path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            drop(self.exit.lock().unwrap().take());
+            if let Some(reaper) = self.reaper.take() {
+                let _ = reaper.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn legacy_health(pid: u32, version: &str, dirty: bool) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "version": version,
+                "pid": pid,
+                "build": {"sha": "b".repeat(40), "dirty": dirty, "source_known": true, "built_at": "then"},
+            })
+            .to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn runtime_identity(pid: u32, version: &str, commit: &str, mode: &str) -> (u16, String) {
+        let current = kin_core::runtime_identity::RuntimeIdentity::current();
+        (
+            200,
+            serde_json::json!({
+                "schema": "kin.runtime-service.v1",
+                "identity": {
+                    "version": version,
+                    "commit_sha": commit,
+                    "source_dirty": false,
+                    "source_known": true,
+                    "target": current.target,
+                    "build_profile": "release",
+                },
+                "mode": mode,
+                "component": "daemon",
+                "pid": pid,
+            })
+            .to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn is_envelope(request: &FakeRequest) -> bool {
+        request.body.contains("\"replacement\"")
+    }
+
+    /// A 0.8 daemon reads the envelope as a malformed incarnation, takes the
+    /// plain retirement, and is stopped through its incarnation once only its
+    /// attached client holds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_0_8_daemon_held_only_by_its_client_is_stopped_through_its_incarnation() {
+        let daemon = FakeDaemon::start(|request, pid, end| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/runtime/identity") => (404, String::new()),
+                ("GET", "/health") => legacy_health(pid, "0.8.6", false),
+                ("POST", "/retire") if is_envelope(request) => (422, "missing field `pid`".into()),
+                ("POST", "/retire") => (
+                    202,
+                    r#"{"retiring":true,"blocked_by":["a client session is attached"]}"#.into(),
+                ),
+                ("POST", "/shutdown") => {
+                    end();
+                    (202, r#"{"stopping":true}"#.into())
+                }
+                _ => (500, String::new()),
+            }
+        })
+        .await;
+        let outcome = retire_for_replacement(
+            daemon.kin_root(),
+            daemon.pid,
+            &successor("0.8.7"),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&outcome, ReplacementOutcome::Replaced { .. }),
+            "{outcome:?}"
+        );
+        let retires = daemon.sent("POST", "/retire");
+        assert!(is_envelope(&retires[0]), "the replacement is asked first");
+        assert!(retires[0].body.contains("Kin 0.8.7 (aaaaaaa)"));
+        assert!(!is_envelope(&retires[1]));
+        let shutdowns = daemon.sent("POST", "/shutdown");
+        assert_eq!(shutdowns.len(), 1, "one stop request, never a second");
+        assert_eq!(
+            serde_json::from_str::<ProcessIdentity>(&shutdowns[0].body).unwrap(),
+            daemon.identity,
+            "the stop request is bound to the recorded incarnation"
+        );
+        assert_eq!(
+            repo_daemon_recorded_endpoint(daemon.kin_root()),
+            (None, None),
+            "the endpoint of a replaced daemon is retired"
+        );
+    }
+
+    /// A beating write keeps a 0.8 daemon from being stopped even when only
+    /// its client holds it, and a sentence this build does not know holds it
+    /// too. Neither is stopped; both are named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_0_8_daemon_with_an_open_write_or_an_unknown_blocker_is_waited_for() {
+        for blocker in [
+            "a client session is attached",
+            "something a later release says",
+        ] {
+            let blocked_by =
+                serde_json::json!({"retiring": true, "blocked_by": [blocker]}).to_string();
+            let daemon = FakeDaemon::start(move |request, pid, end| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", "/runtime/identity") => (404, String::new()),
+                    ("GET", "/health") => legacy_health(pid, "0.8.2", false),
+                    ("POST", "/retire") if is_envelope(request) => (422, String::new()),
+                    ("POST", "/retire") => (202, blocked_by.clone()),
+                    ("POST", "/shutdown") => {
+                        end();
+                        (202, String::new())
+                    }
+                    _ => (500, String::new()),
+                }
+            })
+            .await;
+            if blocker == "a client session is attached" {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                kin_daemon_spawn::write_open_transaction(
+                    daemon.kin_root(),
+                    &kin_daemon_spawn::OpenTransaction {
+                        pid: daemon.pid,
+                        operation: "commit".to_string(),
+                        phase: Some("publish".to_string()),
+                        elapsed_secs: 3,
+                        phase_elapsed_secs: 1,
+                        beat_unix: now,
+                        rss_bytes: None,
+                        peak_rss_bytes: None,
+                    },
+                );
+            }
+            let outcome = retire_for_replacement(
+                daemon.kin_root(),
+                daemon.pid,
+                &successor("0.8.7"),
+                Instant::now() + Duration::from_millis(1500),
+            )
+            .await
+            .unwrap();
+            let ReplacementOutcome::Waiting(waiting_on) = &outcome else {
+                panic!("{blocker}: {outcome:?}");
+            };
+            let expected = if blocker == "a client session is attached" {
+                "a write is open: commit in phase publish for 3s"
+            } else {
+                blocker
+            };
+            assert_eq!(waiting_on, &vec![expected.to_string()], "{blocker}");
+            assert!(daemon.sent("POST", "/shutdown").is_empty(), "{blocker}");
+            assert_eq!(
+                repo_daemon_recorded_endpoint(daemon.kin_root()).0,
+                Some(daemon.pid),
+                "a daemon left running keeps its endpoint"
+            );
+        }
+    }
+
+    /// A daemon from before `/retire` is stopped through its incarnation, and
+    /// only once no commit is on its way to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_0_7_daemon_is_stopped_only_once_no_write_is_open() {
+        let daemon = FakeDaemon::start(|request, pid, end| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/runtime/identity") | ("POST", "/retire") => (404, String::new()),
+                ("GET", "/health") => legacy_health(pid, "0.7.18", false),
+                ("POST", "/shutdown") => {
+                    end();
+                    (202, String::new())
+                }
+                _ => (500, String::new()),
+            }
+        })
+        .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        kin_daemon_spawn::write_approaching_commit(
+            daemon.kin_root(),
+            &kin_daemon_spawn::ApproachingCommit {
+                pid: std::process::id(),
+                announced_unix: now,
+            },
+        );
+        let held = retire_for_replacement(
+            daemon.kin_root(),
+            daemon.pid,
+            &successor("0.8.7"),
+            Instant::now() + Duration::from_millis(800),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            held,
+            ReplacementOutcome::Waiting(vec!["a commit is on its way to the daemon".to_string()])
+        );
+        assert!(daemon.sent("POST", "/shutdown").is_empty());
+
+        kin_daemon_spawn::clear_approaching_commit(daemon.kin_root());
+        let replaced = retire_for_replacement(
+            daemon.kin_root(),
+            daemon.pid,
+            &successor("0.8.7"),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&replaced, ReplacementOutcome::Replaced { .. }),
+            "{replaced:?}"
+        );
+        assert_eq!(daemon.sent("POST", "/shutdown").len(), 1);
+    }
+
+    /// A daemon that takes the replacement is left to finish and go by
+    /// itself, and is never sent a stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_takes_the_replacement_goes_by_itself() {
+        let daemon = FakeDaemon::start(|request, pid, end| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/runtime/identity") => {
+                    runtime_identity(pid, "0.8.7", &"c".repeat(40), "managed")
+                }
+                ("POST", "/retire") if is_envelope(request) => {
+                    end();
+                    (
+                        202,
+                        serde_json::json!({
+                            "retiring": true,
+                            "replacing": true,
+                            "successor": "Kin 0.9.0 (aaaaaaa)",
+                            "blocked_by": [],
+                            "blockers": [],
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => (500, String::new()),
+            }
+        })
+        .await;
+        let outcome = retire_for_replacement(
+            daemon.kin_root(),
+            daemon.pid,
+            &successor("0.9.0"),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ReplacementOutcome::Replaced { steps: Vec::new() });
+        assert_eq!(daemon.sent("POST", "/retire").len(), 1);
+        assert!(daemon.sent("POST", "/shutdown").is_empty());
+    }
+
+    /// A newer daemon, a development build, and a daemon already on the
+    /// successor's release are never asked anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newer_development_and_current_daemons_are_never_asked_to_go() {
+        let cases: [(&str, fn(u32) -> (u16, String), &str); 4] = [
+            (
+                "newer",
+                |pid| runtime_identity(pid, "0.9.0", &"c".repeat(40), "managed"),
+                "Kin 0.9.0",
+            ),
+            (
+                "development mode",
+                |pid| runtime_identity(pid, "0.8.6", &"c".repeat(40), "development"),
+                "development mode",
+            ),
+            (
+                "dirty legacy build",
+                |pid| legacy_health(pid, "0.8.6", true),
+                "uncommitted source changes",
+            ),
+            (
+                "the successor itself",
+                |pid| runtime_identity(pid, "0.8.7", &"a".repeat(40), "managed"),
+                "",
+            ),
+        ];
+        for (case, report, named) in cases {
+            let daemon = FakeDaemon::start(move |request, pid, _| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", "/runtime/identity") if case == "dirty legacy build" => {
+                        (404, String::new())
+                    }
+                    ("GET", "/runtime/identity") | ("GET", "/health") => report(pid),
+                    _ => (500, String::new()),
+                }
+            })
+            .await;
+            let outcome = retire_for_replacement(
+                daemon.kin_root(),
+                daemon.pid,
+                &successor("0.8.7"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            if case == "the successor itself" {
+                assert_eq!(outcome, ReplacementOutcome::AlreadySuccessor);
+            } else {
+                let ReplacementOutcome::Refused(reason) = &outcome else {
+                    panic!("{case}: {outcome:?}");
+                };
+                assert!(reason.contains(&format!("pid {}", daemon.pid)), "{reason}");
+                assert!(reason.contains("/bin/cat"), "{case}: {reason}");
+                assert!(reason.contains(named), "{case}: {reason}");
+            }
+            assert!(
+                daemon.endpoint.only_reads(),
+                "{case}: nothing may be asked of a daemon that is not replaced"
+            );
+            assert!(
+                process_identity(daemon.pid).unwrap().is_some(),
+                "{case}: the daemon is left running"
+            );
+        }
+    }
+
+    // ── update replacement ──────────────────────────────────────────────────
+
+    /// An install-owned stand-in worker behind a scripted endpoint, and the
+    /// handle that ends it.
+    #[cfg(unix)]
+    async fn owned_worker_behind(
+        install: &Path,
+        repo: &Path,
+        answer: impl Fn(&FakeRequest, u32, &dyn Fn()) -> (u16, String) + Send + Sync + 'static,
+    ) -> (Standin, FakeEndpoint) {
+        let kin_root = repo.join(".kin");
+        std::fs::create_dir_all(&kin_root).unwrap();
+        let mut owned = spawn_escalation_standin_at("wait", Some((install, repo)));
+        let input = std::sync::Arc::new(std::sync::Mutex::new(owned.child.stdin.take()));
+        let end = move || drop(input.lock().unwrap().take());
+        let endpoint = FakeEndpoint::serve(owned.child.id(), end, answer).await;
+        publish_fake_endpoint(&kin_root, &owned.target.owner, &endpoint);
+        (owned, endpoint)
+    }
+
+    /// `kin update` replaces the daemon its install runs, a 0.8 daemon held
+    /// only by its client here, and leaves a same-named daemon of another
+    /// install alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_replaces_the_owned_daemon_and_spares_another_installs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install = fixture.path().join("install");
+        let foreign_install = fixture.path().join("foreign");
+        let repo = fixture.path().join("repo");
+        let foreign_repo = fixture.path().join("foreign-repo");
+        std::fs::create_dir_all(foreign_repo.join(".kin")).unwrap();
+        let (owned, endpoint) = owned_worker_behind(&install, &repo, |request, pid, end| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/runtime/identity") => (404, String::new()),
+                ("GET", "/health") => legacy_health(pid, "0.8.6", false),
+                ("POST", "/retire") if is_envelope(request) => (422, String::new()),
+                ("POST", "/retire") => (
+                    202,
+                    r#"{"retiring":true,"blocked_by":["a client session is attached"]}"#.into(),
+                ),
+                ("POST", "/shutdown") => {
+                    end();
+                    (202, String::new())
+                }
+                _ => (500, String::new()),
+            }
+        })
+        .await;
+        let foreign = spawn_escalation_standin_at("wait", Some((&foreign_install, &foreign_repo)));
+
+        let next = successor("0.8.7").replacing_install(&install);
+        let actions = replace_install_owned_daemons_for_update(&install, &next)
+            .await
+            .expect("the owned daemon must be replaced");
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("replaced the daemon for repo")
+                    && action.contains("Kin 0.8.7 (aaaaaaa)")),
+            "{actions:?}"
+        );
+        assert_eq!(endpoint.sent("POST", "/shutdown").len(), 1);
+        assert!(!process_identity_is_current(&owned.target).unwrap());
+        assert!(
+            process_identity_is_current(&foreign.target).unwrap(),
+            "a daemon of another install was touched"
+        );
+    }
+
+    /// A newer daemon running from the install fails the update by pid and
+    /// path and is left running, never asked to go.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_refuses_a_newer_owned_daemon_by_name_and_leaves_it_running() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install = fixture.path().join("install");
+        let repo = fixture.path().join("repo");
+        let (owned, endpoint) = owned_worker_behind(&install, &repo, |request, pid, _| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/runtime/identity") => {
+                    runtime_identity(pid, "9.9.9", &"c".repeat(40), "managed")
+                }
+                _ => (500, String::new()),
+            }
+        })
+        .await;
+        let next = successor("0.8.7").replacing_install(&install);
+        let error = replace_install_owned_daemons_for_update(&install, &next)
+            .await
+            .expect_err("a newer daemon must fail the update");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("pid {}", owned.child.id())),
+            "{message}"
+        );
+        assert!(
+            message.contains("kin-daemon") && message.contains("Kin 9.9.9"),
+            "{message}"
+        );
+        assert!(endpoint.only_reads());
+        assert!(process_identity_is_current(&owned.target).unwrap());
+    }
+
+    /// Install ownership never stands in for a malformed publication: the
+    /// update fails and the daemon is left running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_replacement_cannot_borrow_install_ownership_for_a_malformed_publication() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install = fixture.path().join("install");
+        let repo = fixture.path().join("repo");
+        let kin_root = repo.join(".kin");
+        std::fs::create_dir_all(&kin_root).unwrap();
+        let mut owned = spawn_escalation_standin_at("wait", Some((&install, &repo)));
+        std::fs::write(
+            repo_daemon_pid_path(&kin_root),
+            owned.child.id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(repo_daemon_owner_path(&kin_root), b"not a valid owner").unwrap();
+        let next = successor("0.8.7").replacing_install(&install);
+        assert!(replace_install_owned_daemons_for_update(&install, &next)
+            .await
+            .is_err());
+        assert!(owned.child.try_wait().unwrap().is_none());
+        assert!(process_identity_is_current(&owned.target).unwrap());
+    }
+
+    /// A supervisor from before the managed services directory recorded its
+    /// endpoint where the registry used to live. The updater finds it there
+    /// and stops it through that endpoint, with that endpoint's token.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_from_before_the_services_directory_is_stopped_where_it_recorded_itself() {
+        let fixture = tempfile::tempdir().unwrap();
+        let legacy = fixture.path().join("legacy");
+        let current = fixture.path().join("services");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        assert_eq!(
+            legacy_supervisor_dir_from(
+                Some(legacy.join("registry.json").into_os_string()),
+                Some(fixture.path().join("home"))
+            ),
+            Some(legacy.clone()),
+            "an explicit registry path names where the old supervisor lived"
+        );
+        assert_eq!(
+            legacy_supervisor_dir_from(None, Some(fixture.path().join("home"))),
+            Some(fixture.path().join("home").join(".kin"))
+        );
+
+        use std::io::{Read, Write};
+        let mut child = OwnedTestChild(
+            std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        let pid = child.id();
+        let identity = process_identity(pid).unwrap().unwrap();
+        let input = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take()));
+        let end = move || drop(input.lock().unwrap().take());
+        let expected = identity.clone();
+        let endpoint = FakeEndpoint::serve(pid, end, move |request, _, end| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/shutdown")
+                    if serde_json::from_str::<ProcessIdentity>(&request.body).ok()
+                        == Some(expected.clone()) =>
+                {
+                    end();
+                    (202, String::new())
+                }
+                _ => (409, String::new()),
+            }
+        })
+        .await;
+        let owner = EndpointOwnerRecord::for_identity(identity);
+        std::fs::write(legacy.join("supervisor.pid"), pid.to_string()).unwrap();
+        std::fs::write(legacy.join("supervisor.port"), endpoint.port.to_string()).unwrap();
+        std::fs::write(
+            legacy.join("supervisor.owner"),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(legacy.join("supervisor.token"), "legacy-token\n").unwrap();
+
+        let (dir, named) = supervisor_endpoint_naming_in(pid, [current.clone(), legacy.clone()])
+            .expect("the legacy endpoint names it");
+        assert_eq!(dir, legacy);
+        assert_eq!(named, owner);
+        let target = AttributedStopTarget::published(named);
+        let outcome = tokio::task::block_in_place(|| {
+            stop_supervisor_identity(&dir, &target, Duration::from_secs(5))
+        });
+        assert_eq!(outcome, StopOutcome::Stopped);
+        let shutdowns = endpoint.sent("POST", "/shutdown");
+        assert_eq!(shutdowns.len(), 1);
+        assert_eq!(
+            shutdowns[0].authorization.as_deref(),
+            Some("Bearer legacy-token")
+        );
+        let _ = child.wait();
     }
 }

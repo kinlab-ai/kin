@@ -65,6 +65,18 @@ def drain_locate(fetch, requested=None):
     return _drain_pages(fetch, requested, "entities")
 
 
+def _clause_codes(reason):
+    codes = []
+    for clause in reason.split("; "):
+        if ": " not in clause:
+            return None
+        code, _ = clause.split(": ", 1)
+        if not code or not all(c.islower() or c.isdigit() or c == "_" for c in code):
+            return None
+        codes.append(code)
+    return "; ".join(codes)
+
+
 def restore_compacted(answer, entries):
     """Restore only repetitions the page explicitly points to in its own answer."""
     if not isinstance(entries, list):
@@ -118,14 +130,15 @@ def restore_compacted(answer, entries):
         for reference in references:
             if reference not in ("negative.subject", "_kin.graph_as_of", "negative.trust_reason"):
                 raise ValueError("page advice names an unknown compacted reference")
-            marker = "{%s}" % reference
-            if reference in used or marker not in text:
-                raise ValueError("compacted advice does not carry its advertised reference")
-            used.add(reference)
             original = value(reference)
             replacement = (original if isinstance(original, str) else
                            json.dumps(original, separators=(",", ":"), ensure_ascii=False,
                                       sort_keys=True))
+            codes = _clause_codes(replacement) if reference == "negative.trust_reason" else None
+            marker = "%s ({%s})" % (codes, reference) if codes else "{%s}" % reference
+            if reference in used or marker not in text:
+                raise ValueError("compacted advice does not carry its advertised reference")
+            used.add(reference)
             text = text.replace(marker, replacement)
         parent[key] = text
     return answer
@@ -413,7 +426,7 @@ def _mcp_pages(kin, repo, env, arguments, timeout, tool, drain, transcript_path=
                         json.dump({"tool": tool, "arguments": args, "result": result}, transcript)
                         transcript.write("\n")
                 content = result.get("content") or []
-                if (result.get("isError") and tool in ("trace_data_flow", "impact_analysis", "semantic_locate")) or not content or "text" not in content[0]:
+                if (result.get("isError") and tool in ("trace_data_flow", "impact_analysis", "semantic_locate", "find_references", "refs")) or not content or "text" not in content[0]:
                     raise ValueError("trace MCP refused the page: %s" % result)
                 wire = content[0]["text"]
                 return json.loads(wire), wire

@@ -187,6 +187,34 @@ class Comparison(unittest.TestCase):
         found = [self.reported("crates/a/src/lib.rs", "load", "std::fs::read", line=n) for n in (3, 4)]
         self.assertEqual(lint.compare(found, allowed, None), ([], []))
 
+    def test_windows_worker_cleanup_allowances_are_exact_sites(self):
+        update = "crates/kin-cli/src/commands/update.rs"
+        windows = "crates/kin-cli/src/commands/update_windows.rs"
+        native_open = "windows_sys::Win32::Storage::FileSystem::CreateFileW"
+        positives = {
+            lint.Site(update, "refuse_windows_worker_cleanup_with_recovery_fence", "std::fs::read_dir"),
+            lint.Site(update, "refuse_windows_worker_cleanup_with_recovery_fence", "std::fs::symlink_metadata"),
+            lint.Site(windows, "require_names", "std::fs::read_dir"),
+            lint.Site(windows, "require_worker_cleanup_absent", "std::fs::symlink_metadata"),
+            lint.Site(windows, "revalidate_worker_cleanup_object", native_open),
+        }
+        allowed = lint.load_allowed(lint.ALLOWED_SITES)
+        configured = lint.configured_methods(lint.CONFIG_DIR / "clippy.toml")
+        for site in positives:
+            self.assertIn(site, allowed)
+            self.assertIn(site.method, configured)
+        self.assertIn("std::fs::read_to_string", configured)
+        negatives = {lint.Site(windows, "validate", native_open)}
+        for site in positives:
+            negatives.update({
+                lint.Site(site.file, site.function + "_semantic_neighbor", site.method),
+                lint.Site(site.file, site.function, "std::fs::read_to_string"),
+                lint.Site("crates/kin-cli/src/commands/search.rs", site.function, site.method),
+            })
+        found = [lint.Reported(site, 1) for site in positives | negatives]
+        new, _ = lint.compare(found, allowed, None)
+        self.assertEqual({item.site for item in new}, negatives)
+
     def test_the_list_round_trips_sorted(self):
         path = Path(tempfile.mkdtemp()) / "allowed.txt"
         sites = {

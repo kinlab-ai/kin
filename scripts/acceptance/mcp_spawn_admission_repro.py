@@ -55,6 +55,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -268,6 +269,8 @@ def session(kin: str, daemon_bin: str, repo: Path, kin_home: Path, cwd: Path,
     for leaked in ("KIN_DAEMON_URL", "KIN_NO_DAEMON", "KIN_MCP_REPO"):
         env.pop(leaked, None)
 
+    kin, daemon_bin = prepare_runtime_fixture(kin, daemon_bin, env, kin_home)
+
     proc = subprocess.Popen([kin, "mcp", "start"], cwd=str(cwd), env=env,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -357,6 +360,7 @@ def check_handshake_starts_no_daemon(kin, daemon_bin, workdir) -> dict:
     # This fixture inspects/copies an in-tree store; central layout is
     # qualified separately by brownfield_repro --store-layout central.
     env["KIN_STORE_LAYOUT"] = "in-tree"
+    kin, daemon_bin = prepare_runtime_fixture(kin, daemon_bin, env, home)
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, None, WATCH_SECONDS)
     if outcome["daemons"]:
@@ -383,6 +387,7 @@ def check_roots_answer_starts_no_daemon(kin, daemon_bin, workdir) -> dict:
     # This fixture inspects/copies an in-tree store; central layout is
     # qualified separately by brownfield_repro --store-layout central.
     env["KIN_STORE_LAYOUT"] = "in-tree"
+    kin, daemon_bin = prepare_runtime_fixture(kin, daemon_bin, env, home)
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, outside, repo, None, WATCH_SECONDS)
     if outcome["daemons"]:
@@ -407,6 +412,7 @@ def check_a_tool_call_still_starts_the_daemon(kin, daemon_bin, workdir) -> dict:
     # This fixture inspects/copies an in-tree store; central layout is
     # qualified separately by brownfield_repro --store-layout central.
     env["KIN_STORE_LAYOUT"] = "in-tree"
+    kin, daemon_bin = prepare_runtime_fixture(kin, daemon_bin, env, home)
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, "semantic_locate",
                       WATCH_SECONDS * 2, stop_when="daemon")
@@ -428,6 +434,7 @@ def check_a_tool_call_still_dispatches_the_embed(kin, daemon_bin, workdir) -> di
     # This fixture inspects/copies an in-tree store; central layout is
     # qualified separately by brownfield_repro --store-layout central.
     env["KIN_STORE_LAYOUT"] = "in-tree"
+    kin, daemon_bin = prepare_runtime_fixture(kin, daemon_bin, env, home)
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, "semantic_locate",
                       WATCH_SECONDS * 2, stop_when="embed")

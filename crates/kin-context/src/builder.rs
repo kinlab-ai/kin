@@ -2575,6 +2575,7 @@ mod tests {
             authored_by: IdentityRef::human("test"),
             created_at: Timestamp::now(),
             staleness: StalenessState::Fresh,
+            review: None,
         }
     }
 

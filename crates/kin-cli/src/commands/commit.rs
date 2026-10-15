@@ -7,7 +7,12 @@ use super::commit_progress::{
     daemon_death_explanation, PhaseTail, AUTHORITY_NOT_GIT_NOTE, DETACHED_HEAD_NOTE,
 };
 
-pub async fn run(message: Option<String>, quiet: bool, amend: bool) -> Result<()> {
+pub async fn run(
+    message: Option<String>,
+    quiet: bool,
+    amend: bool,
+    entities: Vec<String>,
+) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     // Before attribution, before the daemon is resolved, before anything this
     // command does for itself. The ambient reconcile tick and this commit both
@@ -21,7 +26,7 @@ pub async fn run(message: Option<String>, quiet: bool, amend: bool) -> Result<()
     // exists.
     let _announced = CommitAnnouncement::announce(layout.root());
 
-    let result = run_daemon_commit(&layout, message.as_deref(), quiet, amend).await?;
+    let result = run_daemon_commit(&layout, message.as_deref(), quiet, amend, &entities).await?;
     if !quiet {
         println!(
             "{}",
@@ -36,8 +41,22 @@ pub async fn run(message: Option<String>, quiet: bool, amend: bool) -> Result<()
                 retained_parse(&layout).as_deref(),
             )
         );
+        if !entities.is_empty() {
+            println!("{}", kept_entities_line(entities.len()));
+        }
     }
     Ok(())
+}
+
+/// What a commit of chosen entities says beneath its summary: that the work it
+/// did not choose is still uncommitted, which is the half a reader cannot see
+/// in the counts above.
+fn kept_entities_line(kept: usize) -> String {
+    let entities = if kept == 1 { "entity" } else { "entities" };
+    format!(
+        "Committed the changes of {kept} chosen {entities}; every other uncommitted change stays \
+         uncommitted, exactly as it was."
+    )
 }
 
 /// What this store's cross-file sweep still owes, when it owes anything.
@@ -284,9 +303,20 @@ pub(super) async fn commit_for_app(
     layout: &kin_core::KinLayout,
     message: &str,
     operation_id: kin_model::OperationId,
+    entities: &[String],
 ) -> AppCommit {
     let _announced = CommitAnnouncement::announce(layout.root());
-    match dispatch_commit(layout, Some(message), true, false, operation_id, None).await {
+    match dispatch_commit(
+        layout,
+        Some(message),
+        true,
+        false,
+        operation_id,
+        None,
+        entities,
+    )
+    .await
+    {
         Ok(result) => AppCommit::Committed {
             change_id: result.change_id,
         },
@@ -306,6 +336,7 @@ async fn run_daemon_commit(
     message: Option<&str>,
     quiet: bool,
     amend: bool,
+    entities: &[String],
 ) -> Result<DaemonCommitResult> {
     // Created once per CLI invocation so transport retry logic can reuse the
     // byte-identical repository transaction.
@@ -317,6 +348,7 @@ async fn run_daemon_commit(
         amend,
         operation_id,
         commit_session_header(),
+        entities,
     )
     .await
     .map_err(CommitStop::into_error)
@@ -369,6 +401,7 @@ async fn dispatch_commit(
     amend: bool,
     operation_id: kin_model::OperationId,
     session: Option<String>,
+    entities: &[String],
 ) -> std::result::Result<DaemonCommitResult, CommitStop> {
     let timestamp = kin_model::Timestamp::now();
     let landed = send_commit(
@@ -379,6 +412,7 @@ async fn dispatch_commit(
         operation_id,
         session,
         &timestamp,
+        entities,
     )
     .await?;
     note_change_in_registry(layout, &timestamp);
@@ -410,6 +444,7 @@ fn note_change_in_registry(layout: &kin_core::KinLayout, at: &kin_model::Timesta
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_commit(
     layout: &kin_core::KinLayout,
     message: Option<&str>,
@@ -418,6 +453,7 @@ async fn send_commit(
     operation_id: kin_model::OperationId,
     session: Option<String>,
     timestamp: &kin_model::Timestamp,
+    entities: &[String],
 ) -> std::result::Result<DaemonCommitResult, CommitStop> {
     let PreparedCommit {
         author,
@@ -427,21 +463,44 @@ async fn send_commit(
     } = prepare_commit(layout, amend)
         .await
         .map_err(CommitStop::NotDispatched)?;
-    let mut payload = serde_json::json!({
-        "operation_id": operation_id,
-        "timestamp": timestamp,
-        "message": message,
-        "author": author,
-    });
-    if let Some(expected_head) = expected_head {
-        payload["amend"] = serde_json::json!(true);
-        payload["expected_head"] = serde_json::json!(expected_head);
-    }
+    let (route, payload) = if entities.is_empty() {
+        let mut payload = serde_json::json!({
+            "operation_id": operation_id,
+            "timestamp": timestamp,
+            "message": message,
+            "author": author,
+        });
+        if let Some(expected_head) = expected_head {
+            payload["amend"] = serde_json::json!(true);
+            payload["expected_head"] = serde_json::json!(expected_head);
+        }
+        ("commands/commit", payload)
+    } else {
+        // Only the chosen entities, through the route that leaves the rest of
+        // the working copy uncommitted. An amend replaces a whole change and
+        // never reaches here with entities.
+        let message = message
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .ok_or_else(|| {
+                CommitStop::NotDispatched(anyhow::anyhow!(
+                    "a commit of chosen entities needs a message"
+                ))
+            })?;
+        let request = super::entity_work::EntityCommitRequest {
+            operation_id,
+            timestamp: timestamp.clone(),
+            message: message.to_string(),
+            author,
+            entities: entities.to_vec(),
+            session_id: session.clone(),
+        };
+        let payload = serde_json::to_value(&request)
+            .map_err(|error| CommitStop::NotDispatched(error.into()))?;
+        ("commands/commit/entities", payload)
+    };
     let mut request = client
-        .post(format!(
-            "{}/commands/commit",
-            daemon_url.trim_end_matches('/')
-        ))
+        .post(format!("{}/{route}", daemon_url.trim_end_matches('/')))
         .json(&payload);
     // Read from the layout this commit names. The local app commits for a
     // repository that is not its working directory, and for `kin commit` the
@@ -452,6 +511,11 @@ async fn send_commit(
     if let Some(session_id) = session {
         request = request.header("X-Kin-Session", session_id);
     }
+    // Not dispatched yet, so a refused admission is a commit that did not run.
+    let request =
+        crate::daemon_client::admit_daemon_request(request, &daemon_url, layout, "commit")
+            .await
+            .map_err(CommitStop::NotDispatched)?;
 
     let kin_root = layout.root().to_path_buf();
     // Opened before the request so the first phase the daemon enters is already
@@ -543,7 +607,7 @@ fn commit_reply_deadline() -> Option<std::time::Duration> {
 /// used a client of its own and sent nothing, so a read-only session could
 /// commit through the CLI. Only a well-formed id is sent: a stale or malformed
 /// value left in a shell must not turn every commit into a bad request.
-fn commit_session_header() -> Option<String> {
+pub(super) fn commit_session_header() -> Option<String> {
     let value = std::env::var("KIN_SESSION_ID").ok()?;
     let value = value.trim();
     uuid::Uuid::parse_str(value).ok()?;
@@ -577,6 +641,9 @@ fn build_commit_client(deadline: Option<std::time::Duration>) -> reqwest::Result
 /// `HTTP 500 Internal Server Error: Core error: ...` on 0.5.52, and the only
 /// exit that read found was deleting the store (FIR-2664).
 fn commit_refusal_message(body: &str) -> Option<String> {
+    if let Some(sentence) = super::entity_work::refusal_message(body) {
+        return Some(sentence);
+    }
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
     let kind = parsed.get("error")?.as_str()?;
     if !matches!(
@@ -1227,6 +1294,30 @@ mod tests {
             "another refusal keeps the envelope its own reader parses"
         );
         assert!(commit_refusal_message("daemon is starting").is_none());
+    }
+
+    /// A commit of chosen entities is refused in the daemon's own sentence, and
+    /// a landed one says the rest of the work is still uncommitted.
+    #[test]
+    fn an_entity_commit_refusal_is_its_own_sentence_and_a_landed_one_says_what_stayed() {
+        let body = serde_json::json!({
+            "error": super::super::entity_work::ENTITY_REFUSED,
+            "message": "left and right were changed in the same place, so Kin cannot commit one \
+                        without the other.",
+        })
+        .to_string();
+        assert_eq!(
+            commit_refusal_message(&body).as_deref(),
+            Some(
+                "left and right were changed in the same place, so Kin cannot commit one without \
+                 the other."
+            )
+        );
+        assert!(!refuses_nothing_to_commit(&body));
+        let line = kept_entities_line(2);
+        assert!(line.contains("2 chosen entities"), "{line}");
+        assert!(line.contains("stays uncommitted"), "{line}");
+        assert!(kept_entities_line(1).contains("1 chosen entity;"));
     }
 
     /// A commit run inside a Kin session names that session to the daemon, which

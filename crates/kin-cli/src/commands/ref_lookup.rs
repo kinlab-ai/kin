@@ -260,10 +260,9 @@ where
     let resolved = super::ref_grammar::resolve(&deferred, graph, reference)
         .map_err(|error| ref_error(reference, format!("{error:#}")))?;
 
-    if graph
-        .get_change(&resolved.change_id)
+    if !graph
+        .holds_change(&resolved.change_id)
         .map_err(|error| anyhow!(error.to_string()))?
-        .is_none()
     {
         return Err(ref_error(
             reference,

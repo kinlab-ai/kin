@@ -116,6 +116,7 @@
 
 pub(crate) mod accepted_enrichment;
 pub mod agent_activity;
+pub mod agent_authorship;
 pub mod api;
 mod artifact_commit;
 pub mod auth_rotation;
@@ -123,15 +124,21 @@ pub mod background_work;
 mod binding_history;
 pub(crate) mod call_site_ledger;
 pub(crate) mod call_site_settlement;
+pub mod client_edits;
 mod commit_changes;
 pub mod commit_deltas;
 pub mod commit_liveness;
+mod committed_guides;
 pub mod daemon;
+pub mod ended_sessions;
 mod entity_drafts;
+mod entity_keep;
 mod entity_lifecycle;
+mod entity_split;
 mod entity_words;
 pub mod error;
 pub mod gcs_endpoint;
+mod git_update;
 pub mod graph_only_members;
 /// First contact with `kin_graph_status` while an embedding pass holds
 /// embedding-work serialization. Test-only, and its own module so the fixture
@@ -174,6 +181,7 @@ mod repository_rename;
 mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
+mod review_flags;
 mod review_transfer;
 mod review_write;
 mod semantic_debt;
@@ -194,6 +202,7 @@ mod sweep_waiters;
 mod test_fixture_cache;
 pub mod traffic_adapter;
 mod unit_lifecycle;
+mod verification_write;
 pub mod watcher_loss;
 pub mod write_veto;
 

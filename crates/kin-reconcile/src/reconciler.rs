@@ -1265,7 +1265,10 @@ impl Reconciler {
             relations: snapshot.relations.clone(),
             ..Default::default()
         };
-        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+        // A private graph the batch is derived in and dropped with it. Nothing
+        // searches it, so it carries no text index; see
+        // `InMemoryGraph::from_snapshot_without_text_index`.
+        let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)
             .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         let mut files = files.to_vec();
         // A manifest the batch changes can rename sources whose bytes it does
@@ -1482,7 +1485,9 @@ impl Reconciler {
         if !delta.tree_deltas.is_empty() || delta.admission_policy_delta.is_some() {
             return Err(batch_invalid("live batch accepts semantic deltas only"));
         }
-        let candidate = kin_db::InMemoryGraph::from_snapshot(current)
+        // Built to apply the delta and compare, then dropped; nothing searches
+        // it, so it carries no text index.
+        let candidate = kin_db::InMemoryGraph::from_snapshot_without_text_index(current)
             .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         candidate
             .apply_transaction_delta(delta)
@@ -1651,7 +1656,7 @@ impl Reconciler {
                 "source adoption cannot supply admission policy authority",
             ));
         }
-        let whole = kin_db::InMemoryGraph::from_snapshot(observed.clone())
+        let whole = kin_db::InMemoryGraph::from_snapshot_without_text_index(observed.clone())
             .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         whole
             .apply_transaction_delta(whole_delta)

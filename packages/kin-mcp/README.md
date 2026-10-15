@@ -8,9 +8,11 @@
 `@kinlab/kin-mcp` is the npm-friendly launcher for Kin's MCP server (the installed
 command is still `kin-mcp`).
 
-It downloads the matching Kin release archive from GitHub, verifies the published
-SHA-256 checksum, extracts both the `kin` CLI and the `kin-daemon` it depends on
-into a local cache, and runs:
+Ordinary launches share the canonical `@kinlab/kin` managed runtime at
+`$KIN_HOME/bin` (`$KIN_DIR` is an alias; the default is `~/.kin/bin`). The
+canonical launcher provisions a first install, migrates legacy releases through a
+privately staged official native bootstrap, and certifies the CLI/daemon source
+identity before this compatibility package runs:
 
 ```sh
 kin mcp start
@@ -137,33 +139,32 @@ Stopping the daemons leaves these in place:
 
 | Path | Size | What it holds |
 | --- | --- | --- |
-| `~/Library/Caches/kin-mcp` (macOS), `~/.cache/kin-mcp` (Linux), `%LOCALAPPDATA%\kin-mcp\Cache` (Windows) | about 150 MB per version | the `kin` and `kin-daemon` binaries this wrapper downloaded |
+| `~/Library/Caches/kin-mcp` (macOS), `~/.cache/kin-mcp` (Linux), `%LOCALAPPDATA%\kin-mcp\Cache` (Windows) | about 150 MB per version | retained legacy binaries or an explicit development cache |
 | `~/.kin` | grows with the repositories Kin has embedded | Kin's home: daemon records, logs and the embedding cache |
 | `~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5` | about 523 MB | the embedding model, fetched the first time Kin embeds a repository |
 | `~/.kin/stores/<name>` for each repository you initialized (`.kin/` for one an earlier version initialized) | grows with history | that repository's graph |
 
 `kin-mcp --stop` prints each path with its size on your machine and the command
-that removes it. By hand, once the daemons have stopped (macOS shown):
+that removes it. The normal native installation is shared with the CLI and other
+clients; use `kin setup uninstall --all` for its managed teardown. Legacy cache
+bytes are separate and are not used by ordinary launches.
 
-```sh
-rm -rf ~/Library/Caches/kin-mcp ~/.kin ~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5
-rm -rf .kin   # in each repository you initialized
-```
-
-Keep `~/.kin` if you also installed Kin with its installer or `@kinlab/kin`;
-`kin setup uninstall --all` removes that install instead.
-
-Set `KIN_MCP_CACHE_DIR` to move the binary cache.
+`KIN_MCP_CACHE_DIR` selects an isolated development cache. Ordinary launches do
+not serve the older versioned caches. Existing cache bytes are retained until
+their owner removes them.
 
 ## Environment
 
-- `KIN_MCP_KIN_BINARY`: run a specific local `kin` binary instead of downloading
-  one (you are then responsible for its `kin-daemon`)
+- `KIN_MCP_KIN_BINARY`: select an explicit development `kin` binary
+  (you are responsible for its matching `kin-daemon`)
 - `KIN_BINARY_PATH`: alias for `KIN_MCP_KIN_BINARY`
-- `KIN_MCP_CACHE_DIR`: override the cache directory
+- `KIN_MANAGED_BIN`: canonical launcher alias for an explicit development binary
+- `KIN_RUNTIME_MODE=development` with a separate `KIN_HOME`: explicitly choose a development home; otherwise the native runtime derives an isolated home
+- `KIN_HOME`, then `KIN_DIR`: root of the normal managed native install
+- `KIN_MCP_CACHE_DIR`: explicitly select an isolated development cache
 - `KIN_MCP_AUTO_INIT=1`: allow the wrapper to run `kin init .` when no Kin store serves the folder
 - `KIN_MCP_TOOL_PROFILE`: override the default `agent-default` tool profile
-- `KIN_MCP_RELEASE_BASE_URL`: override the GitHub release download base URL
+- `KIN_MCP_RELEASE_BASE_URL`: release mirror for an explicitly selected development cache
 
 ## Local Check
 
@@ -174,6 +175,13 @@ npx -y @kinlab/kin-mcp --stop              # stop idle daemons, list what stays 
 ```
 
 Then initialize a repository and let the MCP client launch `kin-mcp`.
+
+## Source development
+
+Run `npm ci --ignore-scripts` and `npm test` in this package. Its development
+dependency links the sibling `kin` package, so source checks work before a new
+release is published. Published installations use the exact canonical package
+version declared in `dependencies`.
 
 ## First-run smoke proof
 

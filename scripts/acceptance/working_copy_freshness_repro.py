@@ -69,6 +69,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from runtime_fixture import prepare_runtime_fixture
 
 # An agent profile serves each answer in plain words and leaves out the verdict
 # codes and evidence blocks this suite reads. Ask every kin it starts for the
@@ -624,7 +625,7 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_modu
             or type(caller.get("site_count")) is not int
             or caller["site_count"] != 1
             or caller.get("sites_absent_reason") is not None
-            or caller.get("sites_partial_reason") is not None
+            or caller.get("sites_partial_reason") not in (None, "language_server_edge")
             or payload.get("candidates") != []
             or type(payload.get("unconfirmed_candidates")) is not int
             or payload["unconfirmed_candidates"] != 0):
@@ -672,10 +673,13 @@ CALL_DOMAIN_INPUTS = ("call_sites", "absence_gate")
 def reference_completion_qualification(payload, negative, verdict):
     """A settled Call census does not certify requested non-call completion.
 
-    Accept only this recorded gap, with a lower bound and no absence claim.
-    This qualifies the returned positives; it never certifies their whole set.
+    Accept only this recorded gap (along with an unproven prior local binding
+    when LSP has enriched an uncommitted working copy), with a lower bound and
+    no absence claim. This qualifies the returned positives; it never certifies
+    their whole set.
     """
     code = "reference_completion_unmeasured"
+    binding_code = "local_binding_unproven"
     kinds = payload.get("relation_kinds")
     inputs = verdict.get("inputs")
     comp = (payload.get("_kin") or {}).get("completeness") or {}
@@ -689,15 +693,28 @@ def reference_completion_qualification(payload, negative, verdict):
             or inputs.get("absence_gate") != "inconclusive"
             or inputs.get("call_sites") != "certified"):
         return False, "the verdict does not separately attribute the non-call completion gap"
+    unproven_binding = inputs.get("source_derivation") == "inconclusive"
+    allowed_inputs = ("reference_completion", "absence_gate") + (
+        ("source_derivation",) if unproven_binding else ())
     if any(reading not in ("certified", "not_applicable") for name, reading in inputs.items()
-           if name not in ("reference_completion", "absence_gate")):
+           if name not in allowed_inputs):
         return False, "another verdict input limits the positive beyond non-call completion"
     codes = [part.strip() for part in str(verdict.get("limiting_factor") or "").split(";")
              if part.strip()]
+    expected_codes = [binding_code, code] if unproven_binding else [code]
+    expected_reason = (
+        binding_code
+        + ": prior-local binding evidence could not be validated for the checked scope, "
+        + "so complete dependency or call-shape knowledge is unproven; "
+        + code + ": non-call completion is unmeasured"
+        if unproven_binding
+        else code + ": non-call completion is unmeasured"
+    )
     reason = negative.get("trust_reason")
-    if (codes != [code]
-            or reason != code + ": non-call completion is unmeasured"
-            or code not in str(negative.get("advice") or "")):
+    advice = str(negative.get("advice") or "")
+    if (codes != expected_codes
+            or reason != expected_reason
+            or any(expected not in advice for expected in expected_codes)):
         return False, "non-call completion provenance does not match its exact limiting code"
     if (verdict.get("absence_claim") != "not_applicable"
             or verdict.get("safe_to_conclude_absent") is not False
@@ -864,6 +881,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         self._repo = None
         self.unadmitted_path = "linkgraph/predicates.py"
+        self.kin, self.daemon = prepare_runtime_fixture(
+            self.kin, daemon, self.env, self.env["KIN_HOME"])
 
     def git(self, args, repo):
         base = ["git", "-c", "core.hooksPath=/dev/null",
@@ -1532,6 +1551,22 @@ def self_test():
 
     expect("a settled Call census preserves separately unmeasured Reference completion",
            qualify(completion), PASS)
+    unproven_binding = copy.deepcopy(completion)
+    unproven_binding["_kin"]["verdict"]["inputs"]["source_derivation"] = "inconclusive"
+    unproven_binding["_kin"]["verdict"]["limiting_factor"] = (
+        "local_binding_unproven; reference_completion_unmeasured")
+    unproven_binding["negative"]["trust_reason"] = (
+        "local_binding_unproven: prior-local binding evidence could not be validated for the checked scope, "
+        "so complete dependency or call-shape knowledge is unproven; "
+        "reference_completion_unmeasured: non-call completion is unmeasured")
+    unproven_binding["negative"]["advice"] = (
+        "local_binding_unproven, reference_completion_unmeasured")
+    expect("a settled Call census over an uncommitted LSP-enriched tree qualifies",
+           qualify(unproven_binding), PASS)
+    unproven_mismatch = copy.deepcopy(unproven_binding)
+    unproven_mismatch["_kin"]["verdict"]["limiting_factor"] = "reference_completion_unmeasured"
+    expect("source_derivation inconclusive without local_binding_unproven fails",
+           qualify(unproven_mismatch), FAIL)
     unsettled = copy.deepcopy(completion)
     unsettled["_kin"]["verdict"]["inputs"].update(
         call_sites="inconclusive", reference_completion="not_applicable")
@@ -1565,6 +1600,13 @@ def self_test():
         args = list(copy.deepcopy(admitted_reference()))
         mutate(args[side] if side < 3 else args)
         return grade_admitted_reference(*args)
+
+    expect("an admitted use also enriched by the language server passes",
+           admitted(lambda p: p["references"][0].update(sites_partial_reason="language_server_edge")),
+           PASS)
+    expect("an admitted use with incomplete call evidence fails",
+           admitted(lambda p: p["references"][0].update(sites_partial_reason="incomplete_call_evidence")),
+           FAIL)
 
     for label, side, mutate in (
             ("a focal in another module", 0,

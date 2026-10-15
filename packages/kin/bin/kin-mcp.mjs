@@ -14,7 +14,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 import { packageVersion, targetKinVersion, notProvisionedMessage } from '../lib/resolve.mjs';
-import { ensureProvisioned } from '../lib/provision.mjs';
+import { developmentLaunchEnvironment, ensureProvisioned } from '../lib/provision.mjs';
 
 const argv = process.argv.slice(2);
 
@@ -45,7 +45,9 @@ if (!binary) {
   process.exit(1);
 }
 
-const result = spawnSync(binary, ['mcp', 'start', ...argv], { stdio: 'inherit' });
+const childEnv = process.env.KIN_MANAGED_BIN
+  ? developmentLaunchEnvironment(binary) : process.env;
+const result = spawnSync(binary, ['mcp', 'start', ...argv], { stdio: 'inherit', env: childEnv });
 if (result.error) {
   process.stderr.write(`kin-mcp: failed to launch managed binary: ${result.error.message}\n`);
   process.exit(1);

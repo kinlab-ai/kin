@@ -170,10 +170,14 @@ impl FloorTransport for HttpTransport {
                 "client": CLIENT_NAME,
                 "lease": lease,
             }));
-        let response = crate::daemon_delegate::with_auth(request)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+        let response = crate::daemon_delegate::send_admitted_daemon_request(
+            "session idle floor hold",
+            base,
+            crate::daemon_delegate::with_auth(request),
+            REQUEST_BUDGET,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -196,10 +200,14 @@ impl FloorTransport for HttpTransport {
                 base.trim_end_matches('/')
             ))
             .json(&serde_json::json!({ "lease": lease }));
-        let response = crate::daemon_delegate::with_auth(request)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+        let response = crate::daemon_delegate::send_admitted_daemon_request(
+            "session idle floor release",
+            base,
+            crate::daemon_delegate::with_auth(request),
+            REQUEST_BUDGET,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
         if response.status().is_success() {
             Ok(())
         } else {

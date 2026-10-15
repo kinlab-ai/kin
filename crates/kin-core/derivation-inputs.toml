@@ -11,6 +11,8 @@ products = ["graph"]
 files = [
     "src/diff.rs",
     "src/git_init.rs",
+    # Selects exact fetched history and builds the changes, aliases and Git authority stored on update.
+    "src/git_update.rs",
     "src/init.rs",
     "src/lib.rs",
     "src/ref_view.rs",
@@ -26,6 +28,7 @@ files = [
 [[excluded]]
 reason = "tests and test support, compiled only under cfg(test) or the test-support feature"
 files = [
+    "src/git_update/tests/mod.rs",
     "src/session_publication_observer_test.rs",
     "src/session_publication_test_support.rs",
     "src/test_env.rs",
@@ -188,6 +191,14 @@ files = [
 
 
 [[excluded_items]]
+file = "src/git_update.rs"
+reason = "local update eligibility and its read-only status shape report persisted authority; the admission adapter does not call them and they produce no stored record"
+items = [
+    "fn git_update_status",
+    "struct GitUpdateStatus",
+]
+
+[[excluded_items]]
 file = "src/ref_view.rs"
 reason = "reads, searches and maintains what is stored (the text index, vectors and embeddings, recall, counts, impact and neighbourhood queries, entity history pages and warnings); answering calls them, deriving never does"
 items = [
@@ -198,7 +209,17 @@ items = [
 reason = "capability-scoped IO for store sidecars and configuration; reads and writes the caller's record bytes without deriving an entity or relation"
 files = ["src/store_records.rs"]
 
+[[excluded]]
+reason = "runtime build identity and managed/development process routing; no semantic derivation"
+files = ["src/runtime_identity.rs"]
+
+[[excluded_items]]
+file = "src/lib.rs"
+reason = "exports process identity metadata without changing graph derivation"
+items = ["mod runtime_identity"]
+
 [dependencies]
+kin-buildinfo = { reason = "compiled runtime provenance for exact CLI and service identity; derives no graph data" }
 kin-io = { reason = "worktree authority tokens and confined store/config record IO; graph derivation uses the supplied source bytes and never derives a value through this crate" }
 semver = { reason = "compares recorded Kin releases before an upgrade; never derives graph data" }
 kin-model = { decides = ["graph"] }

@@ -71,10 +71,10 @@ pub use error::{
 pub use gc_lock::{wait_for_running_git_gc, RunningGitGc, GIT_GC_WAIT};
 pub use global_config::empty_global_git_config;
 pub use lossless::{
-    capture_lossless_git_repository, capture_lossless_git_repository_scoped,
-    closure_reconstruction_count, rehydrate_lossless_git_repository,
-    sync_git_repository_for_authority_handoff, CaptureScope, GitObjectFormat, GitRehydrationResult,
-    LosslessGitRepository,
+    capture_lossless_git_ref, capture_lossless_git_repository,
+    capture_lossless_git_repository_scoped, closure_reconstruction_count,
+    rehydrate_lossless_git_repository, sync_git_repository_for_authority_handoff, CaptureScope,
+    GitObjectFormat, GitRehydrationResult, LosslessGitRepository,
 };
 pub use preflight::{
     git_remote_mapping_facts, kin_store_is_git_ignored, preflight_git_migration,

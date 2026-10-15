@@ -3029,7 +3029,25 @@ mod tests {
             .to_string();
         let status_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&status_reads);
+        let supervisor_home = tempfile::tempdir().unwrap();
+        let mut env = kin_core::test_env::EnvVarGuard::new();
+        without_a_supervisor(&mut env, supervisor_home.path());
+        let mut identity =
+            kin_core::runtime_identity::RuntimeServiceIdentity::current("daemon").unwrap();
+        identity.repository = Some(
+            kin_core::runtime_identity::RuntimeRepositoryBinding::for_layout(&layout)
+                .expect("capture the fixture daemon's actual selected repository")
+                .identity()
+                .clone(),
+        );
         let app = axum::Router::new()
+            .route(
+                "/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(identity) }
+                }),
+            )
             .route(
                 "/readiness",
                 axum::routing::get(|| async {
@@ -3071,10 +3089,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(layout.root().join("daemon.port"), port.to_string()).unwrap();
-        let supervisor_home = tempfile::tempdir().unwrap();
-        let mut env = kin_core::test_env::EnvVarGuard::new();
-        without_a_supervisor(&mut env, supervisor_home.path());
-
         let daemon = crate::daemon_client::running_daemon_reading(&layout).await;
         assert!(
             matches!(

@@ -1367,6 +1367,11 @@ pub(crate) fn is_stale_plan_refusal(error: &DaemonError) -> bool {
 /// `legacy` what an earlier build's records still owe. The same
 /// compare-and-swap that publishes the tree records both in the workspace's
 /// owed derivation ledger, so a refused publication records nothing.
+///
+/// This entry point opens an authority of its own, so it publishes as another
+/// writer would. The daemon publishes through the authority it already holds,
+/// with [`publish_workspace_tree_through`].
+#[cfg(test)]
 pub(crate) fn publish_workspace_tree(
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
@@ -1376,10 +1381,51 @@ pub(crate) fn publish_workspace_tree(
     owed: &[(RepoPath, Hash256)],
     legacy: &[(RepoPath, Hash256)],
 ) -> Result<Option<WorkspaceAdmissionResult>> {
-    let desired_tree = &admitted.desired_tree;
-    let repository_id = authority_context.repository_id().clone();
-    let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
+    publish_workspace_tree_through(
+        blobs,
+        &authority,
+        authority_context.repository_id(),
+        authority_context.workspace_id(),
+        admitted,
+        operation_id,
+        actor,
+        owed,
+        legacy,
+    )
+}
+
+/// [`publish_workspace_tree`] through an authority the caller already holds.
+///
+/// An open decodes the whole persisted authority and re-verifies every body in
+/// repository CAS, and the daemon already holds one for the current
+/// publication. Opening a second one to publish an edit's tree paid that cost
+/// on every admission, and because the commit then landed in an authority the
+/// daemon did not hold, the next reader paid it again to load the successor
+/// this publication had just written. Measured on a converted fastify store in
+/// a debug build on a loaded machine, admitting a one-function edit took 36
+/// seconds, 7 of them in that open and another 10 after the commit, reloading
+/// and re-materializing what it had just written.
+///
+/// The compare-and-swap is unchanged: the roots checked below are the held
+/// authority's, which the daemon hands out only while the durable publication
+/// record still reads as it did before that authority was loaded, and the
+/// commit's own compare-and-swap against the durable head still refuses a
+/// successor built on a head another writer has moved.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_workspace_tree_through(
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    repository_id: &kin_model::RepositoryId,
+    workspace_id: WorkspaceId,
+    admitted: &AdmittedWorkspaceTree,
+    operation_id: OperationId,
+    actor: AuthorId,
+    owed: &[(RepoPath, Hash256)],
+    legacy: &[(RepoPath, Hash256)],
+) -> Result<Option<WorkspaceAdmissionResult>> {
+    let desired_tree = &admitted.desired_tree;
+    let repository_id = repository_id.clone();
     let lease = authority.read_authority();
     if lease.roots() != &admitted.expected_roots {
         return Err(invalid(format!(
@@ -1436,86 +1482,81 @@ pub(crate) fn publish_workspace_tree(
     let vacated = VacatedPaths::from_deltas(&tree_deltas);
     let moves = session_artifact_moves(&tree_deltas);
     let module_relocations =
-        plan_session_module_relocations(blobs, &authority, &workspace.tree, &tree_deltas)?;
-    let semantic_delta =
-        if let Some((observed, after)) = &admitted.observed_semantics {
-            if observed.resolved_tree != workspace.tree || after.resolved_tree != *desired_tree {
+        plan_session_module_relocations(blobs, authority, &workspace.tree, &tree_deltas)?;
+    let semantic_delta = if let Some((observed, after)) = &admitted.observed_semantics {
+        if observed.resolved_tree != workspace.tree || after.resolved_tree != *desired_tree {
+            return Err(invalid(
+                "captured live semantics do not bind the admitted tree transition",
+            ));
+        }
+        let snapshot = lease
+            .workspace_graph_snapshot(&workspace_id)?
+            .ok_or_else(|| invalid("observed workspace has no authority predecessor"))?;
+        let semantic = kin_core::diff_workspace_semantics(
+            &snapshot.entities,
+            &snapshot.relations,
+            &after.entities,
+            &after.relations,
+        )?;
+        let mut references = Vec::new();
+        for (id, old) in &snapshot.external_references {
+            match after.external_references.get(id) {
+                None => {
+                    references.push(kin_model::ExternalReferenceDelta::Removed { old: old.clone() })
+                }
+                Some(new) if old != new => {
+                    return Err(invalid(
+                        "live observation rewrote an immutable external reference identity",
+                    ))
+                }
+                _ => {}
+            }
+        }
+        for (id, new) in &after.external_references {
+            if !snapshot.external_references.contains_key(id) {
+                references.push(kin_model::ExternalReferenceDelta::Added { new: new.clone() });
+            }
+        }
+        WorkspaceSemanticDelta::new_with_external_references(
+            semantic.entity_deltas().to_vec(),
+            semantic.relation_deltas().to_vec(),
+            references,
+        )?
+    } else if vacated.is_empty() && moves.is_empty() {
+        WorkspaceSemanticDelta::default()
+    } else {
+        match lease.workspace_graph_snapshot(&workspace_id)? {
+            Some(snapshot) => {
+                let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
+                let mut entities = retirement.entity_deltas().to_vec();
+                let mut relations = retirement.relation_deltas().to_vec();
+                if !moves.is_empty() {
+                    let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
+                    relations.extend(plan_moved_source_coverage_withdrawals(&graph, &moves)?);
+                    plan_move_binding_transition(&graph, blobs, authority, &moves, &mut relations)?;
+                    kin_reconcile::relocate_binding_obligations(&graph, &moves, &mut relations)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    for (from, to) in &moves {
+                        entities.extend(plan_session_entity_relocations(&graph, from, to)?);
+                    }
+                    bind_session_module_relocations(&mut entities, &module_relocations)?;
+                }
+                WorkspaceSemanticDelta::new(entities, relations)?
+            }
+            // A vacated set with no snapshot to retire from is nothing to carry.
+            // A MOVE with no snapshot is different: the identity is real, this
+            // publication cannot prove it survives, and publishing the tree
+            // anyway would strand it exactly as the missing retirement stranded
+            // a removal. Refusing leaves authority untouched.
+            None if !moves.is_empty() => {
                 return Err(invalid(
-                    "captured live semantics do not bind the admitted tree transition",
-                ));
-            }
-            let snapshot = lease
-                .workspace_graph_snapshot(&workspace_id)?
-                .ok_or_else(|| invalid("observed workspace has no authority predecessor"))?;
-            let semantic = kin_core::diff_workspace_semantics(
-                &snapshot.entities,
-                &snapshot.relations,
-                &after.entities,
-                &after.relations,
-            )?;
-            let mut references = Vec::new();
-            for (id, old) in &snapshot.external_references {
-                match after.external_references.get(id) {
-                    None => references
-                        .push(kin_model::ExternalReferenceDelta::Removed { old: old.clone() }),
-                    Some(new) if old != new => {
-                        return Err(invalid(
-                            "live observation rewrote an immutable external reference identity",
-                        ))
-                    }
-                    _ => {}
-                }
-            }
-            for (id, new) in &after.external_references {
-                if !snapshot.external_references.contains_key(id) {
-                    references.push(kin_model::ExternalReferenceDelta::Added { new: new.clone() });
-                }
-            }
-            WorkspaceSemanticDelta::new_with_external_references(
-                semantic.entity_deltas().to_vec(),
-                semantic.relation_deltas().to_vec(),
-                references,
-            )?
-        } else if vacated.is_empty() && moves.is_empty() {
-            WorkspaceSemanticDelta::default()
-        } else {
-            match lease.workspace_graph_snapshot(&workspace_id)? {
-                Some(snapshot) => {
-                    let retirement = retire_semantics_on_vacated(&snapshot, &vacated)?;
-                    let mut entities = retirement.entity_deltas().to_vec();
-                    let mut relations = retirement.relation_deltas().to_vec();
-                    if !moves.is_empty() {
-                        let graph =
-                            kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
-                        relations.extend(plan_moved_source_coverage_withdrawals(&graph, &moves)?);
-                        plan_move_binding_transition(
-                            &graph,
-                            blobs,
-                            &authority,
-                            &moves,
-                            &mut relations,
-                        )?;
-                        kin_reconcile::relocate_binding_obligations(&graph, &moves, &mut relations)
-                            .map_err(|error| invalid(error.to_string()))?;
-                        for (from, to) in &moves {
-                            entities.extend(plan_session_entity_relocations(&graph, from, to)?);
-                        }
-                        bind_session_module_relocations(&mut entities, &module_relocations)?;
-                    }
-                    WorkspaceSemanticDelta::new(entities, relations)?
-                }
-                // A vacated set with no snapshot to retire from is nothing to carry.
-                // A MOVE with no snapshot is different: the identity is real, this
-                // publication cannot prove it survives, and publishing the tree
-                // anyway would strand it exactly as the missing retirement stranded
-                // a removal. Refusing leaves authority untouched.
-                None if !moves.is_empty() => return Err(invalid(
                     "repository authority holds no workspace graph snapshot to relocate a moved \
                      identity into, so publishing this tree would strand it",
-                )),
-                None => WorkspaceSemanticDelta::default(),
+                ))
             }
-        };
+            None => WorkspaceSemanticDelta::default(),
+        }
+    };
     let mut source_lengths = std::collections::BTreeMap::new();
     let (shared_policy, _) = SharedAdmissionPolicy::derive_from_tree_with_allowances(
         Some(&workspace.shared_admission_policy),
@@ -1527,7 +1568,7 @@ pub(crate) fn publish_workspace_tree(
             // Every rule file in the desired tree is measured here, changed or
             // not, because the policy is derived from the whole tree rather
             // than from what moved.
-            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
+            let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
                 ModelError::InvalidOperation(format!(
                     "{error}, while deriving the admitted workspace policy"
                 ))
@@ -1541,7 +1582,7 @@ pub(crate) fn publish_workspace_tree(
             Ok(length)
         },
         |hash| {
-            read_publishable_source(blobs, &authority, hash)
+            read_publishable_source(blobs, authority, hash)
                 .map(|source| source.body().to_vec())
                 .map_err(|error| {
                     ModelError::InvalidOperation(format!(
@@ -1619,7 +1660,7 @@ pub(crate) fn publish_workspace_tree(
     // source becomes durable. An unchanged rule source is already there and
     // needs no copy.
     for hash in source_hashes {
-        if let Some(body) = read_publishable_source(blobs, &authority, hash)?.body_to_publish() {
+        if let Some(body) = read_publishable_source(blobs, authority, hash)?.body_to_publish() {
             authority.save_source_blob(hash, body)?;
         }
     }
@@ -1709,6 +1750,7 @@ pub(crate) fn plan_native_amend(
         Some(amend),
         SemanticCurrency::DaemonMaintained,
         None,
+        None,
     )
 }
 
@@ -1754,6 +1796,77 @@ pub(crate) fn plan_command_commit(
         amend,
         SemanticCurrency::DaemonMaintained,
         Some(held),
+        None,
+    )
+}
+
+/// What a workspace holds after a change that leaves some of its working copy
+/// uncommitted.
+///
+/// A change of this kind records less than the working copy holds, so the
+/// workspace does not take the change's tree. It takes this graph instead,
+/// whose semantics describe the whole working copy, and its base advances to
+/// the change, so everything the change does not record is uncommitted work
+/// against the new base.
+#[derive(Clone, Copy)]
+pub(crate) enum KeptWorkingCopy<'a> {
+    /// The working copy keeps its tree exactly, and nothing in it is written.
+    /// A commit of chosen entities records part of what is already there.
+    AsItIs(&'a kin_db::InMemoryGraph),
+    /// The working copy takes this graph's tree, which differs from the
+    /// workspace's only at `written`, the source units the caller's own
+    /// operations wrote. An agent's transaction writes its units into the
+    /// working copy and records only them.
+    Written {
+        graph: &'a kin_db::InMemoryGraph,
+        written: &'a BTreeSet<RepoPath>,
+    },
+}
+
+impl<'a> KeptWorkingCopy<'a> {
+    fn graph(self) -> &'a kin_db::InMemoryGraph {
+        match self {
+            Self::AsItIs(graph) | Self::Written { graph, .. } => graph,
+        }
+    }
+}
+
+/// Plan a change that records part of the working copy and leaves the rest of
+/// it uncommitted.
+///
+/// `graph` is the prospective graph the change records: the workspace's base
+/// with only the chosen work in it. `live` is the daemon's graph of the whole
+/// working copy. The workspace keeps its tree and takes `live`'s semantics, so
+/// nothing in the working copy moves, and only its base advances to the new
+/// change. Everything the change does not carry is uncommitted work against
+/// that new base, exactly as it stood before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_kept_workspace_commit(
+    graph: &kin_db::InMemoryGraph,
+    live: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    held: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
+    expected_roots: &RootBundle,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    message: String,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        author,
+        None,
+        &|_| message.clone(),
+        Some(expected_roots),
+        None,
+        SemanticCurrency::AuthoritySnapshot,
+        Some(held),
+        Some(KeptWorkingCopy::AsItIs(live)),
     )
 }
 
@@ -1807,6 +1920,7 @@ pub(crate) fn plan_native_commit(
         None,
         SemanticCurrency::DaemonMaintained,
         None,
+        None,
     )
 }
 
@@ -1841,6 +1955,7 @@ pub(crate) fn plan_native_commit_from_base(
         None,
         SemanticCurrency::AuthoritySnapshot,
         None,
+        None,
     )
 }
 
@@ -1852,9 +1967,12 @@ pub(crate) fn plan_native_commit_from_base(
 /// and it publishes no change, so that content sits ahead of history with no
 /// authorship attached to it. It is already inside the prospective graph a
 /// caller plans against, because the workspace graph takes its resolved tree
-/// from the workspace, so a commit either publishes it or reverts the working
-/// files that hold it. It gets published, and this is what makes that
-/// publication say so.
+/// from the workspace, so a commit planned from that graph alone publishes it.
+/// This is what makes that publication say so. A caller that can tell its own
+/// units from the rest leaves the rest uncommitted instead, through
+/// [`plan_native_commit_from_base_keeping_pending`]; an MCP transaction reaches
+/// this planner only when every unit ahead of the base is one it wrote, so
+/// what it declares here is uncommitted content inside those units.
 ///
 /// `authored_files` names the files the caller's own operations produced. Every
 /// other file this change publishes came from the pending tree, and the rendered
@@ -1887,6 +2005,55 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
         None,
         SemanticCurrency::AuthoritySnapshot,
         held,
+        None,
+    )
+}
+
+/// Plan one exact native transaction that records only what the caller's own
+/// operations wrote and leaves the rest of the working copy uncommitted.
+///
+/// `graph` is the change: the workspace's base change with the caller's
+/// written units in it, and none of the uncommitted work in units the caller
+/// did not write. `workspace` is the whole working copy after the caller's
+/// writes, which the workspace keeps; its tree differs from the workspace's
+/// only at `authored_files`, and only those are written to the working copy.
+/// The base advances to the new change, so the work the change leaves out is
+/// still uncommitted against it, exactly as it stood.
+///
+/// The message is told what the change carried in that its operations did not
+/// write, as [`plan_native_commit_from_base_declaring_carry`] does, which for a
+/// change built this way is nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_native_commit_from_base_keeping_pending(
+    graph: &kin_db::InMemoryGraph,
+    workspace: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    authored_files: &BTreeSet<RepoPath>,
+    message: &dyn Fn(&[RepoPath]) -> String,
+    base: &NativeCommitBase,
+    held: Option<Arc<RepositoryAuthorityManager<LocalFileBackend>>>,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        author,
+        Some(authored_files),
+        message,
+        Some(&base.roots),
+        None,
+        SemanticCurrency::AuthoritySnapshot,
+        held,
+        Some(KeptWorkingCopy::Written {
+            graph: workspace,
+            written: authored_files,
+        }),
     )
 }
 
@@ -2424,6 +2591,7 @@ fn plan_native_commit_inner(
     amend: Option<&NativeAmend>,
     currency: SemanticCurrency,
     held: Option<Arc<RepositoryAuthorityManager<LocalFileBackend>>>,
+    kept: Option<KeptWorkingCopy<'_>>,
 ) -> Result<NativeCommitPlan> {
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
@@ -2516,6 +2684,11 @@ fn plan_native_commit_inner(
         None => None,
     };
 
+    // The tree a kept working copy holds after this change, and the exact
+    // transition from the workspace's tree to it. An agent's transaction moves
+    // only the units it wrote; a commit of chosen entities moves nothing.
+    let mut kept_tree: Option<(kin_model::ResolvedTree, Vec<kin_model::TreeDelta>)> = None;
+
     // Both sides of the semantic diff are whole copies of the graph and neither
     // is read again once the delta exists, so both are scoped to the diff and
     // freed before the phase that follows.
@@ -2543,8 +2716,44 @@ fn plan_native_commit_inner(
                     "repository authority has no graph snapshot for workspace {workspace_id}"
                 ))
             })?;
+        // A change that keeps the rest of the working copy uncommitted leaves
+        // the workspace holding the whole working copy's semantics; any other
+        // commit leaves it holding exactly what the change records.
         let desired_workspace_graph =
-            crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
+            crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || {
+                kept.map(KeptWorkingCopy::graph)
+                    .unwrap_or(graph)
+                    .to_snapshot()
+            });
+        let moved = || invalid("the working copy moved while this change was being planned");
+        match kept {
+            Some(KeptWorkingCopy::AsItIs(_)) => {
+                if desired_workspace_graph.resolved_tree != workspace.tree {
+                    return Err(moved());
+                }
+                kept_tree = Some((workspace.tree.clone(), Vec::new()));
+            }
+            Some(KeptWorkingCopy::Written { written, .. }) => {
+                let transition = kin_core::exact_tree_correction(
+                    &workspace.tree,
+                    &desired_workspace_graph.resolved_tree,
+                )?;
+                // Every unit this moves is one the caller's operations wrote.
+                // Anything else moving means the working copy changed under
+                // the plan, and writing it would overwrite somebody's work.
+                let only_written = transition.iter().all(|delta| {
+                    [delta.old_state(), delta.new_state()]
+                        .into_iter()
+                        .flatten()
+                        .all(|located| written.contains(&located.path))
+                });
+                if !only_written {
+                    return Err(moved());
+                }
+                kept_tree = Some((desired_workspace_graph.resolved_tree.clone(), transition));
+            }
+            None => {}
+        }
         crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
             let semantic = kin_core::diff_workspace_semantics(
                 &authority_workspace_graph.entities,
@@ -2708,8 +2917,66 @@ fn plan_native_commit_inner(
         .collect();
 
     let tree_hash = compute_resolved_tree_hash(&deltas.expected_tree)?;
-    let workspace_tree_deltas =
-        kin_core::exact_tree_correction(&workspace.tree, &deltas.expected_tree)?;
+    // What the workspace holds after the change: the change's own tree and
+    // policy, or, for a kept working copy, its own tree and the policy that
+    // tree is admitted under.
+    let (workspace_tree, workspace_tree_deltas, workspace_tree_hash, workspace_policy) =
+        match (kept, kept_tree) {
+            (Some(KeptWorkingCopy::AsItIs(_)), Some((tree, transition))) => (
+                tree,
+                transition,
+                workspace.tree_hash,
+                workspace.shared_admission_policy.clone(),
+            ),
+            (Some(KeptWorkingCopy::Written { .. }), Some((tree, transition))) => {
+                // A working copy the caller wrote into is admitted again, the
+                // way every admitted tree is: its policy is derived from the
+                // whole tree it now holds, so a written rule source governs it
+                // exactly as it would after an ordinary admission.
+                let (policy, _) = crate::mcp_commit::timed_commit_phase(
+                    "plan_derive_workspace_admission_policy",
+                    || {
+                        SharedAdmissionPolicy::derive_from_tree_with_allowances(
+                            Some(&workspace.shared_admission_policy),
+                            &tree,
+                            |hash| {
+                                read_publishable_source(blobs, &authority, hash)
+                                    .map_err(|error| {
+                                        ModelError::InvalidOperation(format!(
+                                            "{error}, while deriving the kept working copy's policy"
+                                        ))
+                                    })
+                                    .and_then(|source| {
+                                        u64::try_from(source.body().len()).map_err(|_| {
+                                            ModelError::InvalidOperation(format!(
+                                                "kept working copy policy source {hash} exceeds u64"
+                                            ))
+                                        })
+                                    })
+                            },
+                            |hash| {
+                                read_publishable_source(blobs, &authority, hash)
+                                    .map(|source| source.body().to_vec())
+                                    .map_err(|error| {
+                                        ModelError::InvalidOperation(format!(
+                                            "{error}, while reading the approvals the kept working \
+                                             copy's policy derives"
+                                        ))
+                                    })
+                            },
+                        )
+                    },
+                )?;
+                let hash = compute_resolved_tree_hash(&tree)?;
+                (tree, transition, hash, policy)
+            }
+            _ => (
+                deltas.expected_tree.clone(),
+                kin_core::exact_tree_correction(&workspace.tree, &deltas.expected_tree)?,
+                tree_hash,
+                shared_policy.clone(),
+            ),
+        };
     let workspace_generation = workspace.generation.checked_add(1).ok_or_else(|| {
         invalid(format!(
             "workspace {} generation exhausted",
@@ -2759,13 +3026,18 @@ fn plan_native_commit_inner(
         new_base_target: Some(new_target.clone()),
         new_base_tree_hash: Some(tree_hash),
         tree_deltas: workspace_tree_deltas,
-        new_tree_hash: tree_hash,
+        // A kept working copy keeps its tree, and with it the admission policy
+        // that tree was admitted under; the change carries its own policy.
+        new_tree_hash: workspace_tree_hash,
         semantic_delta: workspace_semantic_delta,
-        new_shared_admission_policy: shared_policy.clone(),
-        new_admission_policy: EffectiveAdmissionPolicyStamp {
-            shared: shared_policy.stamp(),
-            local: workspace.admission_policy.local,
+        new_admission_policy: match kept {
+            Some(KeptWorkingCopy::AsItIs(_)) => workspace.admission_policy,
+            _ => EffectiveAdmissionPolicyStamp {
+                shared: workspace_policy.stamp(),
+                local: workspace.admission_policy.local,
+            },
         },
+        new_shared_admission_policy: workspace_policy,
     };
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -2774,9 +3046,19 @@ fn plan_native_commit_inner(
         expected_generation: lease.roots().generation,
         expected_roots: lease.roots().clone(),
         actor: author,
-        reason: match amend {
-            Some(amend) => format!("amend native semantic change {}", amend.expected_head),
-            None => "publish admitted native semantic change".to_string(),
+        reason: match (amend, kept) {
+            (Some(amend), _) => format!("amend native semantic change {}", amend.expected_head),
+            (None, Some(KeptWorkingCopy::AsItIs(_))) => {
+                "publish chosen entities as a native semantic change, keeping the rest of the \
+                 working copy uncommitted"
+                    .to_string()
+            }
+            (None, Some(KeptWorkingCopy::Written { .. })) => {
+                "publish the source units a transaction wrote as a native semantic change, \
+                 keeping the rest of the working copy uncommitted"
+                    .to_string()
+            }
+            (None, None) => "publish admitted native semantic change".to_string(),
         },
         external_objects: Vec::new(),
         git_authority_delta: None,
@@ -2803,6 +3085,27 @@ fn plan_native_commit_inner(
         }
     }
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
+    // A working copy the caller wrote into beside the change takes bodies the
+    // change may not carry, and the projection reads every body it writes back
+    // out of repository CAS.
+    if let (Some(KeptWorkingCopy::Written { .. }), Some(mutation)) =
+        (kept, &transaction.workspace_mutation)
+    {
+        source_hashes.extend(
+            mutation
+                .tree_deltas
+                .iter()
+                .filter_map(|delta| delta.new_state())
+                .filter_map(|located| located.entry.blob_identity()),
+        );
+        source_hashes.extend(
+            mutation
+                .new_shared_admission_policy
+                .sources
+                .iter()
+                .map(|source| source.body_hash),
+        );
+    }
     for entity in change
         .entity_deltas
         .iter()
@@ -2835,8 +3138,11 @@ fn plan_native_commit_inner(
         carried_pending_files,
         carried_semantic_files,
         entity_scope_ids,
+        // A kept working copy is published over itself: the working copy must
+        // still hold the tree it held, and only the units the caller wrote, if
+        // any, are written.
+        target_tree: workspace_tree,
         previous_tree: workspace.tree,
-        target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
         authority,
         owed_derivations: (currency == SemanticCurrency::DaemonMaintained)
@@ -2857,12 +3163,13 @@ fn plan_native_commit_inner(
 ///
 /// Refusing it never kept that content out of a commit either. The workspace
 /// graph takes its resolved tree from the workspace, so the pending content is
-/// inside the prospective graph every caller plans against, and a commit that
-/// excluded it would have to revert the working files that hold it. What the
-/// refusal actually bought was silence about a fold that was going to happen
-/// anyway once the guard was lifted, which is why the caller that lifts it
-/// declares the fold instead: see
-/// [`plan_native_commit_from_base_declaring_carry`].
+/// inside the prospective graph every caller plans against. What keeps it out
+/// of a change is planning the change apart from the working copy, which keeps
+/// its tree and moves only its base: see
+/// [`plan_native_commit_from_base_keeping_pending`] for an MCP transaction and
+/// [`plan_kept_workspace_commit`] for a commit of chosen entities. A caller
+/// that plans from that graph alone publishes the content and declares it:
+/// see [`plan_native_commit_from_base_declaring_carry`].
 pub(crate) fn load_native_commit_base(
     authority_context: &LocalRepositoryAuthorityContext,
 ) -> Result<NativeCommitBase> {

@@ -143,6 +143,10 @@ if you said yes. There is no separate linking step. After you install another to
 `kin setup` again, and `kin setup status` shows what is connected. On Windows, connect AI
 tools inside WSL2.
 
+`kin runtime status --json` checks the shared CLI and daemon installation, including
+their exact source identity. Normal commands refuse mismatched pairs; development
+builds use isolated state. See [runtime installation](docs/runtime-installation.md).
+
 Graph and lexical retrieval work without a model. Embeddings and reranking are optional,
 and their model providers default to `none`. Standard CLI and daemon builds include external
 HTTP model support. Built-in models require a build with optional local inference enabled.
