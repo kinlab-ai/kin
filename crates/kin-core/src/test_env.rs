@@ -342,6 +342,7 @@ pub fn install_test_registry() -> &'static std::path::Path {
         install_process_wide("KIN_REGISTRY_PATH", &path);
         path
     });
+    let _ = crate::registry::create_kin_dir_all(&crate::registry::managed_kin_home());
     path
 }
 

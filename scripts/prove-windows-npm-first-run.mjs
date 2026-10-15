@@ -511,6 +511,8 @@ async function proveCanonical({ workRoot, builtKin, builtDaemon, gitBinary }) {
 
   const env = hermeticEnv({ root, managedBinDir: path.dirname(managedKin) });
   setEnv(env, 'KIN_HOME', kinHome);
+  setEnv(env, 'KIN_MANAGED_BIN', managedKin);
+  setEnv(env, 'KIN_RUNTIME_MODE', 'development');
   setEnv(env, 'KIN_NO_PROVISION', '1');
   setEnv(env, 'KIN_MCP_TOOL_PROFILE', 'agent-default');
   deleteEnv(env, 'KIN_DAEMON_BIN');
@@ -628,6 +630,7 @@ async function proveCompatibility({ workRoot, builtKin, builtDaemon, gitBinary }
 
   const env = hermeticEnv({ root, managedBinDir: path.dirname(cachedKin) });
   setEnv(env, 'KIN_HOME', path.join(root, 'kin-home'));
+  setEnv(env, 'KIN_RUNTIME_MODE', 'development');
   setEnv(env, 'KIN_MCP_CACHE_DIR', cacheRoot);
   setEnv(env, 'KIN_MCP_AUTO_INIT', '1');
   setEnv(env, 'KIN_MCP_RELEASE_BASE_URL', 'http://127.0.0.1:9/kin-offline-proof');

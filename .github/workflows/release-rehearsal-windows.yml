@@ -484,6 +484,7 @@ jobs:
           scratch="kin-windows-admission"
           mkdir -p "$scratch"
           scratch="$(cd "$scratch" && pwd)"
+          trap 'MSYS_NO_PATHCONV=1 taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true; rm -rf "$scratch"/*/kin-home/bin 2>/dev/null || true' EXIT
 
           failures=0
           fail() {

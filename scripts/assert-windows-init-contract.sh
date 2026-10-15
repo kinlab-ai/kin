@@ -53,7 +53,7 @@ unset KIN_STORE KIN_STORE_LAYOUT KIN_REGISTRY_PATH
 
 # `kin init` starts a daemon for each repository it admits. Reap them rather
 # than leaving runner processes behind.
-trap 'taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true' EXIT
+trap 'MSYS_NO_PATHCONV=1 taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true; rm -rf "$scratch"/*/kin-home/bin 2>/dev/null || true' EXIT
 
 # What `kin init` prints when it takes a populated directory in. The colon is
 # part of the wording: a Git import reports "Uncommitted worktree state:", which

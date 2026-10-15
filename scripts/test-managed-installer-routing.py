@@ -127,7 +127,7 @@ class LegacyInstallerBootstrap(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="kin-installer-bootstrap-")
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         self.root = self.home / "managed root"
         (self.root / "bin").mkdir(parents=True)
         (self.root / "lib").mkdir()

@@ -525,6 +525,7 @@ jobs:
           # Absolute, because each fixture's Kin home is read from inside the
           # fixture.
           scratch="$(cd "$scratch" && pwd)"
+          trap 'MSYS_NO_PATHCONV=1 taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true; rm -rf "$scratch"/*/kin-home/bin 2>/dev/null || true' EXIT
 
           # Every assertion reports and the step exits once at the end. One
           # Windows round is expensive, so stopping at the first failure would

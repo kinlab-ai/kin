@@ -2797,8 +2797,9 @@ pub(crate) fn ensure_private_temp_container(parent: &Path, name: &str) -> Result
 impl WindowsPrivateTempDir {
     pub(super) fn create(parent: &Path, prefix: &str) -> Result<Self> {
         let user = CurrentUserSid::load()?;
-        let parent_guard = SecurePathGuard::open(parent, true, Some(&user), false, false)?;
-        parent_guard.validate(Some(&user))?;
+        let parent_user = (prefix != ".update-worker-").then_some(&user);
+        let parent_guard = SecurePathGuard::open(parent, true, parent_user, false, false)?;
+        parent_guard.validate(parent_user)?;
         for _ in 0..128 {
             let path = parent.join(format!("{prefix}{}", uuid::Uuid::new_v4()));
             if !create_private_directory(&path, &user)? {
@@ -2812,7 +2813,7 @@ impl WindowsPrivateTempDir {
                 }
             };
             if let Err(error) = parent_guard
-                .validate(Some(&user))
+                .validate(parent_user)
                 .and_then(|()| tree.validate())
             {
                 drop(tree);
@@ -2864,7 +2865,8 @@ impl WindowsPrivateTempDir {
 
     pub(super) fn validate(&self) -> Result<()> {
         let user = CurrentUserSid::load()?;
-        self.parent.validate(Some(&user))?;
+        self.parent
+            .validate(self.parent.require_private.then_some(&user))?;
         self.tree
             .as_ref()
             .context("private updater directory security was already released")?
