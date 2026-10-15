@@ -128,10 +128,10 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     if let Some(raw) = path.to_str() {
-        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-            return PathBuf::from(format!(r"\\{rest}"));
+        if let Some(rest) = raw.strip_prefix("\\\\?\\UNC\\") {
+            return PathBuf::from(format!("\\\\{rest}"));
         }
-        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        if let Some(rest) = raw.strip_prefix("\\\\?\\") {
             if rest.as_bytes().get(1) == Some(&b':') {
                 return PathBuf::from(rest);
             }

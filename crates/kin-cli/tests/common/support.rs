@@ -1444,6 +1444,9 @@ pub struct Command<'runtime> {
 impl Command<'static> {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
         let program = program.as_ref();
+        if program == OsStr::new(env!("CARGO_BIN_EXE_kin")) {
+            let _ = ensure_sibling_daemon_built();
+        }
         let mut inner = std::process::Command::new(program);
         if is_git_program(program) {
             inner
@@ -3200,11 +3203,11 @@ pub fn daemon_compat_mismatch(
 }
 
 pub fn daemon_compat(runtime: &IsolatedDaemonRuntime, path: &Path) -> Result<(), String> {
-    daemon_compat_within(runtime, path, COMMAND_TIMEOUT)
+    daemon_compat_within(Some(runtime), path, COMMAND_TIMEOUT)
 }
 
 fn daemon_compat_within(
-    runtime: &IsolatedDaemonRuntime,
+    runtime: Option<&IsolatedDaemonRuntime>,
     path: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -3226,7 +3229,10 @@ fn daemon_compat_within(
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
-    let mut command = runtime.command(path);
+    let mut command = match runtime {
+        Some(runtime) => runtime.command(path),
+        None => Command::new(path),
+    };
     let output = command
         .arg("--compat-json")
         .output_within(timeout)
@@ -3313,12 +3319,16 @@ fn daemon_rebuild_profile(kin_bin: &Path) -> Vec<String> {
     }
 }
 
+pub fn ensure_sibling_daemon_built() -> PathBuf {
+    fresh_daemon_bin_with_deadline(None, None)
+}
+
 fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
-    fresh_daemon_bin_with_deadline(runtime, None)
+    fresh_daemon_bin_with_deadline(Some(runtime), None)
 }
 
 fn fresh_daemon_bin_before(runtime: &IsolatedDaemonRuntime, deadline: Instant) -> PathBuf {
-    fresh_daemon_bin_with_deadline(runtime, Some(deadline))
+    fresh_daemon_bin_with_deadline(Some(runtime), Some(deadline))
 }
 
 fn daemon_preparation_budget(
@@ -3337,7 +3347,7 @@ fn daemon_preparation_budget(
 }
 
 fn fresh_daemon_bin_with_deadline(
-    runtime: &IsolatedDaemonRuntime,
+    runtime: Option<&IsolatedDaemonRuntime>,
     deadline: Option<Instant>,
 ) -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));

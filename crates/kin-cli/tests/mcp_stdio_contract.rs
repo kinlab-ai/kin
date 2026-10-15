@@ -71,6 +71,7 @@ fn run_configured_probe_session(
     extra_env: &[(&str, std::ffi::OsString)],
 ) -> McpRun {
     let started = Instant::now();
+    let _ = common::ensure_sibling_daemon_built();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kin"));
     command
         .args(["mcp", "start"])

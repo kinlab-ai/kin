@@ -138,6 +138,10 @@ fixture_kin() {
   shift 2
   local home
   home="$(fixture_home "$dir")"
+  if [ ! -x "$home/bin/kin.exe" ]; then
+    mkdir -p "$home/bin"
+    cp "$kin_bin" "$(dirname "$kin_bin")/kin-daemon.exe" "$home/bin/"
+  fi
   if command -v cygpath > /dev/null 2>&1; then
     home="$(cygpath -w "$home")"
   fi

@@ -228,8 +228,10 @@ async fn an_agents_reads_are_shown_by_entity_and_never_by_what_it_asked_or_where
     );
     assert_path_free(&listed, &forbidden);
 
-    // Written to repository authority once the session has ended, and read
-    // back from there by a daemon that reopens the store.
+    // Written to repository authority once the session has ended and the
+    // quiet window has elapsed, and read back from there by a daemon that
+    // reopens the store.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(crate::agent_authorship::settle(&state, false).await >= 1);
     let layout = state.layout.clone();
     drop(state);

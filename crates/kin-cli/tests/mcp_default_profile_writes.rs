@@ -74,6 +74,7 @@ struct McpSession {
 
 impl McpSession {
     fn start(repo: &Path, home: &Path, kin_home: &Path, registry: &Path, port: u16) -> Self {
+        let _ = common::ensure_sibling_daemon_built();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kin"))
             .args(["mcp", "start"])
             .current_dir(repo)

@@ -100,7 +100,7 @@ jobs:
       # first capture still sees what a new user sees, and `kin embed` is what
       # selects the built-in provider and asks for the model.
       - name: Build kin + kin-daemon from this branch
-        run: cargo build --bin kin --bin kin-daemon --locked --features kin-cli/embeddings,kin-daemon/embeddings
+        run: cargo build --release --bin kin --bin kin-daemon --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
       # The public installer puts both binaries in ~/.kin/bin, and several health
       # checks resolve the launcher by that path rather than by whatever happens
@@ -110,8 +110,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kin/bin"
-          install -m 0755 target/debug/kin "$HOME/.kin/bin/kin"
-          install -m 0755 target/debug/kin-daemon "$HOME/.kin/bin/kin-daemon"
+          install -m 0755 target/release/kin "$HOME/.kin/bin/kin"
+          install -m 0755 target/release/kin-daemon "$HOME/.kin/bin/kin-daemon"
           printf '%s\n' "$HOME/.kin/bin" >> "$GITHUB_PATH"
 
       - name: Drive a real first run and capture what the proof reads

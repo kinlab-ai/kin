@@ -719,7 +719,13 @@ class Suite(object):
         payload = None
         for attempt in range(attempts):
             self.kin_run(["graph", "status"], repo)
-            payload = self.mcp(repo, "find_references", args)
+            try:
+                payload = self.mcp(repo, "find_references", args)
+            except (ValueError, RuntimeError):
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(4)
+                continue
             classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
             if (all(classes.get(c) == "present" for c in classes if c != "imports")
                     and not readiness_pending(payload)):

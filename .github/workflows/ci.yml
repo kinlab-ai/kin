@@ -654,7 +654,7 @@ jobs:
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test repository_merge_resolution
           run_required_target "editor setup guidance" \
-            "full_setup_output_recommends_install_only_when_the_editor_extension_is_missing" \
+            "development_editor_setup_refuses_with_or_without_an_installed_extension" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test setup_editor_guidance
           # The daemon's own library tests, here rather than beside the other

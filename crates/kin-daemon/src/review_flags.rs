@@ -239,6 +239,9 @@ fn is_quiet(state: &DaemonState, sighting: &ReviewFlagSighting, now: &Timestamp)
 /// Write into the repository every held sighting whose session has gone quiet
 /// or ended, as one transaction. Returns how many sightings it took.
 pub(crate) async fn settle_sightings(state: &Arc<DaemonState>) -> usize {
+    if crate::agent_authorship::any_session_at_work(state) {
+        return 0;
+    }
     let now = Timestamp::now();
     let activity = state.coordinator.activity();
     if !activity
@@ -251,6 +254,9 @@ pub(crate) async fn settle_sightings(state: &Arc<DaemonState>) -> usize {
     let _coordinated = state.coordination_gate.lock().await;
     if state.prepared_publication.ensure_serving().is_err() {
         // Not serving writes now. What is held stays held for the next look.
+        return 0;
+    }
+    if crate::agent_authorship::any_session_at_work(state) {
         return 0;
     }
     let ready = activity.take_flag_sightings(|(_, sighting)| is_quiet(state, sighting, &now));

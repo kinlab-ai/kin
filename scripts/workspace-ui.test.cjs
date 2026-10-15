@@ -5054,9 +5054,11 @@ function writtenWords() {
   for (const [name, code] of [["workspace.js", source], ["agents.js", agentsSource], ["graph.js", graphSource]]) {
     for (const { value, line, classes } of literals(code)) if (!classes) words.push({ where: `${name}:${line}`, text: value });
   }
-  const frameBody = frameSource.slice(frameSource.indexOf("<body")).replace(/<script[^>]*>[\s\S]*?<\/script>/g, "");
+  const frameBody = frameSource.slice(frameSource.indexOf("<body"));
   for (const [, value] of frameBody.matchAll(/\s(?:aria-label|title|alt|placeholder)="([^"]*)"/g)) words.push({ where: "index.html", text: value });
-  for (const value of frameBody.replace(/<[^>]*>/g, "\n").split("\n")) if (value.trim()) words.push({ where: "index.html", text: value.trim() });
+  for (const [, tag, value] of frameBody.matchAll(/<(\/?[a-z0-9-]+)[^>]*>([^<]*)/gi)) {
+    if (tag.toLowerCase() !== "script" && value.trim()) words.push({ where: "index.html", text: value.trim() });
+  }
   return words;
 }
 
@@ -6093,7 +6095,7 @@ test("a created branch keeps where it started, offers the switch as a button, an
 
 test("small words hold together: a long title wraps, a branch name stays whole, counts are numerals, and Kin's record start is its own line", async () => {
   const css = fs.readFileSync(path.join(assets, "style.css"), "utf8");
-  const rule = (selector) => css.match(new RegExp(`(^|\\n)${selector.replace(/[.[\]]/g, "\\$&")} \\{([^}]*)\\}`))?.[2] ?? "";
+  const rule = (selector) => css.split("\n").find((line) => line.startsWith(`${selector} {`) && line.endsWith("}"))?.slice(selector.length + 2, -1) ?? "";
   // A step's title is its entity's name, which wraps on a narrow window rather than losing its end.
   assert.match(rule(".step-name .ent"), /white-space: normal/);
   assert.match(rule(".step-name .ent"), /overflow-wrap: anywhere/);
@@ -6131,7 +6133,7 @@ test("small words hold together: a long title wraps, a branch name stays whole, 
 
 test("the tabs scroll inside their own box, so a narrow window never grows sideways", () => {
   const css = fs.readFileSync(path.join(assets, "style.css"), "utf8");
-  const rule = (selector) => css.match(new RegExp(`(^|\\n)${selector.replace(/[.[\]]/g, "\\$&")} \\{([^}]*)\\}`))?.[2] ?? "";
+  const rule = (selector) => css.split("\n").find((line) => line.startsWith(`${selector} {`) && line.endsWith("}"))?.slice(selector.length + 2, -1) ?? "";
   assert.match(rule(".tabs"), /overflow-x: auto/);
   assert.match(rule(".tabs"), /max-width: 100%/);
   assert.match(rule(".tab"), /flex: none/);

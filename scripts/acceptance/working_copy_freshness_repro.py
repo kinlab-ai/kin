@@ -625,7 +625,7 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_modu
             or type(caller.get("site_count")) is not int
             or caller["site_count"] != 1
             or caller.get("sites_absent_reason") is not None
-            or caller.get("sites_partial_reason") is not None
+            or caller.get("sites_partial_reason") not in (None, "language_server_edge")
             or payload.get("candidates") != []
             or type(payload.get("unconfirmed_candidates")) is not int
             or payload["unconfirmed_candidates"] != 0):
@@ -703,7 +703,9 @@ def reference_completion_qualification(payload, negative, verdict):
              if part.strip()]
     expected_codes = [binding_code, code] if unproven_binding else [code]
     expected_reason = (
-        binding_code + ": prior local binding is not proven; "
+        binding_code
+        + ": prior-local binding evidence could not be validated for the checked scope, "
+        + "so complete dependency or call-shape knowledge is unproven; "
         + code + ": non-call completion is unmeasured"
         if unproven_binding
         else code + ": non-call completion is unmeasured"
@@ -1554,7 +1556,8 @@ def self_test():
     unproven_binding["_kin"]["verdict"]["limiting_factor"] = (
         "local_binding_unproven; reference_completion_unmeasured")
     unproven_binding["negative"]["trust_reason"] = (
-        "local_binding_unproven: prior local binding is not proven; "
+        "local_binding_unproven: prior-local binding evidence could not be validated for the checked scope, "
+        "so complete dependency or call-shape knowledge is unproven; "
         "reference_completion_unmeasured: non-call completion is unmeasured")
     unproven_binding["negative"]["advice"] = (
         "local_binding_unproven, reference_completion_unmeasured")
@@ -1597,6 +1600,13 @@ def self_test():
         args = list(copy.deepcopy(admitted_reference()))
         mutate(args[side] if side < 3 else args)
         return grade_admitted_reference(*args)
+
+    expect("an admitted use also enriched by the language server passes",
+           admitted(lambda p: p["references"][0].update(sites_partial_reason="language_server_edge")),
+           PASS)
+    expect("an admitted use with incomplete call evidence fails",
+           admitted(lambda p: p["references"][0].update(sites_partial_reason="incomplete_call_evidence")),
+           FAIL)
 
     for label, side, mutate in (
             ("a focal in another module", 0,

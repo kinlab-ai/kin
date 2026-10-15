@@ -677,11 +677,45 @@ fn bounded(
     rewritten
 }
 
-/// Whether what is held for `record` may be written now: its session has
-/// ended, or it has been quiet for [`QUIET_BEFORE_WRITE`].
+/// Whether any agent session on `state` is currently at work or has been
+/// heard from inside [`QUIET_BEFORE_WRITE`].
+pub(crate) fn any_session_at_work(state: &DaemonState) -> bool {
+    let coordinator = &state.coordinator;
+    let now = Timestamp::now();
+    for session in coordinator.list_sessions().unwrap_or_default() {
+        if session.vendor == crate::agent_activity::DAEMON_OWN_VENDOR {
+            continue;
+        }
+        if coordinator.active_call_count(&session.session_id) > 0 {
+            return true;
+        }
+        let mut last = session.started_at.clone();
+        if session.last_heartbeat > last {
+            last = session.last_heartbeat;
+        }
+        if let Some(at) = coordinator.activity().last_call_at(&session.session_id) {
+            if at > last {
+                last = at;
+            }
+        }
+        if now
+            .0
+            .signed_duration_since(last.0)
+            .to_std()
+            .map_or(true, |idle| idle < QUIET_BEFORE_WRITE)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether what is held for `record` may be written now: it has been quiet
+/// for [`QUIET_BEFORE_WRITE`], and its session has ended or been quiet for
+/// [`QUIET_BEFORE_WRITE`].
 fn is_quiet(state: &DaemonState, record: &HeldRecord) -> bool {
     if record.touched.elapsed() < QUIET_BEFORE_WRITE {
-        return record.record.ended_at.is_some();
+        return false;
     }
     let Ok(session) = uuid::Uuid::parse_str(record.record.session.trim()) else {
         return true;
@@ -717,11 +751,23 @@ pub(crate) async fn settle(state: &Arc<DaemonState>, all: bool) -> usize {
     if !ledger.holds_unwritten() {
         return 0;
     }
+    if !all && any_session_at_work(state) {
+        return 0;
+    }
     let ready_now = {
         let held = lock(&ledger.held);
-        held.records
-            .values()
-            .any(|record| all || is_quiet(state, record))
+        if !all
+            && held
+                .records
+                .values()
+                .any(|record| record.touched.elapsed() < QUIET_BEFORE_WRITE)
+        {
+            false
+        } else {
+            held.records
+                .values()
+                .any(|record| all || is_quiet(state, record))
+        }
     };
     if !ready_now {
         return 0;
@@ -731,9 +777,20 @@ pub(crate) async fn settle(state: &Arc<DaemonState>, all: bool) -> usize {
         // Not serving writes now. What is held stays held for the next look.
         return 0;
     }
+    if !all && any_session_at_work(state) {
+        return 0;
+    }
     let _mutation = state.begin_graph_authority_mutation();
     let (batch, records, held_ids) = {
         let held = lock(&ledger.held);
+        if !all
+            && held
+                .records
+                .values()
+                .any(|record| record.touched.elapsed() < QUIET_BEFORE_WRITE)
+        {
+            return 0;
+        }
         let batch: Vec<(ActorId, u64)> = held
             .records
             .iter()
@@ -1348,6 +1405,39 @@ mod tests {
         assert_eq!(settle(&state, false).await, 0, "written just now: held");
         assert!(state.agent_authorship.holds_unwritten());
         tokio::time::sleep(QUIET_BEFORE_WRITE + Duration::from_millis(50)).await;
+        assert_eq!(settle(&state, false).await, 1);
+        assert!(!state.agent_authorship.holds_unwritten());
+    }
+
+    /// An ended session is held in memory while another agent session is active
+    /// or inside the quiet window, so background settlement does not move the
+    /// repository generation under a concurrent reader.
+    #[tokio::test]
+    async fn an_ended_session_waits_while_another_session_is_at_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = daemon(dir.path());
+        let first = uuid::Uuid::new_v4().to_string();
+        state.agent_authorship.hold_ended(ended(&first, 2, 1));
+        assert_eq!(settle(&state, false).await, 0, "ended just now: held");
+
+        tokio::time::sleep(QUIET_BEFORE_WRITE + Duration::from_millis(50)).await;
+        let active = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "claude-code",
+                kin_model::session::SessionTransport::Mcp,
+                None,
+                dir.path().to_path_buf(),
+                kin_model::session::SessionCapabilities::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            settle(&state, false).await,
+            0,
+            "held while another session is active"
+        );
+        state.coordinator.deregister_session(&active).unwrap();
         assert_eq!(settle(&state, false).await, 1);
         assert!(!state.agent_authorship.holds_unwritten());
     }
