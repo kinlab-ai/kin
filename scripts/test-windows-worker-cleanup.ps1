@@ -85,9 +85,9 @@ function Prepare-RealWorker {
     Assert-Control ($LockFile.Name -match '^\.kin-install-authority-[0-9a-f]{64}\.lock$') 'Reported native lock basename mismatch.'
     return [pscustomobject]@{
         Worker = $Worker
-        Directory = [IO.Path]::GetDirectoryName($Worker.worker_executable)
+        Directory = [IO.Path]::GetDirectoryName((Normalize-KinRuntimePath $Worker.worker_executable))
         LockPath = $LockPath
-        HandoffHash = (Get-FileHash -LiteralPath $Worker.handoff_record -Algorithm SHA256).Hash.ToLowerInvariant()
+        HandoffHash = (Get-FileHash -LiteralPath (Normalize-KinRuntimePath $Worker.handoff_record) -Algorithm SHA256).Hash.ToLowerInvariant()
         Result = $null
     }
 }
@@ -116,8 +116,8 @@ function Clean-RealWorker($Fixture) {
     return Invoke-KinWindowsWorkerCleanup $CanonicalCli $Fixture.Worker $Fixture.Result $Fixture.HandoffHash $FixtureHome
 }
 function Assert-Retained($Fixture) {
-    Assert-Control (Test-Path -LiteralPath $Fixture.Worker.worker_executable) 'Worker helper was unexpectedly removed.'
-    Assert-Control (Test-Path -LiteralPath $Fixture.Worker.handoff_record) 'Handoff authority was unexpectedly removed.'
+    Assert-Control (Test-Path -LiteralPath (Normalize-KinRuntimePath $Fixture.Worker.worker_executable)) 'Worker helper was unexpectedly removed.'
+    Assert-Control (Test-Path -LiteralPath (Normalize-KinRuntimePath $Fixture.Worker.handoff_record)) 'Handoff authority was unexpectedly removed.'
 }
 function Assert-Cleaned($Fixture) {
     Assert-Control (Clean-RealWorker $Fixture) 'Actual native cleanup did not remove the consumed handoff.'
@@ -186,7 +186,7 @@ try {
     foreach ($ComponentName in @('worker_executable', 'handoff_record')) {
         Run-Control "equal-bytes-replaced-native-$ComponentName-is-preserved" {
             $Fixture = Consume-RealWorkerOffline (Prepare-RealWorker)
-            $OriginalPath = $Fixture.Worker.$ComponentName
+            $OriginalPath = Normalize-KinRuntimePath $Fixture.Worker.$ComponentName
             $OriginalObject = Join-Path $OutputRoot ('owned-original-' + [Guid]::NewGuid().ToString('N'))
             Move-Item -LiteralPath $OriginalPath -Destination $OriginalObject
             Copy-Item -LiteralPath $OriginalObject -Destination $OriginalPath

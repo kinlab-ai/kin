@@ -265,9 +265,9 @@ function Invoke-KinWindowsProcess(
     [switch]$CaptureOutput
 ) {
     $Parameters = @{
-        FilePath = $Executable
+        FilePath = (Normalize-KinRuntimePath $Executable)
         ArgumentList = @($Arguments | ForEach-Object { ConvertTo-KinWindowsArgument $_ })
-        WorkingDirectory = $WorkingDirectory
+        WorkingDirectory = (Normalize-KinRuntimePath $WorkingDirectory)
         NoNewWindow = $true
         Wait = $true
         PassThru = $true
@@ -313,7 +313,7 @@ function Invoke-KinWindowsWorkerCleanup(
     try {
         if ($null -eq $WorkerResult -or $WorkerResult.ExitCode -isnot [int] -or
             $WorkerResult.ProcessId -isnot [int] -or $WorkerResult.ProcessId -le 0) { return $false }
-        $ClaimPath = Join-Path ([IO.Path]::GetDirectoryName($Worker.worker_executable)) 'claimed'
+        $ClaimPath = Join-Path ([IO.Path]::GetDirectoryName((Normalize-KinRuntimePath $Worker.worker_executable))) 'claimed'
         $ClaimFile = Get-Item -LiteralPath $ClaimPath -ErrorAction Stop
         if ($ClaimFile.PSIsContainer -or
             ($ClaimFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
@@ -403,16 +403,16 @@ if ((Test-Path $ExistingKinExe) -or (Test-Path $ExistingDaemonExe)) {
         Write-Err "Native Windows worker preparation returned an invalid identity. No component was replaced."
         exit 1
     }
-    $WorkerFile = Get-Item -LiteralPath $Worker.worker_executable
-    $RecordFile = Get-Item -LiteralPath $Worker.handoff_record
+    $WorkerFile = Get-Item -LiteralPath (Normalize-KinRuntimePath $Worker.worker_executable)
+    $RecordFile = Get-Item -LiteralPath (Normalize-KinRuntimePath $Worker.handoff_record)
     if ($WorkerFile.PSIsContainer -or $RecordFile.PSIsContainer -or
         ($WorkerFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
         ($RecordFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-        (Get-FileHash -LiteralPath $Worker.worker_executable -Algorithm SHA256).Hash -ne $Worker.worker_sha256) {
+        (Get-FileHash -LiteralPath (Normalize-KinRuntimePath $Worker.worker_executable) -Algorithm SHA256).Hash -ne $Worker.worker_sha256) {
         Write-Err "Prepared Windows worker identity changed. Refusing to launch it."
         exit 1
     }
-    $HandoffHash = (Get-FileHash -LiteralPath $Worker.handoff_record -Algorithm SHA256).Hash.ToLowerInvariant()
+    $HandoffHash = (Get-FileHash -LiteralPath (Normalize-KinRuntimePath $Worker.handoff_record) -Algorithm SHA256).Hash.ToLowerInvariant()
     # Waiting through Start-Process preserves native nonzero exits even when
     # PowerShell's inherited native-error policy turns failures into exceptions.
     $WorkerResult = Invoke-KinWindowsProcess $Worker.worker_executable @(
