@@ -985,6 +985,7 @@ fn fast_forward(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     publish(
         state,
@@ -1299,6 +1300,7 @@ fn three_way(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     let mut execution = publish(
         state,
@@ -1758,6 +1760,7 @@ pub(crate) fn publish_resolved_merge(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction
         .validate()
@@ -3338,6 +3341,7 @@ fn open_conflicted_merge(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction
         .validate()

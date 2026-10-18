@@ -447,6 +447,7 @@ pub(crate) fn commit_exact_transaction(
         arguments,
         coordination,
         CommitSurface::Semantic,
+        None,
     ) {
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error),
@@ -469,12 +470,17 @@ pub(crate) fn commit_bound_transaction(
     if let Err(error) = crate::mcp_mutate::validate_bound_commit(state, binding, transaction_id) {
         return kin_mcp::ToolCallResult::error(error);
     }
+    let lease_context = match crate::mcp_mutate::entity_edit_lease_context(binding) {
+        Ok(context) => context,
+        Err(error) => return kin_mcp::ToolCallResult::error(error),
+    };
     match commit_exact_transaction_inner(
         state,
         sessions,
         arguments,
         coordination,
         CommitSurface::Semantic,
+        lease_context.as_ref(),
     ) {
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error),
@@ -529,6 +535,7 @@ fn commit_exact_transaction_inner(
     arguments: &HashMap<String, serde_json::Value>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
     surface: CommitSurface,
+    lease_context: Option<&kin_model::entity_lease::EntityEditLeaseContext>,
 ) -> Result<kin_mcp::ToolCallResult, String> {
     #[cfg(test)]
     {
@@ -753,7 +760,7 @@ fn commit_exact_transaction_inner(
         ));
     }
     let requested_message = requested_commit_message(arguments);
-    let plan = match timed_commit_phase("plan_transaction", || {
+    let mut plan = match timed_commit_phase("plan_transaction", || {
         plan_exact_transaction(
             state,
             &authority_context,
@@ -775,6 +782,19 @@ fn commit_exact_transaction_inner(
             ))
         }
     };
+
+    if let Some(context) = lease_context {
+        if uuid::Uuid::parse_str(&transaction.session_id)
+            .ok()
+            .map(kin_model::SessionId)
+            != Some(context.session_id)
+        {
+            return Err(
+                "entity lease proof owner differs from the immutable transaction session".into(),
+            );
+        }
+        plan.native.entity_edit_lease_context = Some(context.clone());
+    }
 
     // Publication fence: from this point until receipt recovery or an explicit
     // reset, the staged operation set is immutable and durable.
@@ -4845,6 +4865,7 @@ pub(crate) mod tests {
             arguments,
             coordination,
             CommitSurface::Conversion,
+            None,
         ) {
             Ok(result) => result,
             Err(error) => kin_mcp::ToolCallResult::error(error),

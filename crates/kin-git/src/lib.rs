@@ -59,7 +59,8 @@ pub mod semantic_import;
 pub mod test_support;
 
 pub use admission_blockers::{
-    check_git_admission_blockers, collect_git_admission_blockers, GitAdmissionReport,
+    check_git_admission_blockers, check_git_admission_blockers_scoped,
+    collect_git_admission_blockers, GitAdmissionReport,
 };
 pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
 pub use authority::build_git_external_authority;

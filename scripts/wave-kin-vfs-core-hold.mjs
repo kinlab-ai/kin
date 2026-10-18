@@ -303,10 +303,15 @@ export async function main({
     });
     pinnedVersion = pinnedCoreVersion(pinnedLock);
   }
-  const registryLatest = await fetchRegistryLatest(VFS_CORE, {
-    registryUrl: env.KIN_REGISTRY_URL || REGISTRY_URL,
-    fetchImpl,
-  });
+  // An uncoupled decision depends only on pin discovery. The normal updater
+  // still resolves published versions and records a registry-unavailable skip.
+  // Do not turn that supported skip into a failed, unnecessary preflight.
+  const registryLatest = pinnedCommit
+    ? await fetchRegistryLatest(VFS_CORE, {
+        registryUrl: env.KIN_REGISTRY_URL || REGISTRY_URL,
+        fetchImpl,
+      })
+    : null;
   const verdict = decide({ registryLatest, pinnedVersion, pinnedCommit });
 
   const emit =

@@ -1309,11 +1309,13 @@ impl StorageBackend for GcsBackend {
         if snapshot
             .repository_authority
             .as_ref()
-            .is_some_and(|authority| !authority.owed_derivations.is_empty())
+            .is_some_and(|authority| {
+                !authority.owed_derivations.is_empty() || authority.carries_entity_edit_leases()
+            })
         {
             return Err(KinDbError::StorageError(format!(
                 "refusing GCS full-snapshot commit for repo {repo_id}: its repository authority \
-                 carries receiver-local owed derivation work, which hosted storage does not hold"
+                 carries receiver-local coordination or owed derivation work, which hosted storage does not hold"
             )));
         }
         let deltas = self.list_delta_objects(repo_id)?;
@@ -2610,6 +2612,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         transaction
@@ -3021,6 +3024,7 @@ pub(crate) mod tests {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             };
             drop(lease);
             transaction

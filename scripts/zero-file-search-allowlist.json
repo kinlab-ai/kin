@@ -2567,7 +2567,7 @@
     },
     {
       "file": "crates/kin-db/src/storage/repository.rs",
-      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe. Review 2026-09-27: carrying_workspace_base reads the exact admitted predecessor through `let metadata = current.metadata();`; this typed authority accessor supplies the held change and tree-hash binding and performs no filesystem query. Review 2026-10-13: frozen-frame and graph-cache integration adds typed authority reads in inherit_workspace_graph, inherited_workspace_graph, operation_identities, lineage_identities and qualify_binding_history_decision_with. The latter now passes next.metadata() to validate_metadata_with together with cached operation identities, so remove the obsolete validate_metadata expression. The seven remaining multiline or next metadata sites belong to workspace_graph_snapshot, inherit_workspace_graph, candidate_frame, workspace_native_admission_snapshot, commit_rederived_repository_transaction and qualify_binding_history_decision_with. The five self.metadata() sites bind or materialize workspace graphs and hash or inspect their operation lineage. All receivers are RepositoryAuthorityState values; none reads filesystem metadata. Counts were verified over the checker's exact scannable lines after function masks and longest pin matches.",
+      "reason": "Pinned to the functions that hold its filesystem primitives rather than exempted whole, so every other function in the file, including any added later, stays graded. It moved into crates/ from its own repository on 2026-09-11 and is graded by this checker for the first time. The pinned functions handle the repository store's on-disk layout, publication and authority records. Every query this file answers (ref and tree resolution, name lookup, the locate cache) stays graded, which is where the thesis forbids a raw-file fallback. Review 2026-09-20: The stale metadata pins are now individually attributed: three multiline typed authority accessors select the exact workspace/Native parent; two self.metadata calls bind/materialize a workspace; exact current/next accesses check schema/history; exact lease expressions resolve parent and frozen overlay. They read RepositoryAuthorityState, not filesystem metadata. Counts are measured after existing function scopes and longest exact matches, so no occurrence budget comes from tests or masked bodies. Review 2026-09-23: the re-derivation commit adds one comparison of the current and next authority schema versions, so a successor that raises the schema is persisted whole rather than offered to the frame encoder; both reads are typed RepositoryAuthorityState metadata. Review 2026-09-24: the re-derivation commit's payment adds one typed read, `next.metadata()`, handed to `rederived_by` so a workspace is paid only where the successor records the verifier's witness naming this commit's operation; it is RepositoryAuthorityState metadata, not a filesystem probe. Review 2026-09-27: carrying_workspace_base reads the exact admitted predecessor through `let metadata = current.metadata();`; this typed authority accessor supplies the held change and tree-hash binding and performs no filesystem query. Review 2026-10-13: frozen-frame and graph-cache integration adds typed authority reads in inherit_workspace_graph, inherited_workspace_graph, operation_identities, lineage_identities and qualify_binding_history_decision_with. The latter now passes next.metadata() to validate_metadata_with together with cached operation identities, so remove the obsolete validate_metadata expression. The seven remaining multiline or next metadata sites belong to workspace_graph_snapshot, inherit_workspace_graph, candidate_frame, workspace_native_admission_snapshot, commit_rederived_repository_transaction and qualify_binding_history_decision_with. The five self.metadata() sites bind or materialize workspace graphs and hash or inspect their operation lineage. All receivers are RepositoryAuthorityState values; none reads filesystem metadata. Counts were verified over the checker's exact scannable lines after function masks and longest pin matches. Review 2026-10-18: receiver-local entity leases add four exact current/next ledger comparisons, one exact source-authority repository identity check, one multiline source-workspace lookup and a second current metadata binding in the new shared commit decision. All receivers are typed repository authority values. The old prepare_repository_commit_decision_with_history wrapper no longer owns any IO and loses its function exemption; the new shared decision remains scanned. New ledger comparisons are separately pinned so the remaining metadata count grows by only the one multiline lookup.",
       "owner": "kin-db",
       "expiration": "2027-03-22",
       "allow_fn": [
@@ -2575,7 +2575,6 @@
         "get_workspace_state",
         "list_repository_refs",
         "materialize_workspace_base_graph_section",
-        "prepare_repository_commit_decision_with_history",
         "resolve_external_alias",
         "resolve_ref_target",
         "resolve_target_change_id",
@@ -2587,10 +2586,13 @@
       ],
       "allow_match": [
         "&self.metadata().roots",
-        "let metadata = current.metadata();",
+        {
+          "expr": "let metadata = current.metadata();",
+          "count": 2
+        },
         {
           "expr": ".metadata()",
-          "count": 7
+          "count": 8
         },
         {
           "expr": "current.metadata().schema_version",
@@ -2603,7 +2605,16 @@
           "expr": "self.metadata()",
           "count": 5
         },
-        "self.metadata().roots.generation"
+        "self.metadata().roots.generation",
+        {
+          "expr": "current.metadata().entity_edit_leases",
+          "count": 2
+        },
+        {
+          "expr": "next.metadata().entity_edit_leases",
+          "count": 2
+        },
+        "state.metadata().repository_id"
       ]
     },
     {
@@ -3388,6 +3399,28 @@
           "expr": "parent.canonicalize().map(|parent| parent.join(name))",
           "count": 1
         }
+      ]
+    },
+    {
+      "file": "crates/kin-db/src/storage/repository/entity_edit_leases.rs",
+      "reason": "Receiver-local lease publication checks read the predecessor workspace and its graph-owned source bindings through two multiline RepositoryAuthorityState metadata accessors. These are persisted graph metadata, not filesystem metadata. Bounded source bytes are resolved only through the authority tree and content-addressed backend. Only the two exact accessor occurrences are excused; the complete helper remains scanned and native filesystem reads remain forbidden.",
+      "owner": "kin-db",
+      "expiration": "2027-09-19",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/mcp_entity_leases.rs",
+      "reason": "The two exact held.metadata accessors inspect the current persisted entity-lease ledger and operation log under the bound repository authority read lease. No filesystem metadata or source search is performed. Only those accessor expressions are pinned; every control, replay and source-hash path remains scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2027-10-10",
+      "allow_match": [
+        "held.metadata().entity_edit_leases",
+        "held.metadata().operation_log"
       ]
     }
   ]

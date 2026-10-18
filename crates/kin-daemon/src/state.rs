@@ -13789,6 +13789,51 @@ impl DaemonState {
         Ok(())
     }
 
+    /// A lease control records no source or derived semantics. Preserve pending
+    /// LSP evidence rather than treating it as paid by this coordination-only op.
+    pub(crate) fn record_entity_lease_control_commit(
+        &self,
+        receipt: &RepositoryCommitReceipt,
+    ) -> Result<()> {
+        receipt.validate().map_err(DaemonError::from)?;
+        let operation = &receipt.operation;
+        let control = operation.entity_edit_lease.as_ref().is_some_and(|event| {
+            event.context.mutation.is_some() && event.context.claims.is_empty()
+        });
+        if self.storage_backend.is_some()
+            || !control
+            || !receipt
+                .roots_before
+                .has_same_replicated_truth(&receipt.roots_after)
+            || operation.workspace_mutation.is_some()
+            || operation.local_overlay_delta.is_some()
+            || operation.merge_transaction_delta.is_some()
+            || operation.git_authority_delta.is_some()
+            || !operation.ref_mutations.is_empty()
+            || operation.default_ref_mutation.is_some()
+        {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "not a local coordination-only entity lease receipt".into(),
+            )));
+        }
+        self.snapshot_generation
+            .compare_exchange(
+                receipt.roots_before.generation,
+                receipt.generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "entity lease finalization has a different predecessor cursor".into(),
+                ))
+            })?;
+        self.graph.invalidate_binding_history();
+        self.post_commit_finalization_pending
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Write derived semantics into the live query graph the way the LSP
     /// enrichment worker does: additive upserts under nothing but the graph
     /// authority epoch, holding neither the coordination gate nor the
@@ -15581,6 +15626,7 @@ impl DaemonState {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let receipt = authority
             .commit_repository_transaction_with_binding_history(
@@ -17477,6 +17523,7 @@ mod tests {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             }
         };
         transaction
@@ -26821,6 +26868,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let receipt = authority
             .commit_repository_transaction(transaction)
@@ -27310,6 +27358,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let receipt = authority
             .commit_repository_transaction(transaction)
@@ -27699,6 +27748,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let receipt = authority
             .commit_repository_transaction(transaction)

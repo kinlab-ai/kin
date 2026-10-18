@@ -16,8 +16,9 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    capture_lossless_git_repository_scoped, check_git_admission_blockers, plan_semantic_git_import,
-    preflight_git_migration, reprove_git_migration, reprove_git_migration_after_publication,
+    capture_lossless_git_repository_scoped, check_git_admission_blockers,
+    check_git_admission_blockers_scoped, plan_semantic_git_import, preflight_git_migration,
+    reprove_git_migration, reprove_git_migration_after_publication,
     seal_all_content_observation_observed, AdmittedContentClosure, CaptureScope,
     GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
     ProvedImportClosure, SealedContentObservation, SealedContentSource, SemanticGitImportPlan,
@@ -976,7 +977,7 @@ fn init_current_commit_from_git_with_hooks(
     {
         let _span = info_span!("kin.init.check_admission_blockers").entered();
         wait_out_git_gc(&source_root);
-        check_git_admission_blockers(&source_root)
+        check_git_admission_blockers_scoped(&source_root, CaptureScope::CheckedOutCommit)
             .map_err(|error| git_boundary_error("admit this Git repository", error))?;
     }
 
@@ -1273,6 +1274,13 @@ fn checked_out_commit_is_entire_repository(source: &Path) -> bool {
     let Ok(repo) = gix::open_opts(source, options) else {
         return false;
     };
+    // A sibling can anchor private history even when this checkout's refs
+    // name only its root commit. Keep commit-only attachment scoped instead
+    // of upgrading it to a full migration with unrelated worktree guards.
+    match repo.worktrees() {
+        Ok(worktrees) if worktrees.is_empty() => {}
+        _ => return false,
+    }
     let Ok(commit) = repo.head_commit() else {
         return false;
     };
@@ -1755,6 +1763,7 @@ fn snapshot_bootstrap_transaction(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        entity_edit_lease: None,
     };
     Ok((transaction, snapshot_id, commit_oid))
 }
@@ -2505,6 +2514,25 @@ pub(crate) mod tests {
     fn staging_parent(source: &Path) -> std::path::PathBuf {
         let store = crate::layout::store_root_for(source);
         crate::layout::store_staging_parent(source, &store).unwrap()
+    }
+
+    #[test]
+    fn a_root_commit_with_a_linked_worktree_keeps_commit_only_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.py"), b"def a():\n    return 1\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "root"]);
+        assert!(checked_out_commit_is_entire_repository(&source));
+        let sibling = root.path().join("sibling");
+        git(
+            &source,
+            ["worktree", "add", "--detach", sibling.to_str().unwrap()],
+        );
+        git(&sibling, ["commit", "--allow-empty", "-m", "private"]);
+        assert!(!checked_out_commit_is_entire_repository(&source));
     }
 
     #[test]

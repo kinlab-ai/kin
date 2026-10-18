@@ -727,6 +727,14 @@ fn sample(field: &Field) -> Value {
             Ty::StringMap => json!({"KEY": "value"}),
             Ty::Enum(spec) => json!(spec.values[0]),
             Ty::Nested(_) if field.name == "capabilities" => json!({"can_write": true}),
+            Ty::Nested(_) if field.name == "entity_edit_lease_claims" => json!({
+                "authority_id": "00000000-0000-0000-0000-000000000001",
+                "resource": {
+                    "workspace_id": "00000000-0000-0000-0000-000000000002",
+                    "entity_id": "00000000-0000-0000-0000-000000000003"
+                },
+                "fence": "1"
+            }),
             Ty::Nested(_) => patch_operation(),
             Ty::Any => json!({"any": "value"}),
             Ty::Array(items) => {

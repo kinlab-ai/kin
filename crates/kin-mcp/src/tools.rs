@@ -1150,6 +1150,27 @@ fn registered_tools() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "kin_entity_leases".into(),
+                description: "Read current receiver-local edit ownership and exact body source hashes for one to sixteen parsed source entities in the daemon-bound workspace. A lease coordinates Kin-managed body edits and deletions; it grants no permission and does not lock native files or provider writes. Requires a live authenticated connection session.".into(),
+                annotations: read_only("Read entity edit leases"),
+                input_schema: serde_json::json!({"type":"object","additionalProperties":false,"required":["entity_ids"],
+                    "properties":{"entity_ids":{"type":"array","minItems":1,"maxItems":16,"uniqueItems":true,"items":{"type":"string","format":"uuid"}}}}),
+            },
+            ToolDefinition {
+                name: "kin_entity_lease".into(),
+                description: "Explicitly acquire a ten-minute parsed entity edit lease, renew it or release it. The daemon binds its own repository/workspace and authenticated session; callers cannot choose an owner, clock or lifetime. Acquire needs the exact entity source hash. Renew/release need the authority UUID and decimal fence previously issued. Preserve request_id and mutation across retries: a replay returns the original outcome and expiry. Edits still require ordinary source CAS and permissions; pass the issued claim through keyed kin_mutate. Native files and provider writes are outside coverage.".into(),
+                annotations: mutates_idempotent("Control entity edit lease"),
+                input_schema: serde_json::json!({"type":"object","additionalProperties":false,"required":["request_id","mutation"],
+                    "properties":{"request_id":{"type":"string","minLength":1,"maxLength":256},"mutation":{"oneOf":[
+                        {"type":"object","additionalProperties":false,"required":["operation","entity_id","expected_source_hash"],"properties":{
+                            "operation":{"const":"acquire"},"entity_id":{"type":"string","format":"uuid"},"expected_source_hash":{"type":"string","pattern":"^[a-fA-F0-9]{64}$","description":"Exact body source_hash from kin_entity_leases. Requires current parsed span provenance and a source unit at most 16 MiB."}}},
+                        {"type":"object","additionalProperties":false,"required":["operation","entity_id","authority_id","fence"],"properties":{
+                            "operation":{"const":"renew"},"entity_id":{"type":"string","format":"uuid"},"authority_id":{"type":"string","format":"uuid"},"fence":{"type":"string","pattern":"^[1-9][0-9]{0,19}$"}}},
+                        {"type":"object","additionalProperties":false,"required":["operation","entity_id","authority_id","fence"],"properties":{
+                            "operation":{"const":"release"},"entity_id":{"type":"string","format":"uuid"},"authority_id":{"type":"string","format":"uuid"},"fence":{"type":"string","pattern":"^[1-9][0-9]{0,19}$"}}}
+                    ]}}}),
+            },
+            ToolDefinition {
                 name: "kin_register_intent".into(),
                 description: crate::handlers::sessions::REGISTER_INTENT_DESC.into(),
                 annotations: mutates("Register work intent"),
@@ -1287,11 +1308,16 @@ fn registered_tools() -> ToolsListResult {
                             "type": "string",
                             "description": "Scope metadata for unkeyed calls; keyed v1 accepts only repository (the daemon-bound workspace)"
                         },
+                        "entity_edit_lease_claims": {
+                            "type":"array","minItems":1,"maxItems":16,
+                            "description":"Optional issued claims for keyed authenticated mutations. Owner is the connection session. Claims never bypass source CAS or permissions.",
+                            "items":crate::requests::entity_edit_lease_claim_schema(crate::request_schema::Profile::Full)
+                        },
                         "request_id": {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 256,
-                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. A keyed call must carry session_id, takes scope repository only, and accepts no field but operations, session_id, scope, request_id and summary. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
+                            "description": "Optional opaque nonblank UTF-8 key (at most 256 bytes). A supporting authenticated daemon durably binds the complete request in this repository and session. Identical retries return the original kin.mutate.receipt.v1 receipt and original authority roots; different arguments refuse. Preserve session_id across retries and MCP restart. A keyed call must carry session_id, takes scope repository only, and accepts operations, session_id, scope, request_id, summary and optional entity_edit_lease_claims. Offline and older daemons refuse keyed calls. Without this key calls remain non-idempotent."
                         },
                         "summary": {
                             "type": "string",
@@ -2637,6 +2663,7 @@ mod tests {
         "kin_mutate",
         "kin_register_intent",
         "kin_release_intent",
+        "kin_entity_lease",
         "kin_review_assign",
         "kin_review_create",
         "kin_review_decide",
@@ -3018,16 +3045,11 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
-        // + 6 durable entity draft tools + 1 lexical_lookup + 1 kin_tool_call
-        // + 1 kin_init + 1 kin_session_exec = 75, + 13 verbs and the retired
-        // `session` = 89. The 23 names the verbs replaced, `session` among
-        // them, stay registered as hidden aliases, so `full` serves 66.
-        // `ask`, the front door that routes a plain question to these verbs,
-        // makes 85 registered and 65 served on `full`.
-        assert_eq!(list.tools.len(), 85);
-        assert_eq!(surface_definitions().tools.len(), 65);
+        // The existing 85 registrations include 20 compatibility aliases.
+        // Two opt-in entity lease tools extend full discovery, while the
+        // ordinary agent belt keeps its existing tool list.
+        assert_eq!(list.tools.len(), 87);
+        assert_eq!(surface_definitions().tools.len(), 67);
     }
 
     /// The reference lists each category's members on a line opening with this

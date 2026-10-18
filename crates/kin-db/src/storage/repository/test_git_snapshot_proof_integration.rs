@@ -54,6 +54,7 @@ fn transaction_shell(manager: &Manager, operation: u128) -> RepositoryTransactio
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     }
 }
 

@@ -577,6 +577,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect.",
     },
     ClauseCode {
+        code: "unparsed_source_requires_semantic_coverage",
+        meaning: "The requested artifact has no parsed source entity. Source bodies and edit bases are withheld until semantic language coverage exists; read a parsed entity by its id.",
+    },
+    ClauseCode {
         code: "value_calls_unmeasured",
         meaning: "Unsettled call sites that never spell the focal's call name could reach it only if it is held as a value or looked up by a computed name, and the escape census could not rule that out, so the answer counts them once with the census reason.",
     },

@@ -95,7 +95,16 @@ pub fn hash_zip(zip_path: &Path) -> Result<String, String> {
             }
             hasher.update(&buffer[..read]);
         }
-        files.push((entry.name().to_string(), hasher.finalize().into()));
+        let name = entry
+            .name()
+            .map_err(|error| {
+                format!(
+                    "{} has an invalid zip entry name: {error}",
+                    zip_path.display()
+                )
+            })?
+            .into_owned();
+        files.push((name, hasher.finalize().into()));
     }
     hash1(&mut files)
 }

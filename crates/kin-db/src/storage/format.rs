@@ -1033,7 +1033,7 @@ impl GraphSnapshot {
     /// the language's current validation state before admitting its proofs.
     /// v29/v30 append Git snapshot proofs inside repository authority, without
     /// changing the top-level record layout.
-    pub const CURRENT_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION;
+    pub const CURRENT_VERSION: u32 = Self::ENTITY_EDIT_LEASES_SECTION_VERSION;
 
     pub const LEGACY_SECTION_TRIMMED_VERSION: u32 = 16;
     pub const BINDING_HISTORY_VERSION: u32 = 17;
@@ -1078,6 +1078,9 @@ impl GraphSnapshot {
 
     /// Git snapshot proofs and a materialized section.
     pub const GIT_SNAPSHOT_PROOFS_SECTION_VERSION: u32 = 30;
+    /// Durable receiver-local entity edit fencing, without/with a section.
+    pub const ENTITY_EDIT_LEASES_VERSION: u32 = 31;
+    pub const ENTITY_EDIT_LEASES_SECTION_VERSION: u32 = 32;
 
     /// A section, and receipts that still embed their operation records.
     pub const SECTION_VERSION: u32 = 14;
@@ -1108,6 +1111,17 @@ impl GraphSnapshot {
     /// ledgers and include records held in a materialized section. Git snapshot
     /// proofs outrank all earlier capabilities and preserve that section axis.
     pub fn wire_version(&self) -> u32 {
+        if self
+            .repository_authority
+            .as_ref()
+            .is_some_and(|authority| authority.requires_entity_edit_lease_wire())
+        {
+            return if self.materialized_graph.is_some() {
+                Self::ENTITY_EDIT_LEASES_SECTION_VERSION
+            } else {
+                Self::ENTITY_EDIT_LEASES_VERSION
+            };
+        }
         if self
             .repository_authority
             .as_ref()
@@ -1301,6 +1315,7 @@ impl GraphSnapshot {
                 | Self::CALL_SITE_LEDGERS_SECTION_VERSION
                 | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
                 | Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION
+                | Self::ENTITY_EDIT_LEASES_SECTION_VERSION
         )
     }
 
@@ -1316,7 +1331,9 @@ impl GraphSnapshot {
                 | Self::CONTEXT_VALIDATIONS_VERSION
                 | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
                 | Self::GIT_SNAPSHOT_PROOFS_VERSION
+                | Self::ENTITY_EDIT_LEASES_VERSION
                 | Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION
+                | Self::ENTITY_EDIT_LEASES_SECTION_VERSION
         )
     }
 
@@ -1356,7 +1373,7 @@ impl GraphSnapshot {
     /// snapshot proofs inside authority and retain the v23/v24 top-level layout.
     /// One decoder reads
     /// every rung and no second copy of the field list exists to drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION;
+    pub const MAX_SUPPORTED_VERSION: u32 = Self::ENTITY_EDIT_LEASES_SECTION_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -1611,7 +1628,7 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; Git snapshot proofs require v{}/v{} without/with a section; \
+                 serialize as v{}; entity edit leases require v31/v32 without/with a section; Git snapshot proofs require v{}/v{} without/with a section; \
                  context validations require v{}/v{} without/with a section; \
                  call-site ledgers require v{}/v{} without/with a section; \
                  other resolution records require v{}/v{} without/with a section; \
@@ -5427,8 +5444,10 @@ mod tests {
                 GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
                 GraphSnapshot::GIT_SNAPSHOT_PROOFS_VERSION,
                 GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
+                GraphSnapshot::ENTITY_EDIT_LEASES_VERSION,
+                GraphSnapshot::ENTITY_EDIT_LEASES_SECTION_VERSION,
             ],
-            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
             "the ladder is contiguous, which is what lets one decoder read every \
              rung with defaulted trailing fields"
         );
@@ -5458,6 +5477,8 @@ mod tests {
             (GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION, true),
             (GraphSnapshot::GIT_SNAPSHOT_PROOFS_VERSION, false),
             (GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION, true),
+            (GraphSnapshot::ENTITY_EDIT_LEASES_VERSION, false),
+            (GraphSnapshot::ENTITY_EDIT_LEASES_SECTION_VERSION, true),
         ] {
             assert_eq!(
                 GraphSnapshot::version_carries_a_section(version),
@@ -5509,6 +5530,14 @@ mod tests {
                 GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
                 GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
             ),
+            (
+                GraphSnapshot::ENTITY_EDIT_LEASES_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            ),
+            (
+                GraphSnapshot::ENTITY_EDIT_LEASES_SECTION_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+            ),
         ] {
             assert!(GraphSnapshot::version_carries_resolution_records(ledgers));
             assert_eq!(
@@ -5524,8 +5553,8 @@ mod tests {
         }
         assert_eq!(
             GraphSnapshot::MAX_SUPPORTED_VERSION,
-            GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
-            "a reader of the Git snapshot proof rungs reads every earlier rung"
+            GraphSnapshot::ENTITY_EDIT_LEASES_SECTION_VERSION,
+            "a reader of the entity edit lease rungs reads every earlier rung"
         );
     }
 
@@ -5768,6 +5797,81 @@ mod tests {
     /// Codec-only evidence: storage's raw-body and tree admission tests build
     /// real Git closures. Here the inert proof isolates positional fields and
     /// version selection from admission so both section shapes are exercised.
+    #[test]
+    fn entity_edit_leases_round_trip_at_both_snapshot_rungs_after_release() {
+        for section in [false, true] {
+            let mut snapshot = if section {
+                a_v14_snapshot("lease section")
+            } else {
+                GraphSnapshot::empty()
+            };
+            snapshot.repository_authority = Some(
+                PersistedRepositoryAuthority::empty(
+                    RepositoryId::new("lease-codec").unwrap(),
+                    &snapshot,
+                )
+                .unwrap(),
+            );
+            snapshot.version = snapshot.wire_version();
+            let legacy = encode_snapshot_without_admission_validation(&snapshot);
+            let ledger = kin_model::entity_lease::EntityEditLeaseLedger {
+                authority_id: Some(uuid::Uuid::from_u128(88)),
+                last_fence: 1,
+                entries: vec![],
+            };
+            snapshot
+                .repository_authority
+                .as_mut()
+                .unwrap()
+                .entity_edit_leases = ledger.clone();
+            snapshot.version = snapshot.wire_version();
+            let expected = if section { 32 } else { 31 };
+            assert_eq!(snapshot.version, expected);
+            let bytes = encode_snapshot_without_admission_validation(&snapshot);
+            assert_eq!(ledger_test_header(&bytes), expected);
+            assert!(GraphSnapshot::check_readable_version(expected, 30).is_err());
+            let decoded = GraphSnapshot::decode_pre_validated(&bytes).unwrap();
+            assert_eq!(
+                decoded
+                    .repository_authority
+                    .as_ref()
+                    .unwrap()
+                    .entity_edit_leases,
+                ledger
+            );
+            assert_eq!(decoded.materialized_graph.is_some(), section);
+            assert_eq!(
+                encode_snapshot_without_admission_validation(&decoded),
+                bytes
+            );
+            assert_eq!(
+                AuthorityEnvelopeSnapshot::from_bytes(&bytes)
+                    .unwrap()
+                    .repository_authority
+                    .unwrap()
+                    .entity_edit_leases,
+                ledger
+            );
+            GraphSnapshot::prove_pre_validated_round_trip(&bytes).unwrap();
+            snapshot.version = if section { 30 } else { 29 };
+            assert!(snapshot
+                .wire_version_checked()
+                .unwrap_err()
+                .to_string()
+                .contains("entity edit leases require v31/v32"));
+            snapshot
+                .repository_authority
+                .as_mut()
+                .unwrap()
+                .entity_edit_leases = Default::default();
+            snapshot.version = snapshot.wire_version();
+            assert_eq!(
+                encode_snapshot_without_admission_validation(&snapshot),
+                legacy
+            );
+        }
+    }
+
     #[test]
     fn git_snapshot_proofs_round_trip_at_both_snapshot_rungs() {
         for section in [false, true] {

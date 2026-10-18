@@ -101,6 +101,53 @@ fn initialized_native_first_publication_reopens_from_durable_files() {
     assert!(lease.snapshot().entities.is_empty());
 }
 
+#[test]
+fn first_publication_strips_receiver_local_entity_lease_fence_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let id = RepositoryId::new("private-local-fence").unwrap();
+    let initialized = source(&temp.path().join("initialized"), &id, false);
+    let expected = initialized.read_authority().roots().clone();
+    let mut snapshot = initialized.read_authority().snapshot().clone();
+    // A released lease still retains its receiver identity and watermark. It
+    // must require the new reader locally, but never claim the destination.
+    let ledger = kin_model::entity_lease::EntityEditLeaseLedger {
+        authority_id: Some(uuid::Uuid::new_v4()),
+        last_fence: 17,
+        entries: Vec::new(),
+    };
+    snapshot
+        .repository_authority
+        .as_mut()
+        .unwrap()
+        .entity_edit_leases = ledger.clone();
+    snapshot.version = snapshot.wire_version();
+    assert_eq!(snapshot.version, 31);
+    let source_backend = local_backend(&temp.path().join("source"));
+    source_backend
+        .save_snapshot(id.as_str(), &snapshot.to_bytes().unwrap(), 0)
+        .unwrap();
+    let source = Arc::new(RepositoryAuthorityManager::open(id.clone(), source_backend).unwrap());
+    let destination = local_backend(&temp.path().join("destination"));
+    let receipt = publish_first_repository(
+        source.clone(),
+        &id,
+        FirstPublicationMode::Native,
+        destination.clone(),
+    )
+    .unwrap();
+    let received = RepositoryAuthorityManager::open(id, destination).unwrap();
+    assert_eq!(receipt.roots, expected);
+    assert_eq!(received.read_authority().roots(), &expected);
+    assert_eq!(
+        received.read_authority().metadata().entity_edit_leases,
+        kin_model::entity_lease::EntityEditLeaseLedger::default()
+    );
+    assert_eq!(
+        source.read_authority().metadata().entity_edit_leases,
+        ledger
+    );
+}
+
 #[cfg(feature = "gcs")]
 #[tokio::test(flavor = "multi_thread")]
 async fn imported_first_publication_extends_five_to_six_without_changing_old_authority() {
@@ -321,6 +368,7 @@ fn owed_publication(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     (transaction, workspace.workspace_id, path, body_hash)
 }

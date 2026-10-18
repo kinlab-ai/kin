@@ -75,7 +75,7 @@ def prepare(root, label, output, kin):
     # --storage local), so mint the fresh control pair there too instead of
     # in the central stores directory a bare init now defaults to.
     env.update(KIN_HOME=str(home), KIN_EMBED_BACKEND="cpu", KIN_DAEMON_AUTO_EMBED="false",
-               KIN_STORE_LAYOUT="in-tree")
+               KIN_STORE_LAYOUT="in-tree", KIN_RUNTIME_MODE="development")
     command = [str(kin), "init", str(fixture), "--defer-enrich", "--json"]
     result = subprocess.run(command, env=env, capture_output=True, text=True)
     (output / (label + "-init.log")).write_text(result.stdout + result.stderr)

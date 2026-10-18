@@ -1728,7 +1728,7 @@ fn validate_head_base(
 /// future optional authority field must be appended after every existing field
 /// and carry a compatibility round-trip proving older, shorter records still
 /// decode. Inserting an optional field earlier shifts all following values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryOperationRecord {
     pub operation_id: OperationId,
@@ -1759,8 +1759,10 @@ pub struct RepositoryOperationRecord {
     /// so an optional field is only additive at the end: an already-written
     /// record simply runs out of elements and takes the default. Anywhere else
     /// it would shift every field after it and silently mis-decode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub merge_transaction_delta: Option<MergeTransactionDelta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_edit_lease: Option<crate::entity_lease::EntityEditLeaseEvent>,
 }
 
 /// The identity-bearing projection of one [`RepositoryOperationRecord`].
@@ -1780,7 +1782,6 @@ pub struct RepositoryOperationRecord {
 /// and then requires every record field to either move the identity or be one
 /// of the two named exclusions. `tests/persisted_schema.rs` holds the
 /// registration that refuses a new mirror arriving without such a test.
-#[derive(Serialize)]
 struct RepositoryOperationIdentity<'a> {
     operation_id: OperationId,
     repository_id: &'a RepositoryId,
@@ -1792,8 +1793,76 @@ struct RepositoryOperationIdentity<'a> {
     default_ref_mutation: &'a Option<DefaultRefMutation>,
     workspace_mutation: &'a Option<WorkspaceMutation>,
     local_overlay_delta: &'a Option<FrozenLocalOverlayDelta>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     merge_transaction_delta: &'a Option<MergeTransactionDelta>,
+    entity_edit_lease: &'a Option<crate::entity_lease::EntityEditLeaseEvent>,
+}
+
+impl Serialize for RepositoryOperationRecord {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let lease = self.entity_edit_lease.is_some();
+        let merge =
+            self.merge_transaction_delta.is_some() || (!serializer.is_human_readable() && lease);
+        let mut out = serializer.serialize_struct(
+            "RepositoryOperationRecord",
+            12 + usize::from(merge) + usize::from(lease),
+        )?;
+        out.serialize_field("operation_id", &self.operation_id)?;
+        out.serialize_field("repository_id", &self.repository_id)?;
+        out.serialize_field("transaction_hash", &self.transaction_hash)?;
+        out.serialize_field("actor", &self.actor)?;
+        out.serialize_field("committed_at", &self.committed_at)?;
+        out.serialize_field("git_authority_delta", &self.git_authority_delta)?;
+        out.serialize_field("ref_mutations", &self.ref_mutations)?;
+        out.serialize_field("default_ref_mutation", &self.default_ref_mutation)?;
+        out.serialize_field("workspace_mutation", &self.workspace_mutation)?;
+        out.serialize_field("local_overlay_delta", &self.local_overlay_delta)?;
+        out.serialize_field("roots_before", &self.roots_before)?;
+        out.serialize_field("roots_after", &self.roots_after)?;
+        if merge {
+            out.serialize_field("merge_transaction_delta", &self.merge_transaction_delta)?;
+        }
+        if lease {
+            out.serialize_field("entity_edit_lease", &self.entity_edit_lease)?;
+        }
+        out.end()
+    }
+}
+
+impl Serialize for RepositoryOperationIdentity<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let lease = self.entity_edit_lease.is_some();
+        let merge =
+            self.merge_transaction_delta.is_some() || (!serializer.is_human_readable() && lease);
+        let mut out = serializer.serialize_struct(
+            "RepositoryOperationIdentity",
+            10 + usize::from(merge) + usize::from(lease),
+        )?;
+        out.serialize_field("operation_id", &self.operation_id)?;
+        out.serialize_field("repository_id", &self.repository_id)?;
+        out.serialize_field("transaction_hash", &self.transaction_hash)?;
+        out.serialize_field("actor", &self.actor)?;
+        out.serialize_field("committed_at", &self.committed_at)?;
+        out.serialize_field("git_authority_delta", &self.git_authority_delta)?;
+        out.serialize_field("ref_mutations", &self.ref_mutations)?;
+        out.serialize_field("default_ref_mutation", &self.default_ref_mutation)?;
+        out.serialize_field("workspace_mutation", &self.workspace_mutation)?;
+        out.serialize_field("local_overlay_delta", &self.local_overlay_delta)?;
+        if merge {
+            out.serialize_field("merge_transaction_delta", &self.merge_transaction_delta)?;
+        }
+        if lease {
+            out.serialize_field("entity_edit_lease", &self.entity_edit_lease)?;
+        }
+        out.end()
+    }
 }
 
 impl RepositoryOperationRecord {
@@ -1821,6 +1890,9 @@ impl RepositoryOperationRecord {
             return Err(ModelError::InvalidOperation(
                 "repository operation id must not be nil".to_string(),
             ));
+        }
+        if let Some(event) = &self.entity_edit_lease {
+            event.validate().map_err(ModelError::InvalidOperation)?;
         }
         self.roots_before.validate()?;
         self.roots_after.validate()?;
@@ -2001,6 +2073,7 @@ impl RepositoryOperationRecord {
             workspace_mutation: &self.workspace_mutation,
             local_overlay_delta: &self.local_overlay_delta,
             merge_transaction_delta: &self.merge_transaction_delta,
+            entity_edit_lease: &self.entity_edit_lease,
         }
     }
 }
@@ -2082,6 +2155,10 @@ pub struct RepositoryTransaction {
     /// using it; this field grants no authority by its presence alone.
     #[serde(default)]
     pub git_snapshot_proofs: Vec<crate::GitSnapshotProof>,
+    /// Receiver-local coordination control, never repository authorization.
+    /// The authenticated holder is compiled input at publication, not request data.
+    #[serde(default)]
+    pub entity_edit_lease: Option<crate::entity_lease::EntityEditLeaseMutation>,
 }
 
 #[derive(Serialize)]
@@ -2109,6 +2186,8 @@ struct RepositoryTransactionHumanReadable<'a> {
     collaboration_delta: &'a Option<CollaborationDelta>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     git_snapshot_proofs: &'a Vec<crate::GitSnapshotProof>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entity_edit_lease: &'a Option<crate::entity_lease::EntityEditLeaseMutation>,
 }
 
 impl Serialize for RepositoryTransaction {
@@ -2137,6 +2216,7 @@ impl Serialize for RepositoryTransaction {
                 sealed_observation: &self.sealed_observation,
                 collaboration_delta: &self.collaboration_delta,
                 git_snapshot_proofs: &self.git_snapshot_proofs,
+                entity_edit_lease: &self.entity_edit_lease,
             }
             .serialize(serializer);
         }
@@ -2148,7 +2228,8 @@ impl Serialize for RepositoryTransaction {
         // so a present later value never slides into an absent earlier one's
         // position. The chain is what keeps the rule stated once as the tail
         // grows: read it upward from the last field.
-        let has_proof_slot = !self.git_snapshot_proofs.is_empty();
+        let has_lease_slot = self.entity_edit_lease.is_some();
+        let has_proof_slot = !self.git_snapshot_proofs.is_empty() || has_lease_slot;
         let has_collaboration_slot = self.collaboration_delta.is_some() || has_proof_slot;
         let has_sealed_slot = self.sealed_observation.is_some() || has_collaboration_slot;
         let has_merge_slot = self.merge_transaction_delta.is_some() || has_sealed_slot;
@@ -2156,7 +2237,8 @@ impl Serialize for RepositoryTransaction {
             + usize::from(has_merge_slot)
             + usize::from(has_sealed_slot)
             + usize::from(has_collaboration_slot)
-            + usize::from(has_proof_slot);
+            + usize::from(has_proof_slot)
+            + usize::from(has_lease_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&self.schema_version)?;
         sequence.serialize_element(&self.operation_id)?;
@@ -2184,6 +2266,9 @@ impl Serialize for RepositoryTransaction {
         }
         if has_proof_slot {
             sequence.serialize_element(&self.git_snapshot_proofs)?;
+        }
+        if has_lease_slot {
+            sequence.serialize_element(&self.entity_edit_lease)?;
         }
         sequence.end()
     }
@@ -2327,7 +2412,8 @@ impl CanonicalTransaction<'_> {
             + usize::from(source.merge_transaction_delta.is_some())
             + usize::from(source.sealed_observation.is_some())
             + usize::from(source.collaboration_delta.is_some())
-            + usize::from(!source.git_snapshot_proofs.is_empty());
+            + usize::from(!source.git_snapshot_proofs.is_empty())
+            + usize::from(source.entity_edit_lease.is_some());
 
         append_canonical_object_header(out, field_count)?;
 
@@ -2346,6 +2432,10 @@ impl CanonicalTransaction<'_> {
         }
         append_canonical_key(out, "default_ref_mutation")?;
         append_canonical_value(out, &source.default_ref_mutation)?;
+        if source.entity_edit_lease.is_some() {
+            append_canonical_key(out, "entity_edit_lease")?;
+            append_canonical_value(out, &source.entity_edit_lease)?;
+        }
         append_canonical_key(out, "expected_generation")?;
         append_canonical_value(out, &source.expected_generation)?;
         append_canonical_key(out, "expected_roots")?;
@@ -2407,7 +2497,8 @@ impl Serialize for CanonicalTransaction<'_> {
                 + usize::from(source.merge_transaction_delta.is_some())
                 + usize::from(source.sealed_observation.is_some())
                 + usize::from(source.collaboration_delta.is_some())
-                + usize::from(!source.git_snapshot_proofs.is_empty());
+                + usize::from(!source.git_snapshot_proofs.is_empty())
+                + usize::from(source.entity_edit_lease.is_some());
             let mut state =
                 serializer.serialize_struct("RepositoryTransactionHumanReadable", field_count)?;
             state.serialize_field("schema_version", &source.schema_version)?;
@@ -2438,6 +2529,9 @@ impl Serialize for CanonicalTransaction<'_> {
             if !source.git_snapshot_proofs.is_empty() {
                 state.serialize_field("git_snapshot_proofs", &source.git_snapshot_proofs)?;
             }
+            if source.entity_edit_lease.is_some() {
+                state.serialize_field("entity_edit_lease", &source.entity_edit_lease)?;
+            }
             return state.end();
         }
 
@@ -2447,7 +2541,8 @@ impl Serialize for CanonicalTransaction<'_> {
         // RepositoryTransaction`, whose element count varies with which
         // optional tail fields are present.
         const LEGACY_FIELD_COUNT: usize = 15;
-        let has_proof_slot = !source.git_snapshot_proofs.is_empty();
+        let has_lease_slot = source.entity_edit_lease.is_some();
+        let has_proof_slot = !source.git_snapshot_proofs.is_empty() || has_lease_slot;
         let has_collaboration_slot = source.collaboration_delta.is_some() || has_proof_slot;
         let has_sealed_slot = source.sealed_observation.is_some() || has_collaboration_slot;
         let has_merge_slot = source.merge_transaction_delta.is_some() || has_sealed_slot;
@@ -2455,7 +2550,8 @@ impl Serialize for CanonicalTransaction<'_> {
             + usize::from(has_merge_slot)
             + usize::from(has_sealed_slot)
             + usize::from(has_collaboration_slot)
-            + usize::from(has_proof_slot);
+            + usize::from(has_proof_slot)
+            + usize::from(has_lease_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&source.schema_version)?;
         sequence.serialize_element(&source.operation_id)?;
@@ -2483,6 +2579,9 @@ impl Serialize for CanonicalTransaction<'_> {
         }
         if has_proof_slot {
             sequence.serialize_element(&source.git_snapshot_proofs)?;
+        }
+        if has_lease_slot {
+            sequence.serialize_element(&source.entity_edit_lease)?;
         }
         sequence.end()
     }
@@ -2695,7 +2794,12 @@ impl RepositoryTransaction {
         change_count: usize,
         changes: impl IntoIterator<Item = Result<C>>,
     ) -> Result<()> {
-        if self.schema_version != REPOSITORY_TRANSACTION_SCHEMA_VERSION {
+        let required_version = if self.entity_edit_lease.is_some() {
+            5
+        } else {
+            REPOSITORY_TRANSACTION_SCHEMA_VERSION
+        };
+        if self.schema_version != required_version {
             return Err(ModelError::InvalidOperation(format!(
                 "unsupported repository transaction version {}",
                 self.schema_version
@@ -2722,9 +2826,31 @@ impl RepositoryTransaction {
             && self.merge_transaction_delta.is_none()
             && self.collaboration_delta.is_none()
             && self.git_snapshot_proofs.is_empty()
+            && self.entity_edit_lease.is_none()
         {
             return Err(ModelError::InvalidOperation(
                 "repository transaction must contain at least one mutation".to_string(),
+            ));
+        }
+        if let Some(mutation) = &self.entity_edit_lease {
+            mutation.validate().map_err(ModelError::InvalidOperation)?;
+        }
+        if self.entity_edit_lease.is_some()
+            && (!self.external_objects.is_empty()
+                || self.git_authority_delta.is_some()
+                || change_count != 0
+                || !self.aliases.is_empty()
+                || !self.ref_mutations.is_empty()
+                || self.default_ref_mutation.is_some()
+                || self.workspace_mutation.is_some()
+                || self.local_overlay_delta.is_some()
+                || self.merge_transaction_delta.is_some()
+                || self.collaboration_delta.is_some()
+                || !self.git_snapshot_proofs.is_empty()
+                || self.sealed_observation.is_some())
+        {
+            return Err(ModelError::InvalidOperation(
+                "entity lease control requires a separate authority operation".into(),
             ));
         }
         if let Some(delta) = &self.collaboration_delta {
@@ -3463,6 +3589,7 @@ mod tests {
             merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         }
     }
 
@@ -3680,6 +3807,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 
@@ -3694,7 +3822,7 @@ mod tests {
     fn snapshot_proof_tail_preserves_all_adjacent_slots_and_named_omissions() {
         let base = workspace_transaction();
         let workspace_id = base.workspace_mutation.as_ref().unwrap().workspace_id;
-        for mask in 0..16 {
+        for mask in 0..32 {
             let mut transaction = base.clone();
             if mask & 1 != 0 {
                 transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
@@ -3710,7 +3838,19 @@ mod tests {
             if mask & 8 != 0 {
                 transaction.git_snapshot_proofs.push(snapshot_proof(&base));
             }
-            let expected_arity = if mask & 8 != 0 {
+            if mask & 16 != 0 {
+                transaction.entity_edit_lease =
+                    Some(crate::entity_lease::EntityEditLeaseMutation::Acquire {
+                        resource: crate::entity_lease::EntityEditLeaseResource {
+                            workspace_id,
+                            entity_id: EntityId::new(),
+                        },
+                        expected_source_hash: Hash256::from_bytes([7; 32]),
+                    });
+            }
+            let expected_arity = if mask & 16 != 0 {
+                20
+            } else if mask & 8 != 0 {
                 19
             } else if mask & 4 != 0 {
                 18
@@ -3731,7 +3871,12 @@ mod tests {
                 rmp_serde::from_slice::<RepositoryTransaction>(&encoded).unwrap(),
                 transaction
             );
+            assert_eq!(
+                transaction.canonical_hash().unwrap(),
+                reference_canonical_hash(&transaction).unwrap()
+            );
             let named = serde_json::to_value(&transaction).unwrap();
+            assert_eq!(named.get("entity_edit_lease").is_some(), mask & 16 != 0);
             assert_eq!(named.get("git_snapshot_proofs").is_some(), mask & 8 != 0);
             assert_eq!(
                 serde_json::from_value::<RepositoryTransaction>(named).unwrap(),
@@ -3906,6 +4051,7 @@ mod tests {
             merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         };
         assert_eq!(
             operation.identity_hash().unwrap().to_string(),
@@ -3944,6 +4090,7 @@ mod tests {
             roots_before: roots(),
             roots_after,
             merge_transaction_delta: None,
+            entity_edit_lease: None,
         };
 
         // An absent merge record is not written at all, so the encoded array
@@ -4310,6 +4457,7 @@ mod tests {
             roots_before: roots(),
             roots_after: roots_after.clone(),
             merge_transaction_delta: None,
+            entity_edit_lease: None,
         };
         assert_ne!(
             record(&workspace_transaction()).identity_hash().unwrap(),
@@ -4439,6 +4587,7 @@ mod tests {
             merge_transaction_delta: transaction.merge_transaction_delta.clone(),
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         };
         let bound = operation.identity_hash().unwrap();
         operation.merge_transaction_delta = None;
@@ -5898,6 +6047,7 @@ mod tests {
             merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         };
         let operation_identity = operation.identity_hash().unwrap();
         let mut updated_operation = operation;
@@ -6144,6 +6294,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 
@@ -8045,6 +8196,7 @@ mod tests {
             merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         };
         operation.validate().unwrap();
         let identity = operation.identity_hash().unwrap();
@@ -8111,6 +8263,7 @@ mod tests {
             merge_transaction_delta: None,
             roots_before: roots(),
             roots_after,
+            entity_edit_lease: None,
         };
         let expected = record.identity_hash().unwrap();
 
@@ -8210,9 +8363,42 @@ mod tests {
             merge_transaction_delta: Some(MergeTransactionDelta::open(
                 crate::merge::tests::sample_record(repository_id.clone(), workspace_id),
             )),
+            entity_edit_lease: Some(crate::entity_lease::EntityEditLeaseEvent {
+                context: crate::entity_lease::EntityEditLeaseContext {
+                    session_id: crate::SessionId(Uuid::from_u128(71)),
+                    mutation: None,
+                    claims: vec![crate::entity_lease::EntityEditLeaseClaim {
+                        authority_id: Uuid::from_u128(72),
+                        resource: crate::entity_lease::EntityEditLeaseResource {
+                            workspace_id,
+                            entity_id: crate::EntityId(Uuid::from_u128(73)),
+                        },
+                        fence: "1".into(),
+                    }],
+                },
+                lease: None,
+            }),
         };
         base.validate().unwrap();
         let baseline = base.identity_hash().unwrap();
+        for has_merge in [false, true] {
+            let mut record = base.clone();
+            if !has_merge {
+                record.merge_transaction_delta = None;
+            }
+            let bytes = rmp_serde::to_vec(&record).unwrap();
+            assert_eq!(messagepack_array_len(&bytes), 14);
+            let decoded: RepositoryOperationRecord = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, record);
+            assert_eq!(rmp_serde::to_vec(&decoded).unwrap(), bytes);
+            assert_eq!(
+                serde_json::to_value(&record)
+                    .unwrap()
+                    .get("merge_transaction_delta")
+                    .is_some(),
+                has_merge
+            );
+        }
 
         // Every field of RepositoryOperationRecord, in declaration order.
         #[allow(clippy::type_complexity)]
@@ -8326,6 +8512,17 @@ mod tests {
                         Some(MergeTransactionDelta::drop_record(existing));
                 }),
             ),
+            (
+                "entity_edit_lease",
+                Box::new(|record| {
+                    record
+                        .entity_edit_lease
+                        .as_mut()
+                        .unwrap()
+                        .context
+                        .session_id = crate::SessionId(Uuid::from_u128(74));
+                }),
+            ),
         ];
 
         let case_count = cases.len();
@@ -8356,6 +8553,7 @@ mod tests {
             &canonical.workspace_mutation,
             &canonical.local_overlay_delta,
             &canonical.merge_transaction_delta,
+            &canonical.entity_edit_lease,
         ))
         .unwrap();
         assert_eq!(
@@ -8434,6 +8632,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         assert!(transaction.validate().is_err());
     }

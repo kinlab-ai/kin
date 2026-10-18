@@ -445,6 +445,7 @@ pub(crate) fn prepare(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction.validate()?;
     let facet_invalidations = tree_deltas

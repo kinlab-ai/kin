@@ -292,6 +292,7 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> BootstrapArm {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     drop(lease);
 

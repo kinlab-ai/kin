@@ -21,6 +21,7 @@ files = [
     "src/storage/history_replay.rs",
     "src/storage/mod.rs",
     "src/storage/repository.rs",
+    "src/storage/repository/entity_edit_leases.rs",
     "src/store.rs",
     "src/types.rs",
 ]

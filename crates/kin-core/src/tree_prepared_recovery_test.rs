@@ -114,6 +114,7 @@ impl Fixture {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
     fn reopen(self) -> Self {

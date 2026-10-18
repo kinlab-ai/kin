@@ -1523,6 +1523,7 @@ mod tests {
                 ..Default::default()
             }),
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         manager.commit_repository_transaction(transaction).unwrap();
         manifest.roots = manager.read_authority().roots().clone();

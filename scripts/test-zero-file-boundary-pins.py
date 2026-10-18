@@ -66,6 +66,8 @@ FILES = (
     "crates/kin-io/src/confined.rs",
     "crates/kin-io/src/store.rs",
     "crates/kin-core/src/runtime_identity.rs",
+    "crates/kin-db/src/storage/repository/entity_edit_leases.rs",
+    "crates/kin-daemon/src/mcp_entity_leases.rs",
 )
 UNPINNED_FILES = (
     "crates/kin-agent/src/belt.rs",
@@ -249,7 +251,8 @@ class BoundaryPins(unittest.TestCase):
     def test_extra_repository_metadata_occurrence_invalidates_pin(self):
         poison = "\nfn __extra_metadata(p: &std::path::Path) { let _ = p.metadata(); }\n"
         for file in (
-            FILES[23], FILES[25], FILES[26],
+            FILES[3], FILES[23], FILES[25], FILES[26],
+            "crates/kin-db/src/storage/repository/entity_edit_leases.rs",
             "crates/kin-cli/src/commands/branch.rs",
             "crates/kin-cli/src/commands/ref_grammar.rs",
             "crates/kin-core/src/history_attach.rs",

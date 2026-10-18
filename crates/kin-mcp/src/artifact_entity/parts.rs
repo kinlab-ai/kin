@@ -32,7 +32,6 @@ use super::{kind, ArtifactEntity, Held, Level};
 use crate::error::{McpError, Result};
 use crate::handlers::common::HeldSourceAuthority;
 use crate::handlers::repository_authority::AuthorityHeadReadSample;
-use crate::source_base::{EntitySourceBase, SourceBaseSchema};
 
 /// What every part id is derived under, so no other derivation shares one.
 const PART_DOMAIN: &[u8] = b"kin.part.v1";
@@ -923,68 +922,16 @@ pub fn rows(owner: ArtifactId, parts: &[Part], within: Option<usize>) -> Value {
     )
 }
 
-/// The `source` reply for one section: its text, the base a patch to it
-/// carries back, the entity it is part of, and its own sections for the
-/// presentation that outlines a long one.
+/// Unparsed heading sections are not parsed source declarations. Keep every
+/// artifact source route on the same refusal, including synthetic section ids.
 pub(super) fn source_reply<G: GraphStore>(
-    held: &HeldSourceAuthority<'_, G>,
-    sample: &AuthorityHeadReadSample,
+    _held: &HeldSourceAuthority<'_, G>,
+    _sample: &AuthorityHeadReadSample,
     part: &HeldPart,
 ) -> Result<Value> {
-    let content = held.tree_content(part.hash)?;
-    let section = part.part();
-    let body = content
-        .get(section.start..section.end)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .ok_or_else(|| McpError::Other(format!("{} is not text", part.label())))?;
-    let level = if part.has_parts() {
-        Level::Parts
-    } else {
-        Level::Text
-    };
-    let mut reply = Map::new();
-    reply.insert("id".into(), json!(part.id));
-    reply.insert("name".into(), json!(section.title));
-    reply.insert("module".into(), json!(part.module()));
-    reply.insert("kind".into(), json!(PART_KIND));
-    reply.insert(super::HELD_AS_KEY.into(), json!(level.word()));
-    reply.insert(PART_OF_KEY.into(), json!(part.owner.label()));
-    reply.insert(super::PROJECTED_AT_KEY.into(), json!(part.owner.place()));
-    reply.insert("source".into(), json!("graph"));
-    if let Some(context) = sample.source_base_context.clone() {
-        let base = EntitySourceBase {
-            schema: SourceBaseSchema::V1,
-            context,
-            entity_id: kin_model::EntityId(part.id),
-            artifact_id: part.owner.id(),
-            source_blob_hash: part.hash.to_string(),
-            start_byte: section.start,
-            end_byte: section.end,
-            body_hash: kin_blobs::digest(body.as_bytes()).to_string(),
-        };
-        base.validate().map_err(McpError::Context)?;
-        reply.insert("source_base".into(), json!(base));
-    }
-    reply.insert("body".into(), json!(body));
-    // The code it names, by name: the edges from prose to code.
-    if let Some(reader) = reader_for(&part.kind) {
-        let named = names(held.store(), reader, body);
-        if !named.is_empty() {
-            reply.insert(NAMES_KEY.into(), json!(named));
-        }
-    }
-    if part.has_parts() {
-        reply.insert(
-            PARTS_KEY.into(),
-            rows(part.owner.id(), &part.parts, Some(part.index)),
-        );
-    }
-    reply.insert(
-        super::REPLY_KEY.into(),
-        json!({"level": level.word(), "bytes": body.len()}),
-    );
-    super::stamp(&mut reply, sample);
-    Ok(Value::Object(reply))
+    Err(McpError::Other(super::unparsed_source_refusal(
+        &part.label(),
+    )))
 }
 
 /// The key a section's reply lists the code it names under.

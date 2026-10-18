@@ -1046,6 +1046,7 @@ fn publish_tree_bytes_as_a_daemon_would(repo: &Path, file: &str, bytes: &[u8], l
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     let owing = kin_db::OwedDerivationUpdate::owe(workspace_id, vec![(path, body)], Vec::new());
     match lineage {
@@ -1793,6 +1794,7 @@ fn a_current_body_certificate_over_stale_declarations_pays_nothing() {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     let verifier = kin_index::binding_history::RederivationBindingHistoryVerifier::default();
     manager
@@ -1971,6 +1973,7 @@ fn add_a_second_workspace(repo: &Path) -> kin_model::WorkspaceId {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     manager
         .commit_repository_transaction(transaction)
@@ -2071,6 +2074,7 @@ fn publish_a_new_file_owing_its_parse(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     manager
         .commit_repository_transaction_owing(
@@ -2786,6 +2790,7 @@ fn a_second_upgrade_is_a_no_op_or_a_clean_requalification() {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             })
             .expect("an ordinary commit lands");
         let workspace = manager.read_authority().metadata().workspaces[0].workspace_id;
@@ -3033,6 +3038,7 @@ fn a_head_an_earlier_change_builds_on_gets_a_fresh_anchor() {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             })
             .expect("a branch builds on main's anchor");
     }
@@ -3237,6 +3243,7 @@ fn publish_scope_test_relations(repo: &Path, relations: &[kin_model::Relation]) 
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         })
         .unwrap();
 }
@@ -3668,6 +3675,7 @@ fn end_the_lineage_of_an_upgraded_store(repo: &Path) {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         })
         .expect("an ordinary commit lands");
     drop(manager);

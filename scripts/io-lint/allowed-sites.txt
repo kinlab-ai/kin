@@ -1426,7 +1426,7 @@ crates/kin-derivation-inputs/src/lib.rs	load	std::path::Path::is_file
 crates/kin-derivation-inputs/src/lib.rs	read_toml	std::fs::read_to_string
 crates/kin-derivation-inputs/src/lib.rs	suggest_exclusions	std::fs::read_to_string
 crates/kin-derivation-inputs/src/lib.rs	workspace_root	std::fs::read_to_string
-crates/kin-git/src/admission_blockers.rs	collect_git_admission_blockers	std::fs::canonicalize
+crates/kin-git/src/admission_blockers.rs	collect_git_admission_blockers_scoped	std::fs::canonicalize
 crates/kin-git/src/admission_blockers.rs	effective_hook_surface	std::fs::read_dir
 crates/kin-git/src/admission_blockers.rs	effective_hook_surface	std::fs::symlink_metadata
 crates/kin-git/src/admission_blockers.rs	is_legacy_kin_hook_link	std::fs::read_link

@@ -459,6 +459,38 @@ crate::typed_request! {
     }
 }
 
+/// Issued receiver-local claim, checked without accepting owner or clock fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EntityEditLeaseClaim(pub kin_model::entity_lease::EntityEditLeaseClaim);
+
+pub fn entity_edit_lease_claim_schema(_profile: Profile) -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["authority_id","resource","fence"],"properties":{
+        "authority_id":{"type":"string","format":"uuid"},"fence":{"type":"string","pattern":"^[1-9][0-9]{0,19}$"},
+        "resource":{"type":"object","additionalProperties":false,"required":["workspace_id","entity_id"],"properties":{
+            "workspace_id":{"type":"string","format":"uuid"},"entity_id":{"type":"string","format":"uuid"}}}}})
+}
+fn check_entity_edit_lease_claim(value: &Value) -> Result<(), String> {
+    let claim: kin_model::entity_lease::EntityEditLeaseClaim =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            "use only the issued entity lease authority_id, resource and decimal fence"
+        })?;
+    claim.checked_fence()?;
+    if claim.resource.workspace_id.0.is_nil() || claim.resource.entity_id.0.is_nil() {
+        return Err("entity lease resource must have nonnil IDs".into());
+    }
+    Ok(())
+}
+static ENTITY_EDIT_LEASE_CLAIM: NestedSpec = NestedSpec {
+    render: entity_edit_lease_claim_schema,
+    check: check_entity_edit_lease_claim,
+};
+impl ArgType for EntityEditLeaseClaim {
+    fn ty() -> Ty {
+        Ty::Nested(&ENTITY_EDIT_LEASE_CLAIM)
+    }
+}
+
 crate::typed_request! {
     pub struct MutateRequest for MUTATE,
     example json!({"operations": [{
@@ -467,6 +499,8 @@ crate::typed_request! {
             "edits": [{"old_text": "retries = 2", "new_text": "retries = 3"}]}}
     }]}),
     rules vec![
+        Rule::Needs { field: "entity_edit_lease_claims", needs: "request_id" },
+
         Rule::Excludes {
             field: "transaction_id",
             with: "summary",
@@ -484,6 +518,7 @@ crate::typed_request! {
         session_id: String { full() },
         scope: String { full() },
         request_id: String { non_empty(), max_len(256), full() },
+        entity_edit_lease_claims: Vec<EntityEditLeaseClaim> { items(1,16), full() },
     }
 }
 
@@ -927,3 +962,26 @@ pub fn check_operation(operation: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod entity_lease_request_tests {
+    use super::*;
+
+    #[test]
+    fn issued_entity_lease_claim_survives_typed_mutation_dispatch() {
+        let claim = json!({"authority_id":uuid::Uuid::from_u128(1),
+            "resource":{"workspace_id":uuid::Uuid::from_u128(2),"entity_id":uuid::Uuid::from_u128(3)},"fence":"18446744073709551615"});
+        let mut args: HashMap<String,Value> = serde_json::from_value(json!({
+            "operations":[{"verb":"update","target":uuid::Uuid::from_u128(3),"body":"fn value() {}","description":"Update value"}],
+            "request_id":"lease-edit","session_id":uuid::Uuid::from_u128(4),"entity_edit_lease_claims":[claim.clone()]})).unwrap();
+        check_call(MUTATE, &mut args).unwrap();
+        assert_eq!(args["entity_edit_lease_claims"], json!([claim]));
+        let mut unkeyed = args.clone();
+        unkeyed.remove("request_id");
+        assert!(check_call(MUTATE, &mut unkeyed).is_err());
+        let mut forged = args;
+        forged.get_mut("entity_edit_lease_claims").unwrap()[0]["session_id"] =
+            json!(uuid::Uuid::from_u128(5));
+        assert!(check_call(MUTATE, &mut forged).is_err());
+    }
+}

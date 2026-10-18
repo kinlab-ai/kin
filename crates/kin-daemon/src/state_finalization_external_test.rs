@@ -74,6 +74,7 @@ fn commit_external_transition(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     authority
         .commit_repository_transaction_and_freeze(transaction)

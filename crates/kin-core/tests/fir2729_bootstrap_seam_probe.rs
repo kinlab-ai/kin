@@ -308,6 +308,7 @@ fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     match transaction.validate() {
         Ok(()) => eprintln!("PROBE wide model validate: OK"),
@@ -494,6 +495,7 @@ fn bootstrap_probe(commits: usize) {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
 
     // Model validation first, because a refusal here and a refusal from storage

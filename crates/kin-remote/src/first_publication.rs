@@ -204,6 +204,7 @@ where
     // destination does not hold them either. Dropping them moves the snapshot
     // version back to what its other contents declare.
     exported_authority.owed_derivations = Default::default();
+    exported_authority.entity_edit_leases = Default::default();
     exported.version = exported.wire_version();
     let snapshot = Arc::new(exported.to_bytes().map_err(NotCommitted)?);
     drop(lease);

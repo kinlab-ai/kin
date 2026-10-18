@@ -508,6 +508,7 @@ fn push(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     seal.validate()
         .context("validate the exact stash seal transaction")?;
@@ -676,6 +677,7 @@ fn return_to_base(
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
     transaction
         .validate()
@@ -887,6 +889,7 @@ fn pop(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction
         .validate()

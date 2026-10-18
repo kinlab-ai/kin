@@ -867,6 +867,7 @@ async fn local_binding_disclosure_review_does_not_requalify_unknown_or_transfer(
                         sealed_observation: None,
                         collaboration_delta: None,
                         git_snapshot_proofs: Vec::new(),
+                        entity_edit_lease: None,
                     },
                     None,
                 )

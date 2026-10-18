@@ -68,7 +68,16 @@ impl GitAdmissionReport {
 /// proof: it establishes that the far more expensive exact proof is worth
 /// running, and that proof still decides.
 pub fn check_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<()> {
-    let report = collect_git_admission_blockers(repo_path)?;
+    check_git_admission_blockers_scoped(repo_path, crate::CaptureScope::Reachable)
+}
+
+/// Check only the authority this admission captures. A checked-out-commit
+/// attachment leaves sibling worktrees and their private history untouched.
+pub fn check_git_admission_blockers_scoped(
+    repo_path: &WorktreeRoot,
+    scope: crate::CaptureScope,
+) -> Result<()> {
+    let report = collect_git_admission_blockers_scoped(repo_path, scope)?;
     if report.is_clear() {
         return Ok(());
     }
@@ -80,6 +89,13 @@ pub fn check_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<()> {
 
 /// The report behind [`check_git_admission_blockers`].
 pub fn collect_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<GitAdmissionReport> {
+    collect_git_admission_blockers_scoped(repo_path, crate::CaptureScope::Reachable)
+}
+
+fn collect_git_admission_blockers_scoped(
+    repo_path: &WorktreeRoot,
+    scope: crate::CaptureScope,
+) -> Result<GitAdmissionReport> {
     let repo_path = repo_path.path();
     let source = fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let repo = open_repo(&source)?;
@@ -109,35 +125,42 @@ pub fn collect_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<GitAdm
         }
     }
 
-    let (tolerated, untolerable) =
-        classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source)?)?;
-    for entry in untolerable {
-        let kind = match entry.worktree.kind {
-            RegisteredGitWorktreeKind::Main => "main",
-            RegisteredGitWorktreeKind::Linked => "linked",
-        };
-        report.blockers.push(GitAdmissionBlocker::new(
-            format!(
-                "another {kind} Git worktree {} {}",
-                entry.worktree.path.display(),
-                entry.reason
-            ),
-            entry.remedy,
-        ));
-    }
-    if !tolerated.is_empty() {
-        report.notes.push(format!(
-            "{} other registered Git worktree(s) share this object database and are not admitted \
-             as Kin workspaces: {}. Each is idle on a branch this capture carries, so their \
-             commits are admitted; any uncommitted work in them is neither admitted nor reported.",
-            tolerated.len(),
-            render_paths(
-                tolerated
-                    .iter()
-                    .map(|worktree| worktree.path.display().to_string())
-                    .collect()
-            )
-        ));
+    if scope == crate::CaptureScope::Reachable {
+        let (tolerated, untolerable) =
+            classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source)?)?;
+        for entry in untolerable {
+            let kind = match entry.worktree.kind {
+                RegisteredGitWorktreeKind::Main => "main",
+                RegisteredGitWorktreeKind::Linked => "linked",
+            };
+            report.blockers.push(GitAdmissionBlocker::new(
+                format!(
+                    "another {kind} Git worktree {} {}",
+                    entry.worktree.path.display(),
+                    entry.reason
+                ),
+                entry.remedy,
+            ));
+        }
+        if !tolerated.is_empty() {
+            report.notes.push(format!(
+                "{} other registered Git worktree(s) share this object database and are not admitted \
+                 as Kin workspaces: {}. Each is idle on a branch this capture carries, so their \
+                 commits are admitted; any uncommitted work in them is neither admitted nor reported.",
+                tolerated.len(),
+                render_paths(
+                    tolerated
+                        .iter()
+                        .map(|worktree| worktree.path.display().to_string())
+                        .collect()
+                )
+            ));
+        }
+    } else {
+        report.notes.push(
+            "This checked-out-commit admission excludes other worktrees and their private history; \
+             those remain in Git and are not admitted".to_string(),
+        );
     }
 
     let hooks = effective_hook_surface(&repo, &ambient)?;
@@ -1340,6 +1363,40 @@ mod tests {
         let refusal = fixture.refusal();
         assert!(refusal.contains("busy-worktree"), "{refusal}");
         assert!(refusal.contains("rebase-merge"), "{refusal}");
+    }
+
+    #[test]
+    fn checked_out_attachment_ignores_sibling_operations_and_private_history() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("busy-detached");
+        git(
+            &fixture.repo,
+            &["worktree", "add", "--detach", other.to_str().unwrap()],
+        );
+        git(&other, &["commit", "--allow-empty", "-m", "private commit"]);
+        let admin = fixture.repo.join(".git/worktrees/busy-detached");
+        fs::create_dir(admin.join("rebase-merge")).unwrap();
+        check_git_admission_blockers_scoped(
+            &worktree(&fixture.repo),
+            crate::CaptureScope::CheckedOutCommit,
+        )
+        .expect("nondestructive attachment excludes sibling state");
+        assert!(!fixture.report().is_clear(), "full migration still refuses");
+        assert!(admin.join("rebase-merge").exists());
+        assert!(
+            check_git_admission_blockers_scoped(
+                &worktree(&other),
+                crate::CaptureScope::CheckedOutCommit,
+            )
+            .is_err(),
+            "the selected worktree's own operation remains a blocker"
+        );
+        fs::remove_file(admin.join("gitdir")).unwrap();
+        check_git_admission_blockers_scoped(
+            &worktree(&fixture.repo),
+            crate::CaptureScope::CheckedOutCommit,
+        )
+        .expect("a broken unrelated registration is outside this admission too");
     }
 
     /// A sibling holding its own refs is reported, naming the ref.

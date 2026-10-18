@@ -476,6 +476,45 @@ pub fn reconcile_source_tree_and_commit_repository_transaction<'a, 'b>(
     )
 }
 
+/// Reconcile a claimed parsed-body mutation using an independently verified
+/// session context. Projection custody, recovery and source CAS are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_source_tree_and_commit_leased_repository_transaction<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    accepted_target_paths: Option<&BTreeSet<RepoPath>>,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+    context: &kin_model::entity_lease::EntityEditLeaseContext,
+) -> Result<(usize, RepositoryCommitReceipt)> {
+    reconcile_source_tree_and_commit_accepting_targets(
+        root,
+        previous_tree,
+        target_tree,
+        previous_entries,
+        entries,
+        authority,
+        transaction,
+        accepted_target_paths,
+        owed,
+        |authority, transaction, owed| {
+            timed_authority_publication(|| {
+                commit_repository_transaction_with_policy(
+                    authority,
+                    transaction,
+                    true,
+                    owed,
+                    Some(context),
+                )
+            })
+        },
+    )
+}
+
 /// Publish an unobserved semantic transition without claiming qualified prior
 /// binding history. Projection custody, exact operation identity, retries and
 /// recovery are identical; only the optional derived certificate is withheld.
@@ -560,7 +599,7 @@ fn reconcile_source_tree_and_commit_accepting_targets<'a, 'b>(
     transaction: RepositoryTransaction,
     accepted_target_paths: Option<&BTreeSet<RepoPath>>,
     owed: Option<&kin_db::OwedDerivationUpdate>,
-    publish: fn(
+    publish: impl FnOnce(
         &RepositoryAuthorityManager<LocalFileBackend>,
         RepositoryTransaction,
         Option<&kin_db::OwedDerivationUpdate>,
@@ -1486,6 +1525,31 @@ pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
     transaction: RepositoryTransaction,
     owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> Result<(usize, RepositoryCommitReceipt)> {
+    verify_observed_target_tree_and_commit_with_lease_context(
+        root,
+        previous_tree,
+        target_tree,
+        previous_entries,
+        entries,
+        authority,
+        transaction,
+        owed,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_observed_target_tree_and_commit_with_lease_context<'a, 'b>(
+    root: &Path,
+    previous_tree: &ResolvedTree,
+    target_tree: &ResolvedTree,
+    previous_entries: impl IntoIterator<Item = (&'b RepoPath, TreeEntry, &'b [u8])>,
+    entries: impl IntoIterator<Item = (&'a RepoPath, TreeEntry, &'a [u8])>,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+    owed: Option<&kin_db::OwedDerivationUpdate>,
+    lease_context: Option<&kin_model::entity_lease::EntityEditLeaseContext>,
+) -> Result<(usize, RepositoryCommitReceipt)> {
     let entries = validated_projection_proof_entries(entries)?;
     let previous_entries = validated_projection_proof_entries(previous_entries)?;
     validate_repository_projection_transaction(
@@ -1508,8 +1572,16 @@ pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
             .projection
             .revalidate_frozen_entries_unchanged(&entry_refs, &identities)?;
         freeze.revalidate_namespace()?;
-        let receipt =
-            commit_repository_transaction_exact(authority, transaction, owed).into_result()?;
+        let receipt = timed_authority_publication(|| {
+            commit_repository_transaction_with_policy(
+                authority,
+                transaction,
+                true,
+                owed,
+                lease_context,
+            )
+        })
+        .into_result()?;
         Ok((entries.len(), receipt))
     }
 
@@ -3787,7 +3859,7 @@ fn commit_repository_transaction_exact_inner(
     transaction: RepositoryTransaction,
     owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
-    commit_repository_transaction_with_policy(authority, transaction, true, owed)
+    commit_repository_transaction_with_policy(authority, transaction, true, owed, None)
 }
 
 fn commit_repository_transaction_unproven(
@@ -3796,7 +3868,7 @@ fn commit_repository_transaction_unproven(
     owed: Option<&kin_db::OwedDerivationUpdate>,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
     timed_authority_publication(|| {
-        commit_repository_transaction_with_policy(authority, transaction, false, owed)
+        commit_repository_transaction_with_policy(authority, transaction, false, owed, None)
     })
 }
 
@@ -3805,23 +3877,38 @@ fn commit_repository_transaction_with_policy(
     transaction: RepositoryTransaction,
     qualify: bool,
     owed: Option<&kin_db::OwedDerivationUpdate>,
+    lease_context: Option<&kin_model::entity_lease::EntityEditLeaseContext>,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
     // The owed update rides every attempt, the exact retry included, because
     // it is part of what this one commit decides. A retry that finds the first
     // attempt already committed replays its receipt, and storage applies no
     // update to a replay.
-    let publish = |transaction| match (qualify, owed) {
-        (true, Some(owed)) => authority.commit_repository_transaction_with_binding_history_owing(
-            transaction,
-            &kin_index::binding_history::LocalBindingHistoryVerifier,
-            owed,
-        ),
-        (true, None) => authority.commit_repository_transaction_with_binding_history(
-            transaction,
-            &kin_index::binding_history::LocalBindingHistoryVerifier,
-        ),
-        (false, Some(owed)) => authority.commit_repository_transaction_owing(transaction, owed),
-        (false, None) => authority.commit_repository_transaction(transaction),
+    let publish = |transaction| {
+        if let Some(context) = lease_context {
+            return authority.commit_repository_transaction_with_entity_edit_leases_qualified(
+                transaction,
+                context,
+                qualify.then_some(
+                    &kin_index::binding_history::LocalBindingHistoryVerifier
+                        as &dyn kin_db::storage::binding_history::BindingHistoryVerifier,
+                ),
+                owed,
+            );
+        }
+        match (qualify, owed) {
+            (true, Some(owed)) => authority
+                .commit_repository_transaction_with_binding_history_owing(
+                    transaction,
+                    &kin_index::binding_history::LocalBindingHistoryVerifier,
+                    owed,
+                ),
+            (true, None) => authority.commit_repository_transaction_with_binding_history(
+                transaction,
+                &kin_index::binding_history::LocalBindingHistoryVerifier,
+            ),
+            (false, Some(owed)) => authority.commit_repository_transaction_owing(transaction, owed),
+            (false, None) => authority.commit_repository_transaction(transaction),
+        }
     };
     let expected_hash = transaction
         .transaction_hash()
@@ -13481,6 +13568,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
 
         let error = validate_repository_projection_transaction(
@@ -14653,6 +14741,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -14791,6 +14880,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -14939,6 +15029,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let competing_transaction = RepositoryTransaction {
             operation_id: OperationId::new(),

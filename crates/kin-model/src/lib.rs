@@ -49,6 +49,7 @@ pub mod context;
 pub mod contract;
 pub mod derivation;
 pub mod entity;
+pub mod entity_lease;
 pub mod error;
 pub mod evidence;
 pub mod external;

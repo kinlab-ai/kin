@@ -407,3 +407,47 @@ test('a reason never carries a newline, which would forge a second output key', 
   });
   assert.equal(/[\r\n]/.test(verdict.reason), false);
 });
+
+
+test('retired external packaging decides uncoupled without fetching or claiming a registry version', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wave-vfs-uncoupled-'));
+  fs.mkdirSync(path.join(root, '.github', 'workflows'), { recursive: true });
+  for (const name of ['release.yml', 'rc-build.yml']) {
+    fs.writeFileSync(path.join(root, '.github', 'workflows', name), 'jobs: {}\n');
+  }
+  let fetches = 0;
+  const written = [];
+  const verdict = await main({
+    root,
+    env: {},
+    fetchImpl: async () => { fetches++; throw new Error('registry is unavailable'); },
+    log: () => {},
+    writeOutput: async (text) => written.push(text),
+  });
+  assert.equal(fetches, 0);
+  assert.equal(verdict.roll, true);
+  assert.match(verdict.reason, /packaging is retired/);
+  assert.match(written.join(''), /^kin_vfs_core_pinned=$/m);
+  assert.match(written.join(''), /^kin_vfs_core_registry=$/m);
+  assert.match(written.join(''), /^kin_vfs_core_roll=true$/m);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('an actual external pin still reads its lock and fails closed on registry 503 without decision outputs', async () => {
+  const root = treeWithPin(PIN);
+  const impl = stubFetch({
+    lock: lockWith([{ name: VFS_CORE, version: '0.4.25', source: null }]),
+    index: '',
+    indexStatus: 503,
+  });
+  const written = [];
+  await assert.rejects(main({
+    root, env: {}, fetchImpl: impl, log: () => {},
+    writeOutput: async (text) => written.push(text),
+  }), /could not read registry index .*HTTP 503/);
+  assert.equal(impl.seen.length, 2);
+  assert.ok(impl.seen[0].startsWith('https://api.github.com/'));
+  assert.equal(impl.seen[1], INDEX_URL);
+  assert.deepEqual(written, []);
+  fs.rmSync(root, { recursive: true, force: true });
+});

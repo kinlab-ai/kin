@@ -1447,6 +1447,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -1770,6 +1771,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: Some(records),
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -1830,6 +1832,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: Some(records),
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3696,6 +3699,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();

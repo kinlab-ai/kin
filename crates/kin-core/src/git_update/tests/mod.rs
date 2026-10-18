@@ -440,6 +440,7 @@ fn native_current_head_reports_explicit_update_gap() {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         })
         .unwrap();
     let status = git_update_status(
@@ -498,6 +499,7 @@ fn dirty_graph_owned_workspace_refuses_before_admission() {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         })
         .unwrap();
     let dirty_authority = fixture.manager.read_authority();

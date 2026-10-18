@@ -1727,6 +1727,7 @@ fn build_repository_bootstrap_transaction(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        entity_edit_lease: None,
     };
 
     if let Some(change_id) = initial_change_id {

@@ -74,6 +74,7 @@ fn publish_hosted_review(
             ..kin_model::CollaborationDelta::default()
         }),
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     drop(lease);
     manager.commit_repository_transaction(transaction).unwrap();
