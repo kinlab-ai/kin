@@ -98,6 +98,87 @@ def call_domain_fixture():
     return tuple(args)
 
 
+def settled_retry_fixture():
+    args = list(fixture())
+    payload = args[0]
+    graph = {"generation": 5, "graph_root": "a1" * 32}
+    reason = ("reference_completion_unmeasured: non-call completion is unmeasured; "
+              "retrieval_degraded: this query reported degradations [graph_authority:retry], "
+              "so it did not run at full capability")
+    payload.update(
+        relation_kinds=["calls", "imports", "references"],
+        call_sites={"settled": True, "clauses": [], "candidates": [], "candidate_count": 0},
+        degradations=[{"component": "graph_authority", "reason": "retry", "attempt_number": 1,
+                       "detail": "the second attempt was confirmed current before it was returned. "
+                                 "Every row in it is settled."}])
+    payload["cross_repo"]["authority_roots"] = {
+        payload["cross_repo"]["authority_anchor"]["repo_id"]: graph["graph_root"]}
+    payload["negative"].update(
+        trust="inconclusive", trust_reason=reason, advice=reason, graph_as_of=copy.deepcopy(graph),
+        degraded_signals=["graph_authority:retry"], bounding_signals=["graph_authority:retry"])
+    payload["_kin"].update(
+        graph_as_of=graph,
+        completeness={"status": "unknown", "bound": "at_least", "counted": {"exact": False},
+                      "limits": ["verdict_inconclusive"]})
+    payload["_kin"]["verdict"].update(
+        state="inconclusive", limiting_factor="reference_completion_unmeasured; retrieval_degraded",
+        inputs={"reference_completion": "inconclusive", "absence_gate": "inconclusive",
+                "call_sites": "certified", "degradations": "inconclusive"})
+    return tuple(args)
+
+
+class SettledReferenceRetry(unittest.TestCase):
+    def test_settled_retry_still_requires_the_exact_admitted_use(self):
+        self.assertEqual(freshness.grade_admitted_reference(*settled_retry_fixture())[0], freshness.PASS)
+
+    def test_two_agreeing_roots_do_not_replace_the_independent_authority_root(self):
+        args = list(copy.deepcopy(settled_retry_fixture()))
+        args[0]["_kin"]["graph_as_of"]["graph_root"] = "b2" * 32
+        args[0]["negative"]["graph_as_of"]["graph_root"] = "b2" * 32
+        self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
+        args = list(copy.deepcopy(settled_retry_fixture()))
+        args[0]["_kin"]["graph_as_of"]["generation"] = 1
+        args[0]["negative"]["graph_as_of"]["generation"] = True
+        self.assertEqual(freshness.grade_admitted_reference(*args)[0], freshness.FAIL)
+
+    def test_retry_does_not_license_other_degradations_or_missing_proofs(self):
+        mutations = [
+            (0, ["degradations", 0, "reason"], "mutation_in_flight"),
+            (0, ["degradations", 0, "reason"], "settled_replay"),
+            (0, ["degradations", 0, "reason"], "unknown"),
+            (0, ["degradations", 0, "attempt_number"], 0),
+            (0, ["degradations", 0, "attempt_number"], True),
+            (0, ["degradations", 0, "detail"], "read not current"),
+            (0, ["degradations"], []),
+            (0, ["negative", "graph_as_of", "graph_root"], "b2" * 32),
+            (0, ["_kin", "graph_as_of", "generation"], True),
+            (0, ["negative", "graph_as_of", "generation"], True),
+            (0, ["cross_repo", "authority_roots"], {}),
+            (0, ["cross_repo", "authority_roots", "fixture-repository"], "b2" * 32),
+            (0, ["negative", "degraded_signals"], ["graph_authority:retry", "other:gap"]),
+            (0, ["_kin", "verdict", "inputs", "source_body"], "inconclusive"),
+            (0, ["_kin", "verdict", "safe_to_conclude_absent"], True),
+            (0, ["_kin", "completeness", "counted", "exact"], True),
+            (0, ["call_sites", "settled"], False),
+            (0, ["call_sites", "candidate_count"], 1),
+            (0, ["cross_repo", "authority_anchor", "repo_id"], "foreign"),
+            (0, ["references", 0, "resolution"], "name_only"),
+            (1, ["source_base"], {}),
+            (1, ["source_identity", "entity_id"], "stale"),
+            (1, ["source_identity", "repository_id"], "foreign"),
+            (2, ["body"], "stale caller body"),
+            (2, ["source_identity", "workspace_id"], "other-workspace"),
+        ]
+        for side, path, value in mutations:
+            with self.subTest(side=side, path=path, value=value):
+                args = list(copy.deepcopy(settled_retry_fixture()))
+                target = args[side]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                self.assertNotEqual(freshness.grade_admitted_reference(*args)[0], freshness.PASS)
+
+
 class PositiveReference(unittest.TestCase):
     def test_exact_graph_sources_prove_the_use_without_claiming_absence(self):
         args = fixture()
@@ -350,7 +431,17 @@ class AdmittedDurability(unittest.TestCase):
         self.assertEqual(self.grade(self.status(), None)[0], freshness.UNREADABLE)
 
 
-class RegistryRepository(unittest.TestCase):
+class MockRuntimeFixture(unittest.TestCase):
+    def setUp(self):
+        # These unit tests use a fictitious executable and mock its wire I/O.
+        # Runtime installation has separate real-binary acceptance coverage.
+        runtime = patch.object(freshness, "prepare_runtime_fixture",
+                               side_effect=lambda kin, daemon, env, home: (kin, daemon))
+        runtime.start()
+        self.addCleanup(runtime.stop)
+
+
+class RegistryRepository(MockRuntimeFixture):
     """The fixture's repository id comes from the run's own registry."""
 
     def test_the_fixture_entry_is_read_and_no_other(self):
@@ -412,7 +503,7 @@ class CommittedAbsence(unittest.TestCase):
                 self.assertEqual(freshness.grade_absence_stays_authoritative_over_a_committed_tree(payload)[0], freshness.FAIL)
 
 
-class WireRetention(unittest.TestCase):
+class WireRetention(MockRuntimeFixture):
     def test_failed_and_malformed_exchanges_stay_retained_and_cannot_grade(self):
         good = {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": json.dumps(fixture()[0])}]}}
         cases = [(7, json.dumps(good), "failure"), (0, "not-json", "bad wire"),

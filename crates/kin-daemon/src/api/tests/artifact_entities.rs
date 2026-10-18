@@ -7,11 +7,10 @@
 //
 // Every case starts from the records the non-entity coverage pass derives,
 // and only a build with embedding support carries that pass, so the cases and
-// their fixtures share its gate. The call and row helpers also serve a
-// Unix-only crate-name case, so they follow the union of those consumers.
-// The read helper serves every build.
+// their fixtures share its gate. The row helper also serves a Unix-only
+// crate-name case, so it follows the union of those consumers. The call and
+// refusal helpers and sample licence serve every build.
 
-#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const ARTIFACT_LICENSE: &str = "MIT License\n\nCopyright (c) 2026 Example Authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction.\n";
 
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
@@ -103,7 +102,6 @@ async fn artifact_fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
 /// verb resolved to the tool that answers it, the call made over the served
 /// route, and the answer paged, enveloped and written as text the way the MCP
 /// server presents a daemon's answer to its client.
-#[cfg(any(unix, feature = "embeddings", feature = "external-embeddings"))]
 async fn artifact_call(
     state: &Arc<DaemonState>,
     verb: &str,
@@ -133,6 +131,7 @@ fn artifact_rows(text: &str, heading: &str) -> Vec<String> {
 }
 
 /// The machine `source` reply for `address`, as the route answers it.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 async fn artifact_read(state: &Arc<DaemonState>, address: &str) -> serde_json::Value {
     let result = edit_path_call(
         state,

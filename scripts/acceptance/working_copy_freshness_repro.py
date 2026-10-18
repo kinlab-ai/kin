@@ -670,6 +670,40 @@ CALL_DOMAIN_CODES = frozenset((
 CALL_DOMAIN_INPUTS = ("call_sites", "absence_gate")
 
 
+def settled_reference_retry(payload, negative):
+    """Only a discarded attempt followed by a confirmed-current read qualifies.
+
+    This is not permission to ignore degraded reads. The producer records this
+    exact retry after its final graph-currency check. In-flight and last-settled
+    replays never qualify. The caller still requires the exact admitted use and
+    both graph-owned source identities, with a lower bound and no absence claim.
+    """
+    rows = payload.get("degradations")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return False
+    row = rows[0]
+    graph = (payload.get("_kin") or {}).get("graph_as_of")
+    detail = row.get("detail")
+    negative_graph = negative.get("graph_as_of")
+    cross_repo = payload.get("cross_repo") or {}
+    repo_id = (cross_repo.get("authority_anchor") or {}).get("repo_id")
+    authority_root = (cross_repo.get("authority_roots") or {}).get(repo_id)
+    return (row.get("component") == "graph_authority" and row.get("reason") == "retry"
+            and type(row.get("attempt_number")) is int and row["attempt_number"] > 0
+            and isinstance(detail, str)
+            and "was confirmed current before it was returned." in detail
+            and "Every row in it is settled." in detail
+            and isinstance(graph, dict)
+            and type(graph.get("generation")) is int and graph["generation"] >= 0
+            and isinstance(graph.get("graph_root"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", graph["graph_root"]) is not None
+            and isinstance(negative_graph, dict)
+            and type(negative_graph.get("generation")) is int
+            and negative_graph == graph and authority_root == graph["graph_root"]
+            and negative.get("degraded_signals") == ["graph_authority:retry"]
+            and negative.get("bounding_signals") == ["graph_authority:retry"])
+
+
 def reference_completion_qualification(payload, negative, verdict):
     """A settled Call census does not certify requested non-call completion.
 
@@ -694,8 +728,12 @@ def reference_completion_qualification(payload, negative, verdict):
             or inputs.get("call_sites") != "certified"):
         return False, "the verdict does not separately attribute the non-call completion gap"
     unproven_binding = inputs.get("source_derivation") == "inconclusive"
+    retry = inputs.get("degradations") == "inconclusive"
+    if retry and not settled_reference_retry(payload, negative):
+        return False, "the extra degradation does not prove a confirmed-current settled retry"
     allowed_inputs = ("reference_completion", "absence_gate") + (
-        ("source_derivation",) if unproven_binding else ())
+        ("source_derivation",) if unproven_binding else ()) + (
+        ("degradations",) if retry else ())
     if any(reading not in ("certified", "not_applicable") for name, reading in inputs.items()
            if name not in allowed_inputs):
         return False, "another verdict input limits the positive beyond non-call completion"
@@ -710,6 +748,11 @@ def reference_completion_qualification(payload, negative, verdict):
         if unproven_binding
         else code + ": non-call completion is unmeasured"
     )
+    if retry:
+        expected_codes.append("retrieval_degraded")
+        expected_reason += (
+            "; retrieval_degraded: this query reported degradations [graph_authority:retry], "
+            "so it did not run at full capability")
     reason = negative.get("trust_reason")
     advice = str(negative.get("advice") or "")
     if (codes != expected_codes
