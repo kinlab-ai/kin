@@ -382,6 +382,7 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     // As the daemon commits a ref write: through the local binding-history
     // verifier, which carries the store's checked lineage across a ref-only
@@ -427,6 +428,7 @@ fn exact_ref_create_transaction(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     }
 }
 
@@ -1464,6 +1466,7 @@ fn publish_uncommitted_workspace_deltas(
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         })
         .expect("commit admitted workspace change");
 

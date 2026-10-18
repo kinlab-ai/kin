@@ -36,9 +36,19 @@ pub struct StatusRequest {
 impl StatusRequest {
     pub fn from_arguments(arguments: &HashMap<String, Value>) -> Result<Self, String> {
         let mut selected = serde_json::Map::new();
-        for key in ["dependencies", "cursor", "max_chars"] {
+        for key in ["dependencies", "cursor"] {
             if let Some(value) = arguments.get(key) {
                 selected.insert(key.into(), value.clone());
+            }
+        }
+        for key in [
+            crate::request_schema::OUTPUT_BUDGET,
+            "max_chars",
+            "max_response_chars",
+        ] {
+            if let Some(value) = arguments.get(key) {
+                selected.insert("max_chars".into(), value.clone());
+                break;
             }
         }
         let request: Self =
@@ -464,7 +474,7 @@ fn page_collections(
         let encoded = serde_json::to_string(&value).map_err(|e| e.to_string())?;
         if encoded.len() > target {
             let Some(encoded) = previous else {
-                return Err("status metadata row or envelope exceeds the response budget; increase max_chars".into());
+                return Err("status metadata row or envelope exceeds the response budget; increase max_output_bytes".into());
             };
             let Some(ContentBlock::Text { text }) = result.content.first_mut() else {
                 unreachable!()
@@ -666,7 +676,9 @@ pub fn enforce_ceiling(result: ToolCallResult, max_chars: usize) -> ToolCallResu
     {
         result
     } else {
-        ToolCallResult::error("status envelope exceeds the response budget; increase max_chars")
+        ToolCallResult::error(
+            "status envelope exceeds the response budget; increase max_output_bytes",
+        )
     }
 }
 
@@ -1027,6 +1039,21 @@ mod tests {
         assert!(page(make(&changed, &json!("registry-a")), &request, &[4; 32]).is_err());
         assert!(page(make(&observation, &json!("registry-b")), &request, &[4; 32]).is_err());
         assert!(page(make(&observation, &json!("registry-a")), &request, &[5; 32]).is_err());
+    }
+
+    #[test]
+    fn status_budget_honors_canonical_bytes_and_legacy_aliases() {
+        for key in [
+            crate::request_schema::OUTPUT_BUDGET,
+            "max_chars",
+            "max_response_chars",
+        ] {
+            let args = HashMap::from([(key.to_string(), json!(60_000))]);
+            assert_eq!(
+                StatusRequest::from_arguments(&args).unwrap().ceiling(),
+                60_000
+            );
+        }
     }
 
     #[test]

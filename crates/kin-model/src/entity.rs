@@ -307,3 +307,15 @@ mod tests {
         assert!(error.to_string().contains("role"));
     }
 }
+
+impl Entity {
+    /// Digest of the exact source unit from which this entity's span was derived.
+    /// Older entities may lack this provenance; a digest is never inferred from
+    /// semantic fingerprints, which deliberately ignore formatting and comments.
+    pub fn recorded_span_source_digest(&self) -> Option<crate::Hash256> {
+        let serde_json::Value::String(hex) = self.metadata.extra.get("blob_hash")? else {
+            return None;
+        };
+        crate::Hash256::from_hex(hex).ok()
+    }
+}

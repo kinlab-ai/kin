@@ -44,7 +44,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{McpError, Result};
 use crate::handlers::common::{EntitySourceScope, HeldSourceAuthority};
-use crate::source_base::{EntitySourceBase, SourceBaseSchema};
+use crate::source_base::EntitySourceBase;
 
 /// What an unparsed entity is: one registry of formats, which the indexer
 /// also reads for the media type it stores.
@@ -542,30 +542,6 @@ impl Read {
     }
 }
 
-/// The base a guarded write to an artifact carries back: the workspace
-/// instant, the artifact, and the length and digest of its content. An
-/// artifact's base names its own id as its entity, which is what tells it
-/// from the base of an entity inside a source ([`is_artifact_base`]).
-fn source_base(
-    context: crate::source_base::SourceBaseContext,
-    entity: &ArtifactEntity,
-    hash: kin_model::Hash256,
-    content: &[u8],
-) -> std::result::Result<EntitySourceBase, String> {
-    let base = EntitySourceBase {
-        schema: SourceBaseSchema::V1,
-        context,
-        entity_id: kin_model::EntityId(entity.id().0),
-        artifact_id: entity.id(),
-        source_blob_hash: hash.to_string(),
-        start_byte: 0,
-        end_byte: content.len(),
-        body_hash: kin_blobs::digest(content).to_string(),
-    };
-    base.validate()?;
-    Ok(base)
-}
-
 /// Whether `base` is an artifact's: it names the artifact as its entity.
 pub fn is_artifact_base(base: &EntitySourceBase) -> bool {
     base.entity_id.0 == base.artifact_id.0
@@ -722,69 +698,56 @@ pub fn source_reply_for_query<G: GraphStore>(
         Named::One(entity) => entity,
     };
     let read = Read::of(held, entity)?;
+    if matches!(read.level, Level::Text | Level::Parts) {
+        return Err(McpError::Other(unparsed_source_refusal(
+            &read.entity.label(),
+        )));
+    }
     let mut reply = read.identity();
     reply.insert(PROJECTED_AT_KEY.into(), json!(read.entity.place()));
     reply.insert("source".into(), json!("graph"));
     let size = read.content.as_ref().map_or(0, |content| content.len());
     let mut about = json!({"level": read.level.word(), "bytes": size});
-    if let (Some(content), TreeEntry::Blob { hash, .. }) =
-        (read.content.as_ref(), read.entity.artifact.entry)
-    {
-        let base = match sample.source_base_context.clone() {
-            Some(context) => {
-                Some(source_base(context, &read.entity, hash, content).map_err(McpError::Context)?)
-            }
-            // Hosted source has no local workspace to change.
-            None => None,
-        };
-        reply.insert("source_base".into(), json!(base));
+    // Bytes are described, never returned, and carry no whole-artifact edit base.
+    if let Some(detail) = &read.described.detail {
+        about["detail"] = json!(detail);
     }
-    match (read.level, read.content.as_ref()) {
-        (Level::Text | Level::Parts, Some(content)) => {
-            let text = std::str::from_utf8(content).map_err(|error| {
-                McpError::Other(format!("{} is not text: {error}", read.entity.name))
-            })?;
-            reply.insert("body".into(), json!(text));
-            // Its sections, for the presentation that serves a long text
-            // held with parts as its outline.
-            if let Some(sections) = &read.parts {
-                reply.insert(
-                    parts::PARTS_KEY.into(),
-                    parts::rows(read.entity.id(), sections, None),
-                );
-            }
-        }
-        // Bytes are described, never returned.
-        _ => {
-            if let Some(detail) = &read.described.detail {
-                about["detail"] = json!(detail);
-            }
-            if let TreeEntry::Blob { hash, .. } = read.entity.artifact.entry {
-                reply.insert(
-                    "content".into(),
-                    json!({"sha256": short_digest(&hash.to_string())}),
-                );
-            }
-            reply.insert(
-                "history".into(),
-                history(held.store(), &read.entity.id(), &sample.source_change_id).value(),
-            );
-            // What names it, the first few; `refs` lists every one.
-            let (rows, total, _) = mentions::named_in(held, &members, &sample.tree, &read.entity);
-            if total > 0 {
-                let shown: Vec<Value> = rows
-                    .into_iter()
-                    .take(mentions::DESCRIPTION_ROWS_MAX)
-                    .collect();
-                reply.insert(mentions::NAMED_IN_KEY.into(), json!(shown));
-                reply.insert(mentions::MATCHED_BY_KEY.into(), json!(mentions::BY_NAME));
-                reply.insert("named_in_total".into(), json!(total));
-            }
-        }
+    if let TreeEntry::Blob { hash, .. } = read.entity.artifact.entry {
+        reply.insert(
+            "content".into(),
+            json!({"sha256": short_digest(&hash.to_string())}),
+        );
+    }
+    reply.insert(
+        "history".into(),
+        history(held.store(), &read.entity.id(), &sample.source_change_id).value(),
+    );
+    // What names it, the first few; `refs` lists every one.
+    let (rows, total, _) = mentions::named_in(held, &members, &sample.tree, &read.entity);
+    if total > 0 {
+        let shown: Vec<Value> = rows
+            .into_iter()
+            .take(mentions::DESCRIPTION_ROWS_MAX)
+            .collect();
+        reply.insert(mentions::NAMED_IN_KEY.into(), json!(shown));
+        reply.insert(mentions::MATCHED_BY_KEY.into(), json!(mentions::BY_NAME));
+        reply.insert("named_in_total".into(), json!(total));
     }
     reply.insert(REPLY_KEY.into(), about);
     stamp(&mut reply, sample);
     Ok(Some(Value::Object(reply)))
+}
+
+/// Unparsed text is an admission artifact, never a source entity or edit base.
+fn unparsed_source_refusal(name: &str) -> String {
+    format!(
+        concat!(
+            "unparsed_source_requires_semantic_coverage: {} is held as unparsed text, ",
+            "not a parsed source entity. Kin does not return a whole artifact body or edit base. ",
+            "Read a parsed entity by its id; this artifact needs semantic language coverage."
+        ),
+        name
+    )
 }
 
 /// The instant of the workspace a reply was read at: the committed change,

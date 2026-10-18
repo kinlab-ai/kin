@@ -100,7 +100,15 @@ pub fn unzip(archive: &Path, destination: &Path) -> Result<Unpacked, String> {
         let mut entry = zip
             .by_index(index)
             .map_err(|error| format!("{}: {error}", archive.display()))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|error| {
+                format!(
+                    "{} has an invalid zip entry name: {error}",
+                    archive.display()
+                )
+            })?
+            .into_owned();
         let relative = contained(Path::new(&name))
             .ok_or_else(|| format!("the entry `{name}` would land outside the archive's tree"))?;
         if entry

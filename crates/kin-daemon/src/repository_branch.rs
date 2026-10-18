@@ -1457,6 +1457,7 @@ fn switch(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     // Validate the derived view before materializing anything over it. This
     // reads the working copy only at paths the workspace tree already tracks
@@ -1886,6 +1887,7 @@ fn replay_switch(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     if transaction.transaction_hash()? != receipt.transaction_hash {
         return Err(branch_conflict(format!(
@@ -2030,6 +2032,7 @@ fn ref_transaction(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     }
 }
 

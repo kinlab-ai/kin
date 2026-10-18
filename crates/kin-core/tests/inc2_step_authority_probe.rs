@@ -548,6 +548,7 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             };
             drop(lease);
             transaction
@@ -941,6 +942,7 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         transaction

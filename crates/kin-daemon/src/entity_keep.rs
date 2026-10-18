@@ -1800,6 +1800,7 @@ pub(crate) fn restore_entity(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction
         .validate()

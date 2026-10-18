@@ -166,9 +166,13 @@ impl ResponseBudget {
     /// `explain: true` turns it off, because a caller asking for the ranking
     /// explanation is asking for the very fields compaction sheds.
     pub fn from_arguments(args: &HashMap<String, Value>) -> Self {
-        let requested = ["max_chars", "max_response_chars"]
-            .into_iter()
-            .find_map(|key| args.get(key).and_then(Value::as_u64));
+        let requested = [
+            crate::request_schema::OUTPUT_BUDGET,
+            "max_chars",
+            "max_response_chars",
+        ]
+        .into_iter()
+        .find_map(|key| args.get(key).and_then(Value::as_u64));
         let explain = args
             .get("explain")
             .and_then(Value::as_bool)
@@ -5100,6 +5104,20 @@ fn consolidate_sample_disclosure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_output_budget_survives_request_normalization() {
+        let arguments = HashMap::from([
+            (
+                crate::request_schema::OUTPUT_BUDGET.to_string(),
+                json!(60_000),
+            ),
+            ("max_chars".to_string(), json!(12_000)),
+        ]);
+        let budget = ResponseBudget::from_arguments(&arguments);
+        assert_eq!(budget.max_chars, 60_000);
+        assert!(budget.explicit_max_chars);
+    }
 
     #[test]
     fn trace_unproven_count_tracks_the_retained_chain() {

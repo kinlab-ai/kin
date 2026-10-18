@@ -224,6 +224,7 @@ fn publish_bootstrap(directory: &std::path::Path, repository: &RepositoryId) {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     drop(lease);
     let receipt = manager

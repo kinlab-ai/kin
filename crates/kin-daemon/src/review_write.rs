@@ -327,6 +327,7 @@ impl ReviewPublication {
             sealed_observation: None,
             collaboration_delta: Some(delta),
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         Ok(Self {
             transaction,

@@ -323,6 +323,7 @@ fn publish_non_user_semantic_move(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     drop(lease);
     manager

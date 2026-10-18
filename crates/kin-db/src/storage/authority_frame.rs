@@ -422,6 +422,9 @@ pub struct AuthorityFrame {
     /// after the ledger; an empty list preserves every earlier frame byte.
     #[serde(default)]
     pub git_snapshot_proofs: Vec<kin_model::GitSnapshotProof>,
+    /// Complete replacement when receiver-local fenced coordination moved.
+    #[serde(default)]
+    pub entity_edit_leases: Option<kin_model::entity_lease::EntityEditLeaseLedger>,
 }
 
 impl Serialize for AuthorityFrame {
@@ -429,7 +432,8 @@ impl Serialize for AuthorityFrame {
         use serde::ser::SerializeStruct;
         // Positional: a trailing field is written only when it, or one after
         // it, is, so every earlier position stays filled.
-        let proofs = !self.git_snapshot_proofs.is_empty();
+        let leases = self.entity_edit_leases.is_some();
+        let proofs = !self.git_snapshot_proofs.is_empty() || leases;
         let ledger = !self.owed_derivations.is_unchanged() || proofs;
         let capability = self.schema_version
             >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
@@ -440,7 +444,8 @@ impl Serialize for AuthorityFrame {
             12 + usize::from(collaboration)
                 + usize::from(capability)
                 + usize::from(ledger)
-                + usize::from(proofs),
+                + usize::from(proofs)
+                + usize::from(leases),
         )?;
         out.serialize_field("schema_version", &self.schema_version)?;
         out.serialize_field("repository_id", &self.repository_id)?;
@@ -466,6 +471,9 @@ impl Serialize for AuthorityFrame {
         if proofs {
             out.serialize_field("git_snapshot_proofs", &self.git_snapshot_proofs)?;
         }
+        if leases {
+            out.serialize_field("entity_edit_leases", &self.entity_edit_leases)?;
+        }
         out.end()
     }
 }
@@ -479,7 +487,7 @@ impl AuthorityFrame {
     /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
     /// version its contents need ([`Self::wire_version`]), so only a frame
     /// that carries collaboration is a version 3 frame.
-    pub const CURRENT_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_VERSION;
+    pub const CURRENT_VERSION: u32 = Self::ENTITY_EDIT_LEASES_VERSION;
 
     /// The version a schema5 frame whose owed derivation ledger did not move
     /// is written at, binding-history capability included.
@@ -519,6 +527,7 @@ impl AuthorityFrame {
 
     /// A successor adding immutable Git snapshot evidence.
     pub const GIT_SNAPSHOT_PROOFS_VERSION: u32 = 10;
+    pub const ENTITY_EDIT_LEASES_VERSION: u32 = 11;
 
     /// The oldest frame format version this binary reads, and the version a
     /// frame that carries no collaboration is still written at.
@@ -547,6 +556,9 @@ impl AuthorityFrame {
     /// capability. In legacy schemas, collaboration uses version3 and a frame
     /// without it keeps the version2 body byte for byte.
     pub fn wire_version(&self) -> u32 {
+        if self.entity_edit_leases.is_some() || self.operation.entity_edit_lease.is_some() {
+            return Self::ENTITY_EDIT_LEASES_VERSION;
+        }
         if !self.git_snapshot_proofs.is_empty() {
             return Self::GIT_SNAPSHOT_PROOFS_VERSION;
         }
@@ -772,7 +784,7 @@ impl AuthorityFrame {
         if frame.wire_version() != declared {
             return Err(KinDbError::StorageError(format!(
                 "authority frame declares version {declared} but its contents are written at \
-                 version {}; Git snapshot proofs require version10, context validations require version9, call-site ledgers \
+                 version {}; entity edit leases require version11, Git snapshot proofs require version10, context validations require version9, call-site ledgers \
                  require version8, other resolution records \
                  require version7, enrichment marks require version6, a moved owed derivation \
                  ledger requires version5, schema5 requires version4, while legacy frames use \
@@ -856,6 +868,9 @@ impl AuthorityFrame {
             }
         }
         self.collaboration.validate_shape()?;
+        if let Some(leases) = &self.entity_edit_leases {
+            leases.validate().map_err(KinDbError::StorageError)?;
+        }
         Ok(())
     }
 
@@ -1024,6 +1039,8 @@ impl AuthorityFrame {
                 &base.git_snapshot_proofs,
                 &successor.git_snapshot_proofs,
             )?,
+            entity_edit_leases: (base.entity_edit_leases != successor.entity_edit_leases)
+                .then(|| successor.entity_edit_leases.clone()),
         };
         frame.validate_shape()?;
         Ok(frame)
@@ -1178,6 +1195,22 @@ impl AuthorityFrame {
         envelope.binding_history = self.binding_history.clone();
         self.owed_derivations
             .apply_to(&mut envelope.owed_derivations);
+        if let Some(leases) = &self.entity_edit_leases {
+            if leases.last_fence < envelope.entity_edit_leases.last_fence {
+                return Err(KinDbError::StorageError(
+                    "entity lease fence watermark moved backwards".into(),
+                ));
+            }
+            if envelope.entity_edit_leases.authority_id.is_some()
+                && leases.authority_id != envelope.entity_edit_leases.authority_id
+            {
+                return Err(KinDbError::StorageError(
+                    "entity lease receiver authority changed within an authority journal".into(),
+                ));
+            }
+            envelope.entity_edit_leases = leases.clone();
+        }
+        envelope.validate_entity_edit_leases()?;
 
         let operation = self.operation.clone();
         if envelope
@@ -1912,6 +1945,7 @@ mod tests {
             roots_before: base.roots.clone(),
             roots_after,
             merge_transaction_delta: None,
+            entity_edit_lease: None,
         };
         let frame = AuthorityFrame {
             schema_version: base.schema_version,
@@ -1929,6 +1963,7 @@ mod tests {
             collaboration: CollaborationPatch::default(),
             binding_history: Vec::new(),
             owed_derivations: OwedDerivationPatch::Unchanged,
+            entity_edit_leases: None,
             git_snapshot_proofs: Vec::new(),
         };
         (base, frame)
@@ -2028,6 +2063,49 @@ mod tests {
             .contains("Git snapshot proofs require version10"));
         frame.git_snapshot_proofs.clear();
         frame.changes.clear();
+        assert_eq!(frame.to_bytes().unwrap(), legacy);
+    }
+
+    #[test]
+    fn entity_lease_frame_uses_new_version_and_preserves_receiver_fence_identity() {
+        let (base, mut frame) = snapshot_wire_fixture();
+        let legacy = frame.to_bytes().unwrap();
+        let authority_id = uuid::Uuid::from_u128(51);
+        frame.entity_edit_leases = Some(kin_model::entity_lease::EntityEditLeaseLedger {
+            authority_id: Some(authority_id),
+            last_fence: 1,
+            entries: vec![],
+        });
+        let bytes = frame.to_bytes().unwrap();
+        assert_eq!(frame.wire_version(), 11);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 11);
+        assert!(AuthorityFrame::check_readable_version(11, 10).is_err());
+        let decoded = AuthorityFrame::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, frame);
+        let successor = decoded.apply_to_envelope(base).unwrap();
+        assert_eq!(successor.entity_edit_leases.last_fence, 1);
+        let (_, mut later) = snapshot_wire_fixture();
+        later.operation.operation_id = kin_model::OperationId::from_uuid(uuid::Uuid::from_u128(52));
+        later.operation.roots_before = successor.roots.clone();
+        later.operation.roots_after = successor.roots.clone();
+        later.operation.roots_after.generation += 1;
+        later.entity_edit_leases = Some(kin_model::entity_lease::EntityEditLeaseLedger {
+            authority_id: Some(uuid::Uuid::from_u128(53)),
+            last_fence: 2,
+            entries: vec![],
+        });
+        assert!(later
+            .apply_to_envelope(successor)
+            .unwrap_err()
+            .to_string()
+            .contains("receiver authority changed"));
+        let mut disguised = bytes;
+        disguised[4..8].copy_from_slice(&10u32.to_le_bytes());
+        assert!(AuthorityFrame::from_bytes(&disguised)
+            .unwrap_err()
+            .to_string()
+            .contains("entity edit leases require version11"));
+        frame.entity_edit_leases = None;
         assert_eq!(frame.to_bytes().unwrap(), legacy);
     }
 
@@ -2153,11 +2231,11 @@ mod tests {
     fn frame_versions_outside_the_supported_range_refuse_by_name() {
         let body = b"never decoded";
         for (version, needle) in [
-            (1, "this kin-db reads versions 2 to 10"),
+            (1, "this kin-db reads versions 2 to 11"),
             (
                 AuthorityFrame::CURRENT_VERSION + 1,
                 "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
-                 reads frame version 11",
+                 reads frame version 12",
             ),
         ] {
             let mut bytes = frame_bytes_from(body);

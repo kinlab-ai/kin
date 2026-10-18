@@ -15263,6 +15263,7 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
             // then installs that receipt into the canonical derived graph. It
             // must never run against a session's read-only temporal view.
             | "kin_transaction_commit"
+            | "kin_entity_lease"
     )
 }
 
@@ -22205,7 +22206,22 @@ async fn mcp_tools_call_internal(
         kin_mcp::outside_graph::question_argument(&request.arguments).map(str::to_string);
     let disclosing_state = Arc::clone(&state);
     let disclosing_headers = headers.clone();
-    let result = if request.name == crate::mcp_mutate::TOOL
+    let result = if [
+        crate::mcp_entity_leases::READ,
+        crate::mcp_entity_leases::WRITE,
+    ]
+    .contains(&request.name.as_str())
+    {
+        let write = request.name == crate::mcp_entity_leases::WRITE;
+        crate::mcp_entity_leases::call(
+            state,
+            headers,
+            request.arguments,
+            tokens.is_enforced(),
+            write,
+        )
+        .await
+    } else if request.name == crate::mcp_mutate::TOOL
         || (request.name == "kin_mutate" && request.arguments.contains_key("request_id"))
     {
         crate::mcp_mutate::call(state, headers, request.arguments, tokens.is_enforced()).await?
@@ -34895,6 +34911,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -35015,6 +35032,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -35246,6 +35264,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -35960,6 +35979,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -45442,6 +45462,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         authority
@@ -45871,6 +45892,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         external
@@ -45953,6 +45975,7 @@ pub(crate) mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 
@@ -59698,6 +59721,7 @@ pub(crate) mod tests {
     include!("api/tests/session_binding_capture.rs");
     include!("api/tests/imported_getter_receiver.rs");
     include!("api/tests/mcp_mutate_source_base.rs");
+    include!("api/tests/mcp_entity_leases.rs");
     #[cfg(unix)]
     include!("api/tests/unchanged_session_closeout.rs");
     #[cfg(unix)]

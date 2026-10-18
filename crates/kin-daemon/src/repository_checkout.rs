@@ -322,6 +322,7 @@ fn plan_and_commit(
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         let replay_hash = replay_transaction
             .transaction_hash()
@@ -708,6 +709,7 @@ fn plan_and_commit(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     // The selected path takes the target change's state, which predates the
     // store's last `kin upgrade` unless the target descends from one of its

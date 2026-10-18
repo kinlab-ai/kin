@@ -293,6 +293,7 @@ pub fn prepare_git_update(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction.validate().map_err(model_error)?;
     Ok(PreparedGitUpdate {

@@ -16,6 +16,7 @@ files = [
     "src/change.rs",
     "src/derivation.rs",
     "src/entity.rs",
+    "src/entity_lease.rs",
     "src/error.rs",
     "src/external.rs",
     "src/external_reference.rs",

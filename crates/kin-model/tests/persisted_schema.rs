@@ -116,6 +116,16 @@ const MUST_BE_SCANNED: &[&str] = &[
 /// exist, so an entry cannot point at a fiction.
 const HAND_WRITTEN_SERIALIZATIONS: &[(&str, &str, &str)] = &[
     (
+        "RepositoryOperationRecord",
+        "operation_identity_mirrors_every_record_field_positionally",
+        "",
+    ),
+    (
+        "RepositoryOperationIdentity",
+        "operation_identity_mirrors_every_record_field_positionally",
+        "",
+    ),
+    (
         "RepositoryTransaction",
         "the_canonical_view_serializes_positionally_identical_bytes",
         "",

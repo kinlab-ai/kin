@@ -284,6 +284,7 @@ pub fn apply_belt_defaults(name: &str, arguments: &mut HashMap<String, serde_jso
     // unconditional insert would silently outrank a caller who had passed
     // `max_response_chars` and hand them a ceiling they never asked for.
     if BUDGET_TOOLS.contains(&name)
+        && !arguments.contains_key(crate::request_schema::OUTPUT_BUDGET)
         && !arguments.contains_key("max_chars")
         && !arguments.contains_key("max_response_chars")
     {
@@ -1061,6 +1062,25 @@ mod tests {
         let mut other = HashMap::from([("compact".to_string(), serde_json::json!(false))]);
         assert_eq!(agent_profile_overrides("semantic_locate", &mut other), None);
         assert!(other.contains_key("compact"));
+    }
+
+    #[test]
+    fn canonical_output_budget_is_not_overridden_by_belt_defaults() {
+        let mut arguments = HashMap::from([(
+            crate::request_schema::OUTPUT_BUDGET.to_string(),
+            serde_json::json!(60_000),
+        )]);
+        apply_belt_defaults("kin_graph_status", &mut arguments);
+        assert!(!arguments.contains_key("max_chars"));
+        assert_eq!(
+            crate::budget::ResponseBudget::from_arguments(&arguments).max_chars,
+            60_000
+        );
+        agent_profile_overrides(crate::handlers::lexical::TOOL_NAME, &mut arguments);
+        assert_eq!(
+            crate::budget::ResponseBudget::from_arguments(&arguments).max_chars,
+            AGENT_DEFAULT_RESPONSE_MAX_CHARS as usize
+        );
     }
 
     /// A literal lookup answers inside this profile's list ceiling, whatever

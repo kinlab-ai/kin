@@ -157,6 +157,7 @@ pub(crate) mod live_read_gate;
 mod local_repository_authority;
 pub mod loop_runner;
 mod mcp_commit;
+mod mcp_entity_leases;
 mod mcp_mutate;
 mod mcp_source_base;
 mod module_code_commit;

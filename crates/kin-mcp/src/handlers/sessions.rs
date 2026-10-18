@@ -1564,7 +1564,7 @@ and arguments to recover the original receipt after a lost response or restart; 
 refuse. Keyed success uses schema kin.mutate.receipt.v1 and original authoritative roots_before \
 and roots_after instead of the legacy live-graph new_root_hash. An expired session can recover \
 published work but cannot resume unpublished work. Keyed offline or older-daemon calls refuse. \
-Keyed requests accept only session_id, request_id, operations, scope and summary; unknown fields \
+Keyed requests accept session_id, request_id, operations, scope, summary and bounded entity_edit_lease_claims; unknown fields \
 and unsupported freshness constraints refuse before execution. Every source change is guarded. \
 An edit of an existing entity carries the source_base returned by a current get_entity_source \
 read in the matching EntitySourceBase, EntitySourcePatch or EntityRemove payload; a \
@@ -1741,6 +1741,9 @@ where
     F: Fn(&'static str, HashMap<String, serde_json::Value>) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<Option<ToolCallResult>, String>>,
 {
+    if arguments.contains_key("entity_edit_lease_claims") && !arguments.contains_key("request_id") {
+        return Ok(ToolCallResult::error("entity lease claims require an authenticated keyed kin_mutate; add a durable request_id"));
+    }
     match checked_mutate_request_id(arguments) {
         Err(error) => return Ok(ToolCallResult::error(error)),
         Ok(Some(_)) => {

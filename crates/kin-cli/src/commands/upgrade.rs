@@ -1526,6 +1526,7 @@ fn plan_upgrade(
         sealed_observation: None,
         collaboration_delta: lineage_record,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     });
     if let Some(transaction) = &transaction {
         transaction

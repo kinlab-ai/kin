@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 65 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 67 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -53,15 +53,12 @@ payload variant, and each variant goes with its verb: `EntitySourcePatch` with `
 `UnitImports` with `update`, `EntityRemove` with `remove`, and `EntityContent`, which gives an
 entity Kin holds without parsing it content Kin already holds, with `replace` or `create`.
 
-A Markdown or reStructuredText text is held with parts: each section its headings open is an
-entity of its own, addressed `module.stem :: title` (`shop.HISTORY :: Version 1.1.0`), with
-the titles that lead to it after more `::` where a title repeats, and found by `locate` by
-its title. `source` on the whole text serves it whole up to 4 KB and otherwise as its outline:
-`header`, the text before its first section, and `members`, its sections by id. `source` on a
-section serves its text, paged like any long body, with a `source_base` that a `patch`, an
-`update` of a section up to 16 KB, or a `remove` carries back; several sections of one text
-change in one transaction. A section's reply lists under `names` the code its code spans name,
-each the one entity that name settles on: a match by name, not a proven reference.
+Unparsed artifacts, including Markdown or reStructuredText outlines, can be found
+by metadata. They do not provide source bodies or edit tickets through the agent
+surface. `source` returns exact parsed entity bodies; an artifact without semantic
+language coverage returns `unparsed_source_requires_semantic_coverage`. Neither
+paging nor a returned artifact UUID bypasses this boundary. Brownfield conversion
+and materialization are separate internal boundaries, not agent source fallbacks.
 
 The reply budget is `max_output_bytes` on every read verb: the most UTF-8 bytes of serialized
 JSON the reply is cut toward, the `_kin` envelope included. `max_chars` and
@@ -547,6 +544,7 @@ bounded. No raw filesystem search or epoch cache supplies missing evidence.
 | `tracked_changes_unchecked` | The daemon could not check whether tracked source changed while no daemon was watching, so the answer may describe bytes the working copy no longer holds; `kin admit` settles it. |
 | `unkeyed_lookups_counted` | Lookups by a name computed at run time could reach the focal only as they could reach anything their receiver holds: no record says anything about the name they look up and none spells a call name, which every reader that does not run the program shares as a blind spot, so the answer counts them in `focal_escape.residue.unkeyed_lookups` rather than listing them as sites to check. It never licenses an absence. |
 | `unlisted_clause` | A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect. |
+| `unparsed_source_requires_semantic_coverage` | The requested artifact has no parsed source entity. Source bodies and edit bases are withheld until semantic language coverage exists; read a parsed entity by its id. |
 | `value_calls_unmeasured` | Unsettled call sites that never spell the focal's call name could reach it only if it is held as a value or looked up by a computed name, and the escape census could not rule that out, so the answer counts them once with the census reason. |
 | `walk_bounded` | The walk stopped at a work bound before its frontier emptied, so a route may exist beyond what was explored. |
 | `walk_depth_bounded` | The walk stopped at max_depth before its frontier emptied; raise max_depth. |
@@ -1401,11 +1399,12 @@ On `refs` the block is taken over the named scope rather than the store. Its nam
 ---
 
 ## 4. Collaborative Sessions & Intent
-*Tools:* `register_session`, `session`, `kin_register_intent`, `kin_release_intent`, `kin_check_traffic`
+*Tools:* `register_session`, `session`, `kin_register_intent`, `kin_release_intent`, `kin_check_traffic`, `kin_entity_leases`, `kin_entity_lease`
 
 - **`session`**: Start, heartbeat or end a named semantic session. Start supplies vendor, client name and optional capabilities; repository authority comes from the connection. Writes and intents can also use the connection's implicit session.
 - **`kin_register_intent` / `kin_release_intent`**: Register or release intent to modify a specific entity or contract, surfacing conflicts before code is edited. A scope naming a symbol outside the repository is refused with `external_symbol_not_served`; see [Calls into symbols outside the repository](#calls-into-symbols-outside-the-repository).
 - **`kin_check_traffic`**: Query concurrent work on target entities or contracts. A scope naming a symbol outside the repository is refused the same way.
+- **`kin_entity_leases` / `kin_entity_lease`**: Read exact source hashes and ownership, then explicitly acquire, renew or release a ten-minute receiver-local edit lease. Claims fence Kin-managed parsed entity body edits and deletions, preserve source CAS and write permissions, and cover neither native file writes nor provider actions. See [Entity edit leases](entity-edit-leases.md) for authenticated controls, durable retries and supported coverage.
 
 ---
 

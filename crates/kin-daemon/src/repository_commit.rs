@@ -77,6 +77,7 @@ impl NativeCommitTarget {
 /// transaction expects and the roots the publication compare-and-swaps against
 /// are the same in-memory state.
 pub struct NativeCommitPlan {
+    pub(crate) entity_edit_lease_context: Option<kin_model::entity_lease::EntityEditLeaseContext>,
     pub change: SemanticChange,
     pub transaction: RepositoryTransaction,
     pub target: NativeCommitTarget,
@@ -515,6 +516,7 @@ pub(crate) fn plan_session_workspace_admission(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction.validate()?;
     let transaction_hash = transaction.transaction_hash()?;
@@ -1641,6 +1643,7 @@ pub(crate) fn publish_workspace_tree_through(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction.validate()?;
 
@@ -3072,6 +3075,7 @@ fn plan_native_commit_inner(
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     transaction.validate()?;
 
@@ -3129,6 +3133,7 @@ fn plan_native_commit_inner(
     // itself, so the read ends here and the open does not.
     drop(lease);
     Ok(NativeCommitPlan {
+        entity_edit_lease_context: None,
         change,
         transaction,
         target: commit_target,
@@ -3602,7 +3607,51 @@ fn commit_native_plan_with_working_copy_proof(
     let target_entries = crate::mcp_commit::timed_commit_phase("load_projection_entries", || {
         load_projection_entries(&authority, &plan.target_tree, &mut body_cache)
     })?;
-    let (projected, receipt) = if plan.previous_tree == plan.target_tree {
+    let (projected, receipt) = if let Some(context) = plan.entity_edit_lease_context.as_ref() {
+        if plan.previous_tree == plan.target_tree
+            || working_copy == WorkingCopyProof::ObservedTargetTree
+        {
+            let previous_entries =
+                load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
+            kin_core::verify_observed_target_tree_and_commit_with_lease_context(
+                layout.working_dir(),
+                &plan.previous_tree,
+                &plan.target_tree,
+                previous_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                target_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                &authority,
+                plan.transaction,
+                plan.owed_derivations.as_ref(),
+                Some(context),
+            )?
+        } else {
+            let previous_entries =
+                load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
+            let accepted = authored
+                .map(|authored| accepted_authored_paths(authored, &target_entries))
+                .filter(|accepted| !accepted.is_empty());
+            kin_core::reconcile_source_tree_and_commit_leased_repository_transaction(
+                layout.working_dir(),
+                &plan.previous_tree,
+                &plan.target_tree,
+                previous_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                target_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                &authority,
+                plan.transaction,
+                accepted.as_ref(),
+                plan.owed_derivations.as_ref(),
+                context,
+            )?
+        }
+    } else if plan.previous_tree == plan.target_tree {
         crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
             kin_core::verify_unchanged_source_tree_and_commit_repository_transaction(
                 layout.working_dir(),
@@ -5110,6 +5159,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         authority
             .commit_repository_transaction(transaction)

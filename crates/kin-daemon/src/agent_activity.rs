@@ -773,7 +773,10 @@ pub fn draft_for_call(
 /// waiting when it ends, so its record must too; see [`record_tool_call`].
 pub fn is_write_tool(tool: &str) -> bool {
     tool.starts_with("kin_transaction")
-        || matches!(tool, "kin_mutate" | "mutate" | "transaction")
+        || matches!(
+            tool,
+            "kin_mutate" | "mutate" | "transaction" | "kin_entity_lease"
+        )
         || tool == crate::mcp_mutate::TOOL
 }
 

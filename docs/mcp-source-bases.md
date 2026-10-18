@@ -1,5 +1,17 @@
 # Guarded entity source edits
 
+The MCP initialize response advertises
+`capabilities.experimental.kin.semanticSourceContract` with schema
+`kin.semantic-source.v1`, `sourceUnit: "parsed_entity"`,
+`wholeFileReads: false`, `unparsedTextSource: "refused"` and
+`moduleSource: "members_only"`. This is an implementation contract, not an
+attestation that a selected graph has complete parsing or current source.
+Clients can probe it without calling a source tool. A missing or unknown contract
+must not be inferred from a package version or the status schema. Unparsed text
+artifacts cannot supply a whole source body or edit base, even with `full_body`;
+they require semantic coverage. Module navigation returns member identities
+rather than an aggregate file body.
+
 `source` returns `source_base` when it can bind the complete body to a
 verified source span and one local workspace authority sample. Preserve that
 object unchanged with the text you read. An absent or `null` value means no supported writable base

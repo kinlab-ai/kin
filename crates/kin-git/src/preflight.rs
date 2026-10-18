@@ -801,14 +801,22 @@ fn observe(
         )));
     }
 
-    let (tolerated_worktrees, untolerable_worktrees) =
-        classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source_worktree)?)?;
-    if !untolerable_worktrees.is_empty() {
-        return Err(GitError::AdditionalWorktrees {
-            count: untolerable_worktrees.len(),
-            worktrees: untolerable_worktrees,
-        });
-    }
+    let tolerated_worktrees = if snapshot.scope == CaptureScope::Reachable {
+        let (tolerated_worktrees, untolerable_worktrees) =
+            classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source_worktree)?)?;
+        if !untolerable_worktrees.is_empty() {
+            return Err(GitError::AdditionalWorktrees {
+                count: untolerable_worktrees.len(),
+                worktrees: untolerable_worktrees,
+            });
+        }
+        tolerated_worktrees
+    } else {
+        // This proof captures only the selected commit and never retires Git.
+        // Do not inspect unrelated registrations: even a malformed sibling
+        // cannot expand or invalidate this selected-commit claim.
+        Vec::new()
+    };
 
     let ambient_repo = open_repo_with_user_ignore_config(&source_worktree)?;
     if stable_path(ambient_repo.git_dir()) != stable_path(repo.git_dir())
@@ -5337,6 +5345,33 @@ mod tests {
             rendered.contains("other-worktree") && rendered.contains("detached HEAD"),
             "the refusal names the worktree and why: {rendered}"
         );
+    }
+
+    #[test]
+    fn checked_out_commit_proof_excludes_busy_sibling_private_history() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("busy-detached");
+        git(
+            &fixture.repo,
+            &["worktree", "add", "--detach", other.to_str().unwrap()],
+        );
+        git(&other, &["commit", "--allow-empty", "-m", "private commit"]);
+        let admin = fixture.repo.join(".git/worktrees/busy-detached");
+        fs::create_dir(admin.join("rebase-merge")).unwrap();
+        let snapshot = crate::lossless::capture_lossless_git_repository_scoped(
+            &worktree(&fixture.repo),
+            RepositoryId::new("scoped-proof").unwrap(),
+            &fixture.store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &fixture.store).unwrap();
+        preflight_git_migration(&worktree(&fixture.repo), &snapshot, &plan, &fixture.store)
+            .expect("proof is restricted to selected checked-out commit");
+        assert!(admin.join("rebase-merge").exists());
+        fixture
+            .preflight()
+            .expect_err("full migration still refuses sibling state");
     }
 
     /// An idle sibling on a shared branch is proved, not refused.

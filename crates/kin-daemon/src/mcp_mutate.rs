@@ -534,6 +534,7 @@ fn prepare(
         request_id,
     };
     let workspace_id = authority.workspace_id().to_string();
+    parse_entity_edit_lease_claims(&arguments, SessionId(session_id), authority.workspace_id())?;
     let value = serde_json::to_value(&arguments).map_err(recovery)?;
     if serde_json::to_vec(&value).map_err(recovery)?.len() > MAX_REQUEST_BYTES {
         return Err(format!(
@@ -577,7 +578,14 @@ fn require_consumed_fields(
 }
 
 fn validate_request_fields(arguments: &HashMap<String, Value>) -> Result<(), String> {
-    const FIELDS: &[&str] = &["session_id", "request_id", "operations", "scope", "summary"];
+    const FIELDS: &[&str] = &[
+        "session_id",
+        "request_id",
+        "operations",
+        "scope",
+        "summary",
+        "entity_edit_lease_claims",
+    ];
     for name in arguments.keys() {
         if !FIELDS.contains(&name.as_str()) {
             return Err(format!("unsupported_request_field: {name} is not supported by kin_mutate_durable_v1; accepted fields are {}; caller-read freshness constraints require a separately supported operation", FIELDS.join(", ")));
@@ -593,6 +601,51 @@ fn validate_request_fields(arguments: &HashMap<String, Value>) -> Result<(), Str
         return Err("invalid_request_field: summary must be a string when supplied".to_string());
     }
     Ok(())
+}
+
+fn parse_entity_edit_lease_claims(
+    arguments: &HashMap<String, Value>,
+    session_id: SessionId,
+    workspace_id: kin_model::WorkspaceId,
+) -> Result<Option<kin_model::entity_lease::EntityEditLeaseContext>, String> {
+    let Some(value) = arguments.get("entity_edit_lease_claims") else {
+        return Ok(None);
+    };
+    let claims: Vec<kin_model::entity_lease::EntityEditLeaseClaim> =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            "invalid_entity_lease_claims: give only authority_id, resource and exact decimal fence"
+        })?;
+    let context = kin_model::entity_lease::EntityEditLeaseContext {
+        session_id,
+        mutation: None,
+        claims,
+    };
+    context.validate()?;
+    if context.claims.is_empty()
+        || context
+            .claims
+            .iter()
+            .any(|claim| claim.resource.workspace_id != workspace_id)
+    {
+        return Err("entity edit lease claims must name one to sixteen entities in the daemon-bound workspace".into());
+    }
+    Ok(Some(context))
+}
+
+/// Read proof only from the immutable request reservation, after its ownership
+/// and digest have been validated. No ordinary commit argument may inject it.
+pub(crate) fn entity_edit_lease_context(
+    binding: &RequestBinding,
+) -> Result<Option<kin_model::entity_lease::EntityEditLeaseContext>, String> {
+    let Some(request) = binding.request.as_ref() else {
+        return Ok(None);
+    };
+    let arguments = serde_json::from_value(request.clone()).map_err(recovery)?;
+    let session = SessionId(uuid::Uuid::parse_str(&binding.identity.session_id).map_err(recovery)?);
+    let workspace = kin_model::WorkspaceId::from_uuid(
+        uuid::Uuid::parse_str(&binding.workspace_id).map_err(recovery)?,
+    );
+    parse_entity_edit_lease_claims(&arguments, session, workspace)
 }
 
 pub(crate) async fn call(

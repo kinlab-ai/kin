@@ -644,6 +644,7 @@ fn hashing_the_replication_root_does_not_materialize_the_authority() {
         sealed_observation: None,
         collaboration_delta: None,
         git_snapshot_proofs: Vec::new(),
+        entity_edit_lease: None,
     };
     drop(lease);
 

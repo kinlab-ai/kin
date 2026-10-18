@@ -9,6 +9,7 @@
 //! one full snapshot with backend CAS, and only after durable acknowledgement
 //! publishes one new `Arc` to readers.
 
+mod entity_edit_leases;
 mod session_publication;
 
 use serde::{Deserialize, Serialize};
@@ -773,6 +774,9 @@ pub struct PersistedRepositoryAuthority {
     /// are replicated authority, not local history-state hints.
     #[serde(default)]
     pub git_snapshot_proofs: Vec<kin_model::GitSnapshotProof>,
+    /// Receiver-local fenced coordination. The watermark remains after release.
+    #[serde(default)]
+    pub entity_edit_leases: kin_model::entity_lease::EntityEditLeaseLedger,
 }
 
 impl Serialize for PersistedRepositoryAuthority {
@@ -780,7 +784,9 @@ impl Serialize for PersistedRepositoryAuthority {
         use serde::ser::SerializeStruct;
         // Positional: a trailing collection is written only when it, or one
         // after it, is, so every earlier position stays filled.
-        let has_proofs = !self.git_snapshot_proofs.is_empty();
+        let has_leases =
+            self.entity_edit_leases.last_fence != 0 || !self.entity_edit_leases.entries.is_empty();
+        let has_proofs = !self.git_snapshot_proofs.is_empty() || has_leases;
         let has_ledger = !self.owed_derivations.is_empty() || has_proofs;
         let has_binding = !self.binding_history.is_empty() || has_ledger;
         let has_merge = !self.merge_transactions.is_empty() || has_binding;
@@ -789,7 +795,8 @@ impl Serialize for PersistedRepositoryAuthority {
             12 + usize::from(has_merge)
                 + usize::from(has_binding)
                 + usize::from(has_ledger)
-                + usize::from(has_proofs),
+                + usize::from(has_proofs)
+                + usize::from(has_leases),
         )?;
         out.serialize_field("schema_version", &self.schema_version)?;
         out.serialize_field("repository_id", &self.repository_id)?;
@@ -815,11 +822,42 @@ impl Serialize for PersistedRepositoryAuthority {
         if has_proofs {
             out.serialize_field("git_snapshot_proofs", &self.git_snapshot_proofs)?;
         }
+        if has_leases {
+            out.serialize_field("entity_edit_leases", &self.entity_edit_leases)?;
+        }
         out.end()
     }
 }
 
 impl PersistedRepositoryAuthority {
+    pub(crate) fn requires_entity_edit_lease_wire(&self) -> bool {
+        self.carries_entity_edit_leases()
+            || self
+                .operation_log
+                .iter()
+                .any(|operation| operation.entity_edit_lease.is_some())
+    }
+
+    pub(crate) fn carries_entity_edit_leases(&self) -> bool {
+        self.entity_edit_leases.last_fence != 0 || !self.entity_edit_leases.entries.is_empty()
+    }
+
+    pub(crate) fn validate_entity_edit_leases(&self) -> Result<(), KinDbError> {
+        self.entity_edit_leases.validate().map_err(storage)?;
+        for entry in &self.entity_edit_leases.entries {
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id == entry.resource.workspace_id)
+            {
+                return Err(storage(
+                    "entity lease refers to an unknown workspace".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this envelope carries language-server enrichment marks: a
     /// workspace that holds some, or a logged operation that recorded or
     /// retired some. A reader older than the marks decodes neither, so a store
@@ -901,6 +939,7 @@ impl PersistedRepositoryAuthority {
             binding_history: Vec::new(),
             owed_derivations: Default::default(),
             git_snapshot_proofs: Vec::new(),
+            entity_edit_leases: Default::default(),
         };
         authority.roots = compute_roots(snapshot, &authority, 0)?;
         Ok(authority)
@@ -1139,6 +1178,7 @@ impl PersistedRepositoryAuthority {
         // made it, and after every workspace is, because a record names a body
         // its workspace tree must hold.
         super::derivation_ledger::validate_metadata(self)?;
+        self.validate_entity_edit_leases()?;
 
         let operation_log_ms = timer.lap_ms();
         if history.history_required() {
@@ -2958,9 +2998,11 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        if current.roots() != next.roots() {
+        if current.roots() != next.roots()
+            || current.metadata().entity_edit_leases != next.metadata().entity_edit_leases
+        {
             return PersistOutcome::NotCommitted(storage(format!(
-                "repository {} equivalent representation rewrite changed semantic roots",
+                "repository {} equivalent representation rewrite changed semantic roots or entity leases",
                 self.repository_id
             )));
         }
@@ -2988,9 +3030,11 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         current: &RepositoryAuthorityState,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        if current.roots() != next.roots() {
+        if current.roots() != next.roots()
+            || current.metadata().entity_edit_leases != next.metadata().entity_edit_leases
+        {
             return PersistOutcome::NotCommitted(storage(format!(
-                "repository {} equivalent representation rewrite changed semantic roots",
+                "repository {} equivalent representation rewrite changed semantic roots or entity leases",
                 self.repository_id
             )));
         }
@@ -3521,6 +3565,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
         // envelope, so they run here too, and no reader of this cheap path is
         // handed a ledger the full open would refuse.
         super::derivation_ledger::validate_metadata(&metadata)?;
+        metadata.validate_entity_edit_leases()?;
         let frames_at = started.elapsed();
 
         // The backend cursor fences physical writes. The roots generation is
@@ -3672,6 +3717,7 @@ impl RepositoryAuthorityMetadata<LocalFileBackend> {
             return Ok(None);
         };
         super::derivation_ledger::validate_metadata(&metadata)?;
+        metadata.validate_entity_edit_leases()?;
         let logical_generation = metadata.roots.generation;
         tracing::debug!(
             repository = %repository_id,
@@ -4069,6 +4115,42 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     /// Load one coherent authority generation for an entire request.
     pub fn read_authority(&self) -> AuthorityReadLease<RepositoryAuthorityState> {
         self.publication.read()
+    }
+
+    /// Exact body digest at a caller-held authority read. This reads only the
+    /// parsed declaration's graph-owned span and returns no source contents.
+    /// Lease source units are bounded to 16 MiB, independently of CAS capacity.
+    pub fn entity_edit_lease_source_hash_at(
+        &self,
+        state: &RepositoryAuthorityState,
+        resource: kin_model::entity_lease::EntityEditLeaseResource,
+    ) -> Result<Hash256, KinDbError> {
+        if state.metadata().repository_id != self.repository_id {
+            return Err(KinDbError::StorageError(
+                "entity lease source authority mismatch".into(),
+            ));
+        }
+        let graph = state
+            .workspace_graph_snapshot(&resource.workspace_id)?
+            .ok_or_else(|| KinDbError::StorageError("entity lease workspace unavailable".into()))?;
+        let workspace = state
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == resource.workspace_id)
+            .ok_or_else(|| KinDbError::StorageError("entity lease workspace unavailable".into()))?;
+        entity_edit_leases::verified_hash(
+            &graph,
+            workspace,
+            resource,
+            self.backend.as_ref(),
+            &self.repository_id,
+        )?
+        .ok_or_else(|| {
+            KinDbError::StorageError(
+                "entity lease requires a parsed independent source declaration".into(),
+            )
+        })
     }
 
     /// Persist exact bytes in the immutable CAS without granting authority.
@@ -4540,6 +4622,59 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 None,
                 true,
             )
+        })
+    }
+
+    /// Publish a lease control or claimed body operation. The daemon supplies
+    /// this context only after independently authenticating its session.
+    /// Generic compatibility writers carry no claims and are still fenced.
+    pub fn commit_repository_transaction_with_entity_edit_leases(
+        &self,
+        transaction: RepositoryTransaction,
+        context: &kin_model::entity_lease::EntityEditLeaseContext,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        self.commit_repository_transaction_with_entity_edit_leases_qualified(
+            transaction,
+            context,
+            None,
+            None,
+        )
+    }
+
+    /// The claimed projection path retains ordinary binding-history and owed
+    /// derivation checks. A lease supplies no admission or authorization bypass.
+    pub fn commit_repository_transaction_with_entity_edit_leases_qualified(
+        &self,
+        transaction: RepositoryTransaction,
+        context: &kin_model::entity_lease::EntityEditLeaseContext,
+        verifier: Option<&dyn super::binding_history::BindingHistoryVerifier>,
+        owed: Option<&super::derivation_ledger::OwedDerivationUpdate>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        context.validate().map_err(storage)?;
+        let transaction_hash = transaction.transaction_hash()?;
+        self.publication.commit(|current| {
+            let decision = prepare_repository_commit_decision_with_lease_context(
+                current,
+                &transaction,
+                transaction_hash,
+                &self.repository_id,
+                self.backend.as_ref(),
+                NativeAdmissionSource::LocalWorkspace,
+                None,
+                None,
+                Some(context),
+            )?;
+            let decision = match verifier {
+                Some(verifier) => self.qualify_binding_history_decision(
+                    current,
+                    &transaction,
+                    decision,
+                    verifier,
+                    None,
+                )?,
+                None => decision,
+            };
+            apply_owed_derivation_update(current, &transaction, decision, owed)
         })
     }
 
@@ -5274,6 +5409,31 @@ fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
     prepared_commit_time: Option<Timestamp>,
 ) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
 {
+    prepare_repository_commit_decision_with_lease_context(
+        current,
+        transaction,
+        transaction_hash,
+        repository_id,
+        backend,
+        source,
+        external_history,
+        prepared_commit_time,
+        None,
+    )
+}
+
+fn prepare_repository_commit_decision_with_lease_context<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    repository_id: &RepositoryId,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+    prepared_commit_time: Option<Timestamp>,
+    lease_context: Option<&kin_model::entity_lease::EntityEditLeaseContext>,
+) -> Result<AuthorityCommitDecision<RepositoryAuthorityState, RepositoryCommitReceipt>, KinDbError>
+{
     let metadata = current.metadata();
     if &transaction.repository_id != repository_id {
         return Err(ModelError::InvalidOperation(format!(
@@ -5322,25 +5482,16 @@ fn prepare_repository_commit_decision_with_history<B: StorageBackend + ?Sized>(
         .into());
     }
 
-    let (next, receipt) = match external_history {
-        Some(changes) => prepare_successor_with_history(
-            current,
-            transaction,
-            transaction_hash,
-            backend,
-            source,
-            Some(changes),
-            prepared_commit_time,
-        )?,
-        None => prepare_successor(
-            current,
-            transaction,
-            transaction_hash,
-            backend,
-            source,
-            prepared_commit_time,
-        )?,
-    };
+    let (next, receipt) = prepare_successor_with_lease_context(
+        current,
+        transaction,
+        transaction_hash,
+        backend,
+        source,
+        external_history,
+        prepared_commit_time,
+        lease_context,
+    )?;
     Ok(AuthorityCommitDecision::Publish {
         next,
         output: receipt,
@@ -5396,6 +5547,7 @@ const SLOW_PUBLICATION_PHASE: std::time::Duration = std::time::Duration::from_mi
 /// `source` says whether the Native changes were published by a workspace on
 /// this replica or admitted from another by transfer, which is the only thing
 /// the admission check treats differently.
+#[cfg(test)]
 fn prepare_successor<B: StorageBackend + ?Sized>(
     current: &RepositoryAuthorityState,
     transaction: &RepositoryTransaction,
@@ -5415,6 +5567,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     )
 }
 
+#[cfg(test)]
 fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     current: &RepositoryAuthorityState,
     transaction: &RepositoryTransaction,
@@ -5423,6 +5576,28 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     source: NativeAdmissionSource,
     external_history: Option<&ChangeMap>,
     prepared_commit_time: Option<Timestamp>,
+) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
+    prepare_successor_with_lease_context(
+        current,
+        transaction,
+        transaction_hash,
+        backend,
+        source,
+        external_history,
+        prepared_commit_time,
+        None,
+    )
+}
+
+fn prepare_successor_with_lease_context<B: StorageBackend + ?Sized>(
+    current: &RepositoryAuthorityState,
+    transaction: &RepositoryTransaction,
+    transaction_hash: Hash256,
+    backend: &B,
+    source: NativeAdmissionSource,
+    external_history: Option<&ChangeMap>,
+    prepared_commit_time: Option<Timestamp>,
+    lease_context: Option<&kin_model::entity_lease::EntityEditLeaseContext>,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
     // Every lap below runs inside its own span as well as reporting its
     // milliseconds, and the two must not drift apart: a profiler reads spans and
@@ -5602,6 +5777,17 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
     };
     drop(replay);
 
+    let entity_edit_lease = entity_edit_leases::fence_successor(
+        current,
+        &snapshot,
+        &mut metadata,
+        transaction,
+        source,
+        lease_context,
+        Timestamp::now().0.timestamp_millis(),
+        backend,
+    )?;
+
     let lap = tracing::info_span!("kindb.prepare.roots").entered();
     // Every workspace transition above is final here, so an owed record whose
     // exact body the successor no longer names is overtaken by the transaction
@@ -5627,6 +5813,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         merge_transaction_delta: transaction.merge_transaction_delta.clone(),
         roots_before: roots_before.clone(),
         roots_after: placeholder_roots(next_generation),
+        entity_edit_lease,
     };
     operation.validate()?;
     metadata.operation_log.push(operation.clone());
@@ -12527,6 +12714,329 @@ mod tests {
             RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
     }
 
+    fn entity_lease_fixture<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+    ) -> Entity {
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(manager))
+            .unwrap();
+        let mut entity = semantic_test_entity("src/lib.rs", "kin", LanguageId::Rust, 1);
+        let body = b"pub fn kin() {}";
+        entity.fingerprint.behavior_hash = digest(body);
+        let source_blob = manager.read_authority().metadata().workspaces[0]
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .unwrap()
+            .entry
+            .blob_identity()
+            .unwrap();
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::json!(source_blob.to_string()),
+        );
+        entity.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new("src/lib.rs"),
+            start_byte: 0,
+            end_byte: body.len(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: body.len() as u32,
+        });
+        manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                manager,
+                0xea01,
+                WorkspaceSemanticDelta::new(
+                    vec![EntityDelta::Added {
+                        new: entity.clone(),
+                    }],
+                    vec![],
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        entity
+    }
+
+    fn lease_control<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        mutation: kin_model::entity_lease::EntityEditLeaseMutation,
+    ) -> RepositoryTransaction {
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.schema_version = 5;
+        transaction.entity_edit_lease = Some(mutation);
+        transaction
+    }
+
+    fn lease_body_edit<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        old: &Entity,
+        operation: u128,
+    ) -> (RepositoryTransaction, Entity) {
+        let source = b"pub fn kin() {1}";
+        manager.save_source_blob(digest(source), source).unwrap();
+        let mut entity = old.clone();
+        entity.fingerprint.behavior_hash = digest(source);
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::json!(digest(source).to_string()),
+        );
+        entity.span.as_mut().unwrap().end_byte = source.len();
+        entity.span.as_mut().unwrap().end_col = source.len() as u32;
+        let mut transaction = semantic_workspace_transaction(
+            manager,
+            operation,
+            WorkspaceSemanticDelta::new(
+                vec![EntityDelta::Modified {
+                    old: old.clone(),
+                    new: entity.clone(),
+                }],
+                vec![],
+            )
+            .unwrap(),
+        );
+        let current = manager.read_authority().metadata().workspaces[0].clone();
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let artifact = current.tree.artifact_at_path(&path).unwrap();
+        let delta = TreeDelta::Updated {
+            artifact_id: artifact.artifact_id,
+            old: LocatedEntry::new(path.clone(), artifact.entry),
+            new: LocatedEntry::new(path, TreeEntry::blob(digest(source), false)),
+        };
+        let mutation = transaction.workspace_mutation.as_mut().unwrap();
+        mutation.tree_deltas = vec![delta];
+        mutation.new_tree_hash =
+            compute_resolved_tree_hash(&current.tree.apply(&mutation.tree_deltas).unwrap())
+                .unwrap();
+        (transaction, entity)
+    }
+
+    #[test]
+    fn entity_edit_leases_fence_legacy_and_claimed_body_writers_and_survive_reopen() {
+        use kin_model::entity_lease::*;
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let entity = entity_lease_fixture(&manager);
+        let workspace_id = manager.read_authority().metadata().workspaces[0].workspace_id;
+        let resource = EntityEditLeaseResource {
+            workspace_id,
+            entity_id: entity.id,
+        };
+        let mutation = EntityEditLeaseMutation::Acquire {
+            resource,
+            expected_source_hash: entity.fingerprint.behavior_hash,
+        };
+        let context = EntityEditLeaseContext {
+            session_id: kin_model::SessionId::new(),
+            mutation: Some(mutation.clone()),
+            claims: vec![],
+        };
+        let before = manager.read_authority().roots().clone();
+        let transaction = lease_control(&manager, 0xea02, mutation);
+        let receipt = manager
+            .commit_repository_transaction_with_entity_edit_leases(transaction.clone(), &context)
+            .unwrap();
+        assert!(before.has_same_replicated_truth(&receipt.roots_after));
+        assert_eq!(
+            manager.read_authority().snapshot().wire_version(),
+            GraphSnapshot::ENTITY_EDIT_LEASES_VERSION
+        );
+        assert!(
+            manager
+                .commit_repository_transaction(transaction.clone())
+                .is_ok(),
+            "a successful exact operation replay applies no new work"
+        );
+        let reopened = initial_manager(Arc::clone(&backend));
+        let held = reopened
+            .read_authority()
+            .metadata()
+            .entity_edit_leases
+            .entries[0]
+            .clone();
+        assert_eq!(held.session_id, context.session_id);
+        let (edit, next) = lease_body_edit(&reopened, &entity, 0xea03);
+        let generation = reopened.read_authority().generation();
+        assert!(reopened
+            .commit_repository_transaction(edit.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("ENTITY_LEASE_HELD"));
+        assert_eq!(reopened.read_authority().generation(), generation);
+        let mut claim = EntityEditLeaseContext {
+            session_id: kin_model::SessionId::new(),
+            mutation: None,
+            claims: vec![EntityEditLeaseClaim {
+                authority_id: held.authority_id,
+                resource,
+                fence: held.fence.to_string(),
+            }],
+        };
+        assert!(reopened
+            .commit_repository_transaction_with_entity_edit_leases(edit.clone(), &claim)
+            .unwrap_err()
+            .to_string()
+            .contains("ENTITY_LEASE_STALE"));
+        claim.session_id = context.session_id;
+        reopened
+            .commit_repository_transaction_with_entity_edit_leases(edit, &claim)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .read_authority()
+                .metadata()
+                .entity_edit_leases
+                .entries[0]
+                .source_hash,
+            next.fingerprint.behavior_hash
+        );
+        assert_eq!(
+            initial_manager(backend)
+                .read_authority()
+                .metadata()
+                .entity_edit_leases
+                .entries[0]
+                .source_hash,
+            next.fingerprint.behavior_hash
+        );
+    }
+
+    #[test]
+    fn entity_edit_leases_refuse_unverified_source_and_tree_only_body_bypass() {
+        use kin_model::entity_lease::*;
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let entity = entity_lease_fixture(&manager);
+        let resource = EntityEditLeaseResource {
+            workspace_id: manager.read_authority().metadata().workspaces[0].workspace_id,
+            entity_id: entity.id,
+        };
+        let mutation = EntityEditLeaseMutation::Acquire {
+            resource,
+            expected_source_hash: entity.fingerprint.behavior_hash,
+        };
+        let context = EntityEditLeaseContext {
+            session_id: kin_model::SessionId::new(),
+            mutation: Some(mutation.clone()),
+            claims: vec![],
+        };
+        assert!(manager
+            .commit_repository_transaction(lease_control(&manager, 0xeb01, mutation.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("authenticated session"));
+        manager
+            .commit_repository_transaction_with_entity_edit_leases(
+                lease_control(&manager, 0xeb02, mutation),
+                &context,
+            )
+            .unwrap();
+        let (mut edit, _) = lease_body_edit(&manager, &entity, 0xeb03);
+        edit.workspace_mutation.as_mut().unwrap().semantic_delta =
+            WorkspaceSemanticDelta::default();
+        let before = manager.read_authority().generation();
+        let error = manager.commit_repository_transaction(edit).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ENTITY_LEASE_DERIVATION_REQUIRED"),
+            "{error}"
+        );
+        assert_eq!(manager.read_authority().generation(), before);
+    }
+
+    #[test]
+    fn entity_edit_leases_are_real_local_journal_operations_with_monotonic_fences() {
+        use kin_model::entity_lease::*;
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        let entity = entity_lease_fixture(&manager);
+        let resource = EntityEditLeaseResource {
+            workspace_id: manager.read_authority().metadata().workspaces[0].workspace_id,
+            entity_id: entity.id,
+        };
+        let mutation = EntityEditLeaseMutation::Acquire {
+            resource,
+            expected_source_hash: entity.fingerprint.behavior_hash,
+        };
+        let mut context = EntityEditLeaseContext {
+            session_id: kin_model::SessionId::new(),
+            mutation: Some(mutation.clone()),
+            claims: vec![],
+        };
+        let transaction = lease_control(&manager, 0xec01, mutation.clone());
+        let stale =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction_with_entity_edit_leases(transaction.clone(), &context)
+            .unwrap();
+        assert!(stale
+            .commit_repository_transaction_with_entity_edit_leases(transaction, &context)
+            .is_err());
+        let fence = manager
+            .read_authority()
+            .metadata()
+            .entity_edit_leases
+            .last_fence;
+        context.mutation = Some(EntityEditLeaseMutation::Release {
+            claim: EntityEditLeaseClaim {
+                authority_id: manager
+                    .read_authority()
+                    .metadata()
+                    .entity_edit_leases
+                    .authority_id
+                    .unwrap(),
+                resource,
+                fence: fence.to_string(),
+            },
+        });
+        manager
+            .commit_repository_transaction_with_entity_edit_leases(
+                lease_control(&manager, 0xec02, context.mutation.clone().unwrap()),
+                &context,
+            )
+            .unwrap();
+        drop(manager);
+        let reopened =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(reopened
+            .read_authority()
+            .metadata()
+            .entity_edit_leases
+            .entries
+            .is_empty());
+        assert_eq!(
+            reopened
+                .read_authority()
+                .metadata()
+                .entity_edit_leases
+                .last_fence,
+            fence
+        );
+        assert_eq!(
+            reopened.read_authority().snapshot().wire_version(),
+            GraphSnapshot::ENTITY_EDIT_LEASES_VERSION
+        );
+        context.mutation = Some(mutation.clone());
+        reopened
+            .commit_repository_transaction_with_entity_edit_leases(
+                lease_control(&reopened, 0xec03, mutation),
+                &context,
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .read_authority()
+                .metadata()
+                .entity_edit_leases
+                .last_fence
+                > fence
+        );
+    }
+
     fn transaction_shell<B: StorageBackend + ?Sized + 'static>(
         manager: &RepositoryAuthorityManager<B>,
         operation: u128,
@@ -12552,6 +13062,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 
@@ -18750,7 +19261,7 @@ mod tests {
     fn prepare_successor_admits_every_mutation_a_transaction_can_carry() {
         /// Each mutation-bearing field, and the call inside `prepare_successor`
         /// that admits it.
-        const ADMITTED: [(&str, &str); 10] = [
+        const ADMITTED: [(&str, &str); 11] = [
             ("external_objects", "admit_external_objects("),
             ("changes", "admit_changes("),
             ("aliases", "admit_aliases("),
@@ -18761,11 +19272,12 @@ mod tests {
             ("local_overlay_delta", "apply_local_overlay("),
             ("collaboration_delta", "apply_collaboration("),
             ("merge_transaction_delta", "apply_merge_transaction("),
+            ("entity_edit_lease", "entity_edit_leases::fence_successor("),
         ];
 
         /// Fields that are precondition or identity rather than admitted
         /// payload, with the reason each one moves no authority by itself.
-        const NOT_A_MUTATION: [(&str, &str); 8] = [
+        const NOT_A_MUTATION: [(&str, &str); 9] = [
             (
                 "schema_version",
                 "a version gate, checked by RepositoryTransaction::validate",
@@ -18779,6 +19291,10 @@ mod tests {
             ("expected_roots", "a compare-and-swap precondition"),
             ("actor", "provenance carried into the operation record"),
             ("reason", "provenance carried into the operation record"),
+            (
+                "git_snapshot_proofs",
+                "raw evidence checked during admission; the proofs grant no authority alone",
+            ),
             (
                 "sealed_observation",
                 "binds the admitted content closure and is verified by \
@@ -18801,6 +19317,17 @@ mod tests {
         let manager = initial_manager(Arc::new(MemoryBackend::default()));
         let mut complete = arbitrary_repository_transaction(&manager);
         complete.collaboration_delta = Some(transferred_collaboration_delta());
+        complete.entity_edit_lease =
+            Some(kin_model::entity_lease::EntityEditLeaseMutation::Release {
+                claim: kin_model::entity_lease::EntityEditLeaseClaim {
+                    authority_id: uuid::Uuid::from_u128(1),
+                    resource: kin_model::entity_lease::EntityEditLeaseResource {
+                        workspace_id: WorkspaceId::new(),
+                        entity_id: EntityId::new(),
+                    },
+                    fence: "1".into(),
+                },
+            });
         assert!(
             complete.merge_transaction_delta.is_some()
                 || complete.sealed_observation.is_some()
@@ -18824,7 +19351,8 @@ mod tests {
         )
         .expect("this file must be readable; the scan below is worthless without it");
         let start = source
-            .find("fn prepare_successor_with_history<B: StorageBackend + ?Sized>(")
+            .find("\nfn prepare_successor_with_lease_context<B: StorageBackend + ?Sized>(")
+            .map(|start| start + 1)
             .expect(
                 "prepare_successor was not found in this file, so the scan matched nothing and \
                  would have reported every row below as satisfied",
@@ -29927,6 +30455,7 @@ mod replaywall_measurements {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 
@@ -30051,6 +30580,7 @@ mod replaywall_measurements {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             };
             drop(lease);
 
@@ -30300,6 +30830,7 @@ mod clockhalf_whole_history {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
 
@@ -30867,6 +31398,7 @@ mod native_admission_lineage {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         transaction
@@ -32155,6 +32687,7 @@ mod collaboration_commit_measurement {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         }
     }
 

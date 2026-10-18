@@ -2906,6 +2906,7 @@ fn transfer_transaction(
         sealed_observation: None,
         collaboration_delta: pack.collaboration.clone(),
         git_snapshot_proofs: pack.git_snapshot_proofs.clone(),
+        entity_edit_lease: None,
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -3327,6 +3328,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3472,6 +3474,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3742,6 +3745,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(source_lease);
         source
@@ -4994,6 +4998,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         fixture
@@ -5057,6 +5062,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         authority
@@ -5518,6 +5524,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: Vec::new(),
+            entity_edit_lease: None,
         };
         drop(lease);
         fixture
@@ -5920,6 +5927,7 @@ mod tests {
             sealed_observation: None,
             collaboration_delta: None,
             git_snapshot_proofs: vec![proof.clone()],
+            entity_edit_lease: None,
         };
         drop(lease);
         source
@@ -6039,6 +6047,7 @@ mod tests {
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             };
             drop(lease);
             fixture

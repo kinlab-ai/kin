@@ -2448,6 +2448,21 @@ fn handle_initialize(
     })
     .unwrap_or_default();
 
+    // A versioned implementation contract, independent of graph population or
+    // initialization readiness. Clients must not infer it from status schema or
+    // package version. Unparsed artifact content is not a semantic source unit.
+    result["capabilities"]["experimental"] = serde_json::json!({
+        "kin": {
+            "semanticSourceContract": {
+                "schema": "kin.semantic-source.v1",
+                "sourceUnit": "parsed_entity",
+                "wholeFileReads": false,
+                "unparsedTextSource": "refused",
+                "moduleSource": "members_only"
+            }
+        }
+    });
+
     // Add kinVersion to serverInfo for Kin-aware clients.
     if let Some(info) = result.get_mut("serverInfo") {
         info["kinVersion"] = serde_json::json!(config.server_version);

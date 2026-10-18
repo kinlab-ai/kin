@@ -385,6 +385,7 @@ async fn session_binding_capture_transferred_equal_authority_materializes_withou
                 sealed_observation: None,
                 collaboration_delta: None,
                 git_snapshot_proofs: Vec::new(),
+                entity_edit_lease: None,
             },
             None,
         )

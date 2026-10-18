@@ -1,5 +1,5 @@
-// A Rust crate root is named by the crate its manifest declares, and an MCP
-// write of the manifest renames it in the same commit.
+// A Rust crate root follows admitted manifest metadata. Unparsed manifests
+// cannot be read or patched through the semantic MCP surface.
 
 /// The name the module of `file` carries in the graph a later commit plans
 /// from, and in the daemon's live graph.
@@ -24,13 +24,11 @@ fn crate_names_module(state: &Arc<DaemonState>, file: &str) -> (String, String) 
     (surface(&base.graph), surface(state.graph.as_ref()))
 }
 
-/// Renaming a package through an MCP write of its manifest renames its
-/// crate's root, whose own bytes the write does not change, in the same
-/// commit. A later edit of the module the root re-exports reads the root as
-/// an admitted dependent, and commits.
+/// Brownfield admission of an externally renamed manifest updates the crate root. The
+/// semantic API refuses the unparsed manifest, while later parsed edits work.
 #[tokio::test]
 #[serial_test::serial]
-async fn renaming_a_package_through_its_manifest_renames_its_root_and_later_edits_commit() {
+async fn admitted_package_rename_preserves_later_semantic_edits_without_manifest_source() {
     let (_dir, state) = mcp_lifecycle_fixture();
     for (path, body) in [
         (
@@ -56,14 +54,16 @@ async fn renaming_a_package_through_its_manifest_renames_its_root_and_later_edit
     );
 
     let session = mcp_test_session(&state);
-    let manifest = artifact_read(&state, "first-name :: Cargo.toml").await;
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(&manifest, &[("first-name", "second-name")])],
+    artifact_assert_source_refused(&state, "first-name :: Cargo.toml").await;
+    // External fixture mutation enters through real brownfield admission,
+    // never a semantic source or unguarded whole-entity replacement.
+    std::fs::write(
+        state.layout.working_dir().join("Cargo.toml"),
+        "[package]\nname = \"second-name\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
+    .unwrap();
+    waiting_admit(&state, "an externally renamed package").await;
+    waiting_commit(&state, "an externally renamed package").await;
     let second = "second_name".to_string();
     assert_eq!(
         crate_names_module(&state, "src/lib.rs"),
@@ -255,13 +255,13 @@ async fn a_symlinked_manifest_names_its_crate_through_init_upgrade_and_live_batc
     );
 }
 
-/// An MCP write of a linked manifest's target alone, a path no Cargo
-/// manifest is named at, renames the root of the crate linked to it in the
-/// same commit, and a later MCP edit beneath that crate commits.
+/// A linked manifest remains unavailable as semantic source. Explicit
+/// brownfield admission of its target still updates dependent crate names,
+/// and a later parsed-entity edit commits.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
-async fn an_mcp_write_of_a_link_target_renames_the_linked_crate_and_later_edits_commit() {
+async fn admitted_link_target_rename_preserves_semantic_edits_without_manifest_source() {
     install_test_registry_override();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -292,32 +292,23 @@ async fn an_mcp_write_of_a_link_target_renames_the_linked_crate_and_later_edits_
         (shared.clone(), shared)
     );
 
-    // The target is an unparsed entity, found by its name as an agent finds
-    // it, and read by the address the reply gives.
+    // Discovery exposes metadata, never a whole manifest or edit ticket.
     let (result, text) =
         artifact_call(&state, "locate", serde_json::json!({"query": "tool.toml"})).await;
     assert_ne!(result.is_error, Some(true), "{text}");
-    let mut target = None;
-    for row in artifact_rows(&text, "results") {
-        let address = row.split("  ").next().unwrap_or_default().to_string();
-        let read = artifact_read(&state, &address).await;
-        if read["body"]
-            .as_str()
-            .is_some_and(|body| body.contains("\"shared-tool\""))
-        {
-            target = Some(read);
-            break;
-        }
+    let rows = artifact_rows(&text, "results");
+    assert!(!rows.is_empty(), "{text}");
+    for row in rows {
+        artifact_assert_source_refused(&state, row.split("  ").next().unwrap()).await;
     }
-    let target = target.unwrap_or_else(|| panic!("locate finds the target by its name: {text}"));
-    let session = mcp_test_session(&state);
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(&target, &[("shared-tool", "written-tool")])],
+    std::fs::write(
+        state.layout.working_dir().join("shared/tool.toml"),
+        "[package]\nname = \"written-tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
+    .unwrap();
+    waiting_admit(&state, "an externally renamed linked manifest").await;
+    waiting_commit(&state, "an externally renamed linked manifest").await;
+    let session = mcp_test_session(&state);
     let written = "written_tool".to_string();
     assert_eq!(
         crate_names_module(&state, "crates/tool/src/lib.rs"),

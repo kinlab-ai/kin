@@ -838,8 +838,9 @@ pub const GET_ENTITY_SOURCE_DESC: &str = "\
 Return the exact implementation body of one entity by ID, served from graph-owned \
 truth, along with its metadata (name, kind, language, file path, line range, \
 signature). This is how you read the actual code for a declaration once \
-semantic_search (or any traversal) has handed you its ID — no need to open the file \
-and hunt for line numbers yourself. A name is accepted in place of the ID: one exact \
+semantic_search (or any traversal) has handed you its ID. Unparsed text artifacts and \
+heading sections are refused with `unparsed_source_requires_semantic_coverage`; they never \
+return an artifact body or edit base. A name is accepted in place of the ID: one exact \
 name, or one owner's member when nothing is named exactly (`get` for the method \
 `Scaffold.get`), returns its body; twins, several owners' members or a partial name return \
 `ambiguous_focal` with every candidate's id and no body. It returns just \

@@ -42,7 +42,9 @@ fn artifact_history() -> String {
          Version 1.0.0\n-------------\n\nReleased 2026-01-01\n\n",
     );
     for entry in 0..120 {
-        text.push_str(&format!("- Entry {entry:03}: one line of the first release.\n"));
+        text.push_str(&format!(
+            "- Entry {entry:03}: one line of the first release.\n"
+        ));
     }
     text
 }
@@ -140,6 +142,22 @@ async fn artifact_read(state: &Arc<DaemonState>, address: &str) -> serde_json::V
     .await;
     assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
     tool_result_payload(&result)
+}
+
+async fn artifact_assert_source_refused(state: &Arc<DaemonState>, address: &str) {
+    let roots = source_base_roots(state);
+    let (result, text) =
+        artifact_call(state, "source", serde_json::json!({"entity_id": address})).await;
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("unparsed_source_requires_semantic_coverage"),
+        "{text}"
+    );
+    let delivered = serde_json::to_string(&result).unwrap();
+    assert!(!delivered.contains("source_base"), "{delivered}");
+    assert!(!delivered.contains("\"body\":"), "{delivered}");
+    assert!(!delivered.contains(ARTIFACT_LICENSE), "{delivered}");
+    assert_eq!(source_base_roots(state), roots);
 }
 
 /// A tracked thing no parser reads is found by its name, exactly, without
@@ -259,13 +277,12 @@ async fn artifact_text_is_found_by_name_and_by_description() {
         .find(|row| row["name"] == "schema.sql")
         .unwrap_or_else(|| panic!("{payload}"))
         .clone();
-    // Its id reads it.
+    // Discovery metadata does not grant a source body or edit base.
     let id = ranked["entity_id"]
         .as_str()
         .or_else(|| ranked["id"].as_str())
         .unwrap_or_else(|| panic!("a ranked row carries its id: {ranked}"));
-    let read = artifact_read(&state, id).await;
-    assert_eq!(read["body"], ARTIFACT_SCHEMA);
+    artifact_assert_source_refused(&state, id).await;
 
     // No row says where anything is projected.
     for query in ["LICENSE", "schema", "readme"] {
@@ -275,230 +292,41 @@ async fn artifact_text_is_found_by_name_and_by_description() {
     }
 }
 
-/// A small text is read whole, with the ticket a write carries back, under
-/// every spelling a reply serves for it. The reply states the level Kin holds
-/// it at and, in one line, where it is projected.
+/// Unparsed source is refused by name and UUID without issuing an edit base.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_text_is_read_whole_with_a_ticket_and_its_level() {
+async fn artifact_text_source_refuses_names_and_ids_without_an_edit_ticket() {
     let (_dir, state) = artifact_fixture().await;
-    let binding = state.local_repository_authority_binding().unwrap();
-    let repository_id = binding.repository_id().as_str();
-    let workspace_id = binding.workspace_id().to_string();
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "shop :: LICENSE"}),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let ticket = text
-        .lines()
-        .find_map(|line| line.strip_prefix("source_base: ticket="))
-        .unwrap_or_else(|| panic!("a read carries a ticket: {text}"));
-    let revision = text
-        .lines()
-        .find(|line| line.starts_with("revision: "))
-        .unwrap_or_else(|| panic!("a read names its revision: {text}"));
-    let body: String = ARTIFACT_LICENSE
-        .lines()
-        .map(|line| format!("  {line}\n"))
-        .collect();
-    assert_eq!(
-        text,
-        format!(
-            "Answer (complete): this is the text of LICENSE, held as text (Kin knows its name, \
-             its history and what refers to it, not its structure), the whole body.\n\
-             shop :: LICENSE  (licence)\n\
-             body:\n\
-             {body}\
-             held_as: text\n\
-             projected_at: LICENSE\n\
-             {revision}\n\
-             source_base: ticket={ticket}\n\
-             source_identity:\n  \
-             shop :: LICENSE  repository_id={repository_id:.8}  workspace_id={workspace_id:.8}"
-        )
-    );
-
-    // The machine reply holds the exact text and the base that guards it.
-    let read = artifact_read(&state, "shop :: LICENSE").await;
-    assert_eq!(read["body"], ARTIFACT_LICENSE);
-    assert_eq!(read["held_as"], "text");
-    assert!(read.get("editor_uri").is_none(), "{read}");
-    let artifact_id = state
+    for address in [
+        "LICENSE",
+        "shop :: LICENSE",
+        "schema.sql",
+        "shop :: README.md",
+    ] {
+        artifact_assert_source_refused(&state, address).await;
+    }
+    let artifact = state
         .graph
         .resolved_tree()
-        .artifact_at_path(&kin_model::RepoPath::from_utf8("LICENSE".to_string()).unwrap())
+        .artifact_at_path(&kin_model::RepoPath::from_utf8("LICENSE").unwrap())
         .unwrap()
         .artifact_id;
-    assert_eq!(read["id"], serde_json::json!(artifact_id.0));
-    assert_eq!(
-        read["source_identity"],
-        serde_json::json!({
-            "repository_id": repository_id,
-            "workspace_id": workspace_id,
-            "entity_id": artifact_id.0,
-        })
-    );
-    assert!(
-        kin_mcp::source_ticket::is_ticket(&read["source_base"]),
-        "{read}"
-    );
-    let id = read["id"].as_str().unwrap().to_string();
-    let short: String = id.chars().filter(|c| *c != '-').take(8).collect();
-    for address in [
-        id.clone(),
-        short.clone(),
-        format!("#{short}"),
-        format!("LICENSE #{short}"),
-        "LICENSE".to_string(),
-        "shop::LICENSE".to_string(),
-    ] {
-        let again = artifact_read(&state, &address).await;
-        assert_eq!(again["id"], read["id"], "{address}");
-        assert_eq!(again["body"], ARTIFACT_LICENSE, "{address}");
-    }
-
-    // One below the package, placed like the code it sits with.
-    let (_, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "schema.sql"}),
-    )
-    .await;
-    assert!(text.contains("\nshop :: schema.sql  (SQL)\n"), "{text}");
-    assert!(
-        text.contains("\nprojected_at: src/shop/schema.sql\n"),
-        "{text}"
-    );
-    // That one line is the only place the reply says where it is projected.
-    assert_eq!(text.matches("src/shop").count(), 1, "{text}");
-
-    // A name two artifacts share names neither, and each is listed by an
-    // address that reads it.
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "README.md"}),
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "message: `README.md` names 2 unparsed entities, and this call takes one. Pass one of: \
-         `shop :: README.md`, `docs :: README.md`."
-    );
-    let docs = artifact_read(&state, "docs :: README.md").await;
-    assert_eq!(docs["body"], "# Documentation\n");
+    artifact_assert_source_refused(&state, &artifact.0.to_string()).await;
 }
 
-/// A text longer than one reply carries is read in excerpts that join to its
-/// exact bytes. Each excerpt carries the ticket a patch needs, and the whole
-/// text asked for at once pages the same way, from its first excerpt.
+/// Paging is not a whole-file fallback for unparsed source.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_long_text_is_read_in_excerpts_that_join_to_the_exact_text() {
-    let (_dir, state) = artifact_fixture().await;
+async fn artifact_long_text_cannot_be_reconstructed_through_source_excerpts() {
+    let (dir, state) = artifact_fixture().await;
     let changelog = artifact_changelog();
     assert!(changelog.len() > kin_mcp::source_pages::FULL_BODY_MAX_BYTES);
-
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "CHANGES.txt"}),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let first = tool_result_payload(&result);
-    let id = first["entity_id"]
-        .as_str()
-        .or_else(|| first["id"].as_str())
-        .unwrap_or_else(|| panic!("{first}"))
-        .to_string();
-    assert!(
-        text.starts_with(
-            "Answer (complete): Excerpt: this is the text of CHANGES.txt, held as text (Kin \
-             knows its name, its history and what refers to it, not its structure), lines +0 \
-             to +"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(&format!(
-            "of {} bytes), not the whole body.",
-            changelog.len()
-        )),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "This excerpt's source_base carries a patch whose old_text is copied from these \
-             lines, and never a whole replacement."
-        ),
-        "{text}"
-    );
-    // Its whole text is not offered: it is longer than one reply carries.
-    assert!(!text.contains("full_body"), "{text}");
-    assert!(text.contains("\nsource_base: ticket="), "{text}");
-
-    // Followed to the end, the excerpts are the text, byte for byte.
-    let mut joined = String::new();
-    let mut cursor: Option<String> = None;
-    let mut excerpts = 0;
-    loop {
-        let mut arguments = serde_json::json!({"entity_id": id});
-        if let Some(cursor) = &cursor {
-            arguments["cursor"] = serde_json::json!(cursor);
-        }
-        let mut result = edit_path_call(&state, "get_entity_source", arguments.clone()).await;
-        let sent: HashMap<String, serde_json::Value> = serde_json::from_value(arguments).unwrap();
-        kin_mcp::source_pages::present("get_entity_source", &sent, &mut result);
-        assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
-        let page = tool_result_payload(&result);
-        assert!(
-            page["body"].as_str().unwrap().len() <= kin_mcp::source_pages::SOURCE_PAGE_BYTES,
-            "{page}"
-        );
-        assert!(
-            page["source_base"].is_object(),
-            "every excerpt carries its base: {page}"
-        );
-        joined.push_str(page["body"].as_str().unwrap());
-        excerpts += 1;
-        match page["next_cursor"].as_str() {
-            Some(next) => cursor = Some(next.to_string()),
-            None => break,
-        }
-        assert!(excerpts < 16, "the excerpts end");
+    for address in ["CHANGES.txt", "shop :: CHANGES.txt"] {
+        artifact_assert_source_refused(&state, address).await;
     }
-    assert!(excerpts > 1);
-    assert_eq!(joined, changelog);
-
-    // Asked for whole, it is served its first excerpt with its ticket, and
-    // nothing past it.
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "CHANGES.txt", "full_body": true}),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(tool_result_payload(&result)["body"], first["body"]);
-    assert!(
-        text.starts_with(
-            "Answer (complete): Excerpt: this is the text of CHANGES.txt, held as text"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains("; a body over 16 KB is never served whole."),
-        "{text}"
-    );
-    assert!(text.contains("\nsource_base: ticket="), "{text}");
-    assert!(!text.contains("Entry 399"), "{text}");
+    assert_eq!(edit_path_disk(&dir, "CHANGES.txt"), changelog);
 }
 
 /// Code is still read as its entities. Asked for whole by its own name it is
@@ -553,299 +381,74 @@ async fn artifact_surface_still_refuses_a_whole_read_of_parsed_code() {
     assert!(!text.contains("held_as"), "{text}");
 }
 
-/// The first excerpt of `address` as the MCP server pages it: the machine
-/// reply, with the base a patch against it carries.
-#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
-async fn artifact_first_excerpt(state: &Arc<DaemonState>, address: &str) -> serde_json::Value {
-    let arguments = serde_json::json!({"entity_id": address});
-    let mut result = edit_path_call(state, "get_entity_source", arguments.clone()).await;
-    let sent: HashMap<String, serde_json::Value> = serde_json::from_value(arguments).unwrap();
-    kin_mcp::source_pages::present("get_entity_source", &sent, &mut result);
-    assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
-    tool_result_payload(&result)
-}
-
-/// A text artifact is changed the way an entity is: an anchored patch with
-/// the ticket of its read lands in the graph and in the projected tree, at
-/// the one place its anchor names, and the artifact keeps its id. A ticket
-/// from before the change, and an anchor that names no one place, are refused
-/// in a sentence, with nothing written.
+/// Unparsed reads leave authority unchanged; parsed edits remain usable.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_text_is_patched_with_the_ticket_of_its_read() {
+async fn unparsed_text_cannot_issue_a_patch_ticket_or_change_authority() {
     let (dir, state) = artifact_fixture().await;
-    let session = mcp_test_session(&state);
-    let read = artifact_read(&state, "shop :: LICENSE").await;
-
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &read,
-            &[("Example Authors", "Example Authors and contributors")],
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Changed shop :: LICENSE; the graph now holds it.");
-    let patched = ARTIFACT_LICENSE.replace("Example Authors", "Example Authors and contributors");
-    assert_eq!(edit_path_disk(&dir, "LICENSE"), patched);
-    // The graph serves the same text back, and it is the same artifact.
-    let after = artifact_read(&state, "shop :: LICENSE").await;
-    assert_eq!(after["body"].as_str().unwrap(), patched);
-    assert_eq!(after["id"], read["id"]);
-    assert_ne!(after["source_base"], read["source_base"]);
-    // Nothing else moved.
-    assert_eq!(edit_path_disk(&dir, "README.md"), ARTIFACT_README);
-    assert_eq!(edit_path_disk(&dir, "src/shop/db.py"), ARTIFACT_DB);
-    let roots = source_base_roots(&state);
-
-    // The ticket of the first read names text that has since changed.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &read,
-            &[("MIT License", "The MIT License")],
-        )],
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "That ticket is from before LICENSE last changed. Read LICENSE again with source and \
-         resend your change with the source_base that read returns. Nothing was written."
-    );
-
-    // An anchor that stands twice names no one place, and one that stands
-    // nowhere names none.
-    for (anchor, refusal) in [
-        (
-            "of ",
-            "Nothing was written: patch edit #0: old_text occurs 2 times in the text of LICENSE, \
-             so extend it with the text beside the one you mean until it occurs once.",
-        ),
-        (
-            "Apache License",
-            "Nothing was written: patch edit #0: old_text is not in the text of LICENSE, so copy \
-             it exactly from what source returned for LICENSE, or read LICENSE again with \
-             source.",
-        ),
-    ] {
-        let (result, text) = edit_path_mutate(
-            &state,
-            &session,
-            vec![edit_path_patch(&after, &[(anchor, "x")])],
-        )
-        .await;
-        assert_eq!(result.is_error, Some(true), "{text}");
-        assert_eq!(text, refusal);
-    }
-    assert_eq!(edit_path_disk(&dir, "LICENSE"), patched);
-    assert_eq!(source_base_roots(&state), roots);
-
-    // A text short enough to be read whole is also replaced whole.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_update(&after, "Public domain.\n")],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Changed shop :: LICENSE; the graph now holds it.");
-    assert_eq!(edit_path_disk(&dir, "LICENSE"), "Public domain.\n");
-    let replaced = artifact_read(&state, "shop :: LICENSE").await;
-    assert_eq!(replaced["body"], "Public domain.\n");
-    assert_eq!(replaced["id"], read["id"]);
-}
-
-/// A long text is patched from an excerpt: the excerpt's ticket carries a
-/// patch whose anchor stands once in the whole text, so a changelog gains an
-/// entry without being read whole. An anchor that also stands in a part the
-/// reader did not see is refused, and so is a whole replacement of a text no
-/// reply carried whole. A search then finds the artifact by what was written.
-#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
-#[tokio::test]
-#[serial_test::serial]
-async fn artifact_long_text_is_patched_from_an_excerpt_and_never_replaced_whole() {
-    let (dir, state) = artifact_fixture().await;
-    let session = mcp_test_session(&state);
-    let changelog = artifact_changelog();
-    let page = artifact_first_excerpt(&state, "CHANGES.txt").await;
-    assert_eq!(page["body_complete"], false, "{page}");
-    assert!(page["body"].as_str().unwrap().len() < changelog.len());
-
-    let entry = "- Entry new: a line a reader of one excerpt added.\n";
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &page,
-            &[(
-                "Unreleased\n----------\n\n",
-                &format!("Unreleased\n----------\n\n{entry}"),
-            )],
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Changed shop :: CHANGES.txt; the graph now holds it.");
-    let patched = changelog.replace(
-        "Unreleased\n----------\n\n",
-        &format!("Unreleased\n----------\n\n{entry}"),
-    );
-    assert_eq!(edit_path_disk(&dir, "CHANGES.txt"), patched);
-    let roots = source_base_roots(&state);
-
-    // An anchor every entry holds stands many times in the whole text.
-    let page = artifact_first_excerpt(&state, "CHANGES.txt").await;
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &page,
-            &[("a change that is described", "a change described")],
-        )],
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Nothing was written: patch edit #0: old_text occurs 400 times in the text of \
-         CHANGES.txt, so extend it with the text beside the one you mean until it occurs once."
-    );
-
-    // The whole text was never in one reply, so it is never replaced whole.
-    let (result, text) =
-        edit_path_mutate(&state, &session, vec![edit_path_update(&page, "Changes\n")]).await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Nothing was written: CHANGES.txt holds more text than one reply carries, so it is \
-         changed by patch and never replaced whole. Send a patch whose old_text is copied from \
-         an excerpt source returned."
-    );
-    assert_eq!(edit_path_disk(&dir, "CHANGES.txt"), patched);
-    assert_eq!(source_base_roots(&state), roots);
-
-    // What was written is found by a description of it.
-    let (_, text) = artifact_call(
-        &state,
-        "locate",
-        serde_json::json!({
-            "query": "a line a reader of one excerpt added",
-            "mode": "description",
-            "surface": "compact"
-        }),
-    )
-    .await;
-    assert!(
-        artifact_rows(&text, "results")
-            .contains(&"shop :: CHANGES.txt  (plain text)  held_as=text".to_string()),
-        "{text}"
-    );
-}
-
-/// A change to an artifact is held to what it is. Source Kin parses is
-/// changed through its entities, and a base that names it as an artifact is
-/// refused; one transaction changes one artifact once.
-#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
-#[tokio::test]
-#[serial_test::serial]
-async fn artifact_writes_refuse_parsed_code_and_two_changes_to_one_artifact() {
-    let (dir, state) = artifact_fixture().await;
-    let session = mcp_test_session(&state);
-    let read = artifact_read(&state, "shop :: LICENSE").await;
-
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![
-            edit_path_patch(&read, &[("MIT License", "The MIT License")]),
-            edit_path_patch(&read, &[("Example Authors", "Example Writers")]),
-        ],
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Nothing was written: one entity is changed more than once in one transaction, so \
-         send every edit to it in one patch's edits."
-    );
+    artifact_assert_source_refused(&state, "shop :: LICENSE").await;
     assert_eq!(edit_path_disk(&dir, "LICENSE"), ARTIFACT_LICENSE);
-
-    // Two edits in one patch are the way to make two changes.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &read,
-            &[
-                ("MIT License", "The MIT License"),
-                ("Example Authors", "Example Writers"),
-            ],
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        edit_path_disk(&dir, "LICENSE"),
-        ARTIFACT_LICENSE
-            .replace("MIT License", "The MIT License")
-            .replace("Example Authors", "Example Writers")
-    );
-
-    // An artifact and a function change in one transaction, or neither does.
-    let license = artifact_read(&state, "shop :: LICENSE").await;
+    // Supported parsed-entity edits remain usable beside the refused artifact.
+    let session = mcp_test_session(&state);
     let function = edit_path_read(&state, &serde_json::json!("shop.db::schema_version")).await;
     let (result, text) = edit_path_mutate(
         &state,
         &session,
-        vec![
-            edit_path_patch(&license, &[("Example Writers", "Example Authors")]),
-            edit_path_patch(&function, &[("return 1", "return 2")]),
-        ],
+        vec![edit_path_patch(&function, &[("return 1", "return 2")])],
     )
     .await;
     assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Changed shop.db :: schema_version and shop :: LICENSE; 1 source unit written; the \
-         graph now holds the change."
-    );
-    assert!(edit_path_disk(&dir, "LICENSE").contains("Example Authors"));
+    assert_eq!(edit_path_disk(&dir, "LICENSE"), ARTIFACT_LICENSE);
     assert!(edit_path_disk(&dir, "src/shop/db.py").contains("return 2"));
+}
 
-    // Source Kin parses is not an artifact to patch: a ticket that names it
-    // as one resolves to nothing, and the write is refused before it stages.
-    let code = state
-        .graph
-        .resolved_tree()
-        .artifact_at_path(&kin_model::RepoPath::from_utf8("src/shop/db.py".to_string()).unwrap())
-        .unwrap()
-        .artifact_id;
-    let license = artifact_read(&state, "shop :: LICENSE").await;
-    let ticket = license["source_base"]["ticket"].as_str().unwrap();
-    let forged = ticket.replacen(license["id"].as_str().unwrap(), &code.0.to_string(), 1);
-    assert_ne!(forged, ticket);
+/// Long unparsed artifacts yield neither excerpts nor edit bases.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+#[tokio::test]
+#[serial_test::serial]
+async fn unparsed_long_text_has_no_excerpt_edit_base() {
+    let (dir, state) = artifact_fixture().await;
+    let roots = source_base_roots(&state);
+    artifact_assert_source_refused(&state, "shop :: CHANGES.txt").await;
+    assert_eq!(edit_path_disk(&dir, "CHANGES.txt"), artifact_changelog());
+    assert_eq!(source_base_roots(&state), roots);
+}
+
+/// Duplicate parsed-entity operations fail atomically without blocking normal edits.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+#[tokio::test]
+#[serial_test::serial]
+async fn parsed_entity_writes_refuse_duplicate_operations_atomically() {
+    let (dir, state) = artifact_fixture().await;
+    let session = mcp_test_session(&state);
+    let function = edit_path_read(&state, &serde_json::json!("shop.db::schema_version")).await;
+    let roots = source_base_roots(&state);
     let before = edit_path_disk(&dir, "src/shop/db.py");
     let (result, text) = edit_path_mutate(
         &state,
         &session,
-        vec![serde_json::json!({
-            "verb": "patch", "target": code.0, "description": "patch code as text",
-            "payload": {"EntitySourcePatch": {
-                "source_base": {"ticket": forged},
-                "edits": [{"old_text": "import sqlite3", "new_text": "import sqlite4"}]
-            }}
-        })],
+        vec![
+            edit_path_patch(&function, &[("return 1", "return 2")]),
+            edit_path_patch(&function, &[("return 1", "return 3")]),
+        ],
     )
     .await;
     assert_eq!(result.is_error, Some(true), "{text}");
-    assert!(text.contains("db.py is held as code"), "{text}");
-    assert!(text.ends_with("Nothing was written."), "{text}");
+    assert!(
+        text.contains("edited more than once in one transaction"),
+        "{text}"
+    );
+    assert_eq!(source_base_roots(&state), roots);
     assert_eq!(edit_path_disk(&dir, "src/shop/db.py"), before);
+    let (result, text) = edit_path_mutate(
+        &state,
+        &session,
+        vec![edit_path_patch(&function, &[("return 1", "return 2")])],
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(edit_path_disk(&dir, "src/shop/db.py").contains("return 2"));
 }
 
 /// A PNG image 16 by 8 pixels: its signature, its header and its end. Only
@@ -900,9 +503,6 @@ async fn artifact_fixture_with_logo() -> (tempfile::TempDir, Arc<DaemonState>) {
 #[serial_test::serial]
 async fn artifact_bytes_are_found_and_described_and_never_returned() {
     let (_dir, state) = artifact_fixture_with_logo().await;
-    let binding = state.local_repository_authority_binding().unwrap();
-    let repository_id = binding.repository_id().as_str();
-    let workspace_id = binding.workspace_id().to_string();
     let png = artifact_png();
 
     for query in ["logo", "logo.png", "png"] {
@@ -946,7 +546,7 @@ async fn artifact_bytes_are_found_and_described_and_never_returned() {
             .unwrap_or_else(|| panic!("the description names its {name}: {text}"))
             .to_string()
     };
-    let (revision, ticket) = (field("revision"), field("source_base"));
+    let revision = field("revision");
     // What names it: the template by its name, the guide by the end of its
     // place.
     let mentions = "matched_by: name\n\
@@ -974,14 +574,11 @@ async fn artifact_bytes_are_found_and_described_and_never_returned() {
              history: changes=1 latest={change}\n\
              {mentions}\
              projected_at: src/shop/static/logo.png\n\
-             revision: {revision}\n\
-             source_base: {ticket}\n\
-             source_identity:\n  \
-             shop.static :: logo.png  repository_id={repository_id:.8}  workspace_id={workspace_id:.8}",
+             revision: {revision}",
             png.len()
         )
     );
-    assert!(ticket.starts_with("ticket="), "{text}");
+    assert!(!text.contains("source_base:"), "{text}");
 
     // Neither reply holds the bytes, nor any spelling of them.
     let machine = artifact_read(&state, "shop.static :: logo.png").await;
@@ -994,14 +591,7 @@ async fn artifact_bytes_are_found_and_described_and_never_returned() {
         .unwrap()
         .artifact_id;
     assert_eq!(machine["id"], serde_json::json!(artifact_id.0));
-    assert_eq!(
-        machine["source_identity"],
-        serde_json::json!({
-            "repository_id": repository_id,
-            "workspace_id": workspace_id,
-            "entity_id": artifact_id.0,
-        })
-    );
+    assert!(machine.get("source_base").is_none(), "{machine}");
     assert!(machine.get("body").is_none(), "{machine}");
     assert!(machine.get("editor_uri").is_none(), "{machine}");
     let served = format!("{machine}{text}");
@@ -1038,311 +628,55 @@ fn artifact_operation(
     })
 }
 
-/// An entity held as bytes is replaced by content Kin already holds: another
-/// image's, or its own as it stood at an earlier change. It keeps its id, its
-/// history grows, and its description follows its new content. A copy is
-/// created beside it, and it is removed. Each refusal says what to send
-/// instead, with nothing written.
+/// Byte descriptions issue no edit base and cannot authorize mutation.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_bytes_are_replaced_by_content_kin_holds_and_removed() {
+async fn artifact_byte_metadata_does_not_authorize_replacement_or_removal() {
     let (dir, state) = artifact_fixture_with_logo().await;
     let session = mcp_test_session(&state);
-    let disk = |place: &str| std::fs::read(dir.path().join(place)).ok();
     let read = artifact_read(&state, "shop.static :: logo.png").await;
-    assert_eq!(read["history"]["changes"], 1, "{read}");
-    let first = read["history"]["latest"].as_str().unwrap().to_string();
-
-    // Another unparsed entity's content.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "replace",
-            &read,
-            serde_json::json!({"EntityContent": {
-                "source_base": read["source_base"], "content_of": "banner.gif"
-            }}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Changed shop.static :: logo.png; the graph now holds it."
-    );
-    assert_eq!(disk("src/shop/static/logo.png"), Some(artifact_gif()));
-    let (_, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "logo.png"}),
-    )
-    .await;
-    assert!(
-        text.starts_with(
-            "Answer (complete): this is the description of logo.png, a GIF image of 32 by 16 \
-             pixels and 14 bytes, held as bytes"
-        ),
-        "{text}"
-    );
-    let replaced = artifact_read(&state, "shop.static :: logo.png").await;
-    assert_eq!(replaced["id"], read["id"]);
-    assert_eq!(replaced["history"]["changes"], 2, "{replaced}");
-    assert_eq!(replaced["history"]["first"], first.as_str(), "{replaced}");
-
-    // The ticket of the first read is from before that change.
+    assert!(read.get("source_base").is_none(), "{read}");
     let roots = source_base_roots(&state);
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
+    for (verb, payload) in [
+        (
             "replace",
-            &read,
             serde_json::json!({"EntityContent": {
                 "source_base": read["source_base"], "content_of": "banner.gif"
             }}),
-        )],
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "That ticket is from before logo.png last changed. Read logo.png again with source and \
-         resend your change with the source_base that read returns. Nothing was written."
-    );
-
-    // Refused in a sentence each, with nothing written.
-    for (content, refusal) in [
-        (
-            serde_json::json!({"content_of": "banner.gif"}),
-            "Nothing was written: the replacement leaves logo.png as it is, so nothing was \
-             written.",
         ),
         (
-            serde_json::json!({"content_of": "db.py"}),
-            "Nothing was written: db.py is held as code, and its source is not given to an \
-             unparsed entity.",
-        ),
-        (
-            serde_json::json!({"content_of": "missing.png"}),
-            "Nothing was written: content_of `missing.png` names no unparsed entity Kin holds, \
-             so find it with locate and pass the id or the module :: name its row shows.",
-        ),
-        (
-            serde_json::json!({"content_of": "logo.png", "at": "deadbeefdeadbeef"}),
-            "Nothing was written: at `deadbeefdeadbeef` names no change in the history Kin \
-             holds for this branch; pass a change id as a history line shows it.",
+            "remove",
+            serde_json::json!({"EntityRemove": {"source_base": read["source_base"]}}),
         ),
     ] {
-        let mut payload = content.clone();
-        payload["source_base"] = replaced["source_base"].clone();
         let (result, text) = edit_path_mutate(
             &state,
             &session,
-            vec![artifact_operation(
-                "replace",
-                &replaced,
-                serde_json::json!({"EntityContent": payload}),
-            )],
+            vec![artifact_operation(verb, &read, payload)],
         )
         .await;
-        assert_eq!(result.is_error, Some(true), "{content}: {text}");
-        assert_eq!(text, refusal, "{content}");
+        assert_eq!(result.is_error, Some(true), "{text}");
+        assert_eq!(source_base_roots(&state), roots);
+        assert_eq!(
+            std::fs::read(dir.path().join("src/shop/static/logo.png")).unwrap(),
+            artifact_png()
+        );
     }
-    assert_eq!(source_base_roots(&state), roots);
-    assert_eq!(disk("src/shop/static/logo.png"), Some(artifact_gif()));
-
-    // Its own content as it stood at the change that first held it.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "replace",
-            &replaced,
-            serde_json::json!({"EntityContent": {
-                "source_base": replaced["source_base"], "content_of": "logo.png", "at": first
-            }}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(disk("src/shop/static/logo.png"), Some(artifact_png()));
-    let restored = artifact_read(&state, "shop.static :: logo.png").await;
-    assert_eq!(restored["history"]["changes"], 3, "{restored}");
-    assert_eq!(
-        restored["artifact"]["detail"], "16 by 8 pixels",
-        "{restored}"
-    );
-
-    // A copy beside it, under a name of its own.
-    let banner = artifact_read(&state, "banner.gif").await;
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "create",
-            &banner,
-            serde_json::json!({"EntityContent": {
-                "source_base": banner["source_base"], "name": "logo-copy.png",
-                "content_of": "shop.static :: logo.png"
-            }}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Created shop.static :: logo-copy.png; the graph now holds it."
-    );
-    assert_eq!(disk("src/shop/static/logo-copy.png"), Some(artifact_png()));
-    let copy = artifact_read(&state, "logo-copy.png").await;
-    assert_ne!(copy["id"], restored["id"]);
-    assert_eq!(copy["held_as"], "bytes");
-
-    // Removed: gone from the projected tree and from every answer.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "remove",
-            &restored,
-            serde_json::json!({"EntityRemove": {"source_base": restored["source_base"]}}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Removed shop.static :: logo.png; the graph now holds it."
-    );
-    assert_eq!(disk("src/shop/static/logo.png"), None);
-    let (_, text) = artifact_call(&state, "locate", serde_json::json!({"query": "logo"})).await;
-    assert_eq!(
-        artifact_rows(&text, "results"),
-        ["shop.static :: logo-copy.png  (PNG image)  held_as=bytes"],
-        "{text}"
-    );
-    let (result, _) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": restored["id"]}),
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true));
 }
 
-/// A new unparsed entity is created with its text beside an entity Kin
-/// holds, unparsed or code, placed where that entity is, and removed. A name
-/// that is a place, that Kin would parse as code, or that is already held
-/// there is refused.
+/// Unparsed metadata cannot supply the base for a new artifact mutation.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_text_is_created_beside_an_entity_and_removed() {
+async fn unparsed_text_metadata_does_not_supply_an_artifact_mutation_base() {
     let (dir, state) = artifact_fixture().await;
-    let session = mcp_test_session(&state);
-    let license = artifact_read(&state, "shop :: LICENSE").await;
-
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "create",
-            &license,
-            serde_json::json!({"EntityContent": {
-                "source_base": license["source_base"], "name": "NOTICE",
-                "text": "Shop includes no third-party work.\n"
-            }}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Created shop :: NOTICE; the graph now holds it.");
-    assert_eq!(
-        edit_path_disk(&dir, "NOTICE"),
-        "Shop includes no third-party work.\n"
-    );
-    let (_, text) =
-        artifact_call(&state, "source", serde_json::json!({"entity_id": "NOTICE"})).await;
-    assert!(
-        text.starts_with("Answer (complete): this is the text of NOTICE, held as text"),
-        "{text}"
-    );
-
-    // Beside a function: where its source is.
-    let function = edit_path_read(&state, &serde_json::json!("shop.db::init_db")).await;
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![serde_json::json!({
-            "verb": "create", "target": function["id"], "description": "add seed data",
-            "payload": {"EntityContent": {
-                "source_base": function["source_base"], "name": "seed.sql",
-                "text": "INSERT INTO item VALUES (1, 'pen', 120);\n"
-            }}
-        })],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Created shop :: seed.sql; the graph now holds it.");
-    assert_eq!(
-        edit_path_disk(&dir, "src/shop/seed.sql"),
-        "INSERT INTO item VALUES (1, 'pen', 120);\n"
-    );
-
-    let license = artifact_read(&state, "shop :: LICENSE").await;
     let roots = source_base_roots(&state);
-    for (name, refusal) in [
-        (
-            "docs/guide.md",
-            "operation #0 ('create'): the name given is not one name: an entity's name holds \
-             no separator, so create it beside an entity Kin holds in the place you mean",
-        ),
-        (
-            "setup.py",
-            "Nothing was written: setup.py names source Kin parses, which is created through \
-             its entities with EntityCreate, not as an unparsed entity.",
-        ),
-        (
-            "README.md",
-            "Nothing was written: `README.md` already stands beside it, so replace that entity, \
-             or create under another name.",
-        ),
-    ] {
-        let (result, text) = edit_path_mutate(
-            &state,
-            &session,
-            vec![artifact_operation(
-                "create",
-                &license,
-                serde_json::json!({"EntityContent": {
-                    "source_base": license["source_base"], "name": name, "text": "x\n"
-                }}),
-            )],
-        )
-        .await;
-        assert_eq!(result.is_error, Some(true), "{name}: {text}");
-        assert_eq!(text, refusal, "{name}");
-    }
+    artifact_assert_source_refused(&state, "shop :: LICENSE").await;
+    artifact_assert_source_refused(&state, "shop :: README.md").await;
     assert_eq!(source_base_roots(&state), roots);
-
-    let notice = artifact_read(&state, "NOTICE").await;
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![artifact_operation(
-            "remove",
-            &notice,
-            serde_json::json!({"EntityRemove": {"source_base": notice["source_base"]}}),
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(text, "Removed shop :: NOTICE; the graph now holds it.");
+    assert_eq!(edit_path_disk(&dir, "LICENSE"), ARTIFACT_LICENSE);
     assert!(!dir.path().join("NOTICE").exists());
-    let (_, text) = artifact_call(&state, "locate", serde_json::json!({"query": "NOTICE"})).await;
-    assert!(!text.contains("held_as"), "{text}");
 }
 
 /// The rows of a text reply under `heading`, which is written
@@ -1412,7 +746,8 @@ async fn artifact_mentions_by_name_answer_refs_on_an_unparsed_entity() {
     }
 
     // Named twice in one entity, it is one row that says so.
-    let (_, text) = artifact_call(&state, "refs", serde_json::json!({"entity_id": "LICENSE"})).await;
+    let (_, text) =
+        artifact_call(&state, "refs", serde_json::json!({"entity_id": "LICENSE"})).await;
     assert_eq!(
         artifact_named_in(&text),
         ["shop.README :: Licence  (section)  See [LICENSE](LICENSE).  held_as=text  times=2"],
@@ -1420,14 +755,23 @@ async fn artifact_mentions_by_name_answer_refs_on_an_unparsed_entity() {
     );
 
     // Named nowhere: none, and still not an absence Kin certifies.
-    let (result, text) =
-        artifact_call(&state, "refs", serde_json::json!({"entity_id": "banner.gif"})).await;
+    let (result, text) = artifact_call(
+        &state,
+        "refs",
+        serde_json::json!({"entity_id": "banner.gif"}),
+    )
+    .await;
     assert_ne!(result.is_error, Some(true), "{text}");
     assert!(text.contains("\nnamed_in: none\n"), "{text}");
     assert!(!text.starts_with("Answer (complete)"), "{text}");
 
     // The description of an entity held as bytes lists what names it.
-    let (_, text) = artifact_call(&state, "source", serde_json::json!({"entity_id": "logo.png"})).await;
+    let (_, text) = artifact_call(
+        &state,
+        "source",
+        serde_json::json!({"entity_id": "logo.png"}),
+    )
+    .await;
     assert_eq!(artifact_named_in(&text).len(), 2, "{text}");
     assert!(text.contains("\nmatched_by: name\n"), "{text}");
 
@@ -1439,124 +783,27 @@ async fn artifact_mentions_by_name_answer_refs_on_an_unparsed_entity() {
     )
     .await;
     assert!(!text.contains("named_in"), "{text}");
-    assert!(text.contains("\nrelation_kinds: calls, imports, references"), "{text}");
+    assert!(
+        text.contains("\nrelation_kinds: calls, imports, references"),
+        "{text}"
+    );
 }
 
-/// A text held with parts and longer than a class is served whole is read as
-/// its outline: the text before its first section, and its sections by id.
-/// A section is read by its address, with the ticket a patch needs and the
-/// code it names. A patch to one section lands without the rest of the text
-/// being read, the section keeps its id, and a ticket of another section
-/// still holds. locate finds a section by its title, and a short text with
-/// parts is read whole.
+/// Artifact outlines are metadata, not permission to read unparsed source.
 #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[tokio::test]
 #[serial_test::serial]
-async fn artifact_sections_are_read_found_and_patched_by_themselves() {
+async fn artifact_outlines_do_not_bypass_the_parsed_source_boundary() {
     let (dir, state) = artifact_fixture().await;
-    let session = mcp_test_session(&state);
-    let history = artifact_history();
-    assert!(history.len() > kin_mcp::container_shape::CONTAINER_INLINE_MAX_BYTES);
-
-    // The outline, and none of the text past its title.
-    let (result, text) =
-        artifact_call(&state, "source", serde_json::json!({"entity_id": "HISTORY.rst"})).await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let outline = tool_result_payload(&result);
-    assert!(outline.get("body").is_none(), "{outline}");
-    assert!(outline.get("source_base").is_none(), "{outline}");
-    assert_eq!(outline["held_as"], "parts", "{outline}");
-    assert_eq!(outline["header"], "History\n=======", "{outline}");
-    let members: Vec<&str> = outline["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|member| member["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(members, ["Version 1.1.0", "Version 1.0.0"], "{outline}");
-    assert!(text.contains("this is the outline of HISTORY.rst"), "{text}");
-    assert!(!text.contains("Entry 000"), "{text}");
-
-    // A section by its address: its text, its ticket and the code it names.
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "shop.HISTORY :: Version 1.1.0"}),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let section = tool_result_payload(&result);
-    assert_eq!(section["name"], "Version 1.1.0", "{section}");
-    assert_eq!(section["kind"], "section");
-    assert_eq!(section["module"], "shop.HISTORY");
-    assert_eq!(section["part_of"], "shop :: HISTORY.rst");
-    assert_eq!(section["id"], outline["members"][0]["id"]);
-    let body = section["body"].as_str().unwrap();
-    assert!(body.starts_with("Version 1.1.0\n-------------\n"), "{body}");
-    assert!(!body.contains("Version 1.0.0"), "{body}");
-    assert!(
-        text.contains("this is the text of the section Version 1.1.0 of shop :: HISTORY.rst"),
-        "{text}"
-    );
-    assert!(text.contains("\nsource_base: ticket="), "{text}");
-    let named: Vec<&str> = section["names"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{section}"))
-        .iter()
-        .map(|row| row["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(named, ["init_db", "schema_version"], "{section}");
-    let older = artifact_read(&state, "shop.HISTORY :: Version 1.0.0").await;
-
-    // A patch to it lands, and nothing else of the text changes.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &section,
-            &[("Unreleased\n", "Released 2026-02-01\n")],
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    assert_eq!(
-        text,
-        "Changed shop.HISTORY :: Version 1.1.0; the graph now holds it."
-    );
-    let patched = history.replacen("Unreleased\n", "Released 2026-02-01\n", 1);
-    assert_eq!(edit_path_disk(&dir, "HISTORY.rst"), patched);
-    let again = artifact_read(&state, "shop.HISTORY :: Version 1.1.0").await;
-    assert_eq!(again["id"], section["id"]);
-
-    // The other section's ticket, from before that change, still holds.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(
-            &older,
-            &[("- Entry 079: one line", "- Entry 079: the last line")],
-        )],
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let patched = patched.replace("- Entry 079: one line", "- Entry 079: the last line");
-    assert_eq!(edit_path_disk(&dir, "HISTORY.rst"), patched);
-
-    // A ticket of a section that changed since is refused.
-    let (result, text) = edit_path_mutate(
-        &state,
-        &session,
-        vec![edit_path_patch(&section, &[("Version 1.1.0\n", "Version 1.2.0\n")])],
-    )
-    .await;
-    assert_eq!(result.is_error, Some(true), "{text}");
-    assert_eq!(edit_path_disk(&dir, "HISTORY.rst"), patched);
-
-    // locate finds a section by its title.
+    artifact_assert_source_refused(&state, "HISTORY.rst").await;
+    artifact_assert_source_refused(&state, "shop :: README.md").await;
+    // Named sections remain discoverable metadata, never a whole-file fallback.
     let (_, text) = artifact_call(
         &state,
         "locate",
-        serde_json::json!({"query": "Version 1.0.0", "mode": "name"}),
+        serde_json::json!({
+            "query": "Version 1.0.0", "mode": "name"
+        }),
     )
     .await;
     assert!(
@@ -1565,19 +812,8 @@ async fn artifact_sections_are_read_found_and_patched_by_themselves() {
             .any(|row| row.starts_with("shop.HISTORY :: Version 1.0.0  (section)")),
         "{text}"
     );
-
-    // A text with parts that fits in a class's bound is read whole.
-    let (result, text) = artifact_call(
-        &state,
-        "source",
-        serde_json::json!({"entity_id": "shop :: README.md"}),
-    )
-    .await;
-    assert_ne!(result.is_error, Some(true), "{text}");
-    let readme = tool_result_payload(&result);
-    assert_eq!(readme["body"], ARTIFACT_README, "{readme}");
-    assert_eq!(readme["held_as"], "parts", "{readme}");
-    assert!(readme.get("parts").is_none(), "{readme}");
+    assert_eq!(edit_path_disk(&dir, "HISTORY.rst"), artifact_history());
+    assert_eq!(edit_path_disk(&dir, "README.md"), ARTIFACT_README);
 }
 
 /// The retrieval record of an entity held as bytes carries the media type of
@@ -1589,7 +825,11 @@ async fn artifact_sections_are_read_found_and_patched_by_themselves() {
 #[serial_test::serial]
 async fn artifact_bytes_records_carry_the_media_type_of_their_format() {
     let (dir, state) = artifact_fixture_with_logo().await;
-    std::fs::write(dir.path().join("src/shop/static/data.blob"), [0u8, 0xFF, 1, 2]).unwrap();
+    std::fs::write(
+        dir.path().join("src/shop/static/data.blob"),
+        [0u8, 0xFF, 1, 2],
+    )
+    .unwrap();
     waiting_admit(&state, "data").await;
     waiting_commit(&state, "Add data").await;
     crate::loop_runner::ensure_non_entity_enrichment_coverage(&state).unwrap();

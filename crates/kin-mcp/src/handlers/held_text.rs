@@ -1109,6 +1109,85 @@ pub(super) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unparsed_text_source_refuses_whole_body_and_edit_base() {
+        for (name, content) in [
+            ("070_profiles.sql", "CREATE TABLE secret_marker (id text);"),
+            ("NOTES.md", "# Whole artifact\n\nsecret_marker\n"),
+        ] {
+            let fixture = DurableTextFixture::new(&[(name, content.as_bytes().to_vec())]);
+            let authority = fixture.local();
+            let config = crate::server::McpServerConfig {
+                session_authority_mode: crate::server::SessionAuthorityMode::OfflineFallback,
+                repository_authority: Some(fixture.local()),
+                ..Default::default()
+            };
+            let sessions = crate::session::SessionRegistry::empty_for_test();
+            // Pin the advertised initialize promise to the real persisted
+            // source-serving path below, not only a constant-string test.
+            let initialized = crate::server::process_message(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                &fixture.graph,
+                &config,
+                &sessions,
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+            let contract =
+                &initialized["capabilities"]["experimental"]["kin"]["semanticSourceContract"];
+            assert_eq!(contract["schema"], "kin.semantic-source.v1");
+            assert_eq!(contract["sourceUnit"], "parsed_entity");
+            assert_eq!(contract["wholeFileReads"], false);
+            assert_eq!(contract["unparsedTextSource"], "refused");
+            for full_body in [false, true] {
+                let args = HashMap::from([
+                    ("entity_id".into(), json!(name)),
+                    ("full_body".into(), json!(full_body)),
+                ]);
+                let reply = super::super::entities::handle_get_entity_source(
+                    &args,
+                    &fixture.graph,
+                    Some(&authority),
+                )
+                .unwrap();
+                assert_eq!(reply.is_error, Some(true));
+                let delivered = serde_json::to_string(&reply).unwrap();
+                assert!(
+                    delivered.contains("unparsed_source_requires_semantic_coverage"),
+                    "{delivered}"
+                );
+                assert!(!delivered.contains("secret_marker"), "{delivered}");
+                assert!(!delivered.contains("source_base"), "{delivered}");
+                // Exercise the actual JSON-RPC tool dispatch as well as the
+                // shared source resolver, including the batched read root.
+                for tool in ["get_entity_source", "get_entity_sources"] {
+                    let arguments = if tool == "get_entity_source" {
+                        json!({"entity_id": name, "full_body": full_body})
+                    } else {
+                        json!({"entity_ids": [name], "full_body": full_body})
+                    };
+                    let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}});
+                    let reply = crate::server::process_message(
+                        &request.to_string(),
+                        &fixture.graph,
+                        &config,
+                        &sessions,
+                    )
+                    .await
+                    .unwrap();
+                    let delivered = serde_json::to_string(&reply).unwrap();
+                    let refused = delivered.contains("unparsed_source_requires_semantic_coverage")
+                        || (tool == "get_entity_sources" && delivered.contains("not_found"));
+                    assert!(refused, "{delivered}");
+                    assert!(!delivered.contains("secret_marker"), "{delivered}");
+                    assert!(!delivered.contains("source_base"), "{delivered}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn durable_local_source_size_refusal_discards_earlier_text_matches() {
         let cap = super::super::repository_authority::HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES;
