@@ -140,6 +140,17 @@ for name in ('run.py', 'probe_startup_binary.py'):
     assert set(env_ns['env']) == {'PATH', 'HOME', 'TMPDIR'}, env_ns['env']
     assert env_ns['env']['HOME'].startswith('/owned/')
     assert 'canary' not in json.dumps(env_ns['env'])
+    # Evaluate the actual update too: an empty private home has no managed
+    # installation. The supplied candidate pair must explicitly select its
+    # isolated development runtime before init or the daemon probe executes.
+    update = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Attribute) and n.func.attr == 'update'
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == 'env')
+    env_ns['token'] = 'owned-fixture-token'
+    exec(compile(ast.Expression(body=update), name, 'eval'), env_ns)
+    assert env_ns['env']['KIN_RUNTIME_MODE'] == 'development', name
+    assert Path(env_ns['env']['KIN_HOME']) != Path(env_ns['env']['HOME']) / '.kin', name
+    assert 'canary' not in json.dumps(env_ns['env']), name
     inherited = dict(fake_os.environ)
     assert set(inherited) != {'PATH', 'HOME', 'TMPDIR'}, 'credential inheritance mutant survived'
 
