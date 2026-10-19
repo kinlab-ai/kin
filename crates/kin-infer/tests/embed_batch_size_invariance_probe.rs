@@ -42,7 +42,7 @@ use kin_infer::{BertConfig, BertModel};
 use std::fs;
 use std::path::Path;
 
-/// Deterministic synthetic token sequence of length `len` (salt varies content).
+/// Deterministic synthetic token sequence of length `len` (seed varies content).
 fn synth(len: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| {

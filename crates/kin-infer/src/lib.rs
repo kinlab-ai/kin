@@ -6651,12 +6651,12 @@ mod tests {
 
         // 12-token target: BELOW the m>=32 MMA floor when alone, crosses it as the
         // batch grows. A filler of length `len` (deterministic, content-distinct).
-        let synth = |len: usize, salt: u32| -> (Vec<u32>, Vec<u32>) {
+        let synth = |len: usize, seed: u32| -> (Vec<u32>, Vec<u32>) {
             let ids: Vec<u32> = (0..len)
                 .map(|i| {
                     1 + ((i as u32)
                         .wrapping_mul(2654435761)
-                        .wrapping_add(salt.wrapping_mul(40503))
+                        .wrapping_add(seed.wrapping_mul(40503))
                         % (vocab as u32 - 1))
                 })
                 .collect();
@@ -6779,12 +6779,12 @@ mod tests {
         let vocab = model.config.vocab_size.max(2);
         let is_metal = format!("{:?}", model.backend()) == "Metal";
 
-        let synth = |len: usize, salt: u32| -> (Vec<u32>, Vec<u32>) {
+        let synth = |len: usize, seed: u32| -> (Vec<u32>, Vec<u32>) {
             let ids: Vec<u32> = (0..len)
                 .map(|i| {
                     1 + ((i as u32)
                         .wrapping_mul(2654435761)
-                        .wrapping_add(salt.wrapping_mul(40503))
+                        .wrapping_add(seed.wrapping_mul(40503))
                         % (vocab as u32 - 1))
                 })
                 .collect();

@@ -1,5 +1,5 @@
 // Batch-size bisection for the forward_batched corruption. Reproduces the exact
-// len-64 entities that corrupted in the truth probe (bucket=1 salt=131+j) and
+// len-64 entities that corrupted in the truth probe (bucket=1 seed=131+j) and
 // sweeps batch size N, reporting worst cosine vs single-forward ground truth.
 // Goal: find the N at which forward_batched starts diverging from forward.
 //   cargo test --features metal --release --test embed_batchsize_sweep -- --nocapture
@@ -63,7 +63,7 @@ fn batchsize_sweep() {
     let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load");
     eprintln!("backend={}", model.backend());
 
-    // len 64 = truth-probe bucket index 1, salt = 1*131 + j (exact corrupting entities).
+    // len 64 = truth-probe bucket index 1, seed = 1*131 + j (exact corrupting entities).
     const LEN: usize = 64;
     let ns = [1usize, 2, 3, 4, 6, 8, 12, 16, 20, 24, 32, 48, 64, 100];
     let maxn = *ns.iter().max().unwrap();

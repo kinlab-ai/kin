@@ -13,7 +13,7 @@ use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo};
 use crate::InferError;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::Once;
 
 // ---------------------------------------------------------------------------
@@ -775,11 +775,12 @@ impl CudaCompute {
         let cname = CString::new(name).ok()?;
         let mut func: CUfunction = ptr::null_mut();
         let res = unsafe { cuModuleGetFunction(&mut func, self.module, cname.as_ptr()) };
-        if res == CUDA_SUCCESS {
-            Some(func)
-        } else {
-            None
+        if res != CUDA_SUCCESS {
+            return None;
         }
+        // The handle starts null and only the driver fills it in, so a success
+        // that left it unset is still no kernel to launch.
+        NonNull::new(func).map(NonNull::as_ptr)
     }
 
     fn launch_1d(&self, func: CUfunction, params: &mut [*mut c_void], total: usize) {

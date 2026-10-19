@@ -3,7 +3,7 @@
 //
 // DEFINITIVE parity test for length-bucketing, against the canonical ground truth
 // (single `forward`, batch=1, which never pads). Builds the exact corpus the
-// bucketing probe used (5 lengths × 20, salt = bucket*131+j) and compares BOTH:
+// bucketing probe used (5 lengths × 20, seed = bucket*131+j) and compares BOTH:
 //   - mixed   = forward_batched(all 100)            [the unbucketed baseline]
 //   - binned  = forward_batched per length-bin, scattered  [the bucketing impl]
 // against single[i] = forward([entity_i]) per entity, per length. This resolves
@@ -83,7 +83,7 @@ fn bucketing_vs_ground_truth() {
     let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load");
     eprintln!("backend={}", model.backend());
 
-    // Exact corpus of the bucketing probe: [32,64,128,256,512] × 20, salt=bucket*131+j.
+    // Exact corpus of the bucketing probe: [32,64,128,256,512] × 20, seed=bucket*131+j.
     let lens = [32usize, 64, 128, 256, 512];
     let mut corpus: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
     for (b, &len) in lens.iter().enumerate() {
