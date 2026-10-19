@@ -85,6 +85,23 @@ def check_contract(root: Path = ROOT) -> None:
                              '"$(git rev-parse HEAD)" != "$SHA"'):
                 if contract not in step:
                     raise AssertionError(f'tag rehearsal must preserve protected policy isolation: {contract}')
+            # The run is the locator step's reported answer, never a file it may
+            # not have written, and the requirement is not gated on that answer,
+            # so a locator that skips or stops reporting is refused here.
+            for contract in ('RC_LOCATED: ${{ steps.locate.outputs.located }}',
+                             'RC_RUN: ${{ steps.locate.outputs.run_id }}',
+                             'if [ "$RC_LOCATED" != true ]; then'):
+                if contract not in step:
+                    raise AssertionError(f'tag rehearsal must read the located RC Build run explicitly: {contract}')
+            if 'rc-locator-result.txt' in step:
+                raise AssertionError('tag rehearsal must not read a locator result file in place of its outputs')
+            condition = step.split('        if: >-\n', 1)[1].split('        env:\n', 1)[0]
+            if condition != ("          steps.resolve.outputs.needed == 'true' &&\n"
+                             "          steps.prior.outputs.ready == 'true'\n"):
+                raise AssertionError('tag rehearsal must run whenever the mint proceeds, not only when an RC Build was located')
+            locate = workflow.split('      - name: Locate the RC Build the release will ship\n', 1)[1].split('\n      - name:', 1)[0]
+            if not locate.startswith('        id: locate\n'):
+                raise AssertionError('the RC Build locator step must be id locate so its outputs reach the rehearsal gate')
             resolve = workflow.split('      - name: Resolve exact coherent release commit\n', 1)[1].split('\n      - name:', 1)[0]
             if resolve.index('echo "authority_main=$authority_main" >> "$GITHUB_OUTPUT"') > resolve.index('git checkout --detach "$sha"'):
                 raise AssertionError('tag rehearsal policy authority must be pinned before candidate checkout')

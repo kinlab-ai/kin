@@ -2267,8 +2267,20 @@ jobs:
       # from the tagged commit, so this runs the locator of the commit being
       # tagged, read-only, with the runner's state files made inert so that
       # code cannot reach the privileged steps below. A commit whose release.yml
-      # locates nothing, because it builds its own bytes, has nothing to rule out.
+      # locates nothing, because it builds its own bytes, has no locator refusal
+      # to rule out.
+      #
+      # The step reports what it found in its outputs, and the rehearsal step
+      # below reads nothing else: located=true with the run_id release.yml will
+      # ship from, or located=false when the tagged release.yml locates nothing.
+      #
+      # Whether release.yml locates is read from a file, never from a pipe into
+      # `grep -q`. grep exits at its first match, git show then dies of SIGPIPE
+      # on a release.yml larger than the pipe buffer, and pipefail turns that
+      # into "locates nothing". That is how the v0.8.7 mint skipped this locator
+      # for a release.yml that does ship RC Build bytes.
       - name: Locate the RC Build the release will ship
+        id: locate
         if: >-
           steps.resolve.outputs.needed == 'true' &&
           steps.prior.outputs.ready == 'true'
@@ -2281,10 +2293,22 @@ jobs:
             echo "::error::the checkout is not ${SHA}, the commit being tagged"
             exit 1
           fi
-          if ! git cat-file -e "${SHA}:scripts/locate-rc-build.mjs" 2>/dev/null ||
-             ! git show "${SHA}:.github/workflows/release.yml" | grep -q 'scripts/locate-rc-build.mjs select'; then
+          tagged_release="$RUNNER_TEMP/tagged-release.yml"
+          if ! git show "${SHA}:.github/workflows/release.yml" > "$tagged_release"; then
+            echo "::error::${SHA} has no readable .github/workflows/release.yml, so a ${TAG} tag would start no release"
+            exit 1
+          fi
+          set +e
+          grep -Fq 'scripts/locate-rc-build.mjs select' "$tagged_release"
+          locates=$?
+          set -e
+          if [ "$locates" -eq 1 ]; then
+            echo "located=false" >> "$GITHUB_OUTPUT"
             echo "::notice::the release.yml ${TAG} will run locates no RC Build bytes, so there is no locator refusal to rule out"
             exit 0
+          elif [ "$locates" -ne 0 ]; then
+            echo "::error::could not read the release.yml ${TAG} will run (grep exit ${locates})"
+            exit 1
           fi
           inert="$RUNNER_TEMP/rc-locator-runner-state"
           mkdir -p "$inert"
@@ -2314,11 +2338,27 @@ jobs:
             echo "::error::release.yml would refuse ${TAG}: scripts/locate-rc-build.mjs select found no RC Build run it may ship for ${SHA}, so the mint writes no tag a release could not finish"
             exit 1
           fi
+          rc_run="$(sed -n 's/^run_id=//p' "$RUNNER_TEMP/rc-locator-result.txt")"
+          if [[ ! "$rc_run" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::the RC Build locator accepted ${SHA} but did not name exactly one run_id, so no run's rehearsal can qualify ${TAG}"
+            exit 1
+          fi
           if [ -s "$inert/summary.md" ]; then
             cat "$inert/summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "release.yml will find the RC Build bytes it ships for ${TAG}"
+          {
+            echo "located=true"
+            echo "run_id=${rc_run}"
+          } >> "$GITHUB_OUTPUT"
+          echo "release.yml will find the RC Build bytes it ships for ${TAG} in run ${rc_run}"
 
+      # The hosted rehearsal exists only on an RC Build run: rc-build.yml runs
+      # it against the archives it built, and the verifier compares the receipt
+      # with that run's Windows archive. A release.yml that builds its own bytes
+      # ships bytes no rehearsal judged, so located=false is a refusal, not a
+      # skip. So is a missing output: this step is not gated on the locator's
+      # answer, so a locator that stops reporting cannot also switch off this
+      # requirement.
       - name: Require the exact candidate's hosted release rehearsal
         if: >-
           steps.resolve.outputs.needed == 'true' &&
@@ -2327,10 +2367,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           AUTHORITY_MAIN: ${{ steps.resolve.outputs.authority_main }}
+          RC_LOCATED: ${{ steps.locate.outputs.located }}
+          RC_RUN: ${{ steps.locate.outputs.run_id }}
         run: |
           set -euo pipefail
-          rc_run="$(sed -n 's/^run_id=//p' "$RUNNER_TEMP/rc-locator-result.txt")"
-          [[ "$rc_run" =~ ^[1-9][0-9]*$ ]]
+          if [ "$RC_LOCATED" != true ]; then
+            echo "::error::no RC Build run was located for ${SHA} (located='${RC_LOCATED}'), and the hosted release rehearsal that qualifies a tag exists only on the RC Build run release.yml ships from, so the mint writes no ${TAG} tag"
+            exit 1
+          fi
+          if [[ ! "$RC_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::the locator reported an RC Build for ${SHA} but no run id (run_id='${RC_RUN}')"
+            exit 1
+          fi
+          rc_run="$RC_RUN"
           gh run download "$rc_run" --repo "$REPO" \
             --name kin-release-rehearsal --dir "$RUNNER_TEMP/rehearsal"
           [[ "$AUTHORITY_MAIN" =~ ^[0-9a-f]{40}$ ]]

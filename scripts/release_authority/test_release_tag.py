@@ -2417,8 +2417,15 @@ const args = process.argv.slice(2);
 writeFileSync(process.env.FAKE_MARK, args.join(' '));
 if (process.env.FAKE_POISON) appendFileSync(process.env.GITHUB_ENV, 'PATH=/elsewhere\\n');
 appendFileSync(args[args.indexOf('--summary') + 1], '### RC Build located\\n');
+if (process.env.FAKE_RUN_ID) console.log(`run_id=${process.env.FAKE_RUN_ID}`);
+console.log('run_attempt=1');
 process.exit(Number(process.env.FAKE_LOCATE || 0));
 """
+# A release.yml well past any pipe buffer, with the locator call near the top
+# the way the real one has it. `git show | grep -q` reads it as "locates
+# nothing" under pipefail, because grep exits at the match and git show dies
+# of SIGPIPE on the rest.
+LARGE_RELEASE_PADDING = "".join(f"# padding line {n:07d} keeps git show writing\n" for n in range(10000))
 
 
 def locator_step_source(release_tag: str) -> str:
@@ -2430,20 +2437,37 @@ def locator_step_source(release_tag: str) -> str:
 
 
 def execute_locator_step(
-    source: str, *, locate: int = 0, poison: bool = False, locates: bool = True, detached: bool = False
-) -> tuple[int, str, bool]:
-    """Run the mint's locator step against a commit carrying a fake locator."""
+    source: str,
+    *,
+    locate: int = 0,
+    poison: bool = False,
+    locates: bool = True,
+    detached: bool = False,
+    large: bool = False,
+    run_id: str = "4242",
+    script: bool = True,
+    release_yml: bool = True,
+) -> tuple[int, str, bool, dict[str, str]]:
+    """Run the mint's locator step against a commit carrying a fake locator.
+
+    Returns the exit status, the log, whether the locator was asked, and the
+    outputs the step wrote to the real GITHUB_OUTPUT.
+    """
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         repo = root / "repo"
         (repo / "scripts").mkdir(parents=True)
         (repo / ".github" / "workflows").mkdir(parents=True)
-        (repo / "scripts" / "locate-rc-build.mjs").write_text(FAKE_LOCATOR, encoding="utf-8")
-        (repo / ".github" / "workflows" / "release.yml").write_text(
-            "run: node scripts/locate-rc-build.mjs select\n" if locates else "run: cargo build\n",
-            encoding="utf-8",
-        )
+        (repo / "README").write_text("candidate\n", encoding="utf-8")
+        if script:
+            (repo / "scripts" / "locate-rc-build.mjs").write_text(FAKE_LOCATOR, encoding="utf-8")
+        if release_yml:
+            release = "run: node scripts/locate-rc-build.mjs select\n" if locates else "run: cargo build\n"
+            (repo / ".github" / "workflows" / "release.yml").write_text(
+                release + (LARGE_RELEASE_PADDING if large else ""),
+                encoding="utf-8",
+            )
         identity = ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
         subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
@@ -2473,6 +2497,7 @@ def execute_locator_step(
             "GITHUB_STEP_SUMMARY": str(summary),
             "FAKE_MARK": str(mark),
             "FAKE_LOCATE": str(locate),
+            "FAKE_RUN_ID": run_id,
         }
         if poison:
             environment["FAKE_POISON"] = "1"
@@ -2482,7 +2507,13 @@ def execute_locator_step(
         asked = mark.read_text() if mark.exists() else ""
         if asked and asked != f"select --repo kinlab-ai/kin --sha {sha} --version 0.8.4 --summary {root}/rc-locator-runner-state/summary.md":
             raise AssertionError(f"the mint asked the locator something else: {asked}")
-        return result.returncode, result.stdout + result.stderr, bool(asked)
+        outputs = {}
+        for line in Path(runner_state["GITHUB_OUTPUT"]).read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key in outputs:
+                raise AssertionError(f"the locator step wrote output {key} twice")
+            outputs[key] = value
+        return result.returncode, result.stdout + result.stderr, bool(asked), outputs
 
 
 def assert_no_tag_is_written_that_release_yml_would_refuse(release_tag: str) -> None:
@@ -2497,24 +2528,44 @@ def assert_no_tag_is_written_that_release_yml_would_refuse(release_tag: str) -> 
             "the mint must ask the RC Build locator after the proof gate and before it mints a token or writes a tag"
         )
     source = locator_step_source(release_tag)
-    code, log, asked = execute_locator_step(source)
+    code, log, asked, outputs = execute_locator_step(source)
     if code != 0 or not asked:
         raise AssertionError(f"a candidate release.yml can ship from was refused: rc={code} {log}")
-    code, log, asked = execute_locator_step(source, locate=1)
-    if code == 0 or "release.yml would refuse v0.8.4" not in log:
+    if outputs != {"located": "true", "run_id": "4242"}:
+        raise AssertionError(f"the locator step did not report the run release.yml ships from: {outputs}")
+    code, log, asked, outputs = execute_locator_step(source, large=True)
+    if code != 0 or not asked or outputs != {"located": "true", "run_id": "4242"}:
+        raise AssertionError(
+            f"the mint must locate the RC Build for a release.yml larger than a pipe buffer: rc={code} {outputs} {log}"
+        )
+    code, log, asked, outputs = execute_locator_step(source, locate=1)
+    if code == 0 or "release.yml would refuse v0.8.4" not in log or outputs:
         raise AssertionError(f"the mint went on to tag a candidate the locator refuses: rc={code} {log}")
+    code, log, asked, outputs = execute_locator_step(source, run_id="")
+    if code == 0 or "did not name exactly one run_id" not in log or outputs:
+        raise AssertionError(f"a locator that names no run was taken as a located RC Build: rc={code} {outputs} {log}")
+    code, log, asked, outputs = execute_locator_step(source, script=False)
+    if code == 0 or "release.yml would refuse v0.8.4" not in log or outputs:
+        raise AssertionError(
+            f"a release.yml that calls a locator its commit lacks was read as building its own bytes: rc={code} {log}"
+        )
     host_env = os.environ.get("GITHUB_ENV")
     host_before = Path(host_env).read_bytes() if host_env and Path(host_env).is_file() else None
-    code, log, _ = execute_locator_step(source, poison=True)
-    if code == 0 or "attempted to change runner state" not in log:
+    code, log, _, outputs = execute_locator_step(source, poison=True)
+    if code == 0 or "attempted to change runner state" not in log or outputs:
         raise AssertionError(f"the locator reached the runner state of the privileged steps: rc={code} {log}")
     if host_before is not None and Path(host_env).read_bytes() != host_before:
         raise AssertionError("the locator test wrote to the host runner GITHUB_ENV")
-    code, log, asked = execute_locator_step(source, locates=False)
+    code, log, asked, outputs = execute_locator_step(source, locates=False)
     if code != 0 or asked or "locates no RC Build bytes" not in log:
         raise AssertionError(f"a release.yml that builds its own bytes must need no locator: rc={code} {log}")
-    code, log, asked = execute_locator_step(source, detached=True)
-    if code == 0 or asked:
+    if outputs != {"located": "false"}:
+        raise AssertionError(f"the locator step did not report that it located nothing: {outputs}")
+    code, log, asked, outputs = execute_locator_step(source, release_yml=False)
+    if code == 0 or asked or outputs or "no readable .github/workflows/release.yml" not in log:
+        raise AssertionError(f"a commit with no release.yml was read as building its own bytes: rc={code} {log}")
+    code, log, asked, outputs = execute_locator_step(source, detached=True)
+    if code == 0 or asked or outputs:
         raise AssertionError(f"the locator was asked about a checkout other than the commit being tagged: {log}")
 
 
@@ -2540,6 +2591,23 @@ def check_rc_build_locator_precondition(release_tag: str) -> None:
         "went on to tag a candidate the locator refuses",
         lambda: assert_no_tag_is_written_that_release_yml_would_refuse(
             mutate('          if [ "$located" -ne 0 ]; then\n', '          if false; then\n')
+        ),
+    )
+    expect_assertion(
+        "the release.yml read goes back through a pipe into grep -q",
+        "larger than a pipe buffer",
+        lambda: assert_no_tag_is_written_that_release_yml_would_refuse(
+            mutate(
+                "          grep -Fq 'scripts/locate-rc-build.mjs select' \"$tagged_release\"\n",
+                "          git show \"${SHA}:.github/workflows/release.yml\" | grep -Fq 'scripts/locate-rc-build.mjs select'\n",
+            )
+        ),
+    )
+    expect_assertion(
+        "the locator step stops reporting the run it located",
+        "did not report the run release.yml ships from",
+        lambda: assert_no_tag_is_written_that_release_yml_would_refuse(
+            mutate('            echo "run_id=${rc_run}"\n', "")
         ),
     )
     expect_assertion(
