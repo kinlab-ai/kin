@@ -9579,16 +9579,8 @@ fn incremental_parse_coverage_relation(
     linker: &IncrementalLinker,
     source: Option<EntitySource<'_>>,
 ) -> Relation {
-    let mut overlays = build_incremental_link_overlays(std::slice::from_ref(file), linker);
-    if source.is_some() {
-        overlays.origin_bindings = incremental_origin_bindings(
-            std::slice::from_ref(file),
-            linker,
-            &overlays.import_map,
-            &overlays.class_bases,
-            source,
-        );
-    }
+    let overlays =
+        build_incremental_link_overlays_reading(std::slice::from_ref(file), linker, source);
     let base_counts = base_resolution_counts_incremental(
         std::slice::from_ref(file),
         linker,
@@ -12070,7 +12062,10 @@ pub fn link_cross_file_incremental_with_graph<G: EntityStore>(
     completeness: &FileParseCompletenessMap,
     graph: &G,
 ) -> IndexResult<Vec<Relation>> {
-    let mut overlays = build_incremental_link_overlays(files, linker);
+    // A receiver's provider or declared return can live in a file this step
+    // did not parse, so the graph answers for those files.
+    let read_entity = |id: &EntityId| graph.get_entity(id).ok().flatten();
+    let mut overlays = build_incremental_link_overlays_reading(files, linker, Some(&read_entity));
     let persisted = graph_overridden_targets(
         files,
         linker,
@@ -12087,16 +12082,6 @@ pub fn link_cross_file_incremental_with_graph<G: EntityStore>(
         },
     )?;
     overlays.overridden_bases.extend(persisted);
-    // A receiver's provider or declared return can live in a file this step
-    // did not parse, so the graph answers for those files.
-    let read_entity = |id: &EntityId| graph.get_entity(id).ok().flatten();
-    overlays.origin_bindings = incremental_origin_bindings(
-        files,
-        linker,
-        &overlays.import_map,
-        &overlays.class_bases,
-        Some(&read_entity),
-    );
     link_cross_file_incremental_internal(files, linker, Some(completeness), overlays)
 }
 
@@ -13584,13 +13569,35 @@ struct IncrementalOriginWorld<'a> {
     fetched: std::cell::RefCell<HashMap<EntityId, Option<Entity>>>,
     facts:
         std::cell::RefCell<HashMap<EntityId, Option<Arc<kin_parser::value_origins::ScopeFacts>>>>,
-    placed: std::cell::OnceCell<HashMap<EntityId, (String, String)>>,
+    placed: std::cell::OnceCell<HashMap<EntityId, (&'a str, &'a str)>>,
+    /// The step's own entities by the leaf of their name, each with its file,
+    /// in the order a walk of `fresh_files` meets them. A member lookup runs
+    /// once per receiver call and read of the step, so scanning every fresh
+    /// entity for each one made a large step quadratic.
+    fresh_by_leaf: std::cell::OnceCell<HashMap<&'a str, Vec<(&'a str, &'a Entity)>>>,
+    /// What each of the step's own files declares under each name.
+    /// It holds every one of the step's files, those that declare nothing
+    /// included, and no other file.
+    fresh_declared: std::cell::OnceCell<FreshDeclarations<'a>>,
+    /// The leaf names of the class-like entities in `fresh`.
+    fresh_class_leaves: std::cell::OnceCell<HashSet<&'a str>>,
     subclasses: std::cell::OnceCell<SubclassIndex>,
     import_roots: std::cell::OnceCell<kin_db::call_site_escape::ImportRoots>,
     outside_bases: std::cell::OnceCell<OutsideBaseIndex>,
     /// The `Implements` hierarchy of the step's own files, which replaces the
     /// linker's retained one for them.
     fresh_implements: HashMap<&'a str, Vec<(String, Vec<String>)>>,
+}
+
+/// File -> name -> what the file declares under that name.
+type FreshDeclarations<'a> = HashMap<&'a str, HashMap<&'a str, FreshDeclaration>>;
+
+/// The entities one of the step's files declares under one name.
+struct FreshDeclaration {
+    /// The first of them in parse order.
+    first: EntityId,
+    /// Whether any of them is class-like.
+    class_like: bool,
 }
 
 impl<'a> IncrementalOriginWorld<'a> {
@@ -13625,6 +13632,9 @@ impl<'a> IncrementalOriginWorld<'a> {
             fetched: Default::default(),
             facts: Default::default(),
             placed: Default::default(),
+            fresh_by_leaf: Default::default(),
+            fresh_declared: Default::default(),
+            fresh_class_leaves: Default::default(),
             subclasses: Default::default(),
             import_roots: Default::default(),
             outside_bases: Default::default(),
@@ -13643,16 +13653,63 @@ impl<'a> IncrementalOriginWorld<'a> {
     }
 
     /// (file, name) of every entity the linker indexes, built on first use.
-    fn placed(&self) -> &HashMap<EntityId, (String, String)> {
+    fn placed(&self) -> &HashMap<EntityId, (&'a str, &'a str)> {
         self.placed.get_or_init(|| {
+            let linker: &'a IncrementalLinker = self.linker;
             let mut placed = HashMap::new();
-            for (file, names) in &self.linker.entity_by_file_name {
+            for (file, names) in &linker.entity_by_file_name {
                 for (name, id) in names {
-                    placed.insert(*id, (file.clone(), name.clone()));
+                    placed.insert(*id, (file.as_str(), name.as_str()));
                 }
             }
             placed
         })
+    }
+
+    /// The step's own entities by the leaf of their name, built on first use.
+    /// Each name's entities keep the order a walk of `fresh_files` meets
+    /// them, which is the order a scan of every fresh entity would list them.
+    fn fresh_by_leaf(&self) -> &HashMap<&'a str, Vec<(&'a str, &'a Entity)>> {
+        self.fresh_by_leaf.get_or_init(|| {
+            let mut by_leaf: HashMap<&'a str, Vec<(&'a str, &'a Entity)>> = HashMap::new();
+            for (&file, entities) in &self.fresh_files {
+                for &entity in entities {
+                    by_leaf
+                        .entry(bare_entity_name(&entity.name))
+                        .or_default()
+                        .push((file, entity));
+                }
+            }
+            by_leaf
+        })
+    }
+
+    /// What the step's own files declare under each name, built on first use.
+    fn fresh_declared(&self) -> &FreshDeclarations<'a> {
+        self.fresh_declared.get_or_init(|| {
+            let mut declared = FreshDeclarations::new();
+            for (&file, entities) in &self.fresh_files {
+                let names = declared.entry(file).or_default();
+                for &entity in entities {
+                    let class_like = is_class_like(Some(&entity.kind));
+                    names
+                        .entry(entity.name.as_str())
+                        .and_modify(|held| held.class_like |= class_like)
+                        .or_insert(FreshDeclaration {
+                            first: entity.id,
+                            class_like,
+                        });
+                }
+            }
+            declared
+        })
+    }
+
+    /// The fresh declaration `file` makes under `name`: `None` when `file` is
+    /// not one of the step's files, so the linker answers for it, and
+    /// `Some(None)` when it is one but declares nothing by that name.
+    fn fresh_declaration(&self, file: &str, name: &str) -> Option<Option<&FreshDeclaration>> {
+        self.fresh_declared().get(file).map(|names| names.get(name))
     }
 }
 
@@ -13673,14 +13730,14 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
         if let Some(fresh) = self.fresh.get(&entity) {
             return fresh.file_origin.as_ref().map(|file| file.0.clone());
         }
-        self.placed().get(&entity).map(|(file, _)| file.clone())
+        self.placed().get(&entity).map(|(file, _)| file.to_string())
     }
 
     fn entity_name(&self, entity: EntityId) -> Option<String> {
         if let Some(fresh) = self.fresh.get(&entity) {
             return Some(fresh.name.clone());
         }
-        self.placed().get(&entity).map(|(_, name)| name.clone())
+        self.placed().get(&entity).map(|(_, name)| name.to_string())
     }
 
     fn locate_class(&self, file: &str, name: &str) -> Option<(String, String)> {
@@ -13779,9 +13836,8 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
     }
 
     fn file_declares(&self, file: &str, name: &str) -> bool {
-        self.fresh_files
-            .get(file)
-            .map(|entities| entities.iter().any(|entity| entity.name == name))
+        self.fresh_declaration(file, name)
+            .map(|declared| declared.is_some())
             .unwrap_or_else(|| {
                 self.linker
                     .entity_by_file_name
@@ -13822,15 +13878,13 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
         let mut members = Vec::new();
         // The step's own parse first: an entity it minted or renamed may not be
         // in the linker's indexes yet.
-        for (file, entities) in &self.fresh_files {
-            for entity in entities {
-                if bare_entity_name(&entity.name) == member && seen.insert(entity.id) {
-                    members.push(crate::receiver_origin::Member {
-                        id: entity.id,
-                        file: (*file).to_string(),
-                        owner: member_owner(&entity.name),
-                    });
-                }
+        for &(file, entity) in self.fresh_by_leaf().get(member).into_iter().flatten() {
+            if seen.insert(entity.id) {
+                members.push(crate::receiver_origin::Member {
+                    id: entity.id,
+                    file: file.to_string(),
+                    owner: member_owner(&entity.name),
+                });
             }
         }
         for (file, id) in self
@@ -13864,10 +13918,8 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
         {
             return Some(bases.clone());
         }
-        let declared = match self.fresh_files.get(file) {
-            Some(entities) => entities
-                .iter()
-                .any(|entity| entity.name == class && is_class_like(Some(&entity.kind))),
+        let declared = match self.fresh_declaration(file, class) {
+            Some(declared) => declared.is_some_and(|declared| declared.class_like),
             None => self
                 .linker
                 .entity_by_file_name
@@ -13898,22 +13950,29 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
     }
 
     fn declares_class_named(&self, leaf: &str) -> bool {
-        self.fresh.values().any(|entity| {
-            bare_entity_name(&entity.name) == leaf && is_class_like(Some(&entity.kind))
-        }) || self
-            .linker
-            .entity_by_name
-            .get(leaf)
-            .into_iter()
-            .flatten()
-            .chain(
-                self.linker
-                    .entity_by_bare_name
-                    .get(leaf)
-                    .into_iter()
-                    .flatten(),
-            )
-            .any(|(_, id)| is_class_like(self.linker.entity_kind_by_id.get(id)))
+        self.fresh_class_leaves
+            .get_or_init(|| {
+                self.fresh
+                    .values()
+                    .filter(|entity| is_class_like(Some(&entity.kind)))
+                    .map(|entity| bare_entity_name(&entity.name))
+                    .collect()
+            })
+            .contains(leaf)
+            || self
+                .linker
+                .entity_by_name
+                .get(leaf)
+                .into_iter()
+                .flatten()
+                .chain(
+                    self.linker
+                        .entity_by_bare_name
+                        .get(leaf)
+                        .into_iter()
+                        .flatten(),
+                )
+                .any(|(_, id)| is_class_like(self.linker.entity_kind_by_id.get(id)))
     }
 
     fn default_export(&self, file: &str) -> Option<String> {
@@ -13943,11 +14002,8 @@ impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
     }
 
     fn declaration(&self, file: &str, name: &str) -> Option<EntityId> {
-        match self.fresh_files.get(file) {
-            Some(entities) => entities
-                .iter()
-                .find(|entity| entity.name == name)
-                .map(|entity| entity.id),
+        match self.fresh_declaration(file, name) {
+            Some(declared) => declared.map(|declared| declared.first),
             None => self
                 .linker
                 .entity_by_file_name
@@ -14248,6 +14304,18 @@ fn build_incremental_link_overlays<'a>(
     files: &'a [FileParseData],
     linker: &'a IncrementalLinker,
 ) -> IncrementalLinkOverlays<'a> {
+    build_incremental_link_overlays_reading(files, linker, None)
+}
+
+/// [`build_incremental_link_overlays`], with the receiver-origin pass reading
+/// the entities of files outside the step through `source`. A caller that has
+/// a source passes it here rather than replacing the bindings afterwards, so
+/// one step runs that pass once.
+fn build_incremental_link_overlays_reading<'a>(
+    files: &'a [FileParseData],
+    linker: &'a IncrementalLinker,
+    source: Option<EntitySource<'_>>,
+) -> IncrementalLinkOverlays<'a> {
     // A stored base name is meaningful only with the bindings from the same
     // parse. Fresh files replace that context, including removal of imports.
     let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
@@ -14322,7 +14390,7 @@ fn build_incremental_link_overlays<'a>(
 
     let exact_import_witnesses = import_witness_overlay(files, linker);
     let origin_bindings =
-        incremental_origin_bindings(files, linker, &import_map, &class_bases, None);
+        incremental_origin_bindings(files, linker, &import_map, &class_bases, source);
     IncrementalLinkOverlays {
         exact_import_witnesses,
         import_map,
@@ -14518,6 +14586,9 @@ mod receiver_binding_tests;
 
 #[cfg(test)]
 mod fixture_receiver_tests;
+
+#[cfg(test)]
+mod incremental_origin_world_tests;
 
 #[cfg(test)]
 mod tests {
