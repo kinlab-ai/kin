@@ -29,7 +29,8 @@ sys.exit(0)
 '''
 
 
-def execute(source: str, *, poison: str = '', receipt: str = '', real_policy: bool = False):
+def execute(source: str, *, poison: str = '', receipt: str = '', real_policy: bool = False,
+            located: str | None = 'true', run_id: str | None = '123'):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         repo = root / 'repo'
@@ -58,14 +59,17 @@ def execute(source: str, *, poison: str = '', receipt: str = '', real_policy: bo
         # replace refs. Both are deliberately hostile in this fixture.
         subprocess.run(['git','update-ref','refs/remotes/origin/main',candidate], cwd=repo, check=True)
         subprocess.run(['git','replace',authority,candidate], cwd=repo, check=True)
-        (root / 'rc-locator-result.txt').write_text('run_id=123\n')
+        # The run comes from the locator step's outputs. A stale result file
+        # naming another run must not be read in their place.
+        (root / 'rc-locator-result.txt').write_text('run_id=999\n')
         (root / 'rehearsal').mkdir()
         if receipt:
             (root / 'rehearsal/rehearsal.json').write_text(receipt)
         bin_dir = root / 'bin'
         bin_dir.mkdir()
         gh = bin_dir / 'gh'
-        gh.write_text('#!/bin/sh\nexit 0\n')
+        gh_log = root / 'gh-calls'
+        gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {str(gh_log)!r}\nexit 0\n')
         gh.chmod(0o755)
         # Safe-path isolation must reject a module planted beside the extracted
         # policy, which would otherwise turn a missing receipt into exit 0.
@@ -77,13 +81,21 @@ def execute(source: str, *, poison: str = '', receipt: str = '', real_policy: bo
             native[name] = str(path)
         mark = root / 'token-would-mint'
         env = {**os.environ, **native, 'AUTHORITY_MAIN': authority, 'SHA': candidate,
-               'REPO': 'owner/product', 'RUNNER_TEMP': str(root), 'GITHUB_WORKSPACE': str(repo),
+               'TAG': 'v0.8.4', 'REPO': 'owner/product', 'RUNNER_TEMP': str(root),
+               'GITHUB_WORKSPACE': str(repo),
                'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'], 'POISON': poison,
                'TOKEN_MARK': str(mark)}
+        # Actions renders an output the locator never wrote as an empty string.
+        env['RC_LOCATED'] = located if located is not None else ''
+        env['RC_RUN'] = run_id if run_id is not None else ''
         result = subprocess.run(['bash','-c',source + '\nprintf minted > "$TOKEN_MARK"\n'],
                                 cwd=repo, env=env, capture_output=True, text=True, timeout=30)
         if any(Path(path).read_bytes() for path in native.values()):
             raise AssertionError('the verifier fixture escaped into native runner channels')
+        downloads = gh_log.read_text().splitlines() if gh_log.exists() else []
+        if any(call.startswith('run download') and not call.startswith(f'run download {run_id} ')
+               for call in downloads):
+            raise AssertionError(f'the rehearsal was read from a run the locator did not report: {downloads}')
         return result.returncode, result.stdout + result.stderr, mark.exists(), candidate_mark.exists()
 
 
@@ -98,6 +110,17 @@ def assert_boundary(release_tag: str) -> None:
         expected = 'runner state' if poison in CHANNELS else 'admitted checkout'
         if code == 0 or minted or expected not in log:
             raise AssertionError(f'rehearsal policy {poison} poison reached the token mint: {code} {log}')
+    # Only an RC Build run carries the rehearsal. A located=false answer, an
+    # answer the locator never wrote, and a located run with no usable id are
+    # refusals before anything is downloaded, never a skip.
+    for label, located, run_id, expected in (
+            ('a release.yml that builds its own bytes', 'false', None, 'no RC Build run was located'),
+            ('a locator that reported nothing', None, None, 'no RC Build run was located'),
+            ('a located run with no id', 'true', None, 'but no run id'),
+            ('a located run with a malformed id', 'true', '12; echo injected', 'but no run id')):
+        code, log, minted, candidate_ran = execute(source, located=located, run_id=run_id)
+        if code == 0 or minted or candidate_ran or expected not in log:
+            raise AssertionError(f'{label} reached the token mint without a hosted rehearsal: {code} {log}')
     for label, record in (('missing', ''), ('stale', json.dumps({
             'schema':'kin.release-rehearsal.v1','status':'PASS','candidate':'0'*40}))):
         code, log, minted, candidate_ran = execute(source, real_policy=True, receipt=record)
@@ -111,6 +134,8 @@ def check_protected_rehearsal_boundary(release_tag: str) -> None:
         ('git --no-replace-objects show "${AUTHORITY_MAIN}:scripts/release-rehearsal.py"',
          'git show "HEAD:scripts/release-rehearsal.py"', 'sole verifier'),
         ('python3 -I "$rehearsal_policy"', 'python3 "$rehearsal_policy"', 'candidate lowered'),
+        ('          if [ "$RC_LOCATED" != true ]; then\n', '          if false; then\n',
+         'without a hosted rehearsal'),
     ):
         expect_assertion('rehearsal policy authority or isolation removed',
                          error,
