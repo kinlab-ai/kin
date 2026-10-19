@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 //
 // Deterministic per-layer divergence trace for the batched-corruption bug.
-// Runs the SAME len-32 entity (corpus_a index 0 = synth(32, salt 0)) two ways in
+// Runs the SAME len-32 entity (corpus_a index 0 = synth(32, seed 0)) two ways in
 // ONE process, with KIN_INFER_DUMP_LAYER=1 set so the model eprintln's a per-layer
 // fingerprint for both:
 //   (1) forward([entity0])                      -> path=single   (ground truth)
@@ -61,8 +61,8 @@ fn layer_divergence_trace() {
     eprintln!("backend={}", model.backend());
 
     // Reconstruct the bin-64 group exactly as embed_bucket_truth_probe does:
-    // lens [32,64,128,256,512] x20, salt = bucket*131 + j. bin64 = idx 0..40
-    // = 20 len-32 (salt 0..19) + 20 len-64 (salt 131..150). Entity 0 = synth(32,0).
+    // lens [32,64,128,256,512] x20, seed = bucket*131 + j. bin64 = idx 0..40
+    // = 20 len-32 (seed 0..19) + 20 len-64 (seed 131..150). Entity 0 = synth(32,0).
     let mut bin64: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
     for j in 0..20u32 {
         bin64.push(synth(32, j));
@@ -72,7 +72,7 @@ fn layer_divergence_trace() {
     }
     let ent0 = bin64[0].clone();
 
-    eprintln!("===== SINGLE forward(entity0 len32 salt0) =====");
+    eprintln!("===== SINGLE forward(entity0 len32 seed0) =====");
     let single = model
         .forward(std::slice::from_ref(&ent0.0), std::slice::from_ref(&ent0.1))
         .expect("single");
