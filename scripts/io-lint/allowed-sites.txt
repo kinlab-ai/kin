@@ -379,7 +379,7 @@ crates/kin-cli/src/commands/setup.rs	bin_path_needs_asking	std::path::Path::is_d
 crates/kin-cli/src/commands/setup.rs	bound_repo_for_mcp_config	std::fs::read
 crates/kin-cli/src/commands/setup.rs	canonical_git_output_path	std::path::Path::canonicalize
 crates/kin-cli/src/commands/setup.rs	canonical_initialized_repo	std::path::Path::canonicalize
-crates/kin-cli/src/commands/setup.rs	capture_mcp_repair_target_excluding	std::fs::symlink_metadata
+crates/kin-cli/src/commands/setup.rs	capture_mcp_repair_candidate	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	claude_code_install_evidence	std::path::Path::exists
 crates/kin-cli/src/commands/setup.rs	cleanup_legacy_shell_path_blocks	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	cleanup_stale_daemons	std::path::Path::exists
@@ -433,6 +433,7 @@ crates/kin-cli/src/commands/setup.rs	read_single_git_pointer	std::fs::symlink_me
 crates/kin-cli/src/commands/setup.rs	record_setup_ledger	std::fs::read
 crates/kin-cli/src/commands/setup.rs	record_setup_ledger	std::fs::read_to_string
 crates/kin-cli/src/commands/setup.rs	recorded_config_recovery_path	std::fs::symlink_metadata
+crates/kin-cli/src/commands/setup.rs	refresh_discovery_blocks	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	remove_full_install_root	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	remove_full_install_root_with_hooks	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	require_windows_path_absent	std::fs::symlink_metadata

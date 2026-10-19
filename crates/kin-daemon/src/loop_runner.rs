@@ -61,6 +61,81 @@ fn delivery_recovery_spacing(recoveries: u64) -> Duration {
         .min(DELIVERY_RECOVERY_SPACING_CEILING)
 }
 
+/// How many times its own cost a failed watcher-loss recovery waits before the
+/// next attempt, at least.
+///
+/// The admission-hold ladder alone spaces attempts by a fixed schedule from
+/// [`ADMISSION_HOLD_BASE`], which suits an attempt that costs seconds. A
+/// complete admission of a large tree delta costs most of an hour: measured on
+/// 2026-10-19, a 1,855-file kin-router delta spent 2,410 s in
+/// `prepare_changed_sources`, failed, and the next attempt started 2 s later,
+/// so the daemon held a core for as long as it stayed up. Four times the cost
+/// keeps a recovery that keeps failing under a fifth of a core, whatever it
+/// costs.
+const RECOVERY_COST_SPACING_MULTIPLE: u32 = 4;
+
+/// How long to wait before the next watcher-loss recovery after `attempts`
+/// failed in a row, the last of which cost `cost`.
+///
+/// The longer of the admission-hold ladder and
+/// [`RECOVERY_COST_SPACING_MULTIPLE`] times the failed attempt's own cost.
+/// Pure, so the spacing is gradeable without a daemon or a clock.
+fn watcher_recovery_spacing(attempts: u64, cost: Duration) -> Duration {
+    let ladder = admission_hold(
+        attempts.saturating_add(kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION),
+        ADMISSION_HOLD_CEILING,
+    )
+    .unwrap_or(ADMISSION_HOLD_BASE);
+    ladder.max(cost.saturating_mul(RECOVERY_COST_SPACING_MULTIPLE))
+}
+
+/// One failed watcher-loss recovery: why it failed, and the repository marks
+/// on either side of it.
+///
+/// A complete admission over the same store is deterministic. If one fails for
+/// the same reason as the attempt before it, and nothing moved the repository
+/// from the end of that earlier failure to the end of this one, then a third
+/// attempt would derive the same tree and refuse it the same way, at the same
+/// cost. The loop then holds further attempts until the marks move, which a
+/// commit, a checkout, an explicit `kin admit` and an ambient round that
+/// publishes an edit all do.
+///
+/// A repair the marks cannot see, such as an edit inside the very admission
+/// being refused, is picked up by an explicit `kin admit` or a daemon restart,
+/// never by repeating the same refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryFailure {
+    /// The refusal the attempt reported, or `None` when it reported none, such
+    /// as a pass that succeeded but whose loss checkpoint could not be saved.
+    /// A failure with no cause never counts as a repeat.
+    cause: Option<String>,
+    marks_before: RepositoryMarks,
+    marks_after: RepositoryMarks,
+}
+
+impl RecoveryFailure {
+    /// Whether this failure repeats `previous` over a store that did not move.
+    fn repeats(&self, previous: &Self) -> bool {
+        self.cause.is_some()
+            && self.cause == previous.cause
+            && previous.marks_after == self.marks_before
+            && self.marks_before == self.marks_after
+    }
+}
+
+/// The refusal a watcher-loss recovery reported, when it reported one.
+fn recovery_failure_cause(
+    outcome: &anyhow::Result<kin_cli::commands::admit::AdmitResponse>,
+) -> Option<String> {
+    match outcome {
+        Ok(response) => response
+            .report
+            .as_ref()
+            .and_then(|report| report.failure.clone()),
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 /// How the loop samples its watcher's delivery; see [`DeliveryCanary`].
 ///
 /// Always on outside tests. A host that drops watcher events without reporting
@@ -1206,6 +1281,27 @@ fn revalidate_proposed_root_rule(
     Ok(())
 }
 
+/// Run one stage of an exact-tree admission, time it as every commit phase is
+/// timed, and count its completion as reconcile work.
+///
+/// A complete admission records durable progress only when it publishes, and on
+/// a large tree delta the stages before publication run for longer than the
+/// supervisor's stall threshold. Each stage that finishes is the supervisor's
+/// evidence that the batch is still advancing; see
+/// [`crate::background_work::BackgroundWorkSupervisor::note_reconcile_work`]. A
+/// stage that fails reports nothing, so a refusal cannot keep a pass alive.
+fn admission_stage<T, E>(
+    state: &DaemonState,
+    phase: &'static str,
+    work: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let outcome = crate::mcp_commit::timed_commit_phase(phase, work);
+    if outcome.is_ok() {
+        state.background_work.note_reconcile_work(Instant::now());
+    }
+    outcome
+}
+
 /// Derive one complete exact-tree transition from the working copy.
 ///
 /// `observation` bounds what may be admitted. `None` is an explicit admission
@@ -1386,7 +1482,7 @@ fn exact_tree_admission_once(
         .iter()
         .filter(|path| !retracted_paths.contains(*path))
         .collect::<Vec<&RepoPath>>();
-    let scan = crate::mcp_commit::timed_commit_phase("scan_working_copy", || {
+    let scan = admission_stage(state, "scan_working_copy", || {
         kin_index::repository::scan_repository_with_native_admission(
             &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
             &ignore,
@@ -1408,10 +1504,9 @@ fn exact_tree_admission_once(
     })
     .map_err(kin_index::IndexError::from)?;
     announce_policy_exclusions(&scan);
-    let mut observed =
-        crate::mcp_commit::timed_commit_phase("observe_tree_and_stage_blobs", || {
-            crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)
-        })?;
+    let mut observed = admission_stage(state, "observe_tree_and_stage_blobs", || {
+        crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)
+    })?;
     if let Some(observation) = observation {
         for artifact in previous.artifacts_by_path() {
             if observation_covers_path(observation, &artifact.path) {
@@ -1533,7 +1628,7 @@ fn exact_tree_admission_once(
     // changed source is derived. A caller that defers publication judges it
     // in its own transaction.
     if publication != TreePublication::DeferredToCaller {
-        crate::mcp_commit::timed_commit_phase("scan_introduced_sensitive_content", || {
+        admission_stage(state, "scan_introduced_sensitive_content", || {
             sensitive_preflight::refuse_blocked_sensitive_content(state, &previous, &deltas)
         })?;
     }
@@ -1594,32 +1689,29 @@ fn exact_tree_admission_once(
             // captured successor then carries both in the same publication, so
             // a pass carrying a single source does not publish its bytes and
             // leave its parse to the live graph alone.
-            let (before, staged) =
-                crate::mcp_commit::timed_commit_phase("stage_live_graph", || {
-                    let before = state.graph.semantic_observation();
-                    let staged =
-                        kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
-                    staged.apply_transaction_delta(&live_delta)?;
-                    Ok::<_, DaemonError>((before, staged))
-                })?;
+            let (before, staged) = admission_stage(state, "stage_live_graph", || {
+                let before = state.graph.semantic_observation();
+                let staged =
+                    kin_db::InMemoryGraph::from_snapshot_without_text_index(before.clone())?;
+                staged.apply_transaction_delta(&live_delta)?;
+                Ok::<_, DaemonError>((before, staged))
+            })?;
             let paths = source_batch::with_owed_paths(state, changed_paths.clone());
-            prepared_sources =
-                crate::mcp_commit::timed_commit_phase("prepare_changed_sources", || {
-                    source_batch::prepare(
-                        state,
-                        reconciler,
-                        &staged,
-                        &paths,
-                        source_batch::BatchPredecessor::Observed(Some(&before)),
-                        &changed_paths,
-                        source_batch::BatchScope::ExactAdmission,
-                    )
-                })?;
+            prepared_sources = admission_stage(state, "prepare_changed_sources", || {
+                source_batch::prepare(
+                    state,
+                    reconciler,
+                    &staged,
+                    &paths,
+                    source_batch::BatchPredecessor::Observed(Some(&before)),
+                    &changed_paths,
+                    source_batch::BatchScope::ExactAdmission,
+                )
+            })?;
             if let Some(prepared) = &prepared_sources {
-                let mut joined =
-                    crate::mcp_commit::timed_commit_phase("join_semantic_delta", || {
-                        source_batch::semantic_delta(&before, prepared.snapshot())
-                    })?;
+                let mut joined = admission_stage(state, "join_semantic_delta", || {
+                    source_batch::semantic_delta(&before, prepared.snapshot())
+                })?;
                 joined.tree_deltas = live_delta.tree_deltas;
                 live_delta = joined;
             }
@@ -1631,7 +1723,7 @@ fn exact_tree_admission_once(
         // has not crossed the repository-v6 compare-and-swap. The scanner's
         // completion proof and the planning base travel with the tree so
         // publication can verify both rather than trust the caller.
-        let admitted = crate::mcp_commit::timed_commit_phase("capture_live_observation", || {
+        let admitted = admission_stage(state, "capture_live_observation", || {
             crate::repository_commit::AdmittedWorkspaceTree::from_complete_observation(
                 observed.completion(),
                 expected_roots,
@@ -1705,7 +1797,7 @@ fn exact_tree_admission_once(
             // still spends it. A deferring caller reports its own publication
             // instead, so a collapsed commit names no admission publication at
             // all, which is what the phase table should show.
-            let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
+            let _ = admission_stage(state, "publish_workspace_admission", || {
                 publish_exact_workspace_tree(state, &admitted)
             })?;
             #[cfg(all(test, unix))]
@@ -1719,7 +1811,7 @@ fn exact_tree_admission_once(
         // earlier live observation; it must not overwrite the newer witness.
         let batch_derivation = (defer && prepared_sources.is_some())
             .then(|| crate::binding_history::Derivation::begin(state));
-        let applied = crate::mcp_commit::timed_commit_phase("apply_live_delta", || {
+        let applied = admission_stage(state, "apply_live_delta", || {
             state
                 .graph
                 .apply_transaction_delta(&live_delta)
@@ -4129,8 +4221,40 @@ async fn round_hold_point_for_test(state: &DaemonState, point: RoundHoldPoint) {
     }
 }
 
-/// What the reconciliation loop becomes after the background-work supervisor
-/// stops its pass: parked, not exited.
+/// Wait out the backoff before the reconcile loop restarts after a confirmed
+/// supervisor stall, keeping coordination housekeeping alive meanwhile.
+///
+/// Returns `true` when the daemon began shutting down during the wait.
+async fn wait_out_stall_restart(
+    state: &DaemonState,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+    interval: Duration,
+) -> bool {
+    let mut cancel = cancel.clone();
+    // A zero poll interval must not turn the wait into the very CPU-spending
+    // spin the supervisor just stopped.
+    let interval = interval.max(Duration::from_millis(200));
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        if *cancel.borrow() {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= until {
+            return false;
+        }
+        sweep_expired_intents(state).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval.min(until - now)) => {}
+            _ = cancel.changed() => {}
+        }
+    }
+}
+
+/// What the reconciliation loop becomes once its pass is stopped for good, by
+/// an explicit halt or a stall whose automatic recovery ran out: parked, not
+/// exited.
 ///
 /// The loop's exit is one of the daemon's shutdown arms, so exiting on a
 /// supervisor stop tore down the API task and every other task with it,
@@ -4139,7 +4263,9 @@ async fn round_hold_point_for_test(state: &DaemonState, point: RoundHoldPoint) {
 /// housekeeping the daemon still owes, and ends on the daemon's own shutdown
 /// signal. Admission stays stopped until a daemon restart clears the
 /// in-memory halt, which is the "a restart retries it" the announcement
-/// promises.
+/// promises. A supervisor stall reaches here only after the loop has
+/// withdrawn premature verdicts and restarted itself within its recovery
+/// budget; see [`crate::background_work::BackgroundPass::stall_checkpoint`].
 async fn park_reconcile_loop(
     state: &DaemonState,
     mut cancel: tokio::sync::watch::Receiver<bool>,
@@ -5819,6 +5945,11 @@ pub async fn run_loop_armed(
     // neither may turn the normal 100ms poll into a complete-tree retry loop.
     let mut watcher_recovery_after: Option<Instant> = None;
     let mut watcher_recovery_attempts = 0_u64;
+    // The last failed recovery, kept to tell a refusal that repeats over an
+    // unchanged store from one that might clear, and the marks a repeated
+    // refusal holds the next attempt against; see [`RecoveryFailure`].
+    let mut last_recovery_failure: Option<RecoveryFailure> = None;
+    let mut recovery_held_until_marks_move: Option<RepositoryMarks> = None;
     // Complete admissions that recovered a watcher loss with no delivery canary
     // acknowledged since, and the earliest the next may start. Kept apart from
     // the failure ladder above because these passes succeed: what they space is
@@ -5852,11 +5983,80 @@ pub async fn run_loop_armed(
             break;
         }
 
-        // The supervisor stopped this loop for spending the machine without
-        // admitting anything. Enforced at this checkpoint, before any lock is
-        // taken, so nothing is abandoned mid-transaction. Graph truth is
-        // untouched and the daemon keeps serving it; what stops is the automatic
-        // tracking of working-copy edits, which the announced reason says.
+        // The supervisor asked this loop to stop for spending a whole threshold
+        // without completing anything. Enforced at this checkpoint, before any
+        // lock is taken, so nothing is abandoned mid-transaction. Nothing
+        // between the verdict and here looks at the halt, so a batch that was
+        // already prepared when the verdict landed published as usual.
+        //
+        // The checkpoint first decides whether the stall was real. The
+        // supervisor can only see that a threshold went by with nothing
+        // completed, which is also what one long stage of a large batch looks
+        // like from outside. If the pass completed anything after the verdict,
+        // the verdict is withdrawn and the loop carries on. If it completed
+        // nothing, the loop waits out a backoff and restarts, within the
+        // recovery budget, instead of staying down until the daemon restarts.
+        if pass.halted() {
+            match pass.stall_checkpoint(state.background_work.stall_restart_base()) {
+                crate::background_work::StallCheckpoint::Withdrawn => {
+                    info!(
+                        "the reconcile pass completed work after the background-work supervisor \
+                         asked it to stop, so the stop described one long stage rather than a \
+                         stall; withdrawing it and continuing"
+                    );
+                }
+                crate::background_work::StallCheckpoint::RestartAfter(delay) => {
+                    state
+                        .reconciliation_status
+                        .store(RECON_PARKED, Ordering::Relaxed);
+                    warn!(
+                        reason = pass.halt_reason().unwrap_or_default(),
+                        restart_in_secs = delay.as_secs_f64(),
+                        restart = pass.stall_restarts().saturating_add(1),
+                        "reconciliation loop stopped by the background-work supervisor for a stall \
+                         it confirmed at its checkpoint; restarting it after a backoff while the \
+                         daemon keeps serving"
+                    );
+                    pass.idle();
+                    // What the loop still holds is owed, not dropped: the
+                    // queue, the retry lane and the watcher survive the wait.
+                    pass.set_deferred(
+                        !pending_events.is_empty() || retry_lane.deferred_owed(),
+                        Instant::now(),
+                    );
+                    // Nothing is on its way into the graph while the loop
+                    // waits, so no read may wait on these events.
+                    queued_mark.release();
+                    if wait_out_stall_restart(&state, &cancel, delay, interval).await {
+                        // The daemon is shutting down; the top of the loop
+                        // ends it.
+                        continue;
+                    }
+                    if pass.resume_supervisor_stall(
+                        delay,
+                        crate::background_work::configured_retry_budget(),
+                        Instant::now(),
+                    ) {
+                        state
+                            .reconciliation_status
+                            .store(RECON_IDLE, Ordering::Relaxed);
+                        info!(
+                            restart = pass.stall_restarts(),
+                            "reconciliation loop restarted after a supervisor stall"
+                        );
+                        continue;
+                    }
+                    // Recovery exhausted: the halt now carries a reason that
+                    // says so, and the loop parks below.
+                }
+                crate::background_work::StallCheckpoint::NotStalled => {}
+            }
+        }
+
+        // The loop is stopped for good: an explicit halt, or a stall whose
+        // automatic recovery ran out. Graph truth is untouched and the daemon
+        // keeps serving it; what stops is the automatic tracking of
+        // working-copy edits, which the announced reason says.
         //
         // Parking, not exiting, is what keeps that announcement true: this
         // loop's exit is a shutdown arm in the daemon's task supervision, so
@@ -5986,12 +6186,25 @@ pub async fn run_loop_armed(
             disclose_watcher_loss(&state, watcher.lost_events(), &mut disclosed_watcher_loss);
         let watcher_recovery_owed =
             !loss_persisted || crate::watcher_loss::read(&state.layout).recovery_required();
+        // A recovery that failed the same way twice over a store that did not
+        // move waits for the store to move. The marks are two atomic loads.
+        if recovery_held_until_marks_move.is_some_and(|held| held != RepositoryMarks::read(&state))
+        {
+            info!(
+                "the repository moved since the last watcher-loss recovery was refused, so the \
+                 next one may run once its spacing allows"
+            );
+            recovery_held_until_marks_move = None;
+        }
         let watcher_recovery_due = watcher_recovery_owed
+            && recovery_held_until_marks_move.is_none()
             && watcher_recovery_after.is_none_or(|after| tick_started >= after)
             && delivery_recovery_not_before.is_none_or(|after| tick_started >= after);
         if !watcher_recovery_owed {
             watcher_recovery_after = None;
             watcher_recovery_attempts = 0;
+            last_recovery_failure = None;
+            recovery_held_until_marks_move = None;
         }
         // A graph-only repository member owns its own host subtree. Admission
         // already refuses to traverse one, so an event beneath it carries no
@@ -6285,6 +6498,8 @@ pub async fn run_loop_armed(
             let recovery_state = &state;
             let recovery_disclosed = &mut disclosed_watcher_loss;
             let checkpoint_result = &mut checkpoint_persisted;
+            let attempt_started = Instant::now();
+            let marks_before = RepositoryMarks::read(&state);
             let outcome = crate::repository_admit::recover_watcher_loss(&state, move || {
                 *checkpoint_result = disclose_watcher_loss(
                     recovery_state,
@@ -6312,23 +6527,46 @@ pub async fn run_loop_armed(
             if recovered {
                 watcher_recovery_after = None;
                 watcher_recovery_attempts = 0;
+                last_recovery_failure = None;
+                recovery_held_until_marks_move = None;
                 commit_yields = 0;
                 pass.advanced(1, now);
                 info!("complete exact-tree admission recovered the recorded watcher loss");
             } else {
                 watcher_recovery_attempts = watcher_recovery_attempts.saturating_add(1);
-                let held_for = admission_hold(
-                    watcher_recovery_attempts.saturating_add(
-                        kin_cli::commands::resources::ADMISSION_FAILURE_STREAK_ATTENTION,
-                    ),
-                    ADMISSION_HOLD_CEILING,
-                )
-                .unwrap_or(ADMISSION_HOLD_BASE);
+                let cost = now.saturating_duration_since(attempt_started);
+                let failure = RecoveryFailure {
+                    cause: recovery_failure_cause(&outcome),
+                    marks_before,
+                    marks_after: RepositoryMarks::read(&state),
+                };
+                let repeated = last_recovery_failure
+                    .as_ref()
+                    .is_some_and(|previous| failure.repeats(previous));
+                let held_for = watcher_recovery_spacing(watcher_recovery_attempts, cost);
                 watcher_recovery_after = Some(now + held_for);
-                warn!(
-                    retry_after_secs = held_for.as_secs(),
-                    "watcher-loss recovery remains owed; retaining its disclosure and retrying"
-                );
+                if repeated {
+                    recovery_held_until_marks_move = Some(failure.marks_after);
+                    warn!(
+                        cause = failure.cause.as_deref().unwrap_or("unknown"),
+                        attempt_secs = cost.as_secs(),
+                        attempts = watcher_recovery_attempts,
+                        "watcher-loss recovery was refused for the same reason as the last attempt \
+                         over a store that has not moved since; holding further complete \
+                         admissions until a commit, checkout or explicit `kin admit` moves the \
+                         repository, instead of repeating the same refusal"
+                    );
+                } else {
+                    warn!(
+                        cause = failure.cause.as_deref().unwrap_or("unknown"),
+                        attempt_secs = cost.as_secs(),
+                        attempts = watcher_recovery_attempts,
+                        retry_after_secs = held_for.as_secs(),
+                        "watcher-loss recovery remains owed; retaining its disclosure and retrying \
+                         after a spacing scaled to what the failed attempt cost"
+                    );
+                }
+                last_recovery_failure = Some(failure);
             }
             pass.set_deferred(
                 !recovered || retry_lane.deferred_owed() || admission_owed(&state).is_some(),
@@ -6763,6 +7001,9 @@ pub async fn run_loop_armed(
                 }
             }
             admitted_events += 1;
+            // Each admitted file is completed work in a batch that publishes
+            // its durable count only once every file is through.
+            pass.completed_work(1, Instant::now());
 
             let (semantic_event, semantic_repo_path) = match admitted {
                 AdmittedFileEvent::Regular {
@@ -7409,6 +7650,7 @@ mod tests {
     include!("loop_runner/tests/single_source_scope.rs");
     include!("loop_runner/tests/silent_watcher.rs");
     include!("loop_runner/tests/incomplete_caller_admission.rs");
+    include!("loop_runner/tests/stall_recovery.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -15731,7 +15973,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
     // had paid.
     let batch_paths = source_batch::with_owed_paths(state, exact_admission.changed_paths.clone());
     let mut batch_delta = crate::state::PassDelta::default();
-    let batch_result = crate::mcp_commit::timed_commit_phase("finish_changed_sources", || {
+    let batch_result = admission_stage(state, "finish_changed_sources", || {
         if let Some(prepared) = exact_admission.prepared_sources.take() {
             prepared.finish(state, &mut reconciler, &mut batch_delta)
         } else {
@@ -15760,6 +16002,7 @@ async fn sync_filesystem_with_graph_publishing_inner(
         drop(graph_mutation);
         return Err(error);
     }
+    state.background_work.note_reconcile_work(Instant::now());
     if exact_admission.deltas.is_empty() {
         drop(binding_derivation);
         drop(graph_mutation);
