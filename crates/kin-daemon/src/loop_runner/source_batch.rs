@@ -196,6 +196,10 @@ pub(super) fn prepare(
                 };
             }
         };
+        // One file indexed is completed work. The batch publishes its durable
+        // count only once every file is derived, which on a large tree delta
+        // is longer than the supervisor's stall threshold.
+        state.background_work.note_reconcile_work(Instant::now());
         let IndexedAny::EntitySource(indexed) = indexed else {
             continue;
         };

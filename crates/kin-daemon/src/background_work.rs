@@ -83,6 +83,20 @@ pub const DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(1800);
 /// How often the supervisor evaluates every registered pass.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// First wait before the reconcile loop restarts after a real supervisor stall.
+///
+/// A stall the loop confirms at its own checkpoint, with nothing completed since
+/// the verdict, is retried rather than parked for the life of the daemon. The
+/// loop's job is to keep the graph level with the working copy, and a daemon
+/// that silently stops doing that until somebody restarts it is the failure
+/// this replaces. The wait doubles per restart up to
+/// [`RECONCILE_STALL_RESTART_CEILING`], and the restarts stay inside the
+/// lifetime bound [`BackgroundPass::resume_supervisor_stall`] enforces.
+pub const RECONCILE_STALL_RESTART_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling of the reconcile loop's restart wait after a real supervisor stall.
+pub const RECONCILE_STALL_RESTART_CEILING: Duration = Duration::from_secs(600);
+
 /// Read a duration from the environment in seconds, falling back to `default`.
 ///
 /// An explicit `0` disables the limit rather than meaning "immediately", because
@@ -150,12 +164,49 @@ struct PassInner {
     stall_restart_progress: u64,
     /// Cumulative delay charged to the retry ladder since the last success.
     retry_spent: Duration,
+    /// Finite completed work units reported through
+    /// [`BackgroundPass::completed_work`]: a finished stage of a batch, one
+    /// file indexed inside it, a validated inference chunk. Monotonic and never
+    /// durable. Counted even while a stop is pending, because what the count
+    /// answers is whether the pass completed anything after the supervisor's
+    /// verdict, and the verdict is exactly when the liveness clock stops
+    /// moving.
+    liveness_units: u64,
+    /// What the pass had recorded when the supervisor stopped it for a stall.
+    stall_verdict: Option<StallVerdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HaltCause {
     SupervisorStall,
     Explicit,
+}
+
+/// The readings a supervisor stall verdict was reached on.
+///
+/// Compared as counts rather than as instants. A stop is honoured at the
+/// pass's own checkpoint, which can be long after the verdict, and the only
+/// question the checkpoint asks is whether anything completed in between.
+/// Counts answer that without trusting two clocks to agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StallVerdict {
+    progress: u64,
+    liveness_units: u64,
+}
+
+/// What a pass's own checkpoint does about a pending supervisor stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallCheckpoint {
+    /// No supervisor stall is pending. Either the pass is running, or it was
+    /// halted explicitly, which parks it as before.
+    NotStalled,
+    /// The pass completed work after the verdict, so the verdict described a
+    /// long stage rather than a wedge. It has been withdrawn and the pass keeps
+    /// running with no backoff and no restart charged.
+    Withdrawn,
+    /// Nothing completed since the verdict: a real stall. The pass waits this
+    /// long, then asks [`BackgroundPass::resume_supervisor_stall`] to restart.
+    RestartAfter(Duration),
 }
 
 impl BackgroundPass {
@@ -176,6 +227,8 @@ impl BackgroundPass {
                 stall_restarts: 0,
                 stall_restart_progress: 0,
                 retry_spent: Duration::ZERO,
+                liveness_units: 0,
+                stall_verdict: None,
             }),
         }
     }
@@ -287,16 +340,74 @@ impl BackgroundPass {
     }
 
     /// Record finite successful work before publication. Empty LSP results are
-    /// completed queries, not durable relations. Starts, polls and failed
-    /// requests must never call this; it cannot clear a halt or retry budget.
+    /// completed queries, not durable relations. A finished stage of a reconcile
+    /// batch, or one file indexed inside it, is completed work the same way.
+    /// Starts, polls and failed requests must never call this; it cannot clear a
+    /// halt or retry budget.
+    ///
+    /// While a stop is pending the liveness clock is left alone, so this cannot
+    /// revive a halted pass. The completed units are still counted, which is
+    /// what lets the pass's own checkpoint tell a verdict reached during one
+    /// long stage from a wedge; see [`stall_checkpoint`](Self::stall_checkpoint).
     pub fn completed_work(&self, units: u64, now: Instant) {
         if units == 0 {
             return;
         }
         let mut inner = self.lock();
+        inner.liveness_units = inner.liveness_units.saturating_add(units);
         if inner.halt.is_none() && inner.working_since.is_some() {
             inner.computed_at = Some(inner.computed_at.map_or(now, |old| old.max(now)));
         }
+    }
+
+    /// Completed work units recorded so far; see [`completed_work`](Self::completed_work).
+    pub fn liveness_units(&self) -> u64 {
+        self.lock().liveness_units
+    }
+
+    /// Restarts charged since the pass last recorded durable progress.
+    pub fn stall_restarts(&self) -> u32 {
+        self.lock().stall_restarts
+    }
+
+    /// Decide, at the pass's own checkpoint, what a pending supervisor stop
+    /// means.
+    ///
+    /// The supervisor judges a pass between checkpoints, so it can only see
+    /// that nothing completed for a whole threshold. That is a wedge, or one
+    /// stage that runs longer than the threshold without reporting from inside
+    /// itself. The checkpoint knows which: if the pass completed anything after
+    /// the verdict (a stage, a file, durable progress), the stage was long and
+    /// the verdict is withdrawn here, with no backoff and no restart charged.
+    /// The work that stage finished is never thrown away, because nothing
+    /// between the verdict and this checkpoint ever looks at the halt.
+    ///
+    /// If nothing completed, the stall was real, and the pass is told how long
+    /// to wait before it asks to restart. An explicit halt is not a supervisor
+    /// stall and is reported as [`StallCheckpoint::NotStalled`], so it parks.
+    pub fn stall_checkpoint(&self, restart_base: Duration) -> StallCheckpoint {
+        let mut inner = self.lock();
+        if inner.halt_cause != Some(HaltCause::SupervisorStall) || inner.publications > 0 {
+            return StallCheckpoint::NotStalled;
+        }
+        // A supervisor stall always carries its verdict. Should one ever lack
+        // it, nothing proves the pass completed anything, so it is treated as
+        // the real stall rather than withdrawn.
+        let completed_since = inner.stall_verdict.is_some_and(|verdict| {
+            inner.progress > verdict.progress || inner.liveness_units > verdict.liveness_units
+        });
+        if completed_since {
+            inner.halt = None;
+            inner.halt_cause = None;
+            inner.stall_verdict = None;
+            // The stretch the verdict measured ended at this checkpoint. The
+            // pass marks its next stretch itself when it next has work.
+            inner.working_since = None;
+            drop(inner);
+            self.halted.store(false, Ordering::Relaxed);
+            return StallCheckpoint::Withdrawn;
+        }
+        StallCheckpoint::RestartAfter(stall_restart_delay(restart_base, inner.stall_restarts))
     }
 
     /// Whether this pass has been stopped and should wind itself down.
@@ -321,6 +432,7 @@ impl BackgroundPass {
         // An explicit stop also disarms automatic recovery of an earlier
         // supervisor stall, while preserving the first reported reason.
         inner.halt_cause = Some(HaltCause::Explicit);
+        inner.stall_verdict = None;
         if inner.halt.is_some() {
             return;
         }
@@ -334,11 +446,13 @@ impl BackgroundPass {
         self.lock().halt_cause == Some(HaltCause::SupervisorStall)
     }
 
-    /// Resume only an observed supervisor stall after the worker has retired
-    /// its servers and waited its cancellable backoff. Two restarts without
-    /// durable progress are enough to distinguish a failed server from a
-    /// persistent stall. Completed queries do not renew that allowance, and
-    /// even durable progress never forgives cumulative retry spending here.
+    /// Resume only an observed supervisor stall after the pass has shed what it
+    /// was holding (the LSP worker retires its servers) and waited its
+    /// cancellable backoff. Two restarts without durable progress are enough to
+    /// distinguish a failed server or a transient wedge from a persistent
+    /// stall. Completed work does not renew that allowance, and even durable
+    /// progress never forgives cumulative retry spending here. On exhaustion
+    /// the halt stays, with a reason that says so, and the pass parks.
     pub fn resume_supervisor_stall(&self, delay: Duration, budget: Duration, now: Instant) -> bool {
         let mut inner = self.lock();
         if inner.halt_cause != Some(HaltCause::SupervisorStall) || inner.publications > 0 {
@@ -359,11 +473,13 @@ impl BackgroundPass {
             );
             inner.halt = Some(reason);
             inner.halt_cause = Some(HaltCause::Explicit);
+            inner.stall_verdict = None;
             return false;
         }
         inner.stall_restarts += 1;
         inner.halt = None;
         inner.halt_cause = None;
+        inner.stall_verdict = None;
         inner.working_since = Some(now);
         self.halted.store(false, Ordering::Relaxed);
         true
@@ -517,11 +633,24 @@ fn is_stalled(
     since_progress.unwrap_or(working_for) >= threshold
 }
 
+/// How long a pass waits before its next restart after `restarts` real stalls:
+/// `base` doubling per restart, up to [`RECONCILE_STALL_RESTART_CEILING`] or
+/// `base`, whichever is larger. Pure, so the ladder is gradeable without a
+/// clock.
+pub fn stall_restart_delay(base: Duration, restarts: u32) -> Duration {
+    let shift = restarts.min(16);
+    base.saturating_mul(1u32 << shift)
+        .min(RECONCILE_STALL_RESTART_CEILING.max(base))
+}
+
 /// Watches every background pass the daemon runs and stops the ones that are
 /// spending the machine without advancing.
 #[derive(Debug)]
 pub struct BackgroundWorkSupervisor {
     stall_threshold: Duration,
+    /// First wait before the reconcile loop restarts after a real stall, in
+    /// milliseconds. [`RECONCILE_STALL_RESTART_BASE`] outside tests.
+    stall_restart_base_ms: AtomicU64,
     passes: RwLock<BTreeMap<&'static str, Arc<BackgroundPass>>>,
     /// Cumulative process CPU time in milliseconds, sampled by the sweep. Read
     /// by `/health`, which must stay cheap enough to poll.
@@ -547,6 +676,9 @@ impl BackgroundWorkSupervisor {
     pub fn new(stall_threshold: Duration) -> Self {
         Self {
             stall_threshold,
+            stall_restart_base_ms: AtomicU64::new(
+                u64::try_from(RECONCILE_STALL_RESTART_BASE.as_millis()).unwrap_or(u64::MAX),
+            ),
             passes: RwLock::new(BTreeMap::new()),
             cpu_millis: AtomicU64::new(0),
             cpu_sampled: AtomicBool::new(false),
@@ -621,6 +753,44 @@ impl BackgroundWorkSupervisor {
         self.stall_threshold
     }
 
+    /// First wait before the reconcile loop restarts after a real stall.
+    pub fn stall_restart_base(&self) -> Duration {
+        Duration::from_millis(self.stall_restart_base_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten the restart wait so a test can drive a real restart. The one
+    /// test that does drives a real watcher, which those tests do on Unix only.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_stall_restart_base_for_test(&self, base: Duration) {
+        self.stall_restart_base_ms.store(
+            u64::try_from(base.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record one unit of completed work on the reconcile pass, if this daemon
+    /// runs one.
+    ///
+    /// Called from inside the admission machinery: when a stage of a complete
+    /// or ambient admission finishes, and for each file a batch indexes or
+    /// admits. Those are the only signals the supervisor has that a batch which
+    /// runs for longer than the stall threshold is still advancing, because the
+    /// batch records durable progress only when it publishes. It feeds the
+    /// liveness clock and nothing else: no durable unit, no retry budget, and
+    /// no effect on a pass that is not working, so an explicit admission or a
+    /// commit that runs the same stages while the loop is idle changes nothing.
+    /// It does keep a loop that is waiting on the coordination gate alive while
+    /// whoever holds the gate keeps completing stages, which is the honest
+    /// reading: the loop is queued behind work that is advancing.
+    ///
+    /// Never registers the pass, so a store that runs no loop grows no
+    /// reconcile row from an explicit admission.
+    pub fn note_reconcile_work(&self, now: Instant) {
+        if let Some(pass) = self.registered(PASS_RECONCILE) {
+            pass.completed_work(1, now);
+        }
+    }
+
     /// Evaluate every pass and stop the stalled ones. Returns the halt reason of
     /// each pass stopped by this sweep, for logging.
     pub fn sweep(&self, now: Instant) -> Vec<String> {
@@ -656,6 +826,10 @@ impl BackgroundWorkSupervisor {
             let progress = inner.progress;
             let recovery = if pass.name() == PASS_LSP {
                 "the daemon keeps serving; the worker may retry with fresh servers within its recovery budget"
+            } else if pass.name() == PASS_RECONCILE {
+                "the daemon keeps serving; if the pass completes work before that checkpoint the stop \
+                 is withdrawn, and otherwise the loop restarts after a backoff within its recovery \
+                 budget"
             } else {
                 "the daemon keeps serving and a restart retries it"
             };
@@ -669,6 +843,10 @@ impl BackgroundWorkSupervisor {
             );
             inner.halt = Some(reason.clone());
             inner.halt_cause = Some(HaltCause::SupervisorStall);
+            inner.stall_verdict = Some(StallVerdict {
+                progress,
+                liveness_units: inner.liveness_units,
+            });
             inner.working_since = None;
             pass.halted.store(true, Ordering::Relaxed);
             stopped.push(reason);
@@ -1844,6 +2022,179 @@ mod tests {
         pass.completed_work(2, at(base, 142));
         assert!(pass.halted());
         assert!(pass.supervisor_stalled());
+    }
+
+    /// Completed work from inside one long stage keeps a working pass alive,
+    /// and silence after it is still a stall.
+    ///
+    /// A reconcile batch over a large tree delta records durable progress only
+    /// when it publishes, which can be most of an hour after it starts. Each
+    /// stage it finishes, and each file it indexes, is completed work, and that
+    /// is what the supervisor judges the pass on in between. A pass that stops
+    /// reporting, whatever wedged it, is stopped a threshold after its last
+    /// report, so the heartbeat does not disarm stall detection.
+    #[test]
+    fn completed_work_inside_a_long_stage_keeps_the_pass_alive_and_silence_still_stops_it() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_RECONCILE);
+        let base = Instant::now();
+        pass.working(base);
+        // Forty-five minutes of one batch, reporting a file every five.
+        for minute in (5..=45).step_by(5) {
+            supervisor.note_reconcile_work(at(base, minute * 60));
+            assert!(
+                supervisor.sweep(at(base, minute * 60 + 299)).is_empty(),
+                "a batch reporting completed work was stopped at minute {minute}"
+            );
+        }
+        assert!(!pass.halted());
+        assert_eq!(
+            pass.progress(),
+            0,
+            "completed work is never durable progress"
+        );
+
+        // Then it wedges: no report for a whole threshold.
+        assert!(supervisor.sweep(at(base, 45 * 60 + 599)).is_empty());
+        assert_eq!(supervisor.sweep(at(base, 45 * 60 + 601)).len(), 1);
+        assert!(pass.halted());
+        assert!(pass.supervisor_stalled());
+    }
+
+    /// Reporting reconcile work never registers a reconcile pass, so a store
+    /// that runs no loop does not grow a row claiming one is idle.
+    #[test]
+    fn reporting_reconcile_work_never_registers_the_pass() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        supervisor.note_reconcile_work(Instant::now());
+        assert!(supervisor.registered(PASS_RECONCILE).is_none());
+        assert!(supervisor.reports(Instant::now()).is_empty());
+    }
+
+    /// A verdict reached during one long stage is withdrawn at the pass's own
+    /// checkpoint once the stage completes work, with no restart charged.
+    ///
+    /// The completed work arrives while the stop is pending. It must not revive
+    /// the pass by itself, because only the pass's checkpoint can tell whether
+    /// what it was doing is finished, and the verdict must still be judged by
+    /// that work rather than by two clocks that need not agree.
+    #[test]
+    fn a_stall_verdict_is_withdrawn_when_the_pass_completes_work_before_its_checkpoint() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_RECONCILE);
+        let base = Instant::now();
+        pass.working(base);
+        assert_eq!(supervisor.sweep(at(base, 629)).len(), 1);
+        assert!(pass.halted());
+
+        // The stage finishes long after the verdict, on a clock that reads
+        // earlier than the sweep's.
+        pass.completed_work(1, at(base, 10));
+        assert!(
+            pass.halted(),
+            "completed work alone cannot revive a stopped pass"
+        );
+        assert_eq!(
+            pass.stall_checkpoint(Duration::from_secs(30)),
+            StallCheckpoint::Withdrawn
+        );
+        assert!(!pass.halted());
+        assert!(pass.halt_reason().is_none());
+        assert_eq!(pass.stall_restarts(), 0);
+        assert!(
+            !pass.is_working(),
+            "the measured stretch ended at the checkpoint"
+        );
+
+        // Durable progress after the verdict withdraws it the same way.
+        pass.working(at(base, 700));
+        assert_eq!(supervisor.sweep(at(base, 1_400)).len(), 1);
+        pass.advanced(3, at(base, 1_000));
+        assert_eq!(
+            pass.stall_checkpoint(Duration::from_secs(30)),
+            StallCheckpoint::Withdrawn
+        );
+        assert!(!pass.halted());
+    }
+
+    /// A stall with nothing completed since the verdict restarts after a
+    /// doubling backoff, and a pass that keeps stalling without durable
+    /// progress parks with a reason that says recovery ran out.
+    #[test]
+    fn a_confirmed_stall_restarts_after_a_doubling_backoff_and_parks_when_recovery_runs_out() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_RECONCILE);
+        let budget = Duration::from_secs(1_800);
+        let restart_base = Duration::from_secs(30);
+        let base = Instant::now();
+        let mut now = base;
+        for (restart, expected) in [(0u32, 30u64), (1, 60)] {
+            pass.working(now);
+            now += Duration::from_secs(601);
+            assert_eq!(supervisor.sweep(now).len(), 1);
+            let StallCheckpoint::RestartAfter(delay) = pass.stall_checkpoint(restart_base) else {
+                panic!("a stall with nothing completed since must restart");
+            };
+            assert_eq!(delay, Duration::from_secs(expected));
+            assert!(pass.halted(), "the pass stays stopped while it waits");
+            assert!(pass.resume_supervisor_stall(delay, budget, now + delay));
+            assert!(!pass.halted());
+            assert_eq!(pass.stall_restarts(), restart + 1);
+            now += delay;
+        }
+
+        // A third stall without durable progress in between: recovery is spent.
+        now += Duration::from_secs(601);
+        assert_eq!(supervisor.sweep(now).len(), 1);
+        let StallCheckpoint::RestartAfter(delay) = pass.stall_checkpoint(restart_base) else {
+            panic!("the checkpoint still asks to restart; the allowance decides");
+        };
+        assert!(!pass.resume_supervisor_stall(delay, budget, now + delay));
+        assert!(pass.halted());
+        assert!(pass
+            .halt_reason()
+            .unwrap()
+            .contains("automatic stall recovery exhausted"));
+        // Parked for good: the checkpoint no longer offers a restart.
+        assert_eq!(
+            pass.stall_checkpoint(restart_base),
+            StallCheckpoint::NotStalled
+        );
+    }
+
+    /// An explicit halt is never withdrawn or restarted by the checkpoint.
+    #[test]
+    fn an_explicit_halt_is_never_withdrawn_at_the_checkpoint() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(PASS_RECONCILE);
+        pass.working(Instant::now());
+        pass.halt("an operator stopped it");
+        pass.completed_work(5, Instant::now());
+        pass.advanced(5, Instant::now());
+        assert_eq!(
+            pass.stall_checkpoint(Duration::from_secs(30)),
+            StallCheckpoint::NotStalled
+        );
+        assert!(pass.halted());
+    }
+
+    #[test]
+    fn the_stall_restart_delay_doubles_to_a_ceiling() {
+        let base = Duration::from_secs(30);
+        assert_eq!(stall_restart_delay(base, 0), Duration::from_secs(30));
+        assert_eq!(stall_restart_delay(base, 1), Duration::from_secs(60));
+        assert_eq!(stall_restart_delay(base, 4), Duration::from_secs(480));
+        assert_eq!(
+            stall_restart_delay(base, 5),
+            RECONCILE_STALL_RESTART_CEILING
+        );
+        assert_eq!(
+            stall_restart_delay(base, 60),
+            RECONCILE_STALL_RESTART_CEILING
+        );
+        // A base above the ceiling is not cut below itself.
+        let long = Duration::from_secs(3_600);
+        assert_eq!(stall_restart_delay(long, 3), long);
     }
 
     #[test]

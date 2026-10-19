@@ -110,6 +110,42 @@ impl Drop for RunningPass {
     }
 }
 
+/// [`RunningPass`] for a pass the reconcile loop runs inline, which holds the
+/// state by reference rather than by `Arc`.
+struct RunningInlinePass<'a> {
+    runs: &'a AdmissionRuns,
+}
+
+impl Drop for RunningInlinePass<'_> {
+    fn drop(&mut self) {
+        self.runs.release();
+    }
+}
+
+/// Wait for the pass `outcome` names and return what it reported.
+async fn attached_outcome(
+    mut outcome: tokio::sync::watch::Receiver<AdmissionRunState>,
+) -> Result<AdmitResponse> {
+    loop {
+        if let AdmissionRunState::Finished(finished) = outcome.borrow_and_update().clone() {
+            return match finished.as_ref() {
+                Ok(response) => Ok(response.clone()),
+                Err(error) => Err(anyhow::anyhow!(error.clone())),
+            };
+        }
+        if outcome.changed().await.is_err() {
+            // The task carrying the pass ended without publishing an outcome,
+            // which is a panic or a daemon shutdown. What the pass managed to
+            // publish before that is unknown from here, and the one answer that
+            // must never be given is a successful one.
+            return Err(anyhow::anyhow!(
+                "the complete exact-tree admission stopped without reporting an outcome; read \
+                 `kin graph status` for the state it left behind"
+            ));
+        }
+    }
+}
+
 /// One observation of what an admission can change.
 ///
 /// The two counts are cardinalities and cannot see a content-only edit: a pass
@@ -161,7 +197,7 @@ fn tree_moved(before: &GraphCensus, after: &GraphCensus) -> Option<bool> {
 /// repository authority context could not be resolved, and the pass stopped
 /// without reporting. Neither may read as success.
 pub(crate) async fn execute(state: &Arc<DaemonState>) -> Result<AdmitResponse> {
-    let mut outcome = match state.admission_runs.claim() {
+    let outcome = match state.admission_runs.claim() {
         AdmissionClaim::Attached(outcome) => outcome,
         AdmissionClaim::Started(sender, outcome) => {
             let owned = Arc::clone(state);
@@ -177,25 +213,7 @@ pub(crate) async fn execute(state: &Arc<DaemonState>) -> Result<AdmitResponse> {
             outcome
         }
     };
-
-    loop {
-        if let AdmissionRunState::Finished(finished) = outcome.borrow_and_update().clone() {
-            return match finished.as_ref() {
-                Ok(response) => Ok(response.clone()),
-                Err(error) => Err(anyhow::anyhow!(error.clone())),
-            };
-        }
-        if outcome.changed().await.is_err() {
-            // The task carrying the pass ended without publishing an outcome,
-            // which is a panic or a daemon shutdown. What the pass managed to
-            // publish before that is unknown from here, and the one answer that
-            // must never be given is a successful one.
-            return Err(anyhow::anyhow!(
-                "the complete exact-tree admission stopped without reporting an outcome; read \
-                 `kin graph status` for the state it left behind"
-            ));
-        }
-    }
+    attached_outcome(outcome).await
 }
 
 /// The watcher loss this pass is entitled to clear, captured before it runs.
@@ -233,11 +251,39 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
 /// Recover a pathless watcher loss through the same complete admission as an
 /// explicit request. The loop samples its watcher once more before recovery is
 /// recorded, so a signal delivered during the pass cannot be cleared unseen.
+///
+/// The recovery takes the same in-flight slot an explicit request does, because
+/// it is the same pass. A `kin admit` that arrives while a recovery runs
+/// attaches to it and reports its outcome, rather than queueing on the
+/// coordination gate and then deriving the whole tree a second time: measured
+/// on 2026-10-19, that second derivation of a 1,855-file delta cost another
+/// 2,189 s and refused exactly as the first had. A recovery that finds an
+/// explicit pass already running attaches to that one for the same reason.
+/// Its loss checkpoint is then not sampled, which is safe: the explicit pass
+/// clears only the loss generation it captured before it started, and a signal
+/// the watcher delivers meanwhile is disclosed on the loop's next tick and
+/// still owes a recovery.
 pub(crate) async fn recover_watcher_loss(
     state: &DaemonState,
     checkpoint: impl FnOnce() -> bool,
 ) -> Result<AdmitResponse> {
-    run_pass_with_loss_checkpoint(state, checkpoint).await
+    match state.admission_runs.claim() {
+        AdmissionClaim::Attached(outcome) => attached_outcome(outcome).await,
+        AdmissionClaim::Started(sender, _outcome) => {
+            // Released after the send, and if this future is dropped mid-pass,
+            // so a request attached to it is never left waiting on nothing.
+            let _running = RunningInlinePass {
+                runs: &state.admission_runs,
+            };
+            let finished = run_pass_with_loss_checkpoint(state, checkpoint).await;
+            let shared = match &finished {
+                Ok(response) => Ok(response.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(AdmissionRunState::Finished(Arc::new(shared)));
+            finished
+        }
+    }
 }
 
 async fn run_pass_with_loss_checkpoint(

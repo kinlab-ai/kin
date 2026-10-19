@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon keeps tracking working-copy edits after a large admission. A complete admission
+  of a big tree delta (measured: 1,855 files, 45 minutes) used to read as stalled after
+  10 minutes, and once it finished the reconcile loop parked until the daemon restarted.
+  Each stage of an admission and each file it indexes now counts as progress, a stop
+  requested during one long stage is withdrawn as soon as the stage completes, and a real
+  stall restarts the loop after a backoff, shown as `parked-by-supervisor` while it waits.
+- A watcher-loss recovery that fails now waits at least four times what the failed attempt
+  cost before it retries, instead of 2 seconds, and stops retrying after the same refusal
+  twice over an unchanged repository until a commit, checkout or `kin admit` moves it. A
+  `kin admit` that arrives during a recovery reports that recovery instead of running the
+  whole admission a second time.
 - `kin update` writes the installed release into the npm launcher's version stamp inside the
   same transaction as the binaries, and a rollback puts the old stamp back byte for byte.
   Every update used to leave the stamp naming the release it replaced, and launchers older
