@@ -793,6 +793,16 @@ impl RuntimeKind {
         }
     }
 
+    /// The command that stops a live runtime of this kind, for the refusal
+    /// that names it.
+    fn stop_remedy(self) -> &'static str {
+        match self {
+            Self::Daemon => "run `kin daemon stop --all`",
+            Self::Vfs => "run `kin vfs off` in the repository it projects",
+            Self::Mcp => "close the agent session that started it",
+        }
+    }
+
     /// Whether a live runtime of this kind must be stopped before managed
     /// bytes may move.
     ///
@@ -13599,7 +13609,7 @@ fn reject_active_managed_runtime(
         )
     })?;
     anyhow::bail!(
-        "active managed {} PID {pid} reports executable {} ({}: {}, object {}:{}, {} bytes, SHA-256 {}); stop it before self-update. This diagnostic never authorizes runtime convergence",
+        "active managed {} PID {pid} reports executable {} ({}: {}, object {}:{}, {} bytes, SHA-256 {}); stop it before self-update: {}, then run `kin update` again. This diagnostic never authorizes runtime convergence",
         kind.label(),
         managed.display(),
         evidence.scope,
@@ -13607,7 +13617,8 @@ fn reject_active_managed_runtime(
         evidence.object.namespace,
         evidence.object.file,
         evidence.identity.size_bytes,
-        evidence.identity.sha256
+        evidence.identity.sha256,
+        kind.stop_remedy()
     );
 }
 
@@ -14183,7 +14194,13 @@ fn mcp_repair_pending_record(lock: &InstallRootLock, version: &str) -> Result<Mc
     } else {
         Vec::new()
     };
-    targets.extend(crate::commands::setup::current_mcp_repair_targets()?);
+    // A config whose Kin entry the person changed or removed is theirs now.
+    // Name each one and leave it alone instead of refusing the update over it.
+    let inventory = crate::commands::setup::current_mcp_repair_inventory()?;
+    for skip in &inventory.skipped {
+        eprintln!("{}", skip.line());
+    }
+    targets.extend(inventory.targets);
     let targets = crate::commands::setup::normalize_mcp_repair_targets(targets)?;
     Ok(McpRepairPending {
         schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
@@ -21210,6 +21227,130 @@ cwd = {:?}
         assert!(record.repair_required);
         assert_eq!(record.targets, vec![existing_target]);
         assert_eq!(record.installed_version, "0.2.22");
+    }
+
+    /// A person who pointed a client's `kin` server somewhere else, such as a
+    /// hosted service, keeps that choice through an update. The updater
+    /// captures only the entries still exactly as setup wrote them, reports
+    /// the rest by client and path, and the repair never rewrites them.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn update_skips_and_reports_mcp_entries_the_person_changed() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        use crate::commands::setup::{
+            read_kin_mcp_entry_from_bytes, ConfigLock, McpRepairSkip, McpRepairSkipReason,
+        };
+        use crate::commands::setup_ledger::{ledger_path, LedgerEntry, SetupLedger};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        // What setup wrote, recorded in the ledger the way setup records it.
+        let codex = home.join(".codex/config.toml");
+        let claude = home.join(".claude.json");
+        let cursor = home.join(".cursor/mcp.json");
+        let gemini = home.join(".gemini/settings.json");
+        let codex_written = format!(
+            "[mcp_servers.kin]\ncommand = \"/old/kin\"\nargs = [\"mcp\", \"start\", \"--repo\", {:?}]\n",
+            repo.to_string_lossy()
+        );
+        let launcher_entry =
+            r#"{"mcpServers":{"kin":{"command":"/old/kin","args":["mcp","start"]}}}"#;
+        for (id, path, bytes) in [
+            ("codex", &codex, codex_written.as_bytes()),
+            ("claude", &claude, launcher_entry.as_bytes()),
+            ("cursor", &cursor, launcher_entry.as_bytes()),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            let entry = read_kin_mcp_entry_from_bytes(path, bytes).unwrap();
+            SetupLedger::update(&ledger_path().unwrap(), |ledger| {
+                ledger.record(LedgerEntry::mcp(id, path.clone(), &entry));
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // The person then moved Codex and Claude Code to a hosted server and
+        // added one to Gemini by hand, which no setup run recorded.
+        let codex_mine =
+            "model = \"mine\"\n\n[mcp_servers.kin]\nurl = \"https://kin.example/mcp\"\n";
+        let claude_mine =
+            r#"{"mcpServers":{"kin":{"type":"http","url":"https://kin.example/mcp"}}}"#;
+        let gemini_mine = r#"{"mcpServers":{"kin":{"httpUrl":"https://kin.example/mcp"}}}"#;
+        fs::write(&codex, codex_mine).unwrap();
+        fs::write(&claude, claude_mine).unwrap();
+        fs::create_dir_all(gemini.parent().unwrap()).unwrap();
+        fs::write(&gemini, gemini_mine).unwrap();
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        let record = mcp_repair_pending_record(&lock, "0.2.22")
+            .expect("an entry the person changed must not fail the update");
+        drop(lock);
+        let normalized =
+            |path: &Path| ConfigLock::normalized_path_with_existing_parent(path).unwrap();
+        assert_eq!(
+            record
+                .targets
+                .iter()
+                .map(|target| (target.id.as_str(), target.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![("cursor", normalized(&cursor))],
+            "only the entry still exactly as setup wrote it is a repair target"
+        );
+
+        let skipped = crate::commands::setup::current_mcp_repair_inventory()
+            .unwrap()
+            .skipped;
+        for (id, path, reason) in [
+            ("codex", &codex, McpRepairSkipReason::ChangedSinceSetup),
+            ("claude", &claude, McpRepairSkipReason::ChangedSinceSetup),
+            ("gemini", &gemini, McpRepairSkipReason::NotWrittenBySetup),
+        ] {
+            let skip = McpRepairSkip {
+                id: id.to_string(),
+                path: normalized(path),
+                reason,
+            };
+            assert!(skipped.contains(&skip), "{id} is reported: {skipped:?}");
+            let line = skip.line();
+            assert!(
+                line.contains(id) && line.contains(&normalized(path).display().to_string()),
+                "{line}"
+            );
+        }
+
+        crate::commands::setup::remerge_mcp_targets_exact_with_finalizer(
+            &record.targets,
+            || Ok(()),
+        )
+        .expect("the Kin-owned entry repairs");
+        assert_eq!(fs::read_to_string(&codex).unwrap(), codex_mine);
+        assert_eq!(fs::read_to_string(&claude).unwrap(), claude_mine);
+        assert_eq!(fs::read_to_string(&gemini).unwrap(), gemini_mine);
+        assert_ne!(
+            fs::read_to_string(&cursor).unwrap(),
+            launcher_entry,
+            "the Kin-owned entry is repaired"
+        );
+    }
+
+    #[test]
+    fn a_runtime_refusal_names_the_command_that_stops_it() {
+        assert!(RuntimeKind::Daemon
+            .stop_remedy()
+            .contains("`kin daemon stop --all`"));
+        assert!(RuntimeKind::Vfs.stop_remedy().contains("`kin vfs off`"));
     }
 
     #[cfg(unix)]

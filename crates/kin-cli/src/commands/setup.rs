@@ -3364,6 +3364,19 @@ pub(crate) fn refresh_discovery_blocks() -> Vec<String> {
         if !discovery_reminder_present(&target.path) {
             continue;
         }
+        // A link, such as one instruction file shared by several agents, is
+        // the person's arrangement. The ledger cannot verify a block through
+        // it, and writing would change the file it points at, so the update
+        // says so and moves on.
+        if fs::symlink_metadata(&target.path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            lines.push(format!(
+                "Left the Kin discovery block in {} as it is: it is a symbolic link or not a regular file, and Kin does not write through one",
+                target.path.display()
+            ));
+            continue;
+        }
         let Some(profile) = client_profile_for_index(target.client) else {
             continue;
         };
@@ -4575,6 +4588,9 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
 /// paths that were re-merged.
 pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
     let outcome = remerge_existing_mcp_configs_detailed();
+    for skip in &outcome.skipped {
+        eprintln!("note: {}", skip.line());
+    }
     for error in outcome.errors {
         eprintln!("WARNING: could not refresh a Kin MCP entry: {error}");
     }
@@ -4585,6 +4601,9 @@ pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
 pub(crate) struct McpRemergeOutcome {
     pub(crate) repaired: Vec<PathBuf>,
     pub(crate) errors: Vec<String>,
+    /// Configs with a `kin` entry that Kin found and left alone, because the
+    /// person changed or removed what setup wrote.
+    pub(crate) skipped: Vec<McpRepairSkip>,
 }
 
 /// One exact MCP repair obligation captured before an updater transaction.
@@ -5590,65 +5609,237 @@ pub(crate) fn bound_repo_for_mcp_config(path: &Path) -> Option<PathBuf> {
     mcp_entry_repo_argument(&entry)
 }
 
-/// Capture only MCP configs Kin already owns, plus exact workspace targets
-/// persisted in the setup ledger. Update never creates a new client config.
-pub(crate) fn current_mcp_repair_targets() -> Result<Vec<McpRepairTarget>> {
+/// Why a repair left a client config that names a `kin` server as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpRepairSkipReason {
+    /// The ledger records the entry `kin setup` wrote, and the entry on disk
+    /// no longer matches it. A person or another tool rewrote it.
+    ChangedSinceSetup,
+    /// The ledger records the entry, and the config no longer holds a `kin`
+    /// entry at all.
+    EntryRemoved,
+    /// The ledger records the entry, and the config file is gone.
+    ConfigGone,
+    /// No setup run recorded the entry, and it is not a local launcher of the
+    /// kind setup writes. A `kin` server pointed at a URL is one.
+    NotWrittenBySetup,
+}
+
+impl McpRepairSkipReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ChangedSinceSetup => "its kin entry changed since `kin setup` wrote it",
+            Self::EntryRemoved => "the kin entry `kin setup` wrote is no longer in it",
+            Self::ConfigGone => "the file `kin setup` wrote is gone",
+            Self::NotWrittenBySetup => {
+                "its kin entry is not a local Kin launcher and no `kin setup` run recorded it"
+            }
+        }
+    }
+}
+
+/// A client config a repair found and deliberately left alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpRepairSkip {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) reason: McpRepairSkipReason,
+}
+
+impl McpRepairSkip {
+    /// One line naming the client, the file and why Kin left it alone.
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "Left the {} MCP config at {} as it is: {}",
+            self.id,
+            self.path.display(),
+            self.reason.describe()
+        )
+    }
+}
+
+/// The configs a repair may rewrite, and the ones it found and left alone.
+#[derive(Debug, Default)]
+pub(crate) struct McpRepairInventory {
+    pub(crate) targets: Vec<McpRepairTarget>,
+    pub(crate) skipped: Vec<McpRepairSkip>,
+}
+
+/// Who asked for a repair, which decides how much of a drifted entry it may
+/// take back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpRepairScope {
+    /// An update, which often runs unattended. It repairs only entries still
+    /// exactly as setup wrote them.
+    Update,
+    /// `kin doctor --fix`, which the person runs after a check reported the
+    /// entry. It also takes back a Kin launcher entry that drifted, such as one
+    /// whose command went stale, but never grafts a launcher onto a server the
+    /// person pointed somewhere else.
+    Requested,
+}
+
+/// Capture only MCP configs Kin still owns, plus exact workspace targets
+/// persisted in the setup ledger, and name the configs it left alone and why.
+/// Update never creates a new client config, and never rewrites one whose Kin
+/// entry a person changed or removed.
+pub(crate) fn current_mcp_repair_inventory() -> Result<McpRepairInventory> {
     let topology = McpTopologyLock::acquire()?;
-    current_mcp_repair_targets_with_topology(&topology)
+    current_mcp_repair_inventory_excluding_with_topology(
+        &topology,
+        &std::collections::BTreeSet::new(),
+        McpRepairScope::Update,
+    )
 }
 
-pub(crate) fn current_mcp_repair_targets_with_topology(
-    topology: &McpTopologyLock,
-) -> Result<Vec<McpRepairTarget>> {
-    current_mcp_repair_targets_excluding_with_topology(topology, &std::collections::BTreeSet::new())
+/// [`current_mcp_repair_inventory`] for a repair the person asked for.
+fn requested_mcp_repair_inventory() -> Result<McpRepairInventory> {
+    let topology = McpTopologyLock::acquire()?;
+    current_mcp_repair_inventory_excluding_with_topology(
+        &topology,
+        &std::collections::BTreeSet::new(),
+        McpRepairScope::Requested,
+    )
 }
 
-fn current_mcp_repair_targets_excluding_with_topology(
+/// The repair targets of [`current_mcp_repair_inventory`] alone.
+#[cfg(test)]
+pub(crate) fn current_mcp_repair_targets() -> Result<Vec<McpRepairTarget>> {
+    Ok(current_mcp_repair_inventory()?.targets)
+}
+
+fn current_mcp_repair_inventory_excluding_with_topology(
     _topology: &McpTopologyLock,
     excluded_paths: &std::collections::BTreeSet<PathBuf>,
-) -> Result<Vec<McpRepairTarget>> {
+    scope: McpRepairScope,
+) -> Result<McpRepairInventory> {
     use crate::commands::setup_ledger::{ArtifactKind, SetupLedger};
 
-    let mut targets = Vec::new();
-    let mut paths = crate::commands::health::mcp_client_config_paths();
+    // The ledger is what proves an entry is still the one setup wrote, so it
+    // is read before any candidate and consulted for every one of them.
+    let recorded = SetupLedger::load(&crate::commands::setup_ledger::ledger_path()?)?
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == ArtifactKind::McpConfig)
+        .collect::<Vec<_>>();
+
+    let mut candidates = crate::commands::health::mcp_client_config_paths()
+        .into_iter()
+        .map(|(id, _label, path)| (id.to_string(), path))
+        .collect::<Vec<_>>();
     if let Ok(home) = home_dir() {
-        paths.push((
-            "antigravity",
-            "Google Antigravity legacy",
+        candidates.push((
+            "antigravity".to_string(),
             home.join(".gemini")
                 .join("antigravity-ide")
                 .join("mcp_config.json"),
         ));
     }
-    for (id, _label, path) in paths {
-        if let Some(target) = capture_mcp_repair_target_excluding(id, path, excluded_paths)? {
-            targets.push(target);
-        }
-    }
+    candidates.extend(
+        recorded
+            .iter()
+            .map(|entry| (entry.target.clone(), entry.path.clone())),
+    );
 
-    let ledger = SetupLedger::load(&crate::commands::setup_ledger::ledger_path()?)?;
-    for entry in ledger
-        .entries
-        .into_iter()
-        .filter(|entry| entry.kind == ArtifactKind::McpConfig)
-    {
-        if let Some(target) =
-            capture_mcp_repair_target_excluding(&entry.target, entry.path, excluded_paths)?
-        {
-            targets.push(target);
+    let mut inventory = McpRepairInventory::default();
+    for (id, path) in candidates {
+        match capture_mcp_repair_candidate(&id, path, &recorded, excluded_paths, scope)? {
+            McpRepairCapture::Target(target) => inventory.targets.push(target),
+            McpRepairCapture::Skipped(skip) => {
+                if !inventory.skipped.contains(&skip) {
+                    inventory.skipped.push(skip);
+                }
+            }
+            McpRepairCapture::Absent => {}
         }
     }
-    normalize_mcp_repair_targets(targets)
+    inventory.targets = normalize_mcp_repair_targets(inventory.targets)?;
+    Ok(inventory)
 }
 
-fn capture_mcp_repair_target_excluding(
+enum McpRepairCapture {
+    Target(McpRepairTarget),
+    Skipped(McpRepairSkip),
+    Absent,
+}
+
+/// The ledger's MCP entries for this client at this config, under any spelling
+/// of the path that resolves to the same file.
+fn recorded_mcp_entries<'a>(
+    recorded: &'a [crate::commands::setup_ledger::LedgerEntry],
+    id: &str,
+    path: &Path,
+) -> Vec<&'a crate::commands::setup_ledger::LedgerEntry> {
+    let normalized = ConfigLock::normalized_path_with_existing_parent(path).ok();
+    recorded
+        .iter()
+        .filter(|entry| entry.target == id)
+        .filter(|entry| {
+            entry.path == path
+                || (normalized.is_some()
+                    && ConfigLock::normalized_path_with_existing_parent(&entry.path).ok()
+                        == normalized)
+        })
+        .collect()
+}
+
+/// Whether a `kin` entry still has the shape setup writes: a local launcher
+/// command. A server named `kin` that a person pointed at a URL, the hosted
+/// service among them, is theirs, so a repair leaves it alone rather than
+/// grafting a launcher onto it.
+fn entry_is_local_launcher(entry: &serde_json::Value) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    let has_command = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty());
+    has_command
+        && !["url", "serverUrl", "httpUrl"]
+            .iter()
+            .any(|key| entry.contains_key(*key))
+}
+
+/// Decide whether one candidate config is a repair target.
+///
+/// An update repairs a config the ledger records only while the entry on disk
+/// is still exactly the one setup wrote. One the person changed or removed is
+/// reported and left alone, because a repair rewrites the entry and would
+/// replace their choice. A repair the person asked for also takes back a
+/// recorded entry that is still a local Kin launcher. A config the ledger does
+/// not record predates the ledger or was written by a setup that could not
+/// record it, so it is repaired when it is still a local Kin launcher. Every
+/// target that remains still goes through [`normalize_mcp_repair_targets`],
+/// which refuses a Kin-owned entry that is broken, such as a
+/// repository-bound one whose repository is no longer initialized.
+fn capture_mcp_repair_candidate(
     id: &str,
     path: PathBuf,
+    recorded: &[crate::commands::setup_ledger::LedgerEntry],
     excluded_paths: &std::collections::BTreeSet<PathBuf>,
-) -> Result<Option<McpRepairTarget>> {
+    scope: McpRepairScope,
+) -> Result<McpRepairCapture> {
+    use crate::commands::setup_ledger::{verify_entry_locked, EntryState};
+
+    let skipped = |path: PathBuf, reason| {
+        McpRepairCapture::Skipped(McpRepairSkip {
+            id: id.to_string(),
+            path,
+            reason,
+        })
+    };
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if recorded_mcp_entries(recorded, id, &path).is_empty() {
+                return Ok(McpRepairCapture::Absent);
+            }
+            // Name the file the way the rest of the report does while its
+            // folder is still there to resolve against.
+            let path = ConfigLock::normalized_path_with_existing_parent(&path).unwrap_or(path);
+            return Ok(skipped(path, McpRepairSkipReason::ConfigGone));
+        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to inspect MCP config {}", path.display()))
@@ -5656,14 +5847,47 @@ fn capture_mcp_repair_target_excluding(
     }
     let path = ConfigLock::normalized_path_with_existing_parent(&path)?;
     if excluded_paths.contains(&path) {
-        return Ok(None);
+        return Ok(McpRepairCapture::Absent);
     }
+    let ledger_entries = recorded_mcp_entries(recorded, id, &path);
     let lock = ConfigLock::acquire(&path)?;
     let Some(bytes) = lock.original_bytes(&path)? else {
-        return Ok(None);
+        return Ok(if ledger_entries.is_empty() {
+            McpRepairCapture::Absent
+        } else {
+            skipped(path, McpRepairSkipReason::ConfigGone)
+        });
     };
-    if read_kin_mcp_entry_from_bytes(&path, &bytes).is_none() {
-        return Ok(None);
+    let Some(entry) = read_kin_mcp_entry_from_bytes(&path, &bytes) else {
+        return Ok(if ledger_entries.is_empty() {
+            McpRepairCapture::Absent
+        } else {
+            skipped(path, McpRepairSkipReason::EntryRemoved)
+        });
+    };
+    let local_launcher = entry_is_local_launcher(&entry);
+    if ledger_entries.is_empty() {
+        if !local_launcher {
+            return Ok(skipped(path, McpRepairSkipReason::NotWrittenBySetup));
+        }
+    } else {
+        let mut state = EntryState::Modified;
+        for recorded in ledger_entries {
+            let mut recorded = recorded.clone();
+            recorded.path = path.clone();
+            state = verify_entry_locked(&recorded, &lock)?.state;
+            if state == EntryState::Verified {
+                break;
+            }
+        }
+        match state {
+            EntryState::Verified => {}
+            EntryState::Modified if scope == McpRepairScope::Requested && local_launcher => {}
+            EntryState::Modified => {
+                return Ok(skipped(path, McpRepairSkipReason::ChangedSinceSetup))
+            }
+            EntryState::Removed => return Ok(skipped(path, McpRepairSkipReason::EntryRemoved)),
+        }
     }
     let repo_root = match id {
         "antigravity_workspace" => workspace_root_for_mcp_path(&path),
@@ -5671,7 +5895,7 @@ fn capture_mcp_repair_target_excluding(
         "codex" | "grok" => codex_repo_from_entry_bytes(&bytes)?,
         _ => None,
     };
-    Ok(Some(McpRepairTarget {
+    Ok(McpRepairCapture::Target(McpRepairTarget {
         id: id.to_string(),
         path,
         repo_root,
@@ -13687,9 +13911,14 @@ pub(crate) fn remerge_mcp_targets_exact_with_topology_and_finalizer(
         .iter()
         .map(|target| target.path.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    for current in current_mcp_repair_targets_excluding_with_topology(topology, &captured_paths)? {
-        targets.push(current);
-    }
+    targets.extend(
+        current_mcp_repair_inventory_excluding_with_topology(
+            topology,
+            &captured_paths,
+            McpRepairScope::Update,
+        )?
+        .targets,
+    );
     targets = normalize_mcp_repair_targets(targets)?;
     targets.sort_by(|left, right| {
         left.path
@@ -13799,13 +14028,19 @@ fn mcp_entry_matches_repair_target(
 }
 
 pub(crate) fn remerge_existing_mcp_configs_detailed() -> McpRemergeOutcome {
-    match current_mcp_repair_targets() {
-        Ok(targets) if !targets.is_empty() => remerge_mcp_targets_with_launcher(
-            &targets,
-            configured_mcp_launcher,
-            "configured installation",
-        ),
-        Ok(_) => McpRemergeOutcome::default(),
+    match requested_mcp_repair_inventory() {
+        Ok(inventory) if !inventory.targets.is_empty() => McpRemergeOutcome {
+            skipped: inventory.skipped,
+            ..remerge_mcp_targets_with_launcher(
+                &inventory.targets,
+                configured_mcp_launcher,
+                "configured installation",
+            )
+        },
+        Ok(inventory) => McpRemergeOutcome {
+            skipped: inventory.skipped,
+            ..Default::default()
+        },
         Err(error) => McpRemergeOutcome {
             errors: vec![format!("could not capture MCP targets: {error:#}")],
             ..Default::default()
@@ -27049,6 +27284,48 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert!(!home.join(".claude").join("CLAUDE.md").exists());
     }
 
+    /// An instruction file that is a symbolic link, such as one shared by
+    /// several agents, is not written through. The update reports it and goes
+    /// on instead of failing or rewriting the file the link points at.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn update_leaves_a_symlinked_instruction_file_alone() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\", \"--repo\", \"/r\"]\n\n\
+             [mcp_servers.kin.env]\nKIN_MCP_TOOL_PROFILE = \"agent-routed\"\n",
+        )
+        .unwrap();
+        let shared = home.join("shared").join("GLOBAL.md");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        let shared_bytes = format!("# Shared\n{KIN_DISCOVERY_REMINDER}");
+        fs::write(&shared, &shared_bytes).unwrap();
+        let agents = codex.join("AGENTS.md");
+        std::os::unix::fs::symlink(&shared, &agents).unwrap();
+
+        let lines = refresh_discovery_blocks();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&agents.display().to_string()) && lines[0].contains("symbolic link"),
+            "{lines:?}"
+        );
+        assert_eq!(fs::read_to_string(&shared).unwrap(), shared_bytes);
+        assert!(fs::symlink_metadata(&agents)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     /// A reminder appended by a Kin that predates the gate stays removable:
     /// uninstall excises exactly the recorded block and leaves the user's own
     /// text alone.
@@ -27187,6 +27464,68 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert_eq!(
             read_kin_mcp_entry(&config).unwrap()["command"].as_str(),
             Some(expected.as_str())
+        );
+    }
+
+    /// `kin doctor --fix`, which `kin update --apply` also runs, takes back a
+    /// Kin launcher entry that drifted but never grafts a launcher onto a
+    /// server the person pointed at a URL, recorded by setup or not.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn doctor_repair_leaves_a_server_the_person_pointed_elsewhere() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &home);
+        write_managed_runtime_fixture(&kin_home, "1111111111111111111111111111111111111111");
+        let cursor = configure_cursor().unwrap();
+        let claude = home.join(".claude.json");
+        merge_configuration_fixture_json(&claude, "claude").unwrap();
+
+        // Cursor's launcher goes stale, the person moves Claude Code to a
+        // hosted server, and adds one to Gemini by hand.
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        root["mcpServers"]["kin"]["command"] = serde_json::json!("/stale/kin");
+        fs::write(&cursor, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        let claude_mine =
+            r#"{"mcpServers":{"kin":{"type":"http","url":"https://kin.example/mcp"}}}"#;
+        fs::write(&claude, claude_mine).unwrap();
+        let gemini = home.join(".gemini/settings.json");
+        fs::create_dir_all(gemini.parent().unwrap()).unwrap();
+        let gemini_mine = r#"{"mcpServers":{"kin":{"httpUrl":"https://kin.example/mcp"}}}"#;
+        fs::write(&gemini, gemini_mine).unwrap();
+
+        let outcome = remerge_existing_mcp_configs_detailed();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            outcome.repaired,
+            vec![ConfigLock::normalized_path(&cursor).unwrap()]
+        );
+        let reasons = outcome
+            .skipped
+            .iter()
+            .map(|skip| (skip.id.as_str(), skip.reason))
+            .collect::<Vec<_>>();
+        assert!(
+            reasons.contains(&("claude", McpRepairSkipReason::ChangedSinceSetup))
+                && reasons.contains(&("gemini", McpRepairSkipReason::NotWrittenBySetup)),
+            "{:?}",
+            outcome.skipped
+        );
+        assert_eq!(fs::read_to_string(&claude).unwrap(), claude_mine);
+        assert_eq!(fs::read_to_string(&gemini).unwrap(), gemini_mine);
+        assert_eq!(
+            read_kin_mcp_entry(&cursor).unwrap()["command"].as_str(),
+            Some(configured_mcp_launcher().unwrap().as_str())
         );
     }
 
@@ -29982,6 +30321,108 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             read_kin_mcp_entry(&windsurf).unwrap()["command"].as_str(),
             Some(kin_home.join("bin/kin").to_string_lossy().as_ref())
         );
+    }
+
+    /// A workspace config setup recorded and the person later deleted is
+    /// reported by client and path, and the repair goes on for the configs Kin
+    /// still owns.
+    #[test]
+    #[serial]
+    fn a_workspace_config_the_person_removed_is_reported_and_skipped() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        write_configuration_writer_launcher_fixture(&kin_home);
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let workspace = repo.join(".agents").join("mcp_config.json");
+        fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        let cursor = home.join(".cursor/mcp.json");
+        fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        merge_configuration_fixture_json(&workspace, "antigravity_workspace").unwrap();
+        merge_configuration_fixture_json(&cursor, "cursor").unwrap();
+        let workspace_path = ConfigLock::normalized_path_with_existing_parent(&workspace).unwrap();
+
+        // The person removes the workspace config, and then the whole
+        // `.agents` folder it lived in.
+        fs::remove_file(&workspace).unwrap();
+        let inventory = current_mcp_repair_inventory().expect("a removed config is no failure");
+        let gone = McpRepairSkip {
+            id: "antigravity_workspace".to_string(),
+            path: workspace_path.clone(),
+            reason: McpRepairSkipReason::ConfigGone,
+        };
+        assert_eq!(inventory.skipped, vec![gone.clone()]);
+        assert!(gone.line().contains("antigravity_workspace"));
+        assert!(gone.line().contains(&workspace_path.display().to_string()));
+        assert_eq!(
+            inventory
+                .targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cursor"]
+        );
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+        let inventory = current_mcp_repair_inventory().unwrap();
+        assert_eq!(inventory.skipped.len(), 1, "{:?}", inventory.skipped);
+        assert_eq!(inventory.skipped[0].id, "antigravity_workspace");
+        assert_eq!(inventory.skipped[0].reason, McpRepairSkipReason::ConfigGone);
+        remerge_mcp_targets_exact_with_finalizer(&inventory.targets, || Ok(()))
+            .expect("the configs Kin owns still repair");
+        assert!(
+            !workspace.parent().unwrap().exists(),
+            "nothing is recreated"
+        );
+    }
+
+    /// Skipping what the person changed loosens nothing for what Kin owns. A
+    /// repository-bound entry still exactly as setup wrote it is captured with
+    /// its binding, and once its repository is no longer initialized the
+    /// update still refuses it rather than skipping it.
+    #[test]
+    #[serial]
+    fn an_unmodified_repository_bound_entry_is_still_validated() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        write_configuration_writer_launcher_fixture(&kin_home);
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".kin")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let codex = home.join(".codex/config.toml");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        merge_configuration_fixture_toml(&codex, &repo).unwrap();
+        let written = fs::read(&codex).unwrap();
+
+        let inventory = current_mcp_repair_inventory().unwrap();
+        assert!(inventory.skipped.is_empty(), "{:?}", inventory.skipped);
+        assert_eq!(inventory.targets.len(), 1);
+        assert_eq!(inventory.targets[0].id, "codex");
+        assert_eq!(
+            inventory.targets[0].repo_root.as_deref(),
+            Some(repo.as_path())
+        );
+
+        fs::remove_dir_all(repo.join(".kin")).unwrap();
+        let error = current_mcp_repair_inventory()
+            .expect_err("a broken entry Kin owns still fails the update");
+        assert!(
+            format!("{error:#}").contains("has no exact initialized repository binding"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&codex).unwrap(), written);
     }
 
     #[test]
