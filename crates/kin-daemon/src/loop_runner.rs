@@ -7398,6 +7398,7 @@ mod tests {
     include!("loop_runner/tests/offline_tracked_changes.rs");
     include!("loop_runner/tests/single_source_scope.rs");
     include!("loop_runner/tests/silent_watcher.rs");
+    include!("loop_runner/tests/incomplete_caller_admission.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {

@@ -132,6 +132,7 @@ fn finalize_with_limits(
         &accepted,
         blobs,
         false,
+        false,
         |source| {
             kin_index::link_cross_file_incremental_with_completeness(
                 std::slice::from_ref(source),
@@ -141,7 +142,7 @@ fn finalize_with_limits(
             .map_err(Into::into)
         },
     )?;
-    for old in external {
+    for old in external.removed {
         delta
             .relation_deltas
             .push(kin_model::RelationDelta::Removed { old });

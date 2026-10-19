@@ -21,6 +21,31 @@ fn invalid(reason: impl std::fmt::Display) -> ReconcileError {
     ReconcileError::InvalidTransaction(format!("authored batch prior binding: {reason}"))
 }
 
+/// Name a binding by the files and declarations at its two ends, so a refusal
+/// says which caller and which withdrawn target it is about.
+fn describe(
+    relation: &kin_model::Relation,
+    entities: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+) -> String {
+    let end = |node: &GraphNodeId| match node.as_entity().and_then(|id| entities.get(&id)) {
+        Some(entity) => format!(
+            "{}::{}",
+            entity
+                .file_origin
+                .as_ref()
+                .map_or("<no file>", |file| file.0.as_str()),
+            entity.name
+        ),
+        None => node.to_string(),
+    };
+    format!(
+        "{} {:?} {}",
+        end(&relation.src),
+        relation.kind,
+        end(&relation.dst)
+    )
+}
+
 /// A private batch can withdraw an unchanged occurrence twice: once while
 /// retiring the target against the authored caller, then from the immutable
 /// predecessor. Only this checked current-body duplicate may yield to the old
@@ -262,7 +287,9 @@ pub(crate) fn retain_removed_bindings(
                     .entities
                     .get(&relation.src.as_entity().unwrap())
                     .and_then(|entity| entity.file_origin.clone())
-                    .ok_or_else(|| invalid("prior source has no file"))?;
+                    .ok_or_else(|| {
+                        invalid(format!("prior caller of {} has no file", relation.id))
+                    })?;
                 let complete = match certified.get(&source) {
                     Some(complete) => *complete,
                     None => {
@@ -303,11 +330,18 @@ pub(crate) fn retain_removed_bindings(
                 .entities
                 .get(&relation.src.as_entity().unwrap())
                 .and_then(|entity| entity.file_origin.as_ref())
-                .ok_or_else(|| invalid("prior source has no file"))?;
+                .ok_or_else(|| invalid(format!("prior caller of {} has no file", relation.id)))?;
+            // Settlement re-parses each obligation's prior body and refuses one
+            // that does not parse completely, so a record grounded in such a
+            // body could never be discharged. Refuse it here, naming the caller.
             if checked.insert(source.clone())
                 && crate::admitted_source::load(&graph, blobs, source)?.is_none()
             {
-                return Err(invalid("prior source is incomplete"));
+                return Err(invalid(format!(
+                    "caller {source} does not parse completely in the predecessor, so it cannot \
+                     ground a record of its withdrawn binding {}",
+                    describe(relation, &prior.entities)
+                )));
             }
         }
         let planned = crate::coverage::plan_withdrawn_local_binding_obligations(
@@ -336,26 +370,36 @@ pub(crate) fn retain_removed_bindings(
                 _ => continue,
             };
             let GraphNodeId::Artifact(artifact) = relation.src else {
-                return Err(invalid("prior debt has no source artifact"));
+                return Err(invalid(format!(
+                    "prior debt {} has no source artifact",
+                    relation.id
+                )));
             };
             let old_path = FilePathId::new(
                 prior
                     .tree
                     .get(&artifact)
-                    .ok_or_else(|| invalid("prior source disappeared"))?
+                    .ok_or_else(|| {
+                        invalid(format!("prior caller artifact {} disappeared", artifact.0))
+                    })?
                     .path
                     .to_string(),
             );
             let mut debt = decode_local_binding_debt(&old_path, artifact, &relation)
                 .map_err(invalid)?
-                .ok_or_else(|| invalid("prior planner omitted debt"))?;
+                .ok_or_else(|| invalid(format!("prior planner omitted debt for {old_path}")))?;
             debt.obligations
                 .retain(|o| selected_ids.contains(&o.retired_relation.id));
             let source_path = FilePathId::new(
                 final_state
                     .resolved_tree
                     .get(&artifact)
-                    .ok_or_else(|| invalid("surviving source lost its artifact"))?
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "surviving caller {old_path} (artifact {}) lost its artifact",
+                            artifact.0
+                        ))
+                    })?
                     .path
                     .to_string(),
             );
@@ -377,22 +421,48 @@ pub(crate) fn retain_removed_bindings(
             unclaimed.remove(&relation.id);
         }
     }
-    if !unclaimed.is_empty() {
-        return Err(invalid(
-            "withdrawn binding has no exact immutable predecessor",
-        ));
+    if let Some(relation) = unclaimed.values().next() {
+        return Err(invalid(format!(
+            "withdrawn binding {} has no exact immutable predecessor ({} withdrawn bindings \
+             unclaimed)",
+            describe(relation, &anchors.entities),
+            unclaimed.len()
+        )));
     }
     let project = kin_index::GraphProjectFiles::new(current, blobs);
     for (artifact, mut debt) in additions {
-        let indexed = crate::admitted_source::load(current, blobs, &debt.source_file)?
-            .ok_or_else(|| invalid("current source is incomplete"))?;
+        let file = debt.source_file.clone();
+        let caller =
+            |reason: &str| invalid(format!("caller {file} (artifact {}): {reason}", artifact.0));
+        let Some(TreeEntry::Blob { hash: sealed, .. }) =
+            current.get_tree_entry(&file).map_err(invalid)?
+        else {
+            return Err(caller("surviving caller has no admitted blob"));
+        };
+        // The batch derives only complete sources. A surviving caller outside
+        // it may hold bytes that parse with errors (a syntax this build's
+        // grammar does not accept) or that are no longer entity source at all.
+        // Its withdrawn binding is still a fact about its immutable prior body,
+        // which the predecessor certified above, so the record is kept and
+        // sealed to the bytes the tree admits now. An incomplete parse cannot
+        // prove a current-body duplicate or discharge an obligation, so such a
+        // caller only accumulates obligations here; the reconcile that next
+        // derives it completely settles them. A stale derivation still refuses.
+        let indexed = match crate::admitted_source::inspect_with_content(current, &file, |hash| {
+            blobs
+                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                .map_err(Into::into)
+        })? {
+            crate::admitted_source::AdmittedSourceReading::NotComplete => None,
+            reading => reading.into_complete(&file)?.map(|source| source.indexed),
+        };
         let mut old = None;
         for relation in crate::binding_debt::held(current, artifact)? {
-            if let Some(held) = decode_local_binding_debt(&debt.source_file, artifact, &relation)
-                .map_err(invalid)?
+            if let Some(held) =
+                decode_local_binding_debt(&file, artifact, &relation).map_err(invalid)?
             {
                 if old.replace(relation).is_some() {
-                    return Err(invalid("multiple current debt records"));
+                    return Err(caller("multiple current debt records"));
                 }
                 for obligation in held.obligations {
                     if let Some(added) = debt
@@ -400,16 +470,20 @@ pub(crate) fn retain_removed_bindings(
                         .iter()
                         .find(|new| new.retired_relation.id == obligation.retired_relation.id)
                     {
-                        if added != &obligation
-                            && !is_current_reobservation(
+                        // Only a complete current parse can prove that a
+                        // different record is this body's duplicate.
+                        let reobserved = || match &indexed {
+                            Some(indexed) => is_current_reobservation(
                                 added,
                                 &obligation,
-                                &indexed,
+                                indexed,
                                 blobs,
                                 &project,
-                            )?
-                        {
-                            return Err(invalid("prior binding identity collision"));
+                            ),
+                            None => Ok(false),
+                        };
+                        if added != &obligation && !reobserved()? {
+                            return Err(caller("prior binding identity collision"));
                         }
                     } else {
                         debt.obligations.push(obligation);
@@ -417,9 +491,10 @@ pub(crate) fn retain_removed_bindings(
                 }
             }
         }
-        // This stamp describes the checked current observation. Each obligation
-        // retains its own immutable prior-source digest for exact settlement.
-        debt.observed_source_digest = kin_model::Hash256::from_bytes(indexed.blob_hash.0);
+        // This stamp seals the record to the caller's current admitted bytes.
+        // Each obligation retains its own immutable prior-source digest for
+        // exact settlement.
+        debt.observed_source_digest = sealed;
         let mut new = build_local_binding_debt(artifact, debt).map_err(invalid)?;
         let change = if let Some(old) = old {
             new.created_in = old.created_in;
@@ -433,6 +508,9 @@ pub(crate) fn retain_removed_bindings(
                 ..Default::default()
             })
             .map_err(invalid)?;
+        let Some(indexed) = indexed else {
+            continue;
+        };
         let mut produced = Vec::new();
         for node in indexed
             .entities

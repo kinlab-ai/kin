@@ -497,6 +497,16 @@ fn prove_stored(
 /// source whose own derivation is stale is left for its own re-derivation in the
 /// same pass rather than refusing this one: its declarations cannot anchor a
 /// replacement proof until they are re-derived from its bytes.
+///
+/// With `defer_unproposed`, which a coherent batch sets while it still withholds
+/// the declarations of sources it has not derived yet, an obsolete occurrence
+/// whose replacement is not proposed is not yet a refusal. The module it names
+/// can be one of those sources: it is admitted, so a relink no longer mints the
+/// external placeholder, but its declarations are not in the universe, so no
+/// local binding exists either. The stored edge is kept and its source named in
+/// [`ReboundRetirement::deferred`]; the step that derives the module rebinds the
+/// waiting source and retires the edge, and the batch checks every deferred
+/// source again once nothing is withheld.
 pub(crate) fn retire_rebound<G: GraphStore>(
     graph: &G,
     current_sources: &[Entity],
@@ -504,10 +514,12 @@ pub(crate) fn retire_rebound<G: GraphStore>(
     rebound: &[Relation],
     blobs: &BlobStore,
     retire_unprovable: bool,
+    defer_unproposed: bool,
     relink: impl Fn(&kin_index::FileParseData) -> Result<Vec<Relation>>,
-) -> Result<Vec<Relation>> {
+) -> Result<ReboundRetirement> {
     let mut files = HashSet::new();
     let mut removed = Vec::new();
+    let mut deferred = std::collections::BTreeSet::new();
     let project = kin_index::GraphProjectFiles::new(graph, blobs);
     for binding in rebound {
         let Some(id) = binding.src.as_entity() else {
@@ -551,7 +563,9 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             .get_tree_entry(&file)
             .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         let Some(TreeEntry::Blob { hash, .. }) = entry else {
-            return Err(invalid("waiting source has no admitted blob"));
+            return Err(invalid(format!(
+                "waiting source {file} has no admitted blob"
+            )));
         };
         let hash_text = hash.to_string();
         if entities.iter().any(|entity| {
@@ -565,26 +579,32 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             if retire_unprovable {
                 continue;
             }
-            return Err(invalid(
-                "waiting source metadata differs from its admitted blob",
-            ));
+            return Err(invalid(format!(
+                "waiting source {file}: metadata differs from its admitted blob"
+            )));
         }
         let digest = kin_blobs::Hash256::from_hex(&hash_text).map_err(invalid)?;
         let bytes = blobs.read(&digest)?;
         if kin_blobs::digest(&bytes) != digest {
-            return Err(invalid("waiting source blob digest mismatch"));
+            return Err(invalid(format!(
+                "waiting source {file}: blob digest mismatch"
+            )));
         }
-        let indexed = kin_index::IndexPipeline::new()
-            .index_file_content_in(&file, &bytes, digest, &project)?
-            .indexed_file;
+        // A waiting source outside the batch keeps its admitted bytes while
+        // each arriving module rebinds it, so its parse is shared, not redone.
+        let indexed = kin_index::shared_index::index_source(&file, &bytes, digest, &project)?;
         if !matches!(indexed.parse_state, ParseState::Valid) {
-            return Err(invalid("waiting source parse is incomplete"));
+            return Err(invalid(format!(
+                "waiting source {file}: parse is incomplete"
+            )));
         }
         if indexed.entities.len() != entities.len() {
             if retire_unprovable {
                 continue;
             }
-            return Err(invalid("waiting declaration set differs from graph truth"));
+            return Err(invalid(format!(
+                "waiting source {file}: declaration set differs from graph truth"
+            )));
         }
         let mut remapped = Vec::new();
         let mut claimed = HashSet::new();
@@ -604,9 +624,9 @@ pub(crate) fn retire_rebound<G: GraphStore>(
                     stale = true;
                     break;
                 }
-                return Err(invalid(
-                    "waiting declaration identity is ambiguous or stale",
-                ));
+                return Err(invalid(format!(
+                    "waiting source {file}: declaration identity is ambiguous or stale"
+                )));
             }
             remapped.push(matches[0].clone());
         }
@@ -642,9 +662,9 @@ pub(crate) fn retire_rebound<G: GraphStore>(
                 .filter(|id| Some(*id) != placeholder)
             {
                 if removed_entities.contains(&id) {
-                    return Err(invalid(
-                        "replacement endpoint is removed in this transaction",
-                    ));
+                    return Err(invalid(format!(
+                        "waiting source {file}: replacement endpoint is removed in this transaction"
+                    )));
                 }
                 if !current_sources.iter().any(|entity| entity.id == id)
                     && graph
@@ -652,9 +672,9 @@ pub(crate) fn retire_rebound<G: GraphStore>(
                         .map_err(|error| ReconcileError::Graph(error.to_string()))?
                         .is_none()
                 {
-                    return Err(invalid(
-                        "replacement depends on an unadmitted cached target",
-                    ));
+                    return Err(invalid(format!(
+                        "waiting source {file}: replacement depends on an unadmitted cached target"
+                    )));
                 }
             }
         }
@@ -666,7 +686,11 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             let source = entities
                 .iter()
                 .find(|entity| relation.src.as_entity() == Some(entity.id))
-                .ok_or_else(|| invalid("relinked external source is not admitted"))?;
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "waiting source {file}: relinked external source is not admitted"
+                    ))
+                })?;
             verify_source(relation, source, &indexed)?;
             retained.insert(relation.id);
         }
@@ -675,10 +699,18 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             let source = entities
                 .iter()
                 .find(|entity| relation.src.as_entity() == Some(entity.id))
-                .ok_or_else(|| invalid("stored external source is not admitted"))?;
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "waiting source {file}: stored external source is not admitted"
+                    ))
+                })?;
             verify_stored_source(&relation, source, &indexed)?;
             let expected = kin_index::placeholder_target_entity(&relation, source.language)
-                .ok_or_else(|| invalid("stored external target proof is invalid"))?;
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "waiting source {file}: stored external target proof is invalid"
+                    ))
+                })?;
             checked_target(&expected, false, || {
                 graph
                     .get_entity(&expected.id)
@@ -686,6 +718,7 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             })?;
             if !retained.contains(&relation.id) {
                 let token = relation.evidence[0].token.as_deref();
+                let mut unproposed = false;
                 for occurrence in indexed.extracted_relations.iter().filter(|raw| {
                     raw.kind == relation.kind
                         && raw.src_name == source.name
@@ -703,7 +736,11 @@ pub(crate) fn retire_rebound<G: GraphStore>(
                     let span = occurrence
                         .site
                         .as_ref()
-                        .ok_or_else(|| invalid("replacement occurrence has no exact site"))?
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "waiting source {file}: replacement occurrence has no exact site"
+                            ))
+                        })?
                         .to_source_span(&file);
                     let carries_site = |candidate: &Relation| {
                         candidate
@@ -720,17 +757,47 @@ pub(crate) fn retire_rebound<G: GraphStore>(
                                 proposed.id == candidate.id && carries_site(proposed)
                             })
                     }) {
-                        return Err(invalid(
-                            "obsolete external occurrence has no proposed admissible replacement",
-                        ));
+                        if defer_unproposed {
+                            unproposed = true;
+                            break;
+                        }
+                        return Err(invalid(format!(
+                            "waiting source {file}: obsolete external occurrence of `{}` from \
+                             `{}` in {} at line {} has no proposed admissible replacement",
+                            token.unwrap_or("?"),
+                            relation.import_source.as_deref().unwrap_or("?"),
+                            source.name,
+                            span.start_line,
+                        )));
                     }
                 }
-                removed.push(relation);
+                if unproposed {
+                    deferred.insert(file.0.clone());
+                } else {
+                    removed.push(relation);
+                }
             }
         }
     }
     removed.sort_by_key(|relation| relation.id);
-    Ok(removed)
+    Ok(ReboundRetirement {
+        removed,
+        deferred: deferred
+            .into_iter()
+            .map(kin_model::FilePathId::new)
+            .collect(),
+    })
+}
+
+/// What [`retire_rebound`] retires, and which waiting sources it left for a
+/// later step of the same batch.
+pub(crate) struct ReboundRetirement {
+    /// Stored external edges proven obsolete with an admissible replacement.
+    pub removed: Vec<Relation>,
+    /// Waiting sources that keep an obsolete edge because its replacement was
+    /// not proposed while the batch withheld declarations. Always empty
+    /// unless `defer_unproposed` was set.
+    pub deferred: Vec<kin_model::FilePathId>,
 }
 
 #[cfg(test)]
