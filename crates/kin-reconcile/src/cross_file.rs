@@ -610,6 +610,12 @@ impl LiveCrossFileLinker {
         self.withheld.remove(&artifact);
     }
 
+    /// Whether a coherent batch still withholds the declarations of a source it
+    /// has not derived yet.
+    pub(crate) fn withholds_declarations(&self) -> bool {
+        !self.withheld.is_empty()
+    }
+
     fn is_withheld(&self, file: &str) -> bool {
         self.artifact_id_by_file
             .get(file)

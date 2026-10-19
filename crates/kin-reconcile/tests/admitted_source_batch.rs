@@ -1545,3 +1545,232 @@ fn prepared_moved_artifact_preserves_already_observed_partial_replacement_at_old
         target
     ));
 }
+
+/// A live admission derives only complete sources, so a caller outside the
+/// batch can hold bytes this build cannot parse completely (a syntax its
+/// grammar rejects, or bytes that are no longer source at all) while a target
+/// it bound to in another file departs. The predecessor still certifies the
+/// caller's prior body, so the withdrawn binding is recorded on the caller,
+/// sealed to the bytes the tree admits for it now, instead of refusing every
+/// other file in the admission.
+#[test]
+fn a_surviving_caller_whose_current_bytes_do_not_parse_keeps_its_withdrawn_binding() {
+    const CALLER: &str = "from b import beta\n\ndef run(value):\n    return beta(value)\n";
+    const PARTIAL: &str = "from b import beta\n\ndef run(value):\n    return beta(value\n";
+    for control in ["partial", "non-source", "moved-partial"] {
+        let mut repo = Repo::new(&[
+            ("b.py", "def beta(value):\n    return value\n"),
+            ("c.py", CALLER),
+        ]);
+        let prior_digest = Hash256::from_bytes(kin_blobs::digest(CALLER.as_bytes()).0);
+        let retired = repo
+            .graph
+            .to_snapshot()
+            .relations
+            .values()
+            .find(|r| {
+                r.kind == RelationKind::Calls
+                    && r.src == GraphNodeId::Entity(repo.entity("run").id)
+                    && r.dst == GraphNodeId::Entity(repo.entity("beta").id)
+            })
+            .cloned()
+            .expect("the caller binds beta before the batch");
+        repo.admit("b.py", "def gamma(value):\n    return value * 2\n");
+        let caller = match control {
+            "partial" => {
+                repo.admit("c.py", PARTIAL);
+                "c.py"
+            }
+            "non-source" => {
+                let blob = repo.blobs.write(&[0, 255, 0, 255]).unwrap();
+                repo.admit_hash("c.py", Hash256::from_bytes(blob.0));
+                "c.py"
+            }
+            "moved-partial" => {
+                move_admitted_artifact(&mut repo, "c.py", "d.py");
+                repo.admit("d.py", PARTIAL);
+                "d.py"
+            }
+            _ => unreachable!(),
+        };
+        let planned = repo
+            .plan(&["b.py"])
+            .unwrap_or_else(|error| panic!("{control}: {error}"));
+        repo.graph = InMemoryGraph::from_snapshot(planned).unwrap();
+        // `debt` reads the record only when it is sealed to the caller's
+        // current admitted bytes.
+        let debt = repo
+            .debt(caller)
+            .unwrap_or_else(|| panic!("{control}: the withdrawn binding must stay recorded"));
+        assert_eq!(debt.source_file, FilePathId::new(caller), "{control}");
+        let obligation = debt
+            .obligations
+            .iter()
+            .find(|o| o.retired_relation.id == retired.id)
+            .unwrap_or_else(|| panic!("{control}: the retired call is an obligation"));
+        assert_eq!(obligation.retired_relation, retired, "{control}");
+        assert_eq!(obligation.source_digest, prior_digest, "{control}");
+        assert_eq!(obligation.target_file, FilePathId::new("b.py"), "{control}");
+        assert_eq!(
+            obligation.prior_source_file.as_ref().map(|f| f.0.as_str()),
+            (control == "moved-partial").then_some("c.py"),
+            "{control}"
+        );
+    }
+}
+
+/// The record a caller with incomplete bytes keeps is ordinary debt: the next
+/// complete derivation of that caller settles it against its real body.
+#[test]
+fn debt_kept_for_an_incomplete_caller_settles_on_its_next_complete_derivation() {
+    let mut repo = Repo::new(&[
+        ("b.py", "def beta(value):\n    return value\n"),
+        (
+            "c.py",
+            "from b import beta\n\ndef run(value):\n    return beta(value)\n",
+        ),
+    ]);
+    repo.admit("b.py", "def gamma(value):\n    return value * 2\n");
+    repo.admit(
+        "c.py",
+        "from b import beta\n\ndef run(value):\n    return beta(value\n",
+    );
+    repo.batch(&["b.py"]);
+    assert!(repo.debt("c.py").is_some());
+    repo.admit("c.py", "def run(value):\n    return value\n");
+    repo.batch(&["c.py"]);
+    assert!(
+        repo.debt("c.py").is_none(),
+        "removing the old occurrence discharges the obligation"
+    );
+}
+
+/// Settlement re-parses an obligation's prior body, so a caller the
+/// predecessor holds only as an incomplete parse cannot ground a record. That
+/// still refuses, and the refusal names the caller and the binding.
+#[test]
+fn a_caller_incomplete_in_the_predecessor_refuses_by_name() {
+    let mut repo = Repo::new(&[
+        ("b.py", "def beta(value):\n    return value\n"),
+        (
+            "c.py",
+            "from b import beta\n\ndef run(value):\n    return beta(value)\n",
+        ),
+    ]);
+    repo.admit(
+        "c.py",
+        "from b import beta\n\ndef run(value):\n    return beta(value\n",
+    );
+    let snapshot = repo.graph.to_snapshot();
+    repo.previous = kin_model::graph::ResolvedGraphState {
+        entities: snapshot.entities,
+        relations: snapshot.relations,
+        tree: snapshot.resolved_tree,
+        external_references: snapshot.external_references,
+        ..Default::default()
+    };
+    repo.admit("b.py", "def gamma(value):\n    return value * 2\n");
+    let error = repo.plan(&["b.py"]).unwrap_err().to_string();
+    assert!(
+        error.contains("caller c.py does not parse completely in the predecessor")
+            && error.contains("b.py::beta"),
+        "{error}"
+    );
+}
+
+/// A caller admitted before a module it imports holds an external placeholder
+/// for that import. A later batch carries the module and also another source
+/// the caller imports. Deriving that other source rebinds the caller, and when
+/// it sorts first the module's declarations are still withheld: the module is
+/// admitted, so the placeholder is not reproduced, but nothing replaces it yet.
+/// The batch keeps the placeholder until it derives the module, then retires it
+/// for the local binding, in either order.
+#[test]
+fn a_module_arriving_after_its_caller_rebinds_the_caller_in_either_batch_order() {
+    const RESTORE: &str =
+        "export async function restore(change: string): Promise<string> {\n  return change;\n}\n";
+    for dependency in ["src/a_dep.ts", "src/z_dep.ts"] {
+        let module = dependency
+            .trim_start_matches("src/")
+            .trim_end_matches(".ts");
+        let importer = format!(
+            "import {{ helper }} from './{module}.js';\nimport {{ restore }} from './adapter.js';\n\nexport async function undo(change: string): Promise<string> {{\n  return await restore(helper(change));\n}}\n"
+        );
+        let mut repo = Repo::new(&[
+            ("src/importer.ts", &importer),
+            (
+                dependency,
+                "export function helper(value: string): string {\n  return value;\n}\n",
+            ),
+        ]);
+        let external_restore = |graph: &InMemoryGraph| {
+            graph.to_snapshot().relations.values().any(|relation| {
+                relation.import_source.as_deref() == Some("./adapter.js")
+                    && relation.evidence.iter().any(|evidence| {
+                        evidence.parser_rule.as_deref()
+                            == Some(kin_index::EXTERNAL_IMPORT_REFERENCE_RULE)
+                    })
+            })
+        };
+        assert!(
+            external_restore(&repo.graph),
+            "{dependency}: the fixture needs the caller's placeholder for the missing module"
+        );
+        repo.admit("src/adapter.ts", RESTORE);
+        // A new export moves the dependency's linker surface, so deriving it
+        // rebinds the caller.
+        repo.admit(
+            dependency,
+            "export function helper(value: string): string {\n  return value;\n}\n\nexport function extra(): number {\n  return 1;\n}\n",
+        );
+        repo.batch(&[dependency, "src/adapter.ts"]);
+        assert!(
+            !external_restore(&repo.graph),
+            "{dependency}: the placeholder is retired"
+        );
+        assert!(
+            calls_ids(
+                &repo,
+                function(&repo, "src/importer.ts", "undo").id,
+                function(&repo, "src/adapter.ts", "restore").id
+            ),
+            "{dependency}: the caller binds the arrived declaration"
+        );
+    }
+}
+
+/// The deferral only waits for the batch to finish. When the arrived module
+/// does not declare the imported name, nothing replaces the placeholder once
+/// every source is derived, and the batch refuses, naming the waiting source,
+/// the import and the line.
+#[test]
+fn a_deferred_placeholder_without_a_replacement_still_refuses_by_name() {
+    let repo = Repo::new(&[
+        (
+            "src/importer.ts",
+            "import { helper } from './a_dep.js';\nimport { restore } from './adapter.js';\n\nexport async function undo(change: string): Promise<string> {\n  return await restore(helper(change));\n}\n",
+        ),
+        (
+            "src/a_dep.ts",
+            "export function helper(value: string): string {\n  return value;\n}\n",
+        ),
+    ]);
+    repo.admit(
+        "src/adapter.ts",
+        "export async function other(change: string): Promise<string> {\n  return change;\n}\n",
+    );
+    repo.admit(
+        "src/a_dep.ts",
+        "export function helper(value: string): string {\n  return value;\n}\n\nexport function extra(): number {\n  return 1;\n}\n",
+    );
+    let error = repo
+        .plan(&["src/a_dep.ts", "src/adapter.ts"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("waiting source src/importer.ts")
+            && error.contains("`restore` from `./adapter.js`")
+            && error.contains("line 4"),
+        "{error}"
+    );
+}

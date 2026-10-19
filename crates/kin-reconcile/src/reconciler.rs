@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -622,6 +622,10 @@ pub struct Reconciler {
     /// The edges retired that way, so the start can count and disclose them.
     /// Always empty unless `retire_unprovable_superseded` is set.
     retired_unreproduced: HashSet<RelationId>,
+    /// Waiting sources that kept an obsolete external edge because a coherent
+    /// batch still withheld the declarations that could replace it. The batch
+    /// checks each again once it withholds nothing.
+    deferred_external: BTreeSet<String>,
 }
 
 impl Reconciler {
@@ -646,6 +650,7 @@ impl Reconciler {
             cross_file: LiveCrossFileLinker::new(),
             retire_unprovable_superseded: false,
             retired_unreproduced: HashSet::new(),
+            deferred_external: BTreeSet::new(),
         }
     }
 
@@ -1378,6 +1383,7 @@ impl Reconciler {
                 .apply_transaction_delta(&result.delta)
                 .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         }
+        reconciler.recheck_deferred_external(&graph, blobs)?;
         let withdrawn_unrecorded = crate::batch_debt::retain_removed_bindings(
             &anchors,
             &graph,
@@ -1461,6 +1467,63 @@ impl Reconciler {
             withdrawn_unrecorded,
             external_unreproduced,
         })
+    }
+
+    /// Check again, against the complete universe, each waiting source that kept
+    /// an obsolete external edge while the batch withheld declarations.
+    ///
+    /// The step that derived the module such an edge names rebinds the waiting
+    /// source and retires the edge, so this normally finds nothing left. An
+    /// edge still held is retired only when the candidate already holds its
+    /// exact local replacement; otherwise the batch refuses, naming the source,
+    /// as it would have without the deferral.
+    fn recheck_deferred_external(
+        &mut self,
+        graph: &kin_db::InMemoryGraph,
+        blobs: &BlobStore,
+    ) -> Result<()> {
+        for file in std::mem::take(&mut self.deferred_external) {
+            let file = FilePathId::new(file);
+            let mut held = Vec::new();
+            for entity in graph
+                .query_entities(&kin_model::EntityFilter {
+                    file_path: Some(file.clone()),
+                    ..Default::default()
+                })
+                .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            {
+                held.extend(
+                    graph
+                        .get_all_relations_for_entity(&entity.id)
+                        .map_err(|error| ReconcileError::Graph(error.to_string()))?
+                        .into_iter()
+                        .filter(|relation| relation.src == GraphNodeId::Entity(entity.id)),
+                );
+            }
+            let retirement = crate::external::retire_rebound(
+                graph,
+                &[],
+                &HashSet::new(),
+                &held,
+                blobs,
+                self.retire_unprovable_superseded,
+                false,
+                |source| self.cross_file.relink_complete_source(graph, source),
+            )?;
+            if !retirement.removed.is_empty() {
+                graph
+                    .apply_transaction_delta(&TransactionDelta {
+                        relation_deltas: retirement
+                            .removed
+                            .into_iter()
+                            .map(|old| RelationDelta::Removed { old })
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Check the exact source/result and the live traffic checker before any
@@ -2184,15 +2247,19 @@ impl Reconciler {
             }
         }
 
-        let rebound_external_removals = crate::external::retire_rebound(
+        let rebound_external = crate::external::retire_rebound(
             graph,
             &stable_entities,
             &removed_entity_ids,
             &cross_file.resolved,
             blob_store,
             self.retire_unprovable_superseded,
+            self.cross_file.withholds_declarations(),
             |source| self.cross_file.relink_complete_source(graph, source),
         )?;
+        self.deferred_external
+            .extend(rebound_external.deferred.into_iter().map(|file| file.0));
+        let rebound_external_removals = rebound_external.removed;
 
         // Build set of newly parsed relations keyed by (src, dst, kind).
         let mut new_relation_keys: HashSet<RelationKey> = HashSet::new();

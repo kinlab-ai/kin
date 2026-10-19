@@ -37,6 +37,9 @@ KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 # Read only by the ignored history-spool wall-time benchmark. This selects
 # a disposable measurement corpus; no product runtime reads it.
 KIN_SPOOL_BENCH_REPO
+# Read only by the ignored incremental-origin step-scaling benchmark in
+# kin-index, to choose which step sizes it times. No product runtime reads it.
+KIN_STEP_SIZES
 # Read only by the admission memory tests' shared probe, to print a per-phase
 # live-heap line during a passing run. Recording is unconditional; this only
 # controls whether the run also narrates. No runtime behaviour keys on it and

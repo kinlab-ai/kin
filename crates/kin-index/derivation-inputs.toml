@@ -43,6 +43,7 @@ reason = "tests: linker unit-test modules, each declared under #[cfg(test)] in l
 files = [
     "src/linker/candidate_recall_tests.rs",
     "src/linker/fixture_receiver_tests.rs",
+    "src/linker/incremental_origin_world_tests.rs",
     "src/linker/receiver_binding_tests.rs",
     "src/linker/receiver_origin_tests.rs",
     "src/linker/receiver_outside_tests.rs",
