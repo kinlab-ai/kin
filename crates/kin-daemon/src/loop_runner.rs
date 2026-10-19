@@ -24,6 +24,7 @@ use crate::state::{
     RECON_PROCESSING,
 };
 
+mod sensitive_preflight;
 mod source_batch;
 
 pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str =
@@ -1528,6 +1529,14 @@ fn exact_tree_admission_once(
         return Err(mass_deletion_refused(removed_count, previous.len() as u64));
     }
     state.mass_deletion_blocked.store(false, Ordering::Relaxed);
+    // Publication would refuse untracked sensitive content only after every
+    // changed source is derived. A caller that defers publication judges it
+    // in its own transaction.
+    if publication != TreePublication::DeferredToCaller {
+        crate::mcp_commit::timed_commit_phase("scan_introduced_sensitive_content", || {
+            sensitive_preflight::refuse_blocked_sensitive_content(state, &previous, &deltas)
+        })?;
+    }
 
     let mut changed_paths = BTreeSet::new();
     let mut semantic_events = Vec::new();
@@ -7395,6 +7404,7 @@ mod tests {
     include!("loop_runner/tests/catch_up_completion.rs");
     include!("loop_runner/tests/reference_read_admission.rs");
     include!("loop_runner/tests/already_held_round.rs");
+    include!("loop_runner/tests/sensitive_preflight.rs");
     include!("loop_runner/tests/offline_tracked_changes.rs");
     include!("loop_runner/tests/single_source_scope.rs");
     include!("loop_runner/tests/silent_watcher.rs");

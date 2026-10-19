@@ -37,8 +37,9 @@ use kin_model::{
 };
 
 use crate::admission::{
-    enforce_sensitive_admission, AdmissionRuleSource as ResolvedAdmissionRuleSource,
-    ResolvedAdmissionMatcher, ResolvedAdmissionRuleSet,
+    enforce_sensitive_admission, sensitive_refusal,
+    AdmissionRuleSource as ResolvedAdmissionRuleSource, ResolvedAdmissionMatcher,
+    ResolvedAdmissionRuleSet, SensitiveAdmissionError,
 };
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
@@ -8029,6 +8030,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         .map(|target| target_change_id(metadata, target))
         .transpose()?
         .and_then(|change| checked.get(&change));
+    let mut blocked = Vec::new();
     for artifact in workspace.tree.artifacts_by_path() {
         let gitlink_is_admitted = match artifact.entry {
             TreeEntry::Gitlink { target } => {
@@ -8037,23 +8039,49 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
             }
             TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => false,
         };
-        verify_artifact_admission(
-            backend,
-            &transaction.repository_id,
-            &matcher,
-            artifact,
-            ArtifactAdmissionContext {
-                policy: &workspace.shared_admission_policy,
-                git_snapshot: checked_snapshot,
-                root_unignore: root_unignore.as_ref(),
-                tracked: tracked.contains(&artifact.artifact_id),
-                gitlink_is_admitted,
-                label: "workspace",
-                case: overlay.case,
-            },
+        collect_sensitive_block(
+            judge_artifact_admission(
+                backend,
+                &transaction.repository_id,
+                &matcher,
+                artifact,
+                ArtifactAdmissionContext {
+                    policy: &workspace.shared_admission_policy,
+                    git_snapshot: checked_snapshot,
+                    root_unignore: root_unignore.as_ref(),
+                    tracked: tracked.contains(&artifact.artifact_id),
+                    gitlink_is_admitted,
+                    label: "workspace",
+                    case: overlay.case,
+                },
+            )?,
+            &mut blocked,
         )?;
     }
-    Ok(())
+    refuse_sensitive_blocks(&blocked)
+}
+
+/// Keep a sensitive-content block for the one refusal that names them all;
+/// any other scan error refuses at once, as before.
+fn collect_sensitive_block(
+    verdict: Result<(), SensitiveAdmissionError>,
+    blocked: &mut Vec<SensitiveAdmissionError>,
+) -> Result<(), KinDbError> {
+    match verdict {
+        Ok(()) => Ok(()),
+        Err(error @ SensitiveAdmissionError::Blocked { .. }) => {
+            blocked.push(error);
+            Ok(())
+        }
+        Err(error) => Err(ModelError::InvalidOperation(error.to_string()).into()),
+    }
+}
+
+fn refuse_sensitive_blocks(blocked: &[SensitiveAdmissionError]) -> Result<(), KinDbError> {
+    match sensitive_refusal(blocked) {
+        Some(refusal) => Err(ModelError::InvalidOperation(refusal).into()),
+        None => Ok(()),
+    }
 }
 
 /// How a Native change that introduces artifacts reached this replica.
@@ -8338,6 +8366,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        let mut blocked = Vec::new();
         for artifact in introduced {
             let gitlink_is_admitted = match artifact.entry {
                 TreeEntry::Gitlink { target } => {
@@ -8345,22 +8374,26 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 }
                 TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => false,
             };
-            verify_artifact_admission(
-                backend,
-                &transaction.repository_id,
-                &matcher,
-                artifact,
-                ArtifactAdmissionContext {
-                    policy,
-                    git_snapshot: checked.get(&change.id),
-                    root_unignore: root_unignore.as_ref(),
-                    tracked: workspace_tracked.contains(&artifact.artifact_id),
-                    gitlink_is_admitted,
-                    label: &format!("native change {}", change.id),
-                    case: overlay.case,
-                },
+            collect_sensitive_block(
+                judge_artifact_admission(
+                    backend,
+                    &transaction.repository_id,
+                    &matcher,
+                    artifact,
+                    ArtifactAdmissionContext {
+                        policy,
+                        git_snapshot: checked.get(&change.id),
+                        root_unignore: root_unignore.as_ref(),
+                        tracked: workspace_tracked.contains(&artifact.artifact_id),
+                        gitlink_is_admitted,
+                        label: &format!("native change {}", change.id),
+                        case: overlay.case,
+                    },
+                )?,
+                &mut blocked,
             )?;
         }
+        refuse_sensitive_blocks(&blocked)?;
     }
     Ok(())
 }
@@ -8615,6 +8648,20 @@ fn admission_refusal(
     )
 }
 
+/// [`judge_artifact_admission`]'s verdict for one artifact as a single error,
+/// the way the refusal-wording tests judge it.
+#[cfg(test)]
+fn verify_artifact_admission<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repository_id: &RepositoryId,
+    matcher: &ResolvedAdmissionMatcher,
+    artifact: &ResolvedArtifact,
+    context: ArtifactAdmissionContext<'_>,
+) -> Result<(), KinDbError> {
+    judge_artifact_admission(backend, repository_id, matcher, artifact, context)?
+        .map_err(|error| ModelError::InvalidOperation(error.to_string()).into())
+}
+
 /// Judge one proposed artifact against the exact rules that bind it.
 ///
 /// The two halves answer to different generations on purpose. `matcher` carries
@@ -8625,13 +8672,17 @@ fn admission_refusal(
 /// admits the artifact it approves. Neither half is skipped: an artifact the
 /// standing rules exclude, and untracked sensitive content with no allowance,
 /// each fail the whole transaction.
-fn verify_artifact_admission<B: StorageBackend + ?Sized>(
+///
+/// The sensitive-content verdict is returned apart from every other refusal,
+/// so a caller judging a whole tree can name every blocked artifact in one
+/// refusal.
+fn judge_artifact_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
     matcher: &ResolvedAdmissionMatcher,
     artifact: &ResolvedArtifact,
     context: ArtifactAdmissionContext<'_>,
-) -> Result<(), KinDbError> {
+) -> Result<Result<(), SensitiveAdmissionError>, KinDbError> {
     let decision = matcher.decide(&artifact.path, false, context.tracked);
     // Only a raw-object-verified bootstrap snapshot can carry a committed
     // artifact past an ignore rule. This neither marks the artifact tracked
@@ -8660,7 +8711,7 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     let (content_hash, kind) = match artifact.entry {
         TreeEntry::Blob { hash, executable } => (hash, SensitiveArtifactKind::Blob { executable }),
         TreeEntry::Symlink { target_blob } => (target_blob, SensitiveArtifactKind::Symlink),
-        TreeEntry::Gitlink { .. } if context.gitlink_is_admitted => return Ok(()),
+        TreeEntry::Gitlink { .. } if context.gitlink_is_admitted => return Ok(Ok(())),
         TreeEntry::Gitlink { target } => {
             return Err(ModelError::InvalidOperation(format!(
                 "{} introduces gitlink {} at {} without verified Git external authority",
@@ -8670,7 +8721,7 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
         }
     };
     if context.tracked {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let body = load_unbounded_body(
         backend,
@@ -8678,15 +8729,14 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
         content_hash,
         &format!("{} artifact {}", context.label, artifact.path),
     )?;
-    enforce_sensitive_admission(
+    Ok(enforce_sensitive_admission(
         &artifact.path,
         content_hash,
         kind,
         &body,
         false,
         &context.policy.sensitive_allowances,
-    )
-    .map_err(|error| ModelError::InvalidOperation(error.to_string()).into())
+    ))
 }
 
 /// One shared replay decode of an immutable authority-free snapshot payload.
@@ -13714,8 +13764,23 @@ mod tests {
         ignore_body: Option<&[u8]>,
         allow_sensitive: bool,
     ) -> RepositoryTransaction {
+        let allowed: &[&str] = if allow_sensitive { &[path] } else { &[] };
+        native_root_with_files(manager, case, &[(path, body)], ignore_body, allowed)
+    }
+
+    /// A Native root change introducing every one of `files`, approving the
+    /// paths in `allowed` by their exact digest.
+    fn native_root_with_files(
+        manager: &RepositoryAuthorityManager<MemoryBackend>,
+        case: AdmissionCase,
+        files: &[(&str, &[u8])],
+        ignore_body: Option<&[u8]>,
+        allowed: &[&str],
+    ) -> RepositoryTransaction {
         let mut transaction = arbitrary_repository_transaction(manager);
-        manager.save_source_blob(digest(body), body).unwrap();
+        for (_, body) in files {
+            manager.save_source_blob(digest(body), body).unwrap();
+        }
 
         let mut sources = Vec::new();
         let mut additions = Vec::new();
@@ -13739,22 +13804,25 @@ mod tests {
             });
         }
 
-        let path = RepoPath::from_utf8(path).unwrap();
-        let body_hash = digest(body);
-        additions.push(TreeDelta::Added {
-            artifact_id: ArtifactId(Uuid::from_u128(31)),
-            new: LocatedEntry::new(path.clone(), TreeEntry::blob(body_hash, false)),
-        });
-        let allowances = allow_sensitive
-            .then(|| SensitiveArtifactAllowance {
-                path,
-                content_hash: body_hash,
-                kind: SensitiveArtifactKind::Blob { executable: false },
-                approved_by: AuthorId::new("authority-test"),
-                reason: "explicit exact test allowance".to_string(),
-            })
-            .into_iter()
-            .collect();
+        let mut allowances = Vec::new();
+        for (index, (path, body)) in files.iter().enumerate() {
+            let allow = allowed.contains(path);
+            let path = RepoPath::from_utf8(*path).unwrap();
+            let body_hash = digest(body);
+            additions.push(TreeDelta::Added {
+                artifact_id: ArtifactId(Uuid::from_u128(31 + index as u128)),
+                new: LocatedEntry::new(path.clone(), TreeEntry::blob(body_hash, false)),
+            });
+            if allow {
+                allowances.push(SensitiveArtifactAllowance {
+                    path,
+                    content_hash: body_hash,
+                    kind: SensitiveArtifactKind::Blob { executable: false },
+                    approved_by: AuthorId::new("authority-test"),
+                    reason: "explicit exact test allowance".to_string(),
+                });
+            }
+        }
         let shared = SharedAdmissionPolicy::new(0, sources, allowances).unwrap();
 
         let change = transaction.changes.first_mut().unwrap();
@@ -17006,6 +17074,56 @@ mod tests {
             "unexpected sensitive-addition error: {error}"
         );
         assert_eq!(sensitive_manager.read_authority().generation(), 0);
+    }
+
+    /// Every blocked artifact is named in the one refusal, with the digest and
+    /// entry kind its approval must carry, so a single round of approvals
+    /// clears them all. An approved artifact is not named, and nothing is
+    /// published.
+    #[test]
+    fn a_refusal_names_every_blocked_sensitive_addition_at_once() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let first = b"TOKEN=supersecret123\n".as_slice();
+        let second = b"def connect():\n    password = \"s3cret-notekeeper-value\"\n".as_slice();
+        let approved = b"API_KEY=approved-for-this-fixture\n".as_slice();
+        let transaction = native_root_with_files(
+            &manager,
+            AdmissionCase::Sensitive,
+            &[
+                (".env", first),
+                ("app/search.py", second),
+                ("config/approved.env", approved),
+                ("app/plain.py", b"def plain():\n    return 1\n".as_slice()),
+            ],
+            None,
+            &["config/approved.env"],
+        );
+        let error = manager
+            .commit_repository_transaction(transaction)
+            .expect_err("unapproved sensitive additions must not acquire authority")
+            .to_string();
+        assert!(
+            error.contains("untracked sensitive content at 2 paths"),
+            "the refusal counts every block: {error}"
+        );
+        for (path, body, finding) in [
+            (".env", first, "SensitivePath"),
+            ("app/search.py", second, "CredentialAssignment"),
+        ] {
+            assert!(
+                error.contains(&format!(
+                    "{path} ({finding}, digest {}, blob)",
+                    digest(body)
+                )),
+                "the refusal names {path} with what its approval must carry: {error}"
+            );
+        }
+        assert!(
+            !error.contains("config/approved.env") && !error.contains("app/plain.py"),
+            "an approved or harmless artifact is not named: {error}"
+        );
+        assert!(error.contains("kin allow"), "{error}");
+        assert_eq!(manager.read_authority().generation(), 0);
     }
 
     #[test]

@@ -655,6 +655,56 @@ pub enum SensitiveAdmissionError {
     },
 }
 
+/// One refusal for every artifact the sensitive-content scan blocked.
+///
+/// An admission that met several blocked artifacts used to name only the
+/// first, so an author approved it, waited for the whole admission again, and
+/// met the next one. A delta carrying nine such files took nine attempts.
+/// Every blocked artifact is named here with the digest and entry kind its
+/// approval must carry, so one round of `kin allow` clears them all. A single
+/// blocked artifact keeps its own message unchanged. Anything other than a
+/// block is not a scan verdict and is never folded in here.
+pub fn sensitive_refusal(blocked: &[SensitiveAdmissionError]) -> Option<String> {
+    let mut named = Vec::new();
+    for error in blocked {
+        let SensitiveAdmissionError::Blocked {
+            path,
+            content_hash,
+            kind,
+            finding,
+        } = error
+        else {
+            continue;
+        };
+        let kind = match kind {
+            SensitiveArtifactKind::Blob { executable: false } => "blob",
+            SensitiveArtifactKind::Blob { executable: true } => "blob+x",
+            SensitiveArtifactKind::Symlink => "symlink",
+        };
+        named.push((
+            error,
+            format!("{path} ({finding:?}, digest {content_hash}, {kind})"),
+        ));
+    }
+    match named.as_slice() {
+        [] => None,
+        [(error, _)] => Some(error.to_string()),
+        all => Some(format!(
+            "untracked sensitive content at {} paths is blocked before authority publication: \
+             {}; approve each by recording its exact path, digest, and entry kind in \
+             .kin-allowances at the repository root, which `kin allow <path> --reason \"<why>\"` \
+             writes for you one path at a time; the approvals are tracked, so they travel with \
+             the repository and a later edit to any of these files changes its digest and blocks \
+             it again",
+            all.len(),
+            all.iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
+    }
+}
+
 pub fn enforce_sensitive_admission(
     path: &RepoPath,
     content_hash: Hash256,
