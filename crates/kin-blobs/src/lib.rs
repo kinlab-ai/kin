@@ -327,7 +327,7 @@ impl BlobStore {
         let hash = digest(data);
         let hex = hash.to_string();
         let shard_name = &hex[..2];
-        let shard_dir = self.root.join(shard_name);
+        let shard_dir = self.root().join(shard_name);
         let blob_path = shard_dir.join(&hex[2..]);
 
         // Deduplication: if the blob already exists, skip writing.
@@ -396,7 +396,7 @@ impl BlobStore {
             let hash = digest(data);
             hashes.push(hash);
             let hex = hash.to_string();
-            let shard_dir = self.root.join(&hex[..2]);
+            let shard_dir = self.root().join(&hex[..2]);
             let blob = shard_dir.join(&hex[2..]);
             if blob.exists() || !staging.insert(hash) {
                 continue;
@@ -509,7 +509,7 @@ impl BlobStore {
             // that names are not becoming durable on schedule.
             if let Err(e) = self.sync() {
                 warn!(
-                    root = %self.root.display(),
+                    root = %self.root().display(),
                     error = %e,
                     "deferred directory barrier failed on the write drain; \
                      affected directories stay pending for a later sync"
@@ -567,18 +567,18 @@ impl BlobStore {
         let mut root_unsynced = false;
 
         if root {
-            match self.barrier_dir(&self.root) {
+            match self.barrier_dir(self.root()) {
                 Ok(()) => {}
                 // A removed root has no entry left to make durable.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    first_error = Some(BlobError::io(&self.root, e));
+                    first_error = Some(BlobError::io(self.root(), e));
                     root_unsynced = true;
                 }
             }
         }
         for (shard, renames) in shards {
-            let shard_dir = self.root.join(&shard);
+            let shard_dir = self.root().join(&shard);
             match self.barrier_dir(&shard_dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root_unsynced => {
@@ -588,14 +588,14 @@ impl BlobStore {
                     // does not owe a root-creation barrier, so validate the
                     // root lazily before forgiving the missing child even
                     // when `root` was false at the start of this drain.
-                    match validate_dir_type(&self.root) {
+                    match validate_dir_type(self.root()) {
                         Ok(()) => {}
                         // The store root itself is gone, so the child has no
                         // namespace entry left to make durable.
                         Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(root_error) => {
                             if first_error.is_none() {
-                                first_error = Some(BlobError::io(&self.root, root_error));
+                                first_error = Some(BlobError::io(self.root(), root_error));
                             }
                             root_unsynced = true;
                             unsynced.push((shard, renames));
@@ -757,17 +757,17 @@ impl BlobStore {
     /// that are not 2-hex-char shard directories are ignored, and a missing root
     /// yields an empty result rather than an error.
     pub fn list_hashes(&self) -> Result<Vec<Hash256>> {
-        let entries = match fs::read_dir(&self.root) {
+        let entries = match fs::read_dir(self.root()) {
             Ok(entries) => entries,
             // A store that has never been written to (or whose root was reaped by
             // a prior compaction) simply holds nothing.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(BlobError::io(&self.root, e)),
+            Err(e) => return Err(BlobError::io(self.root(), e)),
         };
 
         let mut hashes = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| BlobError::io(&self.root, e))?;
+            let entry = entry.map_err(|e| BlobError::io(self.root(), e))?;
             let shard = entry.file_name();
             let shard = shard.to_string_lossy();
             // Only real 2-hex-char shard dirs hold blobs. This skips `.corrupt`
@@ -867,7 +867,7 @@ impl BlobStore {
     /// never removed. Errors are intentionally swallowed — a non-empty or
     /// concurrently-repopulated shard simply stays, which is harmless.
     fn prune_empty_shards(&self) {
-        let entries = match fs::read_dir(&self.root) {
+        let entries = match fs::read_dir(self.root()) {
             Ok(entries) => entries,
             Err(_) => return,
         };
@@ -905,7 +905,7 @@ impl BlobStore {
         if !blob_path.exists() {
             return Ok(None);
         }
-        let corrupt_dir = self.root.join(".corrupt");
+        let corrupt_dir = self.root().join(".corrupt");
         fs::create_dir_all(&corrupt_dir).map_err(|e| BlobError::io(&corrupt_dir, e))?;
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dest = corrupt_dir.join(format!("{}-{}-{}", hash, std::process::id(), seq));
@@ -941,7 +941,7 @@ impl BlobStore {
     /// Layout: `{root}/{hash[0..2]}/{hash[2..]}` (Git-style sharding).
     fn blob_path(&self, hash: &Hash256) -> PathBuf {
         let hex = hash.to_string();
-        self.root.join(&hex[..2]).join(&hex[2..])
+        self.root().join(&hex[..2]).join(&hex[2..])
     }
 
     /// Write one blob body to `path`, issuing the content barrier this store's
@@ -1006,7 +1006,7 @@ impl Drop for BlobStore {
     fn drop(&mut self) {
         if let Err(e) = self.sync() {
             warn!(
-                root = %self.root.display(),
+                root = %self.root().display(),
                 error = %e,
                 "deferred directory barrier failed on the drop drain; \
                  renames in the affected directories may not be durable"

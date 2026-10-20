@@ -1438,11 +1438,58 @@ pub fn is_daemon_loss_error(message: &str) -> bool {
 /// (which the daemon writes via `ensure_loopback_token`). When neither is
 /// present we send no header — harmless while enforcement is flag-gated, and
 /// correct once it is enabled.
-fn daemon_auth_token() -> Option<String> {
-    resolve_daemon_auth_token(
+///
+/// The store's token authenticates the daemon on this machine and nothing
+/// else, so it goes only to a loopback `destination`; see
+/// [`resolve_daemon_auth_token_for`].
+fn daemon_auth_token_for(destination: Option<&reqwest::Url>) -> Option<String> {
+    resolve_daemon_auth_token_for(
         std::env::var("KIN_DAEMON_AUTH_TOKEN").ok(),
         discover_kin_dir().as_deref(),
+        destination,
     )
+}
+
+/// [`resolve_daemon_auth_token`] for a request to `destination`.
+///
+/// `KIN_DAEMON_URL` and a recorded route can both name a host other than this
+/// machine, and the store's token sent there would hand that host the local
+/// credential in cleartext. So the token read from `<kin_dir>/daemon.token`
+/// travels only to a loopback destination, and a request whose destination
+/// cannot be read carries none. An explicit `KIN_DAEMON_AUTH_TOKEN` travels
+/// anywhere, because pairing a credential with an endpoint by hand is what
+/// that variable is for. The CLI's daemon client applies the same rule.
+fn resolve_daemon_auth_token_for(
+    env_token: Option<String>,
+    kin_dir: Option<&Path>,
+    destination: Option<&reqwest::Url>,
+) -> Option<String> {
+    let kin_dir = kin_dir.filter(|_| destination.is_some_and(url_is_loopback));
+    resolve_daemon_auth_token(env_token, kin_dir)
+}
+
+/// Whether `url` names this machine: http or https, no userinfo, and a host
+/// that is `localhost` or a loopback address.
+///
+/// The parsed host is compared, never a prefix of the text, because
+/// `http://127.0.0.1.example.com/` and `http://localhost@elsewhere.example/`
+/// both start with a loopback spelling and neither is loopback.
+fn url_is_loopback(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    }
 }
 
 /// Pure resolution of the daemon bearer token, factored out of
@@ -1545,10 +1592,17 @@ fn discover_kin_dir_from(start: &Path) -> Option<std::path::PathBuf> {
 /// which talks to the daemon's `/spine/*` routes directly rather than
 /// through this module's own forwarding helpers.
 pub(crate) fn with_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match daemon_auth_token() {
+    match daemon_auth_token_for(request_destination(&request).as_ref()) {
         Some(token) => request.bearer_auth(token),
         None => request,
     }
+}
+
+/// The URL a request will go to, read from a copy so the request itself is
+/// untouched. `None` when the request cannot be copied or does not build.
+fn request_destination(request: &reqwest::RequestBuilder) -> Option<reqwest::Url> {
+    let copy = request.try_clone()?.build().ok()?;
+    Some(copy.url().clone())
 }
 
 /// The session a forwarded request names: the call's own `session_id`, else
@@ -6707,6 +6761,90 @@ mod tests {
         let kin_dir = dir.path().join(".kin");
         std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
         assert!(resolve_daemon_auth_token(None, Some(&kin_dir)).is_none());
+    }
+
+    fn url(text: &str) -> reqwest::Url {
+        reqwest::Url::parse(text).expect("test URL parses")
+    }
+
+    #[test]
+    fn only_a_loopback_url_names_this_machine() {
+        for loopback in [
+            "http://127.0.0.1:4219/session",
+            "http://127.9.9.9/",
+            "http://localhost:4219/",
+            "http://LOCALHOST/",
+            "http://[::1]:4219/",
+            "https://127.0.0.1/",
+        ] {
+            assert!(url_is_loopback(&url(loopback)), "{loopback}");
+        }
+        for elsewhere in [
+            "http://10.0.0.5:4219/",
+            "http://host.docker.internal:4219/",
+            "http://127.0.0.1.example.com/",
+            "http://localhost@elsewhere.example/",
+            "http://user:secret@127.0.0.1/",
+            "https://kin.example/",
+            "ftp://127.0.0.1/",
+        ] {
+            assert!(!url_is_loopback(&url(elsewhere)), "{elsewhere}");
+        }
+    }
+
+    /// The store's token authenticates this machine's daemon, so a delegate
+    /// pointed anywhere else never sends it, in cleartext or otherwise.
+    #[test]
+    fn the_store_token_goes_only_to_a_loopback_daemon() {
+        let (_guard, kin_dir) = kin_dir_with_token("loopback-secret\n");
+        let local = url("http://127.0.0.1:4219/session/abc/process");
+        assert_eq!(
+            resolve_daemon_auth_token_for(None, Some(&kin_dir), Some(&local)).as_deref(),
+            Some("loopback-secret")
+        );
+        for elsewhere in [
+            "http://10.0.0.5:4219/session/abc/process",
+            "http://127.0.0.1.example.com/session",
+            "https://kin.example/session",
+        ] {
+            assert!(
+                resolve_daemon_auth_token_for(None, Some(&kin_dir), Some(&url(elsewhere)))
+                    .is_none(),
+                "{elsewhere}"
+            );
+        }
+        // A request whose destination cannot be read carries no local token.
+        assert!(resolve_daemon_auth_token_for(None, Some(&kin_dir), None).is_none());
+    }
+
+    /// An explicit `KIN_DAEMON_AUTH_TOKEN` is a credential paired with its
+    /// endpoint by hand, so it goes wherever the delegate is pointed.
+    #[test]
+    fn an_explicit_token_travels_to_its_endpoint() {
+        let (_guard, kin_dir) = kin_dir_with_token("loopback-secret");
+        let remote = url("https://kin.example/session");
+        assert_eq!(
+            resolve_daemon_auth_token_for(
+                Some("paired-token".to_string()),
+                Some(&kin_dir),
+                Some(&remote)
+            )
+            .as_deref(),
+            Some("paired-token")
+        );
+    }
+
+    #[test]
+    fn a_request_destination_is_read_without_consuming_the_request() {
+        let request = reqwest::Client::new()
+            .post("http://127.0.0.1:4219/session/abc/process")
+            .json(&serde_json::json!({ "pid": 1 }));
+        assert_eq!(
+            request_destination(&request),
+            Some(url("http://127.0.0.1:4219/session/abc/process"))
+        );
+        let built = request.build().expect("the original request still builds");
+        assert_eq!(built.url().path(), "/session/abc/process");
     }
 
     // ── Scope request-building (forwarded session/intent tools) ──────────────

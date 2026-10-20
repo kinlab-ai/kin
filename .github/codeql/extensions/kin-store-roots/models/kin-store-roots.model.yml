@@ -1,0 +1,26 @@
+# Store roots that path-injection analysis may trust.
+#
+# CodeQL's axum model treats every handler parameter as remote input,
+# including the `State` extractor that hands a handler the server's own
+# state. Kin's servers build that state at startup from their own store, so a
+# path reached through it was chosen by the server and not by a request. Each
+# accessor below returns that store root or working tree, a constant name
+# inside it, or (for the hosted text index) a hex digest of the repository
+# id. None of them can carry caller input, so their results are barriers. A
+# component a caller joins onto one of these roots is still tracked: only the
+# root itself is trusted.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      - ["<kin_core::layout::KinLayout>::root", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::working_dir", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::kindb_dir", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::kindb_head_generation_path", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::kindb_hydration_semantics_path", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::kindb_embedding_coverage_marker_path", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_core::layout::KinLayout>::hosted_text_index_dir", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_blobs::BlobStore>::root", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_daemon::state::CoordinationEventLog>::path", "ReturnValue", "path-injection", "manual"]
+      - ["<kin_daemon::state::CoordinationEventLog>::failure_marker", "ReturnValue", "path-injection", "manual"]
