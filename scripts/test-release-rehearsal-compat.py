@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,52 @@ SOURCE = Path(__file__).with_name("release-rehearsal-compat.py")
 SPEC = importlib.util.spec_from_file_location("release_rehearsal_compat", SOURCE)
 COMPAT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMPAT)
+MIRROR_PROOF = Path(__file__).with_name("test-windows-install-mirror.ps1")
+CANDIDATE_PROOF = Path(__file__).with_name("prove-candidate-install.mjs")
+
+# One table for the disposable-runner rule, which the compatibility setup, the
+# mirror installer proof and the candidate install proof each implement. A
+# declared Depot runner needs every part of the match; each row below drops or
+# bends one part of it.
+DEPOT = {
+    "GITHUB_ACTIONS": "true",
+    "RUNNER_ENVIRONMENT": "self-hosted",
+    "RUNNER_NAME": "depot-97rttqzvck",
+    "KIN_DISPOSABLE_RUNNER": "depot",
+    "DEPOT_ORG_ID": "a1b2c3d4e5",
+}
+
+
+def without(env, name):
+    return {key: value for key, value in env.items() if key != name}
+
+
+DISPOSABLE_RUNNER_CASES = (
+    ("no Actions environment", {}, None),
+    ("GitHub-hosted runner", {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}, "github-hosted"),
+    ("hosted label outside Actions", {"RUNNER_ENVIRONMENT": "github-hosted"}, None),
+    ("plain self-hosted runner", {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted"}, None),
+    ("declared single-use Depot runner", DEPOT, "depot"),
+    ("Depot runner name without the workflow marker", without(DEPOT, "KIN_DISPOSABLE_RUNNER"), None),
+    ("workflow marker without a Depot runner name", dict(DEPOT, RUNNER_NAME="build-box-1"), None),
+    ("workflow marker without any runner name", without(DEPOT, "RUNNER_NAME"), None),
+    ("Depot match without Depot's organization id", without(DEPOT, "DEPOT_ORG_ID"), None),
+    ("Depot match with an empty organization id", dict(DEPOT, DEPOT_ORG_ID=""), None),
+    ("Depot match outside Actions", without(DEPOT, "GITHUB_ACTIONS"), None),
+    ("workflow marker with another value", dict(DEPOT, KIN_DISPOSABLE_RUNNER="true"), None),
+    ("Depot name with a trailing newline", dict(DEPOT, RUNNER_NAME="depot-97rttqzvck\n"), None),
+    ("name that only contains the Depot prefix", dict(DEPOT, RUNNER_NAME="my-depot-97rttqzvck"), None),
+    ("upper-case Depot name", dict(DEPOT, RUNNER_NAME="DEPOT-97RTTQZVCK"), None),
+    ("bare Depot prefix", dict(DEPOT, RUNNER_NAME="depot-"), None),
+    ("Depot markers on a GitHub-hosted runner", dict(DEPOT, RUNNER_ENVIRONMENT="github-hosted"), "github-hosted"),
+)
+
+
+def powershell_rule() -> str:
+    text = MIRROR_PROOF.read_text()
+    start = text.index("# disposable-runner rule:")
+    end = text.index("# end disposable-runner rule")
+    return text[start:end]
 
 
 def baseline_meta():
@@ -145,9 +193,63 @@ class ExecutionEvidence(unittest.TestCase):
         COMPAT.validate_host("win32", "AMD64", env)
         for system, machine, modified in (("darwin", "arm64", env), ("win32", "ARM64", env),
                                           ("win32", "AMD64", {}),
-                                          ("win32", "AMD64", dict(env, RUNNER_ENVIRONMENT="self-hosted"))):
+                                          ("win32", "AMD64", dict(env, RUNNER_ENVIRONMENT="self-hosted")),
+                                          ("darwin", "arm64", DEPOT), ("win32", "ARM64", DEPOT)):
             with self.subTest(system=system, machine=machine, env=modified), self.assertRaises(ValueError):
                 COMPAT.validate_host(system, machine, modified)
+
+    def test_only_a_hosted_or_declared_depot_runner_is_disposable(self):
+        for label, env, expected in DISPOSABLE_RUNNER_CASES:
+            with self.subTest(label):
+                self.assertEqual(COMPAT.disposable_runner(env), expected)
+                if expected is None:
+                    with self.assertRaises(ValueError):
+                        COMPAT.validate_host("win32", "AMD64", env)
+                else:
+                    self.assertEqual(COMPAT.validate_host("win32", "AMD64", env), expected)
+
+    def test_the_candidate_install_proof_applies_the_same_rule(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required to compare the candidate install proof's rule")
+        program = (
+            "import { disposableRunner } from " + json.dumps(CANDIDATE_PROOF.resolve().as_uri()) + ";"
+            "let input = ''; process.stdin.on('data', (chunk) => { input += chunk; });"
+            "process.stdin.on('end', () => { process.stdout.write(JSON.stringify("
+            "JSON.parse(input).map((env) => disposableRunner(env)))); });"
+        )
+        cases = [env for _, env, _ in DISPOSABLE_RUNNER_CASES]
+        result = subprocess.run([node, "--input-type=module", "-e", program], input=json.dumps(cases),
+                                capture_output=True, text=True, timeout=60, check=True)
+        for (label, _, expected), actual in zip(DISPOSABLE_RUNNER_CASES, json.loads(result.stdout), strict=True):
+            with self.subTest(label):
+                self.assertEqual(actual, expected)
+
+    def test_the_mirror_installer_proof_applies_the_same_rule(self):
+        rule = powershell_rule()
+        for condition in ('$env:GITHUB_ACTIONS -ceq "true"',
+                          '$env:RUNNER_ENVIRONMENT -ceq "github-hosted"',
+                          '$env:RUNNER_ENVIRONMENT -ceq "self-hosted"',
+                          "$env:RUNNER_NAME -cmatch '^depot-[a-z0-9]+\\z'",
+                          '$env:KIN_DISPOSABLE_RUNNER -ceq "depot"',
+                          '-not [string]::IsNullOrEmpty($env:DEPOT_ORG_ID)'):
+            self.assertIn(condition, rule)
+        text = MIRROR_PROOF.read_text()
+        self.assertLess(text.index("# end disposable-runner rule"), text.index("if ($null -eq $DisposableHost) {"))
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            self.skipTest("pwsh is not installed; the rule's text is pinned above")
+        names = sorted({name for _, env, _ in DISPOSABLE_RUNNER_CASES for name in env} | set(DEPOT))
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "disposable-runner-rule.ps1"
+            script.write_text("Set-StrictMode -Version Latest\n" + rule
+                              + "\nif ($null -eq $DisposableHost) { 'none' } else { $DisposableHost }\n")
+            for label, env, expected in DISPOSABLE_RUNNER_CASES:
+                with self.subTest(label):
+                    child = {key: value for key, value in os.environ.items() if key not in names}
+                    child.update(env)
+                    result = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+                                            env=child, capture_output=True, text=True, timeout=60, check=True)
+                    self.assertEqual(result.stdout.strip(), expected or "none")
 
     def test_binary_evidence_requires_real_nonempty_files(self):
         with tempfile.TemporaryDirectory() as directory:

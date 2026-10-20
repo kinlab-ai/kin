@@ -8,7 +8,8 @@ candidate install.ps1 in child pwsh processes using file:// paths with spaces.
 The receipt covers checksum/extraction boundaries and the exact expected
 runtime refusal of legacy stable binaries. Current-protocol binaries require
 positive runtime readiness and their own RC Build and release qualification.
-User PATH changes require a disposable GitHub-hosted Windows x86_64 account.
+User PATH changes require a disposable Windows x86_64 account: a GitHub-hosted
+runner, or a single-use Depot runner the workflow declares.
 #>
 [CmdletBinding()]
 param(
@@ -34,8 +35,27 @@ if (
 ) {
     throw "The mirror installer proof requires native Windows x86_64 PowerShell."
 }
-if ($env:GITHUB_ACTIONS -cne "true" -or $env:RUNNER_ENVIRONMENT -cne "github-hosted") {
-    throw "The mirror installer proof requires a disposable GitHub-hosted account."
+# disposable-runner rule: a GitHub-hosted runner, or a single-use Depot VM that
+# the workflow itself declares with KIN_DISPOSABLE_RUNNER=depot. A runner name
+# alone never admits a self-hosted machine. prove-candidate-install.mjs and
+# release-rehearsal-compat.py apply the same rule, and
+# test-release-rehearsal-compat.py runs all three on one table of cases.
+$DisposableHost = $null
+if ($env:GITHUB_ACTIONS -ceq "true") {
+    if ($env:RUNNER_ENVIRONMENT -ceq "github-hosted") {
+        $DisposableHost = "github-hosted"
+    } elseif (
+        $env:RUNNER_ENVIRONMENT -ceq "self-hosted" -and
+        $env:RUNNER_NAME -cmatch '^depot-[a-z0-9]+\z' -and
+        $env:KIN_DISPOSABLE_RUNNER -ceq "depot" -and
+        -not [string]::IsNullOrEmpty($env:DEPOT_ORG_ID)
+    ) {
+        $DisposableHost = "depot"
+    }
+}
+# end disposable-runner rule
+if ($null -eq $DisposableHost) {
+    throw "The mirror installer proof requires a disposable GitHub-hosted account or a declared single-use Depot runner."
 }
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "The mirror installer proof requires PowerShell 7 and child pwsh."
@@ -339,7 +359,7 @@ $Result = [ordered]@{
     status = "FAIL"
     baseline = [ordered]@{ tag = "v0.8.6"; version = $Version; archive_sha256 = $ExpectedArchiveHash }
     installer = [ordered]@{ path = $InstallerPath; sha256 = Get-Sha256 $InstallerPath }
-    host_scope = "disposable GitHub-hosted native Windows x86_64 account"
+    host_scope = if ($DisposableHost -ceq "depot") { "disposable single-use Depot native Windows x86_64 runner" } else { "disposable GitHub-hosted native Windows x86_64 account" }
     scope = "real stable checksum/extraction and exact legacy runtime refusal; no legacy readiness claim; current-protocol binaries require separate positive qualification"
     runtime_protocol_min_version = "0.8.7"
     cases = [System.Collections.Generic.List[object]]::new()

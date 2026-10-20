@@ -57,11 +57,38 @@ def digest(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def validate_host(system: str, machine: str, env: dict) -> None:
+DEPOT_RUNNER_NAME = re.compile(r"depot-[a-z0-9]+")
+
+
+def disposable_runner(env: dict):
+    """The disposable-runner rule, or None for any other host.
+
+    A GitHub-hosted runner, or a single-use Depot VM that the workflow itself
+    declares with KIN_DISPOSABLE_RUNNER=depot. A runner name alone never admits
+    a self-hosted machine. test-windows-install-mirror.ps1 and
+    prove-candidate-install.mjs apply the same rule, and
+    test-release-rehearsal-compat.py runs all three on one table of cases.
+    """
+    if env.get("GITHUB_ACTIONS") != "true":
+        return None
+    if env.get("RUNNER_ENVIRONMENT") == "github-hosted":
+        return "github-hosted"
+    if (env.get("RUNNER_ENVIRONMENT") == "self-hosted"
+            and DEPOT_RUNNER_NAME.fullmatch(env.get("RUNNER_NAME") or "")
+            and env.get("KIN_DISPOSABLE_RUNNER") == "depot"
+            and env.get("DEPOT_ORG_ID")):
+        return "depot"
+    return None
+
+
+def validate_host(system: str, machine: str, env: dict) -> str:
     if system != "win32" or machine.lower() not in {"amd64", "x86_64"}:
         raise ValueError("compatibility baseline requires native Windows x86_64")
-    if env.get("GITHUB_ACTIONS") != "true" or env.get("RUNNER_ENVIRONMENT") != "github-hosted":
-        raise ValueError("compatibility setup requires a disposable GitHub-hosted account")
+    host = disposable_runner(env)
+    if host is None:
+        raise ValueError("compatibility setup requires a disposable GitHub-hosted account "
+                         "or a declared single-use Depot runner")
+    return host
 
 
 def validate_version(text: str, name: str) -> None:
@@ -200,13 +227,14 @@ def run_command(command: list[str], label: str, output: Path, cwd: Path,
 
 
 def rehearse(output: Path, baseline_archive: Path) -> dict:
-    validate_host(sys.platform, platform.machine(), os.environ)
+    host = validate_host(sys.platform, platform.machine(), os.environ)
     # This directory belongs to one invocation. Never overwrite earlier proof.
     output.mkdir(parents=True, exist_ok=False)
     result = {
         "schema": SCHEMA, "status": "FAIL", "coverage": "compatibility-baseline",
         "baseline": dict(BASELINE), "platform": sys.platform, "architecture": platform.machine(),
-        "host_scope": "disposable GitHub-hosted Windows account",
+        "host_scope": ("disposable single-use Depot Windows runner" if host == "depot"
+                       else "disposable GitHub-hosted Windows account"),
         "scope": "independently verified legacy archive, stable CLI/daemon identity and repository-free agent setup; "
                  "candidate binaries require separate RC Build and preflight qualification",
     }
