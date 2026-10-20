@@ -462,10 +462,12 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
 }
 EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
+    # The one row keeps the windows-latest name release verification looks up
+    # and names the Depot runner it runs on unless the outage switch is set.
     (
         ".github/workflows/release-rehearsal-windows.yml",
         "install-proof",
-    ): "9b1bb25eaca3670476e75890b49606cecf502b03abd6f3e7d774d44972750102",
+    ): "8f5dcbb1d128db3e2c8151b582136b3e6182fca915767bf4f73c3ede7124a760",
     (
         ".github/workflows/fuzz.yml",
         "fuzz",

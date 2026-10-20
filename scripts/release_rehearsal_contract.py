@@ -45,7 +45,18 @@ def check_contract(root: Path = ROOT) -> None:
     rehearsal = (workflows / 'release-rehearsal.yml').read_text()
     check_context_checkout(rehearsal)
     check_context_checkout(windows)
-    for contract in ('needs: [windows, tooling]', 'runs-on: ubuntu-latest',
+    runner = "runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}"
+    if rehearsal.count(runner) != 2 or rehearsal.count('runs-on:') != 2:
+        raise AssertionError('both release rehearsal Linux legs must use the reviewed Depot runner and outage switch')
+    windows_runner = "runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && matrix.os || matrix.runner }}"
+    if windows.count(windows_runner) != 1 or '"os":"windows-latest","runner":"depot-windows-2022-16"' not in windows:
+        raise AssertionError('the Windows rehearsal must keep its windows-latest name and the reviewed Depot runner')
+    marker = "KIN_DISPOSABLE_RUNNER: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS != 'true' && 'depot' || '' }}"
+    declared = [line for line in windows.splitlines()
+                if 'KIN_DISPOSABLE_RUNNER' in line and not line.lstrip().startswith('#')]
+    if declared != ['      ' + marker]:
+        raise AssertionError('only the Depot branch of the Windows rehearsal runner may declare a disposable Depot runner')
+    for contract in ('needs: [windows, tooling]',
                      'name: kin-release-rehearsal', 'if-no-files-found: error',
                      'scripts/release-rehearsal.py" environment',
                      'scripts/release-rehearsal.py" imports',

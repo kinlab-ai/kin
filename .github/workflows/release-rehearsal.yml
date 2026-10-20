@@ -27,6 +27,9 @@ permissions:
   contents: read
   attestations: read
 
+# Every leg runs on Depot, as rc-build.yml does. The KIN_RC_USE_GITHUB_RUNNERS
+# outage switch selects the GitHub-hosted runners instead. It changes no proof
+# rule.
 jobs:
   windows:
     uses: ./.github/workflows/release-rehearsal-windows.yml
@@ -38,7 +41,7 @@ jobs:
       local_artifact: ${{ inputs.local_artifact }}
   tooling:
     name: Rehearse release tooling
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 15
     steps:
       - name: Require the workflow context candidate before checkout
@@ -110,7 +113,7 @@ jobs:
   collect:
     name: Collect release rehearsal
     needs: [windows, tooling]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
       - name: Require the workflow context candidate before checkout

@@ -3118,7 +3118,7 @@ impl DaemonClient {
         session_id: &str,
         limit: Option<usize>,
     ) -> Result<serde_json::Value> {
-        let mut url = format!("{}/session/{}/calls", self.base_url, session_id);
+        let mut url = format!("{}{}", self.base_url, session_route(session_id, "/calls")?);
         if let Some(limit) = limit {
             url.push_str(&format!("?limit={limit}"));
         }
@@ -3135,8 +3135,11 @@ impl DaemonClient {
     pub async fn end_session(&self, session_id: &str) -> Result<()> {
         let resp = self
             .send(
-                self.client
-                    .delete(format!("{}/session/{}", self.base_url, session_id)),
+                self.client.delete(format!(
+                    "{}{}",
+                    self.base_url,
+                    session_route(session_id, "")?
+                )),
                 "session end",
             )
             .await?;
@@ -3207,7 +3210,11 @@ impl DaemonClient {
         let resp = self
             .send(
                 self.client
-                    .post(format!("{}/session/{}/scope", self.base_url, session_id))
+                    .post(format!(
+                        "{}{}",
+                        self.base_url,
+                        session_route(session_id, "/scope")?
+                    ))
                     .json(&serde_json::json!({ "ref_string": ref_string })),
                 "scope update",
             )
@@ -3221,8 +3228,11 @@ impl DaemonClient {
     pub async fn clear_scope(&self, session_id: &str) -> Result<()> {
         let resp = self
             .send(
-                self.client
-                    .delete(format!("{}/session/{}/scope", self.base_url, session_id)),
+                self.client.delete(format!(
+                    "{}{}",
+                    self.base_url,
+                    session_route(session_id, "/scope")?
+                )),
                 "scope clear",
             )
             .await?;
@@ -3235,8 +3245,11 @@ impl DaemonClient {
     pub async fn get_scope(&self, session_id: &str) -> Result<Option<ScopeResponse>> {
         let resp = self
             .send(
-                self.client
-                    .get(format!("{}/session/{}/scope", self.base_url, session_id)),
+                self.client.get(format!(
+                    "{}{}",
+                    self.base_url,
+                    session_route(session_id, "/scope")?
+                )),
                 "scope read",
             )
             .await?;
@@ -3248,6 +3261,19 @@ impl DaemonClient {
         }
         Ok(Some(resp.json().await.context("parse scope response")?))
     }
+}
+
+/// The daemon path for one session's `rest`, with the session id parsed as the
+/// UUID every `/session/{id}` route requires.
+///
+/// The id is a path segment, and it arrives from a flag or `KIN_SESSION_ID`.
+/// Unparsed, an id holding `/`, `?` or `..` would address a different route
+/// than the one the caller named. Parsed, it can only be a session, and a
+/// malformed one is refused here rather than reaching the daemon at all.
+pub(crate) fn session_route(session_id: &str, rest: &str) -> Result<String> {
+    let session = Uuid::parse_str(session_id.trim())
+        .map_err(|_| anyhow!("{session_id:?} is not a Kin session id, which is a UUID"))?;
+    Ok(format!("/session/{session}{rest}"))
 }
 
 fn is_transient_bool_env(name: &str) -> bool {
@@ -18486,6 +18512,57 @@ mod tests {
         .is_err());
 
         paired.apply("KIN_DAEMON_AUTH_TOKEN", None::<&str>);
+    }
+
+    /// A session id becomes a path segment, so only a UUID may become one.
+    #[test]
+    fn a_session_route_carries_only_a_parsed_session_id() {
+        let session = "196D8EDB-C20C-4D44-8F59-D0E96E6F74C1";
+        assert_eq!(
+            session_route(session, "/scope").unwrap(),
+            "/session/196d8edb-c20c-4d44-8f59-d0e96e6f74c1/scope"
+        );
+        assert_eq!(
+            session_route(&format!(" {session}\n"), "").unwrap(),
+            "/session/196d8edb-c20c-4d44-8f59-d0e96e6f74c1"
+        );
+        for hostile in [
+            "",
+            "../repos",
+            "196d8edb-c20c-4d44-8f59-d0e96e6f74c1/../../agents",
+            "196d8edb-c20c-4d44-8f59-d0e96e6f74c1?calls=1",
+            "196d8edb-c20c-4d44-8f59-d0e96e6f74c1#scope",
+            "agent-7",
+        ] {
+            let refusal = session_route(hostile, "/calls")
+                .expect_err("a session id that is not a UUID never becomes a path");
+            assert!(
+                refusal.to_string().contains("is not a Kin session id"),
+                "{hostile:?}: {refusal:#}"
+            );
+        }
+    }
+
+    /// The client refuses a malformed session id before it sends anything, so
+    /// an endpoint that answers nothing still yields the session's own error.
+    #[tokio::test]
+    async fn a_malformed_session_id_is_refused_before_any_request() {
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority("http://127.0.0.1:9", None, None)
+                .unwrap();
+        for refusal in [
+            client.session_calls("../agents", Some(1)).await.map(drop),
+            client.end_session("../agents").await,
+            client.set_scope("../agents", "main").await.map(drop),
+            client.clear_scope("../agents").await,
+            client.get_scope("../agents").await.map(drop),
+        ] {
+            let error = refusal.expect_err("a malformed session id is refused");
+            assert!(
+                error.to_string().contains("is not a Kin session id"),
+                "{error:#}"
+            );
+        }
     }
 
     /// A supervisor route is written by whichever process registered, so the

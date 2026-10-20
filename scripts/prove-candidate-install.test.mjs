@@ -39,6 +39,23 @@ test('Windows real-installer side effects require a disposable hosted account an
   assert.match(scope.host_cleanup_owner, /not this proof driver/);
 });
 
+test('a self-hosted runner is disposable only as a single-use Depot runner the workflow declares', () => {
+  const depot = { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'self-hosted', RUNNER_NAME: 'depot-97rttqzvck',
+    KIN_DISPOSABLE_RUNNER: 'depot', DEPOT_ORG_ID: 'a1b2c3d4e5' };
+  const scope = installerHostScope('win32', depot);
+  assert.equal(scope.host, 'disposable single-use Depot runner');
+  assert.equal(scope.user_path_restored, false);
+  assert.match(scope.host_cleanup_owner, /^Depot runner teardown, not this proof driver$/);
+  const { KIN_DISPOSABLE_RUNNER, ...unmarked } = depot;
+  assert.throws(() => installerHostScope('win32', unmarked), /persistent/, 'a Depot name without the workflow marker');
+  assert.throws(() => installerHostScope('win32', { ...depot, RUNNER_NAME: 'build-box-1' }), /persistent/,
+    'the workflow marker without a Depot name');
+  const { DEPOT_ORG_ID, ...unorganized } = depot;
+  assert.throws(() => installerHostScope('win32', unorganized), /persistent/, 'a Depot match without its organization id');
+  const { GITHUB_ACTIONS, ...outside } = depot;
+  assert.throws(() => installerHostScope('win32', outside), /disposable/, 'a Depot match outside Actions');
+});
+
 for (const [name, change] of [
   ['wrong platform', (m) => { m.target = 'aarch64-apple-darwin'; }],
   ['wrong artifact', (m) => { m.artifact = 'kin-macos-x86_64'; }],

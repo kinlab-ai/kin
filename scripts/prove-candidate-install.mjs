@@ -29,16 +29,34 @@ const readRegular = (name) => {
   return fs.readFileSync(name);
 };
 
+// disposable-runner rule: a GitHub-hosted runner, or a single-use Depot VM that
+// the workflow itself declares with KIN_DISPOSABLE_RUNNER=depot. A runner name
+// alone never admits a self-hosted machine. test-windows-install-mirror.ps1 and
+// release-rehearsal-compat.py apply the same rule, and
+// test-release-rehearsal-compat.py runs all three on one table of cases.
+export function disposableRunner(env) {
+  if (env.GITHUB_ACTIONS !== 'true') return null;
+  if (env.RUNNER_ENVIRONMENT === 'github-hosted') return 'github-hosted';
+  if (env.RUNNER_ENVIRONMENT === 'self-hosted'
+      && /^depot-[a-z0-9]+$/.test(env.RUNNER_NAME ?? '')
+      && env.KIN_DISPOSABLE_RUNNER === 'depot'
+      && Boolean(env.DEPOT_ORG_ID)) return 'depot';
+  return null;
+}
+
 export function installerHostScope(platform, env) {
   if (platform === 'win32') {
     // install.ps1 changes HKCU User PATH and uses the runner's temporary area.
     // HOME/USERPROFILE do not isolate that Windows account. Do not offer this
     // proof as a safe installer experiment on a persistent Windows account.
     assert.equal(env.GITHUB_ACTIONS, 'true', 'Windows installer proof requires disposable GitHub-hosted Actions');
-    assert.equal(env.RUNNER_ENVIRONMENT, 'github-hosted', 'Windows installer proof refuses persistent/self-hosted runners');
-    return { kin_home: 'fresh isolated directory', host: 'disposable GitHub-hosted runner',
+    const host = disposableRunner(env);
+    assert.ok(host, 'Windows installer proof refuses persistent/self-hosted runners other than a declared single-use Depot runner');
+    const owner = host === 'depot' ? 'Depot' : 'GitHub-hosted';
+    return { kin_home: 'fresh isolated directory',
+      host: host === 'depot' ? 'disposable single-use Depot runner' : 'disposable GitHub-hosted runner',
       user_path_restored: false, installer_temporary_state: 'runner temporary area',
-      host_cleanup_owner: 'GitHub-hosted runner teardown, not this proof driver' };
+      host_cleanup_owner: `${owner} runner teardown, not this proof driver` };
   }
   return { kin_home: 'fresh isolated directory', host_cleanup_owner: 'runner teardown',
     user_path_restored: null };

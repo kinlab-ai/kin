@@ -2115,16 +2115,19 @@ pub fn build_bulk_refs_response(
     if request.entity_ids.is_empty() {
         anyhow::bail!("bulk_refs requires at least one entity_id");
     }
-    if request.entity_ids.len() > MAX_BULK_ENTITIES {
+    // The capacity is the count this check bounded, so a request body never
+    // sizes the allocation itself.
+    let requested = request.entity_ids.len();
+    if requested > MAX_BULK_ENTITIES {
         anyhow::bail!(
             "bulk_refs accepts at most {} entity_ids (got {})",
             MAX_BULK_ENTITIES,
-            request.entity_ids.len()
+            requested
         );
     }
 
     let relation_kinds = parse_bulk_relation_kind(&request.kind)?;
-    let mut results = Vec::with_capacity(request.entity_ids.len());
+    let mut results = Vec::with_capacity(requested);
     let mut with_references = 0usize;
     let mut without_references = 0usize;
     let mut error_count = 0usize;
@@ -5933,6 +5936,30 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_bulk_request_over_the_entity_limit_is_refused_before_any_row() {
+        let graph = kin_db::InMemoryGraph::new();
+        let request = |count: usize| BulkRefsRequest {
+            entity_ids: (0..count)
+                .map(|_| kin_model::EntityId::new().to_string())
+                .collect(),
+            kind: "Any".to_string(),
+            compact: true,
+        };
+        let refused = build_bulk_refs_response(&graph, &request(201))
+            .expect_err("one id over the limit is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("at most 200 entity_ids (got 201)"),
+            "{refused:#}"
+        );
+        let at_limit =
+            build_bulk_refs_response(&graph, &request(200)).expect("exactly the limit is answered");
+        assert_eq!(at_limit.total_checked, 200);
+        assert_eq!(at_limit.results.len(), 200);
     }
 
     #[test]

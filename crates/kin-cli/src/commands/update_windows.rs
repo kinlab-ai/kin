@@ -20,7 +20,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
-use std::ptr::{null, null_mut};
+use std::ptr::{null, null_mut, NonNull};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
@@ -965,10 +965,13 @@ struct ManagedFileSecurity {
 }
 
 fn canonical_acl_bytes(acl: *mut ACL, label: &str) -> Result<Vec<u8>> {
+    // Every caller rules out a NULL ACL today. Holding it as `NonNull` keeps
+    // the header and ACE reads below sound without depending on that.
+    let acl = NonNull::new(acl).with_context(|| format!("managed config {label} is NULL"))?;
     let mut info = ACL_SIZE_INFORMATION::default();
     if unsafe {
         GetAclInformation(
-            acl,
+            acl.as_ptr(),
             (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
             size_of::<ACL_SIZE_INFORMATION>() as u32,
             AclSizeInformation,
@@ -987,24 +990,27 @@ fn canonical_acl_bytes(acl: *mut ACL, label: &str) -> Result<Vec<u8>> {
     // SetSecurityInfo is allowed to reallocate an otherwise identical ACL, so
     // hashing the raw ACL header makes a security-preserving copy compare
     // unequal. Canonicalize the revision, ACE count, and exact used ACE bytes.
-    let header = unsafe { &*acl };
+    let header = unsafe { acl.as_ref() };
     if u32::from(header.AceCount) != info.AceCount {
         anyhow::bail!("managed config {label} ACE count changed during inspection");
     }
     let mut entries = Vec::with_capacity(info.AceCount as usize);
     for index in 0..info.AceCount {
         let mut ace = null_mut();
-        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+        if unsafe { GetAce(acl.as_ptr(), index, &mut ace) } == 0 {
             return Err(win32_error(&format!(
                 "failed to read managed config {label} ACE {index}"
             )));
         }
-        let ace_header = unsafe { &*(ace as *const ACE_HEADER) };
+        // A success that hands back no ACE carries no Windows error to report.
+        let ace = NonNull::new(ace.cast::<ACE_HEADER>())
+            .with_context(|| format!("managed config {label} ACE {index} is NULL"))?;
+        let ace_header = unsafe { ace.as_ref() };
         let ace_len = usize::from(ace_header.AceSize);
         if ace_len < size_of::<ACE_HEADER>() || ace_len > info.AclBytesInUse as usize {
             anyhow::bail!("managed config {label} ACE {index} has invalid byte length");
         }
-        let ace_bytes = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_len) };
+        let ace_bytes = unsafe { std::slice::from_raw_parts(ace.as_ptr().cast::<u8>(), ace_len) };
         entries.push(ace_bytes.to_vec());
     }
 
@@ -3468,6 +3474,12 @@ pub(super) fn verify_managed_bundle_generation_locked(
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::AddMandatoryAce;
+
+    #[test]
+    fn a_null_acl_is_refused_before_it_is_read() {
+        let error = canonical_acl_bytes(null_mut(), "DACL").expect_err("a NULL ACL is refused");
+        assert_eq!(error.to_string(), "managed config DACL is NULL");
+    }
 
     #[test]
     fn windows_private_ace_bounds_precede_sid_validation() {

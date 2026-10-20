@@ -26,17 +26,31 @@ on:
 permissions:
   contents: read
   attestations: read
+# The leg runs on a 16-core Depot Windows runner, the one rc-build.yml builds the
+# Windows archive on, unless the KIN_RC_USE_GITHUB_RUNNERS outage switch selects
+# windows-latest. Its name stays windows-latest either way, because release
+# verification finds the leg by that job name. Git's long path support is on
+# because the deepest tracked fixture passes Windows' 260-character limit
+# under the Depot runner's longer work directory.
+#
+# The installer proofs change the user PATH, so they run only on a disposable
+# account. Depot runs each job on a single-use VM that GitHub reports as
+# self-hosted, so the job declares it with KIN_DISPOSABLE_RUNNER=depot, set
+# only when the Depot runner is selected. The proofs admit a self-hosted runner
+# only with that declaration, a depot- runner name and Depot's DEPOT_ORG_ID.
 
 jobs:
   install-proof:
     name: ${{ matrix.os }}
     if: ${{ github.event_name != 'release' || inputs.release_tag || startsWith(github.event.release.tag_name, 'v') }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS == 'true' && matrix.os || matrix.runner }}
+    env:
+      KIN_DISPOSABLE_RUNNER: ${{ vars.KIN_RC_USE_GITHUB_RUNNERS != 'true' && 'depot' || '' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include: [{"os":"windows-latest","setup-shell":"powershell"}]
+        include: [{"os":"windows-latest","runner":"depot-windows-2022-16","setup-shell":"powershell"}]
     steps:
       - name: Require the workflow context candidate before checkout
         shell: bash
@@ -51,7 +65,9 @@ jobs:
           fi
       - name: Preserve canonical candidate source bytes
         shell: bash
-        run: git config --global core.autocrlf false
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
       - name: Checkout the exact rehearsal source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
