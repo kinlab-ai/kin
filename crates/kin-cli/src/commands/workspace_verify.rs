@@ -320,12 +320,15 @@ fn scope_of(body: &VerifyBody) -> Result<WorkVerifyScope, String> {
     if !entities.is_empty() && change.is_some() {
         return Err("Name entities or a change, not both.".to_string());
     }
-    if entities.len() > ENTITIES_PER_REQUEST {
+    // The capacity is the count this check bounded, so a request body never
+    // sizes the allocation itself.
+    let named = entities.len();
+    if named > ENTITIES_PER_REQUEST {
         return Err(format!(
             "One test run names at most {ENTITIES_PER_REQUEST} entities."
         ));
     }
-    let mut ids = Vec::with_capacity(entities.len());
+    let mut ids = Vec::with_capacity(named);
     for raw in entities {
         let id = raw.trim();
         if uuid::Uuid::parse_str(id).is_err() {
@@ -644,6 +647,27 @@ mod tests {
         let mut nil = body(None, None);
         nil.operation_id = kin_model::OperationId(uuid::Uuid::nil());
         assert!(scope_of(&nil).is_err());
+    }
+
+    #[test]
+    fn a_request_over_the_entity_limit_is_refused_and_the_limit_is_kept() {
+        let ids = |count: usize| {
+            (0..count)
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect::<Vec<_>>()
+        };
+        let over = ids(ENTITIES_PER_REQUEST + 1);
+        assert_eq!(
+            scope_of(&body(Some(over.iter().map(String::as_str).collect()), None)).unwrap_err(),
+            format!("One test run names at most {ENTITIES_PER_REQUEST} entities.")
+        );
+        let at_limit = ids(ENTITIES_PER_REQUEST);
+        let scope = scope_of(&body(
+            Some(at_limit.iter().map(String::as_str).collect()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(scope.entities, at_limit);
     }
 
     fn a_run(stage: Stage) -> Arc<VerifyRun> {

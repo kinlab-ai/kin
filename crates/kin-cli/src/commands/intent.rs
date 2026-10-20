@@ -157,15 +157,11 @@ pub async fn release(intent_id: String) -> Result<()> {
 
 /// `kin intent clear <session-id>` — Clear all intents for a session via daemon API.
 pub async fn clear(session_id: String) -> Result<()> {
+    let route = crate::daemon_client::session_route(&session_id, "/intents")?;
     let daemon = daemon().await?;
 
     let resp = daemon
-        .send_untyped(
-            reqwest::Method::DELETE,
-            &format!("/session/{session_id}/intents"),
-            "intent clear",
-            None,
-        )
+        .send_untyped(reqwest::Method::DELETE, &route, "intent clear", None)
         .await
         .context("query daemon intent clear endpoint")?;
     if resp.status().is_success() {
