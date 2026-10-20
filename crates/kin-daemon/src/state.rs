@@ -1578,20 +1578,20 @@ impl CoordinationEventLog {
         };
         let mut bytes = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
         bytes.push(b'\n');
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.path().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let path_existed = self.path.exists();
-        let original_len = std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
+        let path_existed = self.path().exists();
+        let original_len = std::fs::metadata(self.path()).map_or(0, |metadata| metadata.len());
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?;
+            .open(self.path())?;
         let persist_result = (|| -> std::io::Result<()> {
             file.write_all(&bytes)?;
             kin_blobs::durable::sync_data(&file)?;
             if !path_existed {
-                if let Some(parent) = self.path.parent() {
+                if let Some(parent) = self.path().parent() {
                     sync_directory_metadata(parent)?;
                 }
             }
@@ -1608,14 +1608,14 @@ impl CoordinationEventLog {
     }
 
     pub fn persisted_failure_count(&self) -> u64 {
-        std::fs::read_to_string(&self.failure_marker)
+        std::fs::read_to_string(self.failure_marker())
             .ok()
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or(0)
     }
 
     fn persist_failure_count(&self, count: u64) {
-        let temp = self.failure_marker.with_extension("failed.tmp");
+        let temp = self.failure_marker().with_extension("failed.tmp");
         let result = (|| -> std::io::Result<()> {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -1625,8 +1625,8 @@ impl CoordinationEventLog {
             file.write_all(format!("{count}\n").as_bytes())?;
             kin_blobs::durable::sync_data(&file)?;
             drop(file);
-            std::fs::rename(&temp, &self.failure_marker)?;
-            if let Some(parent) = self.failure_marker.parent() {
+            std::fs::rename(&temp, self.failure_marker())?;
+            if let Some(parent) = self.failure_marker().parent() {
                 sync_directory_metadata(parent)?;
             }
             Ok(())
@@ -1637,9 +1637,15 @@ impl CoordinationEventLog {
         }
     }
 
-    #[cfg(test)]
+    /// The JSONL log, fixed when the log opens as a constant name in the
+    /// store root.
     pub(crate) fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// The failure-count marker beside the log, fixed the same way.
+    fn failure_marker(&self) -> &std::path::Path {
+        &self.failure_marker
     }
 }
 

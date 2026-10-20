@@ -125,9 +125,22 @@ fn configured_control() -> Option<PathBuf> {
 
 /// The exact operation this session was materialized under, read from the
 /// retained session base rather than guessed from current state.
-fn session_operation(session_dir: &Path) -> Option<OperationId> {
+///
+/// The hook runs before the publication validates the request, so it reads
+/// only a session the publication itself would open: a directory directly
+/// inside the store's runs directory once links are resolved. A request that
+/// names any other directory installs no observer.
+fn session_operation(runs_dir: &Path, session_dir: &Path) -> Option<OperationId> {
+    let runs = std::fs::canonicalize(runs_dir).ok()?;
+    let session = std::fs::canonicalize(session_dir).ok()?;
+    if !session.starts_with(&runs) {
+        return None;
+    }
+    if session.parent() != Some(runs.as_path()) {
+        return None;
+    }
     let base: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(session_dir.join(".kin-session/base.json")).ok()?)
+        serde_json::from_slice(&std::fs::read(session.join(".kin-session/base.json")).ok()?)
             .ok()?;
     let text = base["reconcile_operation_id"].as_str()?;
     Some(OperationId::from_uuid(uuid::Uuid::parse_str(text).ok()?))
@@ -147,7 +160,7 @@ pub(crate) fn install_child_observers(
     session_dir: &Path,
 ) -> Option<ChildObservers> {
     configured_stop()?;
-    let operation = session_operation(session_dir)?;
+    let operation = session_operation(&state.layout.runs_dir(), session_dir)?;
     // The retained storage capability reports its resolved namespace path, and
     // a temporary root reaches that namespace through a symlinked ancestor on
     // this platform, so the payload observer has to name the resolved one. The
@@ -436,7 +449,8 @@ async fn fixture_with_completion(label: &str, evidence: Evidence, complete: bool
     let base_generation = state
         .snapshot_generation
         .load(std::sync::atomic::Ordering::SeqCst);
-    let operation = session_operation(&session).expect("materialized session base");
+    let operation =
+        session_operation(&layout.runs_dir(), &session).expect("materialized session base");
 
     drop(app);
     drop(runtime);
@@ -493,6 +507,48 @@ async fn install_never_committed_lead(state: &Arc<DaemonState>) -> kin_model::Re
         "the Unknown control requires that lead to be absent from durable authority"
     );
     relation.id
+}
+
+/// A request names its session directory, and the crash hook reads that
+/// directory before the publication validates it, so the hook holds itself to
+/// the publication's own rule: a session base is read only from a direct child
+/// of the runs directory, never from a path that climbs out with `..`, an
+/// absolute path elsewhere, a link that resolves outside, or a deeper entry.
+#[test]
+fn the_crash_hook_reads_a_session_base_only_inside_the_runs_directory() {
+    let store = tempfile::tempdir().unwrap();
+    let runs = store.path().join("runs");
+    let outside = store.path().join("outside");
+    let operation = uuid::Uuid::new_v4();
+    let base = serde_json::json!({ "reconcile_operation_id": operation.to_string() });
+    for dir in [
+        runs.join("session-a"),
+        runs.join("session-a/nested"),
+        outside.clone(),
+    ] {
+        std::fs::create_dir_all(dir.join(".kin-session")).unwrap();
+        std::fs::write(dir.join(".kin-session/base.json"), base.to_string()).unwrap();
+    }
+    std::os::unix::fs::symlink(&outside, runs.join("session-link")).unwrap();
+
+    assert_eq!(
+        session_operation(&runs, &runs.join("session-a")),
+        Some(OperationId::from_uuid(operation))
+    );
+    for refused in [
+        runs.join("session-a/../../outside"),
+        outside.clone(),
+        runs.join("session-link"),
+        runs.join("session-a/nested"),
+        runs.clone(),
+    ] {
+        assert_eq!(
+            session_operation(&runs, &refused),
+            None,
+            "{}",
+            refused.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

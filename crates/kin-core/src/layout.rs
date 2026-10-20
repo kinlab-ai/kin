@@ -162,17 +162,17 @@ impl KinLayout {
 
     /// `.kin/config.toml`
     pub fn config_path(&self) -> PathBuf {
-        self.root.join("config.toml")
+        self.root().join("config.toml")
     }
 
     /// `.kin/manifest.json`
     pub fn manifest_path(&self) -> PathBuf {
-        self.root.join("manifest.json")
+        self.root().join("manifest.json")
     }
 
     /// `.kin/kindb/` — KinDB snapshot and index directory.
     pub fn kindb_dir(&self) -> PathBuf {
-        self.root.join("kindb")
+        self.root().join("kindb")
     }
 
     /// `.kin/kindb/ingest-cas/` — non-authoritative blob staging for explicit
@@ -351,52 +351,52 @@ impl KinLayout {
 
     /// `.kin/stashes/` — Named overlay snapshots.
     pub fn stashes_dir(&self) -> PathBuf {
-        self.root.join("stashes")
+        self.root().join("stashes")
     }
 
     /// `.kin/backups/` — Graph snapshot backups.
     pub fn backups_dir(&self) -> PathBuf {
-        self.root.join("backups")
+        self.root().join("backups")
     }
 
     /// `.kin/projections/` — Generated file/doc projections.
     pub fn projections_dir(&self) -> PathBuf {
-        self.root.join("projections")
+        self.root().join("projections")
     }
 
     /// `.kin/docs/` — Living docs (AGENTS.md, ARCHITECTURE.md, etc.).
     pub fn docs_dir(&self) -> PathBuf {
-        self.root.join("docs")
+        self.root().join("docs")
     }
 
     /// `.kin/bench/` — Benchmark traces and reports.
     pub fn bench_dir(&self) -> PathBuf {
-        self.root.join("bench")
+        self.root().join("bench")
     }
 
     /// `.kin/runs/` — Validation run evidence.
     pub fn runs_dir(&self) -> PathBuf {
-        self.root.join("runs")
+        self.root().join("runs")
     }
 
     /// `.kin/logs/` — Daemon logs.
     pub fn logs_dir(&self) -> PathBuf {
-        self.root.join("logs")
+        self.root().join("logs")
     }
 
     /// `.kin/adapters/` — Assistant adapter config.
     pub fn adapters_dir(&self) -> PathBuf {
-        self.root.join("adapters")
+        self.root().join("adapters")
     }
 
     /// `.kin/shallow/` — Persisted C2 shallow-syntax metadata.
     pub fn shallow_dir(&self) -> PathBuf {
-        self.root.join("shallow")
+        self.root().join("shallow")
     }
 
     /// `.kin/version` — layout schema version marker.
     pub fn version_path(&self) -> PathBuf {
-        self.root.join("version")
+        self.root().join("version")
     }
 
     /// Read the schema version from the `.kin/version` file.
@@ -489,7 +489,7 @@ impl KinLayout {
 
     /// `.kin/sync_state.json` — persisted sync state per remote.
     pub fn sync_state_path(&self) -> PathBuf {
-        self.root.join("sync_state.json")
+        self.root().join("sync_state.json")
     }
 
     /// `.kin/merge_state.json` — persisted merge conflict state.
@@ -497,7 +497,7 @@ impl KinLayout {
     /// Written by `kin merge` when conflicts are detected, read by
     /// `kin conflicts` and `kin resolve`, cleared on resolution or abort.
     pub fn merge_state_path(&self) -> PathBuf {
-        self.root.join("merge_state.json")
+        self.root().join("merge_state.json")
     }
 
     /// `.kin/pending-release.json` — exact serialized daemon release request
@@ -505,13 +505,13 @@ impl KinLayout {
     /// rejection. This lets a later CLI process resume an uncertain timeout or
     /// transport failure without constructing a second release marker.
     pub fn pending_release_path(&self) -> PathBuf {
-        self.root.join("pending-release.json")
+        self.root().join("pending-release.json")
     }
 
     /// `.kin/pending-release.lock` — cross-process serialization for release
     /// recovery, policy preflight, and marker construction.
     pub fn pending_release_lock_path(&self) -> PathBuf {
-        self.root.join("pending-release.lock")
+        self.root().join("pending-release.lock")
     }
 
     /// All directories that must exist inside `.kin/`.

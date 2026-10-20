@@ -1,0 +1,24 @@
+# Identifiers that cleartext-logging analysis may treat as public.
+#
+# CleartextLogging.ql flags values whose names look sensitive: anything
+# spelled `uid`, `session_id` or `cert`. The functions below return public
+# identifiers that Kin prints for people and agents on purpose: workspace,
+# operation, entity and session ids (the daemon's bearer token, not a session
+# id, is what authenticates a caller), a parse-coverage certificate's detail,
+# which is evidence about a parse and not a cryptographic certificate, the
+# supervisor endpoint a CLI talks to, and the keyring account name derived as a
+# SHA-256 of the hosted URL. None of them is a credential, so their results are
+# barriers for log-injection, the barrier kind CleartextLogging.ql honours.
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      - ["<kin_model::ids::WorkspaceId>::from_uuid", "ReturnValue", "log-injection", "manual"]
+      - ["<kin_model::ids::OperationId>::from_uuid", "ReturnValue", "log-injection", "manual"]
+      - ["<kin_index::coverage_certificate::CertificateDetail>::from_certificate", "ReturnValue", "log-injection", "manual"]
+      - ["kin_mcp::handlers::common::parse_session_id", "ReturnValue", "log-injection", "manual"]
+      - ["kin_daemon::api::parse_session_id", "ReturnValue", "log-injection", "manual"]
+      - ["kin_daemon::api::parse_uuid", "ReturnValue", "log-injection", "manual"]
+      - ["kin_cli::daemon_client::trusted_supervisor_endpoint", "ReturnValue", "log-injection", "manual"]
+      - ["kin_cli::commands::auth::account_key", "ReturnValue", "log-injection", "manual"]
