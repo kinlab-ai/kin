@@ -15,7 +15,7 @@ repository = "https://github.com/firelock-ai/kin-vfs"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-lru = "0.18"
+lru = "0.19"
 parking_lot = { workspace = true }
 sha2 = "0.10"
 
